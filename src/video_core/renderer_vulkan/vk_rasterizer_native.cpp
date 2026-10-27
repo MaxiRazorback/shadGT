@@ -3508,6 +3508,39 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         ResolveTargets(regs, *pipeline, targets);
     }
 
+    // Experimental post-process resolution: only the known full-screen composition draw.
+    static const bool low_composition = [] {
+        const char* env = std::getenv("RYGT_LOW_RES_COMPOSITION");
+        return env && env[0] == '1';
+    }();
+    const auto* composition_fs = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+    bool scale_composition = false;
+    if (low_composition && composition_fs && composition_fs->pgm_hash == 0xb33ec4df &&
+        targets.colors[0] && !targets.depth && !regs.blend_control[0].enable && regs.color_target_mask.GetMask(0) == 0xf &&
+        std::none_of(targets.colors.begin() + 1, targets.colors.end(), [](auto* e) { return e != nullptr; })) {
+        const auto& desc = targets.colors[0]->image->Desc();
+        const auto flags = r.instance.GetPhysicalDevice().getFormatProperties(
+            targets.color_formats[0]).optimalTilingFeatures;
+        const auto required = vk::FormatFeatureFlagBits::eBlitSrc |
+                              vk::FormatFeatureFlagBits::eBlitDst |
+                              vk::FormatFeatureFlagBits::eSampledImageFilterLinear;
+        if (desc.width == 1920 && desc.height == 1080 && desc.samples == 1 &&
+            desc.layers == 1 && desc.mips == 1 && u32(desc.format) == u32(targets.color_formats[0]) &&
+            (flags & required) == required) {
+            if (!composition_scratch) {
+                auto scratch_desc = desc;
+                scratch_desc.width = 960;
+                scratch_desc.height = 540;
+                scratch_desc.usage = Native::Rhi::ImageUsageTransferSrc |
+                                     Native::Rhi::ImageUsageTransferDst;
+                scratch_desc.name = "composition scale scratch";
+                composition_scratch = device->CreateImage(scratch_desc);
+            }
+            scale_composition = composition_scratch &&
+                composition_scratch->Desc().format == desc.format;
+        }
+    }
+
     if (r.FrameDumpActive() || Rasterizer::ExposureLogOn()) {
         r.FrameDumpPass(regs, targets.state, pipeline); // NAT-117
     }
@@ -3690,6 +3723,23 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         r.UpdatePrimitiveState(is_indexed, quad_triangles);
         r.UpdateRasterizationState();
         r.UpdateColorBlendingState(pipeline);
+        if (scale_composition) {
+            auto viewports = s.dynamic.viewports;
+            auto scissors = s.dynamic.scissors;
+            scale_composition = viewports.size() == 1 && scissors.size() == 1 &&
+                viewports[0].x == 0.f && viewports[0].width == 1920.f &&
+                ((viewports[0].height == 1080.f && viewports[0].y == 0.f) ||
+                 (viewports[0].height == -1080.f && viewports[0].y == 1080.f)) &&
+                scissors[0].offset.x == 0 && scissors[0].offset.y == 0 &&
+                scissors[0].extent.width == 1920 && scissors[0].extent.height == 1080;
+            if (scale_composition) {
+                viewports[0].x *= 0.5f; viewports[0].y *= 0.5f;
+                viewports[0].width *= 0.5f; viewports[0].height *= 0.5f;
+                scissors[0].extent = vk::Extent2D{960, 540};
+                s.dynamic.SetViewports(viewports);
+                s.dynamic.SetScissors(scissors);
+            }
+        }
         s.dynamic.Commit(r.instance, CmdBuf{s.cmd});
         Rasterizer::t_dynamic_state = saved;
     }
@@ -3738,6 +3788,49 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         feedback_layout(vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT,
                         vk::ImageLayout::eGeneral);
         s.buffers_written = true;
+    }
+
+    if (scale_composition) {
+        EndRendering();
+        GlobalBarrier();
+        const vk::Image scratch{Handle<VkImage_T>(composition_scratch->NativeHandle())};
+        const vk::Image output{Handle<VkImage_T>(targets.colors[0]->image->NativeHandle())};
+        if (!composition_scratch_initialized) {
+            const vk::ImageMemoryBarrier2 transition{
+                .srcStageMask = vk::PipelineStageFlagBits2::eTopOfPipe,
+                .dstStageMask = vk::PipelineStageFlagBits2::eAllTransfer,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .oldLayout = vk::ImageLayout::eUndefined, .newLayout = vk::ImageLayout::eGeneral,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = scratch,
+                .subresourceRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}};
+            s.cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                                    .pImageMemoryBarriers = &transition});
+            composition_scratch_initialized = true;
+        }
+        {
+            const vk::ImageCopy copy{
+                .srcSubresource{vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                .dstSubresource{vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                .extent{960, 540, 1}};
+            s.cmd.copyImage(output, vk::ImageLayout::eGeneral, scratch,
+                            vk::ImageLayout::eGeneral, copy);
+            s.list->Barrier(Native::Rhi::ScopeTransfer, Native::Rhi::ScopeTransfer);
+            vk::ImageBlit blit{};
+            blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+            blit.dstSubresource = blit.srcSubresource;
+            blit.srcOffsets[1] = vk::Offset3D{960, 540, 1};
+            blit.dstOffsets[1] = vk::Offset3D{1920, 1080, 1};
+            s.cmd.blitImage(scratch, vk::ImageLayout::eGeneral, output,
+                            vk::ImageLayout::eGeneral, blit, vk::Filter::eLinear);
+        }
+        s.list->Barrier(Native::Rhi::ScopeAll, Native::Rhi::ScopeAll);
+        s.written.push_back(targets.colors[0]);
+        static std::atomic<u32> scale_logged{};
+        if (Sample(scale_logged)) {
+            LOG_WARNING(Render_Vulkan, "COMPOSITION-SCALE: 960x540 shading, 1920x1080 output; HUD unchanged");
+        }
     }
 
     ++stats.draws;

@@ -52,6 +52,7 @@ class ImageRegistry;
 struct MadeImage;
 namespace Rhi {
 class Buffer;
+class Image;
 class CommandList;
 class Device;
 class Fence;
@@ -603,6 +604,8 @@ private:
     std::unique_ptr<Native::ImageRegistry> registry;
     std::unique_ptr<Native::Rhi::Buffer> gds;
     std::unique_ptr<Native::Rhi::Buffer> lds;
+    std::unique_ptr<Native::Rhi::Image> composition_scratch;
+    bool composition_scratch_initialized = false;
 
     std::recursive_mutex mutex; ///< v0: the recorder thread records; flips may come from others
     Stream stream;
