@@ -614,7 +614,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.hw.fs.num_inputs = regs.num_interp;
         static const bool direct_barycentric_requested = [] {
             const char* value = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC");
-            return value && std::strcmp(value, "1") == 0;
+            return !value || std::strcmp(value, "0") != 0;
         }();
         info.hw.fs.single_sample_barycentric = UseSingleSampleBarycentric(
             instance.GetVendorID(), profile.supports_fragment_shader_barycentric,
@@ -794,8 +794,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
     };
     if (const char* value = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC");
-        value && std::strcmp(value, "1") == 0 && instance.GetVendorID() == 0x1002) {
-        LOG_WARNING(Render_Vulkan, "AMD-BARY: single-sample compiler candidate requested; KHR {}",
+        (!value || std::strcmp(value, "0") != 0) && instance.GetVendorID() == 0x1002) {
+        LOG_WARNING(Render_Vulkan, "AMD-BARY: single-sample compiler path enabled; KHR {}",
                     profile.supports_fragment_shader_barycentric);
     }
     // D2: read-only guest buffers are read in place through the direct-memory page table.
@@ -807,7 +807,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     const char* barycentric_env = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC");
     SetSingleSampleBarycentricCacheEnabled(UseSingleSampleBarycentric(
         instance.GetVendorID(), profile.supports_fragment_shader_barycentric, 1,
-        barycentric_env && std::strcmp(barycentric_env, "1") == 0));
+        !barycentric_env || std::strcmp(barycentric_env, "0") != 0));
     CreateDriverCache();
     LoadElseScopeFixed();
     // PERF-032: the shader store is used again, without the startup precompile Lance had removed:
