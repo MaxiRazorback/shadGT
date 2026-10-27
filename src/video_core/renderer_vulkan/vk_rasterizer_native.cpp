@@ -4425,13 +4425,37 @@ void NativeRenderer::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>*
     }
 }
 
+void NativeRenderer::TrimFillPatterns(u64 current_key) {
+    // Fill values can change throughout a race. Cache recent patterns within a bounded
+    // budget; unlike rendered images, these buffers can always be regenerated.
+    constexpr u64 PatternBudget = 64ull << 20;
+    u64 total = 0;
+    for (const auto& [key, pattern] : fill_patterns) {
+        total += pattern.buffer->Size();
+    }
+    while (total > PatternBudget && fill_patterns.size() > 1) {
+        auto oldest = fill_patterns.end();
+        for (auto it = fill_patterns.begin(); it != fill_patterns.end(); ++it) {
+            if (it->first != current_key &&
+                (oldest == fill_patterns.end() || it->second.last_use < oldest->second.last_use)) {
+                oldest = it;
+            }
+        }
+        if (oldest == fill_patterns.end()) break;
+        total -= oldest->second.buffer->Size();
+        // RHI destruction retires the buffer after recorded GPU work completes.
+        fill_patterns.erase(oldest);
+    }
+}
+
 const Native::Rhi::Buffer* NativeRenderer::PatternBuffer(u32 lo, u32 hi, u64 bytes) {
     // NAT-134: a device buffer holding lo, hi, lo, hi... for fills, made once per pattern and
     // grown when a bigger picture needs it (only ever read afterwards).
     const u64 key = u64(lo) | (u64(hi) << 32);
-    auto& slot = fill_patterns[key];
-    if (slot && slot->Size() >= bytes) {
-        return slot.get();
+    const auto found = fill_patterns.find(key);
+    if (found != fill_patterns.end() && found->second.buffer->Size() >= bytes) {
+        found->second.last_use = ++fill_pattern_clock;
+        return found->second.buffer.get();
     }
     const u64 size = std::max<u64>(Common::AlignUp(bytes, 64_KB), 1_MB);
     auto buffer = device->CreateBuffer({.size = size,
@@ -4440,7 +4464,7 @@ const Native::Rhi::Buffer* NativeRenderer::PatternBuffer(u32 lo, u32 hi, u64 byt
                                         .memory = Native::Rhi::MemoryKind::DeviceLocal,
                                         .name = "native fill pattern"});
     if (!buffer) {
-        return slot.get();
+        return found != fill_patterns.end() ? found->second.buffer.get() : nullptr;
     }
     Stream& s = Begin();
     EndRendering();
@@ -4475,11 +4499,12 @@ const Native::Rhi::Buffer* NativeRenderer::PatternBuffer(u32 lo, u32 hi, u64 byt
     }
     transfer_barrier();
     ++s.commands;
-    if (slot) {
-        retired_patterns.push_back(std::move(slot)); // still read by recorded copies
-    }
-    slot = std::move(buffer);
-    return slot.get();
+    auto& slot = fill_patterns[key];
+    // Replaced buffers follow the same fence retirement as evicted cache entries.
+    slot.buffer = std::move(buffer);
+    slot.last_use = ++fill_pattern_clock;
+    TrimFillPatterns(key);
+    return slot.buffer.get();
 }
 
 bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 rows) {
@@ -5300,6 +5325,23 @@ void NativeRenderer::EvictImages() {
     }
     if (frame <= KeepFrames || frame % 30 != 0) {
         return;
+    }
+    // Read-only mirrors are reloadable copies, unlike GPU-written regions and images.
+    // Reclaim a scene's cold mirrors even below the capacity budget; waiting until the
+    // budget fills otherwise keeps every track's peak resident through later menus.
+    constexpr u64 MirrorIdleFrames = 600;
+    std::vector<std::pair<VAddr, u64>> cold_mirrors;
+    {
+        std::shared_lock map_lock{buffer_map_mutex};
+        for (const auto& [base, mirror] : mirrors) {
+            if (frame > mirror.used_frame && frame - mirror.used_frame > MirrorIdleFrames) {
+                cold_mirrors.emplace_back(mirror.begin, mirror.end - mirror.begin);
+            }
+        }
+    }
+    for (const auto& [address, bytes] : cold_mirrors) {
+        ++stats.mirrors_evicted;
+        DropMirrors(address, bytes); // invalidates bindings; existing GPU-safe destruction
     }
     // FIX-157: a picture the GPU wrote stays past its idle time
     // while nothing else writes its memory: its pixels exist nowhere else (the GPU's writes stay
