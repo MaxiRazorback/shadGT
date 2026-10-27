@@ -152,6 +152,22 @@ std::string WatchedBytes(VAddr address) {
     return fmt::format("{:08x} {:08x} {:08x} {:08x}", head[0], head[1], head[2], head[3]);
 }
 
+bool CompatibleLayerStrides(const VideoCore::ImageInfo& a, const VideoCore::ImageInfo& b) {
+    // A Vulkan array view cannot relocate its layers to match a different guest slice
+    // stride. Equal pitch and tiling alone do not make differently sized arrays aliases.
+    if (a.resources.layers <= 1 && b.resources.layers <= 1) return true;
+    if (a.resources.layers == 0 || b.resources.layers == 0 ||
+        a.resources.levels != b.resources.levels) return false;
+    for (u32 level = 0; level < a.resources.levels; ++level) {
+        const auto& x = a.mips_layout[level];
+        const auto& y = b.mips_layout[level];
+        if (x.size % a.resources.layers != 0 || y.size % b.resources.layers != 0 ||
+            x.size / a.resources.layers != y.size / b.resources.layers ||
+            x.offset != y.offset || x.pitch != y.pitch || x.height != y.height) return false;
+    }
+    return true;
+}
+
 bool SameLayout(const VideoCore::ImageInfo& a, const VideoCore::ImageInfo& b) {
     if (a.guest_address != b.guest_address || a.num_bits != b.num_bits ||
         a.size != b.size || a.pitch != b.pitch || a.tile_mode != b.tile_mode ||
@@ -302,6 +318,7 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                 if (cached.props.is_depth && cached.num_bits == info.num_bits &&
                     !it->second->reused.load(std::memory_order_relaxed) &&
                     cached.resources.layers >= info.resources.layers &&
+                    CompatibleLayerStrides(cached, info) &&
                     ((cached.size.width == info.size.width &&
                       cached.size.height == info.size.height) ||
                      (cached.pitch == info.pitch && cached.size.width >= info.size.width &&
@@ -336,6 +353,7 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                     c.props.has_stencil == info.props.has_stencil && c.type == info.type &&
                     c.resources.levels >= info.resources.levels &&
                     c.resources.layers >= info.resources.layers &&
+                    CompatibleLayerStrides(c, info) &&
                     c.size.width >= info.size.width && c.size.height >= info.size.height &&
                     (!require_format || c.pixel_format == info.pixel_format) &&
                     (!info.props.is_depth || c.pixel_format == info.pixel_format) &&
