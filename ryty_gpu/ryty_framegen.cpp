@@ -115,6 +115,26 @@ ffxReturnCode_t DispatchGeneration(ffxDispatchDescFrameGeneration* params, void*
 } // namespace
 
 std::atomic<u64> g_shown_frames{};
+namespace {
+std::atomic<s64> g_generated_at{};
+struct GenerationWindow {
+    std::chrono::steady_clock::time_point start{};
+    u64 shown{}, game{};
+    u32 confirmations{};
+} g_generation_window;
+}
+void ReportWorking(bool working) {
+    const auto stamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    g_generated_at.store(working ? stamp : 0, std::memory_order_relaxed);
+}
+bool Working() {
+    const auto stamp = g_generated_at.load(std::memory_order_relaxed);
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    return stamp && now >= stamp && now - stamp < 2000000000LL;
+}
+
 
 bool Requested() {
     // NVIDIA DLSS frame generation (ryty_dlssg.h) replaces the AMD one when both are on.
@@ -234,6 +254,8 @@ bool FrameGen::CreateSwapchain(const Instance& instance, const vk::SwapchainCrea
 
 void FrameGen::Destroy() {
     g_shown_frames.store(0, std::memory_order_relaxed);
+    ReportWorking(false);
+    g_generation_window = {};
     if (framegen_context) {
         ffxContext context = framegen_context;
         g_api.destroy_context(&context, nullptr);
@@ -384,10 +406,14 @@ void FrameGen::Prepare(vk::CommandBuffer cmdbuf, vk::SwapchainKHR swapchain, vk:
             logged = true;
             LOG_ERROR(Render_Vulkan, "Frame generation: configuring failed (code {})", result);
         }
+        ReportWorking(false);
+        g_generation_window = {};
         return;
     }
 
     if (!config.frameGenerationEnabled) {
+        ReportWorking(false);
+        g_generation_window = {};
         static u32 bypass_logged{};
         if (bypass_logged++ < 12)
             LOG_INFO(Render_Vulkan, "Frame generation: bypass prepare (scene ready {}, fresh {}, compile/pause ready {})",
@@ -431,6 +457,26 @@ void FrameGen::Prepare(vk::CommandBuffer cmdbuf, vk::SwapchainKHR swapchain, vk:
         if (!logged) {
             logged = true;
             LOG_ERROR(Render_Vulkan, "Frame generation: preparing failed (code {})", result);
+        }
+    }
+    if (result != FFX_API_RETURN_OK) {
+        ReportWorking(false);
+        g_generation_window = {};
+    } else if (present_count) {
+        const u64 shown = g_shown_frames.load(std::memory_order_relaxed);
+        auto& sample = g_generation_window;
+        if (sample.start == std::chrono::steady_clock::time_point{} || shown < sample.shown ||
+            frame_id < sample.game) {
+            sample = {now, shown, frame_id};
+        } else if (now - sample.start >= std::chrono::seconds{1}) {
+            // More displayed frames than submitted game frames is actual generation.
+            // Margin excludes a short presentation-queue drain at the sample boundary.
+            const auto game_delta = frame_id - sample.game;
+            const auto shown_delta = shown - sample.shown;
+            const bool extra = game_delta >= 2 && shown_delta > game_delta + 2;
+            const u32 confirmations = extra ? std::min(sample.confirmations + 1, 2u) : 0;
+            ReportWorking(confirmations >= 2);
+            sample = {now, shown, frame_id, confirmations};
         }
     }
     if (result == FFX_API_RETURN_OK && scene_valid) {

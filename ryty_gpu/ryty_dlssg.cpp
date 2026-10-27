@@ -14,6 +14,7 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "ryty_gpu/ryty_dlssg.h"
+#include "ryty_gpu/ryty_framegen.h"
 #include "ryty_gpu/ryty_dlssg_options.h"
 #include "ryty_gpu/ryty_dlssg_state.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -515,12 +516,15 @@ void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
                      static_cast<u32>(cleared_tags.size()), command_buffer);
     }
     g_sl.reset_pending = !(ready && mode_set);
+    if (!(ready && mode_set)) RytyFrameGen::ReportWorking(false);
     Marker(sl::PCLMarker::eRenderSubmitEnd);
 
     // Frames shown (game and generated) for the FPS counter, and DLSS-G's status when it changes.
     if (g_sl.dlssg_get_state) {
         sl::DLSSGState state{};
         if (g_sl.dlssg_get_state(viewport, state, nullptr) == sl::Result::eOk) {
+            if (ready && mode_set && state.numFramesActuallyPresented > 1)
+                RytyFrameGen::ReportWorking(true);
             RytyFrameGen::g_shown_frames.fetch_add(state.numFramesActuallyPresented,
                                                    std::memory_order_relaxed);
             if (static_cast<int>(state.status) != g_sl.last_status) {
@@ -564,6 +568,7 @@ void PresentEnd() {
 
 void Shutdown() {
     std::scoped_lock lock{g_sl.mutex};
+    RytyFrameGen::ReportWorking(false);
     g_sl.motion_vectors_view.reset();
     g_sl.depth_view.reset();
     g_sl.motion_vectors.Destroy();

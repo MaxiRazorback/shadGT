@@ -94,4 +94,9 @@ bool Requested();
 /// Frames shown so far (game and generated), for the FPS counter; 0 while generation is off.
 u64 ShownFrames();
 
+/// True only after recent extra presented frames were observed, not merely enabled.
+bool Working();
+void ReportWorking(bool working);
+
+
 } // namespace Vulkan::RytyFrameGen
