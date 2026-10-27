@@ -8,6 +8,7 @@
 #include <thread>
 
 #include "common/spin_mutex.h"
+#include "common/fetch_code_snapshot.h"
 
 #include <atomic>
 #include <chrono>
@@ -479,6 +480,7 @@ private:
         std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data;
         std::span<const u32> code; // FIX-160: over code_copy, not guest memory
         std::vector<u32> code_copy;
+        std::vector<Common::FetchCodeSnapshot> fetch_code;
         VAddr code_base{};
         Shader::RuntimeInfo runtime_info;
         Shader::Backend::Bindings start;

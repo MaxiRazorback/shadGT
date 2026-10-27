@@ -4,6 +4,9 @@
 #include <utility>
 #include "common/assert.h"
 #include "common/recoverable.h"
+#ifdef RYTY_GPU
+#include "core/memory.h"
+#endif
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/frontend/opcodes.h"
@@ -58,6 +61,12 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
     if (sgpr_base >= info.user_data.size() || info.user_data.size() - sgpr_base < 2) {
         throw Common::RecoverableFailure("fetch shader pointer lies outside the user-data registers");
     }
+    if (t_fetch_code_snapshots) {
+        for (const auto& snapshot : *t_fetch_code_snapshots) {
+            if (snapshot.sgpr_base == sgpr_base) return snapshot.words.data();
+        }
+        throw Common::RecoverableFailure("queued fetch shader has no owned input snapshot");
+    }
     const u32* code;
     std::memcpy(&code, &info.user_data[sgpr_base], sizeof(code));
     if (reinterpret_cast<uintptr_t>(code) < 0x10000 ||
@@ -97,9 +106,33 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
                 reinterpret_cast<uintptr_t>(code), (ptr - code - 1) * sizeof(u32), reason, word));
         }
     };
-    while (true) {
+    const auto read_word = [&]() -> u32 {
         require(size_t(ptr - code) < MaxFetchDwords, "missing return instruction", 0);
-        const u32 word0 = *(ptr++);
+        if (t_fetch_code_snapshots) {
+            // The snapshot may be shorter than the general parser bound.
+            bool available = false;
+            for (const auto& snapshot : *t_fetch_code_snapshots) {
+                if (snapshot.sgpr_base == info.fetch_shader_sgpr_base) {
+                    available = size_t(ptr - code) < snapshot.words.size();
+                    break;
+                }
+            }
+            require(available, "truncated owned fetch shader", 0);
+        }
+        u32 word{};
+#ifdef RYTY_GPU
+        if (!Core::RytyMemory::GuardedCopy(&word, ptr, sizeof(word))) {
+            throw Common::RecoverableFailure(fmt::format(
+                "fetch shader input is unreadable at {:#x}", reinterpret_cast<uintptr_t>(ptr)));
+        }
+#else
+        word = *ptr;
+#endif
+        ++ptr;
+        return word;
+    };
+    while (true) {
+        const u32 word0 = read_word();
         const auto encoding = GetInstructionEncoding(word0);
 
         if (encoding == InstEncoding::SOP1) {
@@ -135,7 +168,7 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
         } else if (encoding == InstEncoding::MUBUF || encoding == InstEncoding::MTBUF) {
             // SRSRC is in units of 4 SPGRs while SBASE is in pairs of SGPRs
             require(size_t(ptr - code) < MaxFetchDwords, "truncated buffer instruction", word0);
-            const u32 word1 = *(ptr++);
+            const u32 word1 = read_word();
             const u32 srsrc = ((word1 >> 16) & 0x1f) * 4;
             require(srsrc < loads.size() && loads[srsrc].valid,
                     "buffer instruction has no valid descriptor load", word0);

@@ -12,6 +12,7 @@
 #include "common/assert.h"
 #include "common/read_capture.h"
 #include "common/types.h"
+#include "common/fetch_code_snapshot.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/frontend/copy_shader.h"
 #include "shader_recompiler/frontend/tessellation.h"
@@ -40,6 +41,8 @@ struct ReplayInputs {
     const void* tess_constants{};           // TessellationDataConstantBuffer
 };
 inline thread_local const ReplayInputs* t_replay = nullptr;
+// Set only while a queued translation owns its auxiliary fetch programs.
+inline thread_local const std::vector<Common::FetchCodeSnapshot>* t_fetch_code_snapshots = nullptr;
 
 enum class Qualifier : u8 {
     None,

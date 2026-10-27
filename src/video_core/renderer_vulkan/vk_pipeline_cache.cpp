@@ -43,6 +43,7 @@
 #include "core/memory.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/info.h"
+#include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/buffer_cache/direct_memory.h"
@@ -196,6 +197,11 @@ private:
         const auto start = std::chrono::steady_clock::now();
         Shader::Optimization::g_diag_compiling_code = job.code;
         Shader::Optimization::g_diag_compiling_hash = job.hash;
+        struct RestoreFetchInputs {
+            const std::vector<Common::FetchCodeSnapshot>* previous;
+            ~RestoreFetchInputs() { Shader::t_fetch_code_snapshots = previous; }
+        } restore_fetch{Shader::t_fetch_code_snapshots};
+        Shader::t_fetch_code_snapshots = &job.fetch_code;
         try {
             Common::RecoverableScope recoverable;
             const auto program = Shader::TranslateProgram(job.code, pools, *info, runtime_info,
@@ -4088,6 +4094,39 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
     std::ranges::copy(params.code, job->code_copy.begin());
 #endif
     job->code = job->code_copy;
+    // Capture the separately allocated fetch code before the guest can recycle it.
+    // Inline-fetch debugging accepts more instructions than the bounded fetch parser;
+    // keep that optional mode on its existing synchronous path.
+    if (EmulatorSettings.IsInlineFetchShader()) return false;
+    try {
+        Common::RecoverableScope recoverable;
+        const auto read = [](uintptr_t address, u32& word) {
+#ifdef RYTY_GPU
+            return Core::RytyMemory::GuardedCopy(&word, reinterpret_cast<const void*>(address),
+                                                sizeof(word));
+#else
+            std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+            return true;
+#endif
+        };
+        const auto length = [](u32 word) -> u32 {
+            using Shader::Gcn::InstEncoding;
+            switch (Shader::Gcn::GetInstructionEncoding(word)) {
+            case InstEncoding::MUBUF:
+            case InstEncoding::MTBUF: return 2;
+            case InstEncoding::SOP1:
+            case InstEncoding::SMRD:
+            case InstEncoding::VOP2:
+            case InstEncoding::SOPP:
+            case InstEncoding::VOP1: return 1;
+            default: return 0;
+            }
+        };
+        if (!Common::SnapshotFetchPrograms(job->code, job->user_data, read, length,
+                                           job->fetch_code)) return false;
+    } catch (const Common::RecoverableFailure&) {
+        return false; // A real draw can retry; no worker may read the rejected pointer.
+    }
     job->start = start;
     jobs.push_back(job);
     ++translate_stats.queued;
