@@ -74,9 +74,19 @@ bool MatchExperimentalCompositionTexture(AmdGpu::Image& sharp, const Shader::Inf
         const char* env = std::getenv("RYGT_EXPERIMENTAL_SCENE_VIEWPORT");
         return env && std::strcmp(env, "1") == 0;
     }();
+    static const u32 scene_width = [] {
+        const char* value = std::getenv("RYGT_SCENE_WIDTH");
+        return value ? u32(std::strtoul(value, nullptr, 10)) : 960u;
+    }();
+    static const u32 scene_height = [] {
+        const char* value = std::getenv("RYGT_SCENE_HEIGHT");
+        return value ? u32(std::strtoul(value, nullptr, 10)) : 540u;
+    }();
+    if (scene_width < 320 || scene_width > 3840 || scene_height < 180 || scene_height > 2160 ||
+        (scene_width == 1920 && scene_height == 1080)) return true;
     if (!enabled || stage.pgm_hash != 0xb33ec4df || resource.is_written || resource.is_depth ||
         sharp.GetType() != AmdGpu::ImageType::Color2D || sharp.width != 1919 ||
-        sharp.height != 1079 || sharp.Pitch() != 1024 || sharp.NumLevels() != 1 ||
+        sharp.height != 1079 || sharp.NumLevels() != 1 ||
         sharp.NumLayers() != 1 || sharp.base_level != 0) {
         return true;
     }
@@ -85,8 +95,8 @@ bool MatchExperimentalCompositionTexture(AmdGpu::Image& sharp, const Shader::Inf
     const auto* target = registry.FindExisting(sharp.Address(), [&](const Native::ImageEntry& entry) {
         const auto& info = entry.info;
         return !entry.from_cpu && !info.props.is_depth && info.pixel_format == format &&
-               info.size.width == 960 && info.size.height == 540 && info.size.depth == 1 &&
-               info.pitch == 1024 && info.tile_mode == tile_mode && info.num_samples == 1 &&
+               info.size.width == scene_width && info.size.height == scene_height && info.size.depth == 1 &&
+               info.pitch == sharp.Pitch() && info.tile_mode == tile_mode && info.num_samples == 1 &&
                info.resources.levels == 1 && info.resources.layers == 1;
     }, true);
     if (!target) return false;
@@ -95,8 +105,8 @@ bool MatchExperimentalCompositionTexture(AmdGpu::Image& sharp, const Shader::Inf
     static std::atomic<u32> logged{};
     if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
         LOG_WARNING(Render_Vulkan,
-            "RES-COMP: sampled view {:#x} matched rendered target 960x540 (output 1920x1080)",
-            sharp.Address());
+            "RES-COMP: sampled view {:#x} matched rendered target {}x{} (game composition 1920x1080)",
+            sharp.Address(), scene_width, scene_height);
     }
     return true;
 }

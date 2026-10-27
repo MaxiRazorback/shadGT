@@ -1362,6 +1362,14 @@ void PS4_SYSV_ABI MatchExperimentalSceneViewport(
     u64 self, u64 output, u64 auxiliary, u64 scene, u64 depth, u64 motion,
     float x, float y, float width, float height, float scene_x, float scene_y,
     u64 extra_a, u64 extra_b) {
+    static const u32 scene_width = [] {
+        const char* value = std::getenv("RYGT_SCENE_WIDTH");
+        return value ? u32(std::strtoul(value, nullptr, 10)) : 960u;
+    }();
+    static const u32 scene_height = [] {
+        const char* value = std::getenv("RYGT_SCENE_HEIGHT");
+        return value ? u32(std::strtoul(value, nullptr, 10)) : 540u;
+    }();
     u32 output_extent{}, scene_extent{};
     // These are verified color-target hint fields, not guessed ImageInfo offsets.
     if (output && scene && scene_x == 1.0f && scene_y == 1.0f &&
@@ -1369,11 +1377,14 @@ void PS4_SYSV_ABI MatchExperimentalSceneViewport(
             reinterpret_cast<const void*>(output + 0x44), sizeof(output_extent)) &&
         Core::RytyMemory::GuardedCopy(&scene_extent,
             reinterpret_cast<const void*>(scene + 0x44), sizeof(scene_extent)) &&
-        output_extent == 0x04380780 && scene_extent == 0x021c03c0) {
-        scene_x = scene_y = 0.5f;
+        output_extent == 0x04380780 && scene_width >= 320 && scene_width <= 3840 &&
+        scene_height >= 180 && scene_height <= 2160 &&
+        scene_extent == ((scene_height << 16) | scene_width)) {
+        scene_x = float(scene_width) / 1920.f;
+        scene_y = float(scene_height) / 1080.f;
         static std::atomic<u32> logged{};
         if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
-            std::fprintf(stderr, "[resolution] scene viewport 960x540; output 1920x1080\n");
+            std::fprintf(stderr, "[resolution] scene viewport %ux%u; game composition 1920x1080\n", scene_width, scene_height);
         }
     }
     g_scene_viewport(self, output, auxiliary, scene, depth, motion,
