@@ -3,6 +3,7 @@
 
 #include <cstdlib>
 #include <fstream>
+#include <stdexcept>
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/polyfill_thread.h"
@@ -123,8 +124,8 @@ void DataBase::Open() {
         // shaders are translated, the store kept the old translations and drew with them (a
         // magenta car and red scenery on an RX 7600 after updating to PR #88, until the folder
         // was deleted by hand). The store now carries a version: a store without this one is
-        // set aside as <store>.outdated and starts again, and the launcher's shader pack stamp
-        // goes with it, so the next Play prepares the pack into the new store. Raise the
+        // deleted and starts again, along with any previous <store>.outdated backup. The
+        // launcher's shader pack stamp is removed, so the next Play prepares the new store. Raise the
         // version whenever a change makes stored translations wrong.
         // AMD-311: each vertex order of AMD's per-vertex reads has a store of its own version.
         // AMD-312: Radeon RX 9000 cards (RDNA4) use store 4: an RX 9060 XT drew the road at
@@ -158,16 +159,17 @@ void DataBase::Open() {
                 auto outdated = cache_path;
                 outdated += ".outdated";
                 std::filesystem::remove_all(outdated, ec);
-                std::filesystem::rename(cache_path, outdated, ec);
                 if (ec) {
-                    LOG_ERROR(Render, "FIX-213: could not set aside the outdated shader store {}: "
-                              "{}", cache_path.string(), ec.message());
+                    throw std::runtime_error("Could not remove obsolete shader cache: " + ec.message());
+                }
+                std::filesystem::remove_all(cache_path, ec);
+                if (ec) {
+                    throw std::runtime_error("Could not remove incompatible shader cache: " + ec.message());
                 } else {
                     std::filesystem::remove(GetUserPath(PathType::CacheDir) / "shaders-pack.txt",
                                             ec);
-                    LOG_WARNING(Render, "FIX-213: shader store of another version ('{}') set "
-                                "aside as {}; shaders are translated again",
-                                version, outdated.string());
+                    LOG_WARNING(Render, "FIX-213: shader store of another version ('{}') removed; "
+                                "shaders are translated again", version);
                 }
             }
         }
