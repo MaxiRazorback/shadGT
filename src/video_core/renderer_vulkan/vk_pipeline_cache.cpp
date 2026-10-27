@@ -3504,6 +3504,11 @@ bool PipelineCache::PreservesDepthOutput() const {
         !regs.depth_buffer.DepthValid()) {
         return false;
     }
+    // Match RefreshGraphicsKey: disabled color writes ignore stale bound color
+    // attachments. Such a draw is still a depth-only bake and cannot be skipped.
+    if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable) {
+        return true;
+    }
     // Shadow bakes need all depth-only draws, including on their first encounter.
     // Ordinary color rendering also writes depth but must keep its asynchronous policy.
     for (u32 cb = 0; cb < std::size(regs.color_buffers); ++cb) {

@@ -1466,7 +1466,7 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         WatchPages(pages[first], end - pages[first]);
         first = last;
     }
-    const auto copy_in = [&](VAddr from, u64 size) {
+    const auto copy_imported = [&](VAddr from, u64 size) {
         direct->ForEachPart(from, size,
                             [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset,
                                 u64 bytes) {
@@ -1477,6 +1477,17 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
                                                                 .size = bytes});
                             });
     };
+    const auto copy_snapshot = [&](VAddr from, const u8* data, u64 bytes) {
+        // The CPU can rewrite/reuse the imported guest pages before a queued
+        // copy executes. Upload exactly the bytes compared below from storage
+        // retained by this stream until GPU completion, not from the live pages.
+        const auto [buffer, offset, upload] = Allocate(bytes, 4);
+        std::memcpy(upload, data, bytes);
+        s.cmd.copyBuffer(buffer, dst,
+                         vk::BufferCopy{.srcOffset = offset,
+                                        .dstOffset = from - region.begin,
+                                        .size = bytes});
+    };
     for (size_t i = 0; i < pages.size(); ++i) {
         const VAddr page = pages[i];
         if (page < region.begin || page >= region.end) {
@@ -1485,10 +1496,14 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         const u64 page_bytes = std::min<u64>(4096, region.end - page);
         const auto& before = snapshots[i];
         std::array<u8, 4096> now;
-        if (!before || !Core::RytyMemory::GuardedCopy(now.data(),
-                                                      reinterpret_cast<const void*>(page),
-                                                      page_bytes)) {
-            copy_in(page, page_bytes);
+        if (!Core::RytyMemory::GuardedCopy(now.data(), reinterpret_cast<const void*>(page),
+                                         page_bytes)) {
+            // GPU-only/unreadable memory must continue to use its GPU backing.
+            copy_imported(page, page_bytes);
+            continue;
+        }
+        if (!before) {
+            copy_snapshot(page, now.data(), page_bytes);
             continue;
         }
         // The runs of 16-byte pieces the CPU changed (gaps under 64 bytes joined).
@@ -1505,7 +1520,7 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
                 continue;
             }
             if (in_run) {
-                copy_in(page + run_begin, run_end - run_begin);
+                copy_snapshot(page + run_begin, now.data() + run_begin, run_end - run_begin);
                 changed += run_end - run_begin;
             }
             in_run = true;
@@ -1513,7 +1528,7 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
             run_end = at + n;
         }
         if (in_run) {
-            copy_in(page + run_begin, run_end - run_begin);
+            copy_snapshot(page + run_begin, now.data() + run_begin, run_end - run_begin);
             changed += run_end - run_begin;
         }
         ++stats.region_partial_pages;
