@@ -31,6 +31,7 @@
 #include "ryty_gpu/ryty_framegen.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "ryty_gpu/ryty_input_bridge.h"
+#include "ryty_gpu/ryty_camera.h"
 #include "ryty_gpu/ryty_library.h"
 #include "ryty_gpu/native/gts_hooks.h"
 #include "ryty_gpu/native/image_registry.h"
@@ -232,6 +233,7 @@ void DrawCompileNotice() {
 
 void DrawFpsCounter() {
     Ryty::DrawControllerOverlay();
+    Ryty::Camera::DrawOverlay();
     DrawPrecompileProgress();
     if (!Vulkan::GetPrecompileProgress().active) {
         DrawCompileNotice();
@@ -377,6 +379,9 @@ void StartHeapReport() {
 
 void Ryty::RytyLibraryInitialize() {
     InitializeCommon("shadgt_ryty.log");
+    // Camera file I/O, executable validation and hook setup belong to library startup,
+    // before the game runs camera callbacks, never to the per-frame overlay draw.
+    Camera::InitializeRuntime();
     LOG_INFO(Lib_GnmDriver, "Ryty: starting shadGT renderer");
     // shadGT's main() loads the player list (user/users.json, created with defaults when
     // missing); a gamepad is only assigned to a player that exists ("User 1 not found").

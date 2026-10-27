@@ -29,6 +29,8 @@
 #include "input/input_handler.h"
 #include "video_core/renderdoc.h"
 #include "ryty_gpu/ryty_input_bridge.h"
+#include "ryty_gpu/ryty_camera.h"
+#include "ryty_gpu/ryty_camera_input.h"
 
 namespace {
 
@@ -348,6 +350,11 @@ void ForwardInput() {
             }
             controller.SetTriggerFeedback(left, right, left_rumble, right_rumble);
             const auto state = controller.ReadState();
+            if (slot == 0) {
+                DWORD foreground_pid{};
+                GetWindowThreadProcessId(GetForegroundWindow(), &foreground_pid);
+                Ryty::Camera::PublishStick(Ryty::Camera::NormalizeOrbitAxis(ClampAxis(state.axes[2])), Ryty::Camera::NormalizeOrbitAxis(ClampAxis(state.axes[3])), foreground_pid == GetCurrentProcessId());
+            }
             RytyPadInputState input{};
             input.buttons = static_cast<std::uint32_t>(state.buttonsState);
             input.sticks = {ClampAxis(state.axes[0]), ClampAxis(state.axes[1]),

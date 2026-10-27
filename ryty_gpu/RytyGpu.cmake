@@ -101,6 +101,9 @@ ryty_add_library(ryty_gpu libSceVideoOut
         ryty_gpu/ryty_entry.cpp
         ryty_gpu/ryty_input_bridge.cpp
         ryty_gpu/ryty_controller_overlay.cpp
+        ryty_gpu/ryty_camera_overlay.cpp
+        ryty_gpu/ryty_camera_settings.cpp
+        ryty_gpu/ryty_camera_runtime.cpp
         ryty_gpu/ryty_write_watch.cpp
         # Stutter diagnostics (RYGT_DIAG=1), ryty_diag.h.
         ryty_gpu/ryty_diag.cpp
@@ -234,3 +237,5 @@ target_include_directories(ryty_np PRIVATE "${SHADNET_PROTO_OUT}")
 foreach(target IN ITEMS ryty_ngs2 ryty_ajm ryty_audio3d ryty_zlib ryty_discmap ryty_screenshot ryty_np)
     target_sources(${target} PRIVATE ryty_gpu/ryty_hle_precompile.cpp)
 endforeach()
+
+target_link_libraries(ryty_gpu PRIVATE bcrypt)
