@@ -442,7 +442,7 @@ private:
     /// PERF-076: new graphics pipelines build in the background while their draws are skipped.
     static bool AsyncPipelines();
     static bool WritesMemory(const std::array<const Shader::Info*, MaxShaderStages>& infos);
-    static bool NeverSkipped(const std::array<const Shader::Info*, MaxShaderStages>& infos);
+    bool NeverSkipped(const std::array<const Shader::Info*, MaxShaderStages>& infos);
     struct AsyncStats {
         u64 deferred{};
         u64 installed{};
