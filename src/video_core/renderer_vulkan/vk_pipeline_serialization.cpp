@@ -38,7 +38,7 @@ static constexpr u32 ShaderBinaryVersionVertexFetch = 277u;
 // Fragment reflections use cube views; other stages keep their existing array path.
 static constexpr u32 ShaderBinaryVersionNativeCube = 279u;
 // AMD single-sample KHR barycentrics change the fragment interface and interpolation.
-static constexpr u32 ShaderBinaryVersionSingleSampleBarycentric = 281u;
+static constexpr u32 ShaderBinaryVersionSingleSampleBarycentric = 282u;
 
 static bool UsesScalarPrefix(const Shader::Info& info) {
     return info.hw_stage == Shader::HwStage::Compute &&

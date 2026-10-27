@@ -658,9 +658,15 @@ void PatchPhiNodes(const IR::Program& program, EmitContext& ctx) {
 std::vector<u32> EmitSPIRV(const Profile& device_profile, const RuntimeInfo& runtime_info,
                            const IR::Program& program, Bindings& binding) {
     auto profile = device_profile;
+    // AMD explicit interpolation and KHR per-vertex arrays are alternative ABIs.
+    // Both extensions may be enabled on the device, but a shader must select one.
+    if (profile.supports_amd_shader_explicit_vertex_parameter) {
+        profile.supports_fragment_shader_barycentric = false;
+    }
     if (runtime_info.hw_stage == HwStage::Fragment &&
         runtime_info.hw.fs.single_sample_barycentric) {
         profile.supports_amd_shader_explicit_vertex_parameter = false;
+        profile.supports_fragment_shader_barycentric = true;
         // Preserve P1/P2 arithmetic when MOV makes another component per-vertex.
         // Otherwise the shared attribute qualifier turns prior hardware reads into P0.
         profile.needs_manual_interpolation = true;
