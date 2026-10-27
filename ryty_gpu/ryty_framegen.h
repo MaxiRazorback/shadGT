@@ -18,7 +18,9 @@ namespace Vulkan::RytyFrameGen {
 // Owned by one presentation Frame. Its ready semaphore orders these copies before
 // FG preparation, and its present fence protects reuse/reallocation.
 struct SceneInputs {
-    vk::Image depth{}, motion{};
+    vk::Image depth{}, motion{}, hudless{};
+    vk::Extent2D hudless_size{};
+    vk::Format hudless_format{};
     vk::Extent2D size{};
     float jitter_x{}, jitter_y{}, motion_scale_x{}, motion_scale_y{};
     float frame_time_ms{};
@@ -30,6 +32,12 @@ struct SceneSnapshot {
     vk::Extent2D size{};
     bool initialized{};
     SceneInputs inputs{};
+    VideoCore::UniqueImage hudless_scene, hudless_output;
+    vk::UniqueImageView hudless_scene_view, hudless_output_view;
+    vk::Extent2D hudless_scene_size{}, hudless_output_size{};
+    vk::Format hudless_output_format{};
+    bool hudless_scene_initialized{}, hudless_output_initialized{};
+    bool hudless_scene_valid{};
 };
 
 /// ryGT: AMD FSR 3.1 frame generation (amd_fidelityfx_vk.dll, GPU.framegen_enabled). FidelityFX

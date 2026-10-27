@@ -1052,6 +1052,66 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 }
 
 #ifdef RYTY_GPU
+void Presenter::PrepareHudlessReference(Frame& frame, vk::CommandBuffer cmd, vk::Format input_format) {
+    auto& snapshot = frame.framegen_scene;
+    if (!snapshot.inputs.valid || !snapshot.hudless_scene_valid) return;
+    const auto output_format = swapchain.GetSurfaceFormat().format;
+    const vk::Extent2D output_size{frame.width, frame.height};
+    if (!snapshot.hudless_scene_view) {
+        snapshot.hudless_scene_view = Check<"create FG HUD-less input view">(
+            instance.GetDevice().createImageViewUnique({.image = snapshot.hudless_scene,
+                .viewType = vk::ImageViewType::e2D, .format = input_format,
+                .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}}));
+    }
+    if (snapshot.hudless_output_size != output_size || snapshot.hudless_output_format != output_format) {
+        snapshot.hudless_output_view.reset();
+        snapshot.hudless_output = VideoCore::UniqueImage{instance.GetDevice(), instance.GetAllocator()};
+        snapshot.hudless_output.Create({.imageType = vk::ImageType::e2D, .format = output_format,
+            .extent = {frame.width, frame.height, 1}, .mipLevels = 1, .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled});
+        snapshot.hudless_output_view = Check<"create FG HUD-less output view">(
+            instance.GetDevice().createImageViewUnique({.image = snapshot.hudless_output,
+                .viewType = vk::ImageViewType::e2D, .format = output_format,
+                .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}}));
+        snapshot.hudless_output_size = output_size;
+        snapshot.hudless_output_format = output_format;
+        snapshot.hudless_output_initialized = false;
+    }
+    const vk::ImageMemoryBarrier2 before{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = snapshot.hudless_output_initialized ? vk::AccessFlagBits2::eShaderRead
+                                                            : vk::AccessFlags2{},
+        .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+        .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+        .oldLayout = snapshot.hudless_output_initialized ? vk::ImageLayout::eShaderReadOnlyOptimal
+                                                        : vk::ImageLayout::eUndefined,
+        .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = snapshot.hudless_output,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}};
+    cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &before});
+    Frame hudless;
+    hudless.width = frame.width; hudless.height = frame.height;
+    hudless.image = snapshot.hudless_output; hudless.image_view = *snapshot.hudless_output_view;
+    hudless.is_hdr = frame.is_hdr;
+    pp_pass.Render(cmd, *snapshot.hudless_scene_view, snapshot.hudless_scene_size,
+                   hudless, pp_settings, {}, false);
+    auto after = before;
+    after.srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
+    after.srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite;
+    after.dstStageMask = vk::PipelineStageFlagBits2::eComputeShader;
+    after.dstAccessMask = vk::AccessFlagBits2::eShaderRead;
+    after.oldLayout = vk::ImageLayout::eGeneral;
+    after.newLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &after});
+    snapshot.hudless_output_initialized = true;
+    snapshot.inputs.hudless = snapshot.hudless_output;
+    snapshot.inputs.hudless_format = output_format;
+    snapshot.inputs.hudless_size = output_size;
+}
+
 Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
                                      const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                      VAddr cpu_address) {
@@ -1065,7 +1125,7 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     const auto scene_sequence = g_prepared_frames.load(std::memory_order_relaxed);
     if (display && !display->upscaler.empty() && scene_sequence)
         rasterizer->GetTemporalDlss().CopyFrameGenerationInputs(scene_sequence - 1,
-                                                               frame->framegen_scene);
+                                                               frame->framegen_scene, true);
     if (!display) {
         return PrepareBlankFrame(false, frame);
     }
@@ -1165,6 +1225,7 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
                                           RytyFrameGen::Working());
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
+    PrepareHudlessReference(*frame, pass_cmdbuf, view_format);
     pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, pp_settings, ui_layer_view,
                    dlss_scaled);
     const vk::ImageMemoryBarrier2 back{
@@ -1618,6 +1679,7 @@ Frame* Presenter::GetRenderFrame() {
     record_wait();
 #ifdef RYTY_GPU
     frame->framegen_scene.inputs = {}; // never reuse another scene's metadata on a blank frame
+    frame->framegen_scene.hudless_scene_valid = false;
 #endif
 
     if (frame->width != expected_frame_width || frame->height != expected_frame_height ||

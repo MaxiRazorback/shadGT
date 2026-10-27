@@ -282,8 +282,10 @@ void GtsDlssPass::copyDepthForFsr() {
     transit(depth, vk::ImageLayout::eShaderReadOnlyOptimal);
 }
 
-bool GtsDlssPass::CopyFrameGenerationInputs(u64 frame, RytyFrameGen::SceneSnapshot& snapshot) {
+bool GtsDlssPass::CopyFrameGenerationInputs(u64 frame, RytyFrameGen::SceneSnapshot& snapshot,
+                                            bool native_hudless) {
     snapshot.inputs = {};
+    snapshot.hudless_scene_valid = false;
     if (!RytyFrameGen::Requested() || failed || (!useFsr && !useXess) ||
         sceneFrame != frame || !renderSize.width || !renderSize.height ||
         fsrDepth.format != vk::Format::eR32Sfloat || motion.format != vk::Format::eR16G16Sfloat)
@@ -304,16 +306,17 @@ bool GtsDlssPass::CopyFrameGenerationInputs(u64 frame, RytyFrameGen::SceneSnapsh
         snapshot.initialized = false;
     }
     scheduler.EndRendering();
-    const auto copy = [&](Texture& source, VideoCore::UniqueImage& target) {
+    const auto copy = [&](Texture& source, VideoCore::UniqueImage& target,
+                          vk::Extent2D copy_size, bool initialized) {
         transit(source, vk::ImageLayout::eTransferSrcOptimal);
         const vk::ImageMemoryBarrier2 before{
-            .srcStageMask = snapshot.initialized ? vk::PipelineStageFlagBits2::eAllCommands
+            .srcStageMask = initialized ? vk::PipelineStageFlagBits2::eAllCommands
                                                  : vk::PipelineStageFlagBits2::eTopOfPipe,
-            .srcAccessMask = snapshot.initialized ? vk::AccessFlagBits2::eShaderRead
+            .srcAccessMask = initialized ? vk::AccessFlagBits2::eShaderRead
                                                   : vk::AccessFlags2{},
             .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
             .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
-            .oldLayout = snapshot.initialized ? vk::ImageLayout::eShaderReadOnlyOptimal
+            .oldLayout = initialized ? vk::ImageLayout::eShaderReadOnlyOptimal
                                               : vk::ImageLayout::eUndefined,
             .newLayout = vk::ImageLayout::eTransferDstOptimal,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -325,7 +328,7 @@ bool GtsDlssPass::CopyFrameGenerationInputs(u64 frame, RytyFrameGen::SceneSnapsh
                                                .pImageMemoryBarriers = &before});
         const vk::ImageCopy region{.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
             .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-            .extent = {renderSize.width, renderSize.height, 1}};
+            .extent = {copy_size.width, copy_size.height, 1}};
         cmd.copyImage(source.image, vk::ImageLayout::eTransferSrcOptimal, target,
                       vk::ImageLayout::eTransferDstOptimal, region);
         auto after = before;
@@ -339,8 +342,26 @@ bool GtsDlssPass::CopyFrameGenerationInputs(u64 frame, RytyFrameGen::SceneSnapsh
                                                .pImageMemoryBarriers = &after});
         transit(source, vk::ImageLayout::eShaderReadOnlyOptimal);
     };
-    copy(fsrDepth, snapshot.depth);
-    copy(motion, snapshot.motion);
+    copy(fsrDepth, snapshot.depth, renderSize, snapshot.initialized);
+    copy(motion, snapshot.motion, renderSize, snapshot.initialized);
+    if (native_hudless) {
+        // Native Resolve copied this scene into the game buffer before HUD drawing.
+        // The pass-owned native image itself has not received those HUD draws.
+        if (snapshot.hudless_scene_size != outputSize) {
+            snapshot.hudless_scene_view.reset();
+            snapshot.hudless_scene = VideoCore::UniqueImage{instance.GetDevice(), instance.GetAllocator()};
+            snapshot.hudless_scene.Create({.flags = vk::ImageCreateFlagBits::eMutableFormat,
+                .imageType = vk::ImageType::e2D, .format = native.format,
+                .extent = {outputSize.width, outputSize.height, 1}, .mipLevels = 1,
+                .arrayLayers = 1, .samples = vk::SampleCountFlagBits::e1,
+                .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst});
+            snapshot.hudless_scene_size = outputSize;
+            snapshot.hudless_scene_initialized = false;
+        }
+        copy(native, snapshot.hudless_scene, outputSize, snapshot.hudless_scene_initialized);
+        snapshot.hudless_scene_initialized = true;
+        snapshot.hudless_scene_valid = true;
+    }
     snapshot.initialized = true;
     snapshot.inputs = {.depth = snapshot.depth, .motion = snapshot.motion, .size = renderSize,
         .jitter_x = jitterX, .jitter_y = jitterY,

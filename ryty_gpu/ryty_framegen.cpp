@@ -393,7 +393,12 @@ void FrameGen::Prepare(vk::CommandBuffer cmdbuf, vk::SwapchainKHR swapchain, vk:
     const bool scene_ready = !RytyFsr3::TemporalRequested() || scene_valid;
     config.frameGenerationEnabled = enabled && fresh_frame && scene_ready;
     config.allowAsyncWorkloads = false;
-    config.HUDLessColor = FfxApiResource{};
+    const bool hudless_valid = scene_valid && scene->hudless && scene->hudless_size == size &&
+                               scene->hudless_format == format;
+    config.HUDLessColor = hudless_valid
+        ? Resource(scene->hudless, scene->hudless_format, scene->hudless_size,
+                   FFX_API_RESOURCE_USAGE_READ_ONLY, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ)
+        : FfxApiResource{};
     config.flags = 0;
     config.onlyPresentGenerated = false;
     config.generationRect = {0, 0, static_cast<int32_t>(size.width),
@@ -482,9 +487,9 @@ void FrameGen::Prepare(vk::CommandBuffer cmdbuf, vk::SwapchainKHR swapchain, vk:
     if (result == FFX_API_RETURN_OK && scene_valid) {
         static u32 scene_logged{};
         if (scene_logged++ < 12)
-            LOG_INFO(Render_Vulkan, "Frame generation: real scene {}x{} R32 depth + motion, scene {} FG {}, jitter ({}, {}), enabled {}",
+            LOG_INFO(Render_Vulkan, "Frame generation: real scene {}x{} R32 depth + motion, scene {} FG {}, jitter ({}, {}), enabled {}, HUD-less {}",
                 input_size.width, input_size.height, scene->sequence, frame_id,
-                scene->jitter_x, scene->jitter_y, config.frameGenerationEnabled);
+                scene->jitter_x, scene->jitter_y, config.frameGenerationEnabled, hudless_valid);
     }
     (void)hdr;
 }

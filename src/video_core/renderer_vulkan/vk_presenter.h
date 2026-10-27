@@ -122,6 +122,9 @@ public:
 
 private:
     Frame* GetRenderFrame();
+#ifdef RYTY_GPU
+    void PrepareHudlessReference(Frame& frame, vk::CommandBuffer cmd, vk::Format input_format);
+#endif
 
     void RecreateFrame(Frame* frame, u32 width, u32 height);
 

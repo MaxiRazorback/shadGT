@@ -52,7 +52,8 @@ public:
                  GtsSceneImage motion, GtsSceneImage resolved,
                  const std::array<float, 28>& constants);
     bool HasScene(u64 frame, u64 resolvedUid) const;
-    bool CopyFrameGenerationInputs(u64 frame, RytyFrameGen::SceneSnapshot& snapshot);
+    bool CopyFrameGenerationInputs(u64 frame, RytyFrameGen::SceneSnapshot& snapshot,
+                                   bool native_hudless = false);
     void PrepareScene(u64 frame, GtsSceneImage resolved);
     void Resolve(u64 frame, GtsSceneImage display);
     bool ResolveNativeComposition(u64 frame, GtsSceneImage scene, GtsSceneImage display);
