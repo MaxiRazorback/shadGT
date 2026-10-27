@@ -28,6 +28,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/compiler_worker_budget.h"
+#include "video_core/renderer_vulkan/shared_creation_cache.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -319,29 +320,29 @@ private:
 // both compiled shader libraries and only link. Pipelines own their shared libraries.
 class StageLibraryCache {
 public:
+    using Owner = std::shared_ptr<vk::UniquePipeline>;
     static StageLibraryCache& Instance() { static StageLibraryCache cache; return cache; }
-    std::shared_ptr<vk::UniquePipeline> Find(vk::Device device, u64 key) {
-        std::scoped_lock lock{mutex};
-        const auto it = libraries.find({device, key});
-        return it != libraries.end() ? it->second.lock() : nullptr;
-    }
-    std::shared_ptr<vk::UniquePipeline> Insert(vk::Device device, u64 key, vk::Pipeline library, bool share) {
-        auto owned = std::make_shared<vk::UniquePipeline>(library, device);
-        if (!share) return owned;
-        std::scoped_lock lock{mutex};
-        auto& cached = libraries[{device, key}];
-        if (auto existing = cached.lock()) return existing;
-        cached = owned;
-        // Weak entries own no GPU resources; remove expired keys as scenes change.
-        if (++insertions % 128 == 0) {
-            std::erase_if(libraries, [](const auto& entry) { return entry.second.expired(); });
+    Owner Find(vk::Device device, u64 key) { return libraries.Find({device, key}); }
+    template<class Factory>
+    Owner Acquire(vk::Device device, u64 key, bool share, Factory&& factory) {
+        bool created = false;
+        const auto create = [&] {
+            created = true;
+            return std::make_shared<vk::UniquePipeline>(factory(), device);
+        };
+        if (!share) return create();
+        auto result = libraries.GetOrCreate({device, key}, create);
+        if (!created) {
+            const u64 avoided = duplicates_avoided.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (avoided <= 3 || avoided % 64 == 0) {
+                LOG_INFO(Render_Vulkan, "SHADER-CACHE: avoided {} duplicate shader-library compilations", avoided);
+            }
         }
-        return owned;
+        return result;
     }
 private:
-    std::mutex mutex;
-    std::map<std::pair<vk::Device, u64>, std::weak_ptr<vk::UniquePipeline>> libraries;
-    size_t insertions{};
+    SharedCreationCache<std::pair<vk::Device, u64>, vk::UniquePipeline> libraries;
+    std::atomic<u64> duplicates_avoided{0};
 };
 
 class LibraryKey {
@@ -962,25 +963,26 @@ GraphicsPipeline::GraphicsPipeline(
         const bool fragment_reused = bool(fragment_library);
         // PERF-018: the two shader libraries are compiled at the same time, the fragment one
         // on another thread.
-        std::future<vk::Pipeline> fragment_future;
+        std::future<StageLibraryCache::Owner> fragment_future;
         if (!fragment_library && share_libraries) {
-            fragment_future = std::async(std::launch::async, create_library, size_t{2});
+            fragment_future = std::async(std::launch::async, [&] {
+                return library_cache.Acquire(device, fragment_hash, true, [&] { return create_library(2); });
+            });
         }
         std::array<vk::Pipeline, 4> library_handles{};
         library_handles[0] = create_library(0);
         if (!pre_raster_library) {
-            pre_raster_library = create_library(1);
-            pre_raster_owner = library_cache.Insert(device, pre_raster_hash, pre_raster_library, share_libraries);
+            pre_raster_owner = library_cache.Acquire(device, pre_raster_hash, share_libraries,
+                [&] { return create_library(1); });
             pre_raster_library = **pre_raster_owner;
         }
         library_handles[3] = create_library(3);
         if (fragment_future.valid()) {
-            fragment_library = fragment_future.get();
+            fragment_owner = fragment_future.get();
+            fragment_library = **fragment_owner;
         } else if (!fragment_library) {
-            fragment_library = create_library(2);
-        }
-        if (!fragment_reused) {
-            fragment_owner = library_cache.Insert(device, fragment_hash, fragment_library, share_libraries);
+            fragment_owner = library_cache.Acquire(device, fragment_hash, share_libraries,
+                [&] { return create_library(2); });
             fragment_library = **fragment_owner;
         }
         library_link->shared_libraries = {pre_raster_owner, fragment_owner};
