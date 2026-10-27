@@ -2482,17 +2482,17 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
         LOG_WARNING(Render_Vulkan, "DIAG-150: native shader {:#x} use {} sources:{}",
                     stage.pgm_hash, watched_bind, sources);
     }
-    // Opt-in composition comparison: use the existing descriptor-backed buffer path
+    // AMD defaults to the validated descriptor-backed buffer path
     // rather than repeating guest page-table walks for each scalar constant load.
-    static const bool composition_descriptors = [] {
+    static const bool composition_descriptors = [&] {
         const char* env = std::getenv("RYGT_COMPOSITION_BUFFER_DESCRIPTORS");
-        return env && env[0] == '1';
+        return env && *env ? env[0] == '1' : r.instance.GetVendorID() == 0x1002;
     }();
     const bool descriptor_composition = composition_descriptors &&
         stage.sw_stage == Shader::SwStage::Fragment && stage.pgm_hash == 0xb33ec4df;
-    static const bool postprocess_descriptors = [] {
+    static const bool postprocess_descriptors = [&] {
         const char* env = std::getenv("RYGT_POSTPROCESS_BUFFER_DESCRIPTORS");
-        return env && env[0] == '1';
+        return env && *env ? env[0] == '1' : r.instance.GetVendorID() == 0x1002;
     }();
     const bool descriptor_postprocess = postprocess_descriptors &&
         stage.sw_stage == Shader::SwStage::Fragment &&
@@ -2683,9 +2683,9 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                     // Bounded zero-copy scalar prefix: alias an existing imported view.
                     // No gather, snapshot or new buffer allocation; out-of-prefix reads
                     // retain the existing direct translation and its full bounds.
-                    static const bool prefix_descriptor = [] {
+                    static const bool prefix_descriptor = [&] {
                         const char* env = std::getenv("RYGT_COMPUTE_PREFIX_DESCRIPTOR");
-                        return env && env[0] == '1';
+                        return env && *env ? env[0] == '1' : r.instance.GetVendorID() == 0x1002;
                     }();
                     if (prefix_descriptor && stage.sw_stage == Shader::SwStage::Compute &&
                         stage.pgm_hash == 0xd0af5a54 && !desc.is_written && size >= 4_KB &&
@@ -4386,15 +4386,15 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
     DrawBindings& b = p.bindings;
     const u64 alignment = r.instance.StorageMinAlignment();
     // Match BindBuffers: prepared and recorder-side draws must choose the same path.
-    static const bool composition_descriptors = [] {
+    static const bool composition_descriptors = [&] {
         const char* env = std::getenv("RYGT_COMPOSITION_BUFFER_DESCRIPTORS");
-        return env && env[0] == '1';
+        return env && *env ? env[0] == '1' : r.instance.GetVendorID() == 0x1002;
     }();
     const bool descriptor_composition = composition_descriptors &&
         stage.sw_stage == Shader::SwStage::Fragment && stage.pgm_hash == 0xb33ec4df;
-    static const bool postprocess_descriptors = [] {
+    static const bool postprocess_descriptors = [&] {
         const char* env = std::getenv("RYGT_POSTPROCESS_BUFFER_DESCRIPTORS");
-        return env && env[0] == '1';
+        return env && *env ? env[0] == '1' : r.instance.GetVendorID() == 0x1002;
     }();
     const bool descriptor_postprocess = postprocess_descriptors &&
         stage.sw_stage == Shader::SwStage::Fragment &&
