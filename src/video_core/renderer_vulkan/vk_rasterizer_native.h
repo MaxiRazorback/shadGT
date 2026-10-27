@@ -62,6 +62,7 @@ class Fence;
 namespace Vulkan {
 
 class Rasterizer;
+struct GtsSceneImage;
 class GraphicsPipeline;
 class ComputePipeline;
 
@@ -105,6 +106,7 @@ public:
         vk::ImageView ui_layer{};
         vk::Extent2D output_size{};
         bool dlss_scaled = false;
+        std::string upscaler;
     };
     std::optional<Display> FindDisplay(const VideoCore::ImageInfo& info, vk::Format view_format,
                                        vk::Extent2D output_size);
@@ -362,6 +364,18 @@ private:
 
     bool ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline, Targets& out);
     bool PrepareUiTarget(Targets& targets, const GraphicsPipeline& pipeline);
+    GtsSceneImage TemporalImage(const Native::ImageEntry& entry);
+    void CaptureNativeFsr(const GraphicsPipeline& pipeline, const Targets& targets,
+                          const DrawBindings& bindings);
+    bool BeginNativeFsr(const GraphicsPipeline& pipeline, const Targets& targets,
+                        const DrawBindings& bindings);
+    void FinishNativeFsr(const Targets& targets);
+    struct FsrComposition;
+    std::unique_ptr<FsrComposition> fsr_composition;
+    u64 fsr_display_frame = ~u64{};
+    VAddr fsr_display_address{};
+    std::string fsr_display_backend;
+
     void ResolveUiDisplay(VAddr address, bool keep);
     void SyncUiReads(std::span<const Shader::Info* const> stages);
     void SyncUiRange(VAddr address, u64 size, bool keep);

@@ -1057,6 +1057,8 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     const VideoCore::TextureCache::ImageDesc desc{attribute, cpu_address};
     const vk::Format view_format = GetFrameViewFormat(attribute.attrib.pixel_format);
     Frame* frame = GetRenderFrame();
+    rasterizer->GetTemporalDlss().SetOutputSize({frame->width, frame->height},
+        attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq);
     const auto display = native.FindDisplay(desc.info, view_format, {frame->width, frame->height});
     if (!display) {
         return PrepareBlankFrame(false, frame);
@@ -1111,7 +1113,7 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     bool scaled = false;
     bool dlss_scaled = false;
     vk::ImageView ui_layer_view{};
-    std::string upscaler; // FSR-204: for the window title
+    std::string upscaler = display->upscaler; // actual Native scene reconstruction
     const vk::Extent2D game_size = image_size;
     if (display->output_view) {
         image_view = display->output_view;
@@ -1119,7 +1121,8 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
         ui_layer_view = display->ui_layer;
         dlss_scaled = display->dlss_scaled;
         scaled = true;
-        upscaler = display->dlss_scaled ? "DLSS" : "high-resolution UI";
+        if (display->dlss_scaled) upscaler = "DLSS";
+        else if (upscaler.empty()) upscaler = "high-resolution UI";
     }
     if (const auto dlss_view =
             scaled ? image_view
@@ -1149,7 +1152,7 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
         const auto before = image_view;
         image_view = fsr_pass.Render(pass_cmdbuf, image_view, image_size,
                                      {frame->width, frame->height}, fsr_settings, frame->is_hdr);
-        upscaler = image_view != before ? "FSR 1" : "no upscaling";
+        if (image_view != before) upscaler = "FSR 1";
     }
     RytyUpscalerStatus::ReportResolution(frame->width, frame->height,
                                           game_size.width, game_size.height);

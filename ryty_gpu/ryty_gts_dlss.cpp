@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <string_view>
 #include "common/logging/log.h"
+#include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "ryty_gpu/ryty_gts_dlss.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -12,7 +13,7 @@
 
 namespace Vulkan {
 namespace {
-vk::Extent2D Size(const VideoCore::Image& image) {
+vk::Extent2D Size(const GtsSceneImage& image) {
     return {image.info.size.width, image.info.size.height};
 }
 constexpr vk::ImageSubresourceLayers ColorLayer{vk::ImageAspectFlagBits::eColor, 0, 0, 1};
@@ -25,6 +26,52 @@ vk::ImageBlit Blit(vk::Extent2D from, vk::Extent2D to) {
                                     vk::Offset3D{s32(to.width), s32(to.height), 1}}};
 }
 } // namespace
+
+GtsSceneImage::GtsSceneImage(VideoCore::Image& image)
+    : info{image.info}, image_uid{image.image_uid}, aspect_mask{image.aspect_mask}, cached{&image} {}
+GtsSceneImage::GtsSceneImage(const VideoCore::ImageInfo& desc, u64 uid, vk::Image image,
+                            vk::ImageAspectFlags aspects,
+                            std::function<vk::ImageView(vk::Format)> view,
+                            std::function<void()> modified)
+    : info{desc}, image_uid{uid}, aspect_mask{aspects}, raw{image},
+      native_view{std::move(view)}, native_modified{std::move(modified)},
+      state{vk::PipelineStageFlagBits2::eAllCommands,
+            vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            vk::ImageLayout::eGeneral} {}
+vk::Image GtsSceneImage::GetImage() const { return cached ? cached->GetImage() : raw; }
+vk::ImageView GtsSceneImage::View(vk::Format format) {
+    if (!cached) return native_view(format);
+    VideoCore::ImageViewInfo view{};
+    view.format = format;
+    return *cached->FindView(view).image_view;
+}
+void GtsSceneImage::MarkGpuModified() {
+    if (cached) cached->MarkGpuModified(); else native_modified();
+}
+VideoCore::Image::State GtsSceneImage::State() const {
+    return cached ? cached->backing->state : state;
+}
+
+void GtsDlssPass::transitSource(GtsSceneImage& source, vk::ImageLayout layout,
+                               vk::PipelineStageFlags2 stage, vk::AccessFlags2 access) {
+    if (source.cached) {
+        runtime.Transit(source.cached, layout, stage, access);
+        runtime.FlushBarriers();
+        return;
+    }
+    const auto old = source.state;
+    const vk::ImageMemoryBarrier2 barrier{
+        .srcStageMask = old.pl_stage, .srcAccessMask = old.access_mask,
+        .dstStageMask = stage, .dstAccessMask = access,
+        .oldLayout = old.layout, .newLayout = layout,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = source.raw,
+        .subresourceRange = {.aspectMask = source.aspect_mask, .levelCount = 1, .layerCount = 1}};
+    scheduler.DirectCommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+    source.state = {stage, access, layout};
+}
 
 GtsDlssPass::GtsDlssPass(const Instance& gpuInstance, Scheduler& gpuScheduler, Runtime& gpuRuntime)
     : instance{gpuInstance}, scheduler{gpuScheduler}, runtime{gpuRuntime} {
@@ -97,9 +144,9 @@ void GtsDlssPass::transit(Texture& t, vk::ImageLayout layout) {
     t.layout = layout;
 }
 
-void GtsDlssPass::copyInput(VideoCore::Image& source, Texture& dest) {
+void GtsDlssPass::copyInput(GtsSceneImage source, Texture& dest) {
     scheduler.EndRendering();
-    runtime.Transit(&source, vk::ImageLayout::eTransferSrcOptimal,
+    transitSource(source, vk::ImageLayout::eTransferSrcOptimal,
                     vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead);
     runtime.FlushBarriers();
     transit(dest, vk::ImageLayout::eTransferDstOptimal);
@@ -110,10 +157,13 @@ void GtsDlssPass::copyInput(VideoCore::Image& source, Texture& dest) {
     scheduler.CommandBuffer().copyImage(source.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
         dest.image, vk::ImageLayout::eTransferDstOptimal, region);
     transit(dest, vk::ImageLayout::eShaderReadOnlyOptimal);
+    if (!source.cached) transitSource(source, vk::ImageLayout::eGeneral,
+        vk::PipelineStageFlagBits2::eAllCommands,
+        vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
 }
 
-bool GtsDlssPass::Capture(u64 frame, VideoCore::Image& color, VideoCore::Image& sourceDepth,
-                         VideoCore::Image& sourceMotion, VideoCore::Image& resolved,
+bool GtsDlssPass::Capture(u64 frame, GtsSceneImage color, GtsSceneImage sourceDepth,
+                         GtsSceneImage sourceMotion, GtsSceneImage resolved,
                          const std::array<float, 28>& constants) {
     if (!Enabled() || failed || !supportedDisplay || requestedSize.width == 0 ||
         scheduler.ThreadRing() || sceneFrame == frame) return false;
@@ -194,7 +244,10 @@ bool GtsDlssPass::Capture(u64 frame, VideoCore::Image& color, VideoCore::Image& 
     jitterX = constants[20] * constants[14];
     jitterY = constants[21] * constants[15];
     copyInput(sourceDepth, depth);
-    if (useFsr || useXess) copyDepthForFsr();
+    if (useFsr || useXess) {
+        if (sourceDepth.info.props.is_depth) copyDepthForFsr();
+        else copyInput(sourceDepth, fsrDepth);
+    }
     copyInput(sourceMotion, motion);
     copyInput(color, this->color);
     return true;
@@ -233,12 +286,12 @@ bool GtsDlssPass::HasScene(u64 frame, u64 uid) const {
     return !failed && sceneFrame == frame && sceneUid == uid && outputFrame != frame;
 }
 
-void GtsDlssPass::PrepareScene(u64 frame, VideoCore::Image& resolved) {
+void GtsDlssPass::PrepareScene(u64 frame, GtsSceneImage resolved) {
     if (!HasScene(frame, resolved.image_uid)) return;
-    const auto previous = resolved.backing->state;
+    const auto previous = resolved.State();
     scheduler.EndRendering();
     transit(color, vk::ImageLayout::eTransferSrcOptimal);
-    runtime.Transit(&resolved, vk::ImageLayout::eTransferDstOptimal,
+    transitSource(resolved, vk::ImageLayout::eTransferDstOptimal,
                     vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferWrite);
     runtime.FlushBarriers();
     const vk::ImageCopy region{.srcSubresource = ColorLayer, .dstSubresource = ColorLayer,
@@ -246,17 +299,22 @@ void GtsDlssPass::PrepareScene(u64 frame, VideoCore::Image& resolved) {
     scheduler.CommandBuffer().copyImage(color.image, vk::ImageLayout::eTransferSrcOptimal,
         resolved.GetImage(), vk::ImageLayout::eTransferDstOptimal, region);
     resolved.MarkGpuModified();
-    runtime.Transit(&resolved, previous.layout, previous.pl_stage, previous.access_mask);
+    transitSource(resolved, previous.layout, previous.pl_stage, previous.access_mask);
     runtime.FlushBarriers();
 }
 
-void GtsDlssPass::Resolve(u64 frame, VideoCore::Image& display) {
+void GtsDlssPass::Resolve(u64 frame, GtsSceneImage display) {
     if (failed || frame != sceneFrame || outputFrame == frame || Size(display) != renderSize ||
         display.info.pixel_format != vk::Format::eA2B10G10R10UnormPack32) return;
     scheduler.EndRendering();
-    runtime.Transit(&display, vk::ImageLayout::eShaderReadOnlyOptimal,
+    transitSource(display, vk::ImageLayout::eShaderReadOnlyOptimal,
                     vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);
     runtime.FlushBarriers();
+    SCOPE_EXIT {
+        if (!display.cached) transitSource(display, vk::ImageLayout::eGeneral,
+            vk::PipelineStageFlagBits2::eAllCommands,
+            vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
+    };
     transit(reconstruction, vk::ImageLayout::eGeneral);
     if (useFsr || useXess) {
         // FSR-200: FSR reads the picture in its own A2B10G10R10 layout, so its output needs no
@@ -272,7 +330,7 @@ void GtsDlssPass::Resolve(u64 frame, VideoCore::Image& display) {
             .motion_format = motion.format,
             .output = reconstruction.image,
             .output_format = reconstruction.format,
-            .color_view = useXess ? *display.FindView(colorInfo).image_view : vk::ImageView{},
+            .color_view = useXess ? display.View(colorInfo.format) : vk::ImageView{},
             .depth_view = fsrDepth.view.get(),
             .motion_view = motion.view.get(),
             .output_view = reconstruction.view.get(),
@@ -328,7 +386,7 @@ void GtsDlssPass::Resolve(u64 frame, VideoCore::Image& display) {
     }
     VideoCore::ImageViewInfo viewInfo{};
     viewInfo.format = vk::Format::eA2R10G10B10UnormPack32;
-    const auto view = *display.FindView(viewInfo).image_view;
+    const auto view = display.View(viewInfo.format);
     RygtDlssFrame desc{};
     desc.struct_size = sizeof(desc);
     desc.version = RYGT_DLSS_TEMPORAL_API_VERSION;
@@ -364,6 +422,17 @@ void GtsDlssPass::Resolve(u64 frame, VideoCore::Image& display) {
     nativeDirty = true;
 }
 
+bool GtsDlssPass::ResolveNativeComposition(u64 frame, GtsSceneImage scene,
+                                          GtsSceneImage display) {
+    Resolve(frame, scene);
+    if (!isActive(frame, scene.image_uid)) return false;
+    copyBack(display);
+    // Native already composed the reconstructed picture into the guest-sized output.
+    // HUD draws continue normally; do not redirect or scale them a second time.
+    outputFrame = ~u64{};
+    return true;
+}
+
 bool GtsDlssPass::isActive(u64 frame, u64 uid) const {
     return !failed && uid && uid == displayUid && frame == outputFrame;
 }
@@ -381,20 +450,20 @@ bool GtsDlssPass::OverrideHud(u64 frame, u64 uid, RenderState& state) {
     return true;
 }
 
-void GtsDlssPass::SyncGuestRead(u64 frame, VideoCore::Image& display) {
+void GtsDlssPass::SyncGuestRead(u64 frame, GtsSceneImage display) {
     if (!isActive(frame, display.image_uid) || !nativeDirty) return;
-    const auto previous = display.backing->state;
+    const auto previous = display.State();
     copyBack(display);
     ++guestSyncs;
-    runtime.Transit(&display, previous.layout, previous.pl_stage, previous.access_mask);
+    transitSource(display, previous.layout, previous.pl_stage, previous.access_mask);
     runtime.FlushBarriers();
     transit(native, vk::ImageLayout::eColorAttachmentOptimal);
 }
 
-void GtsDlssPass::FallbackHud(u64 frame, VideoCore::Image& display, vk::ImageLayout restoreLayout) {
+void GtsDlssPass::FallbackHud(u64 frame, GtsSceneImage display, vk::ImageLayout restoreLayout) {
     if (!isActive(frame, display.image_uid)) return;
     copyBack(display);
-    runtime.Transit(&display, restoreLayout, vk::PipelineStageFlagBits2::eAllCommands,
+    transitSource(display, restoreLayout, vk::PipelineStageFlagBits2::eAllCommands,
                     vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
     runtime.FlushBarriers();
     outputFrame = ~u64{};
@@ -420,19 +489,22 @@ void GtsDlssPass::ScaleHud(u64 frame, u64 uid, Viewports& viewports, Scissors& s
     }
 }
 
-void GtsDlssPass::copyBack(VideoCore::Image& display) {
+void GtsDlssPass::copyBack(GtsSceneImage display) {
     scheduler.EndRendering();
     transit(native, vk::ImageLayout::eTransferSrcOptimal);
-    runtime.Transit(&display, vk::ImageLayout::eTransferDstOptimal,
+    transitSource(display, vk::ImageLayout::eTransferDstOptimal,
                     vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferWrite);
     runtime.FlushBarriers();
     scheduler.DirectCommandBuffer().blitImage(native.image, vk::ImageLayout::eTransferSrcOptimal,
-        display.GetImage(), vk::ImageLayout::eTransferDstOptimal, Blit(outputSize, renderSize), vk::Filter::eLinear);
+        display.GetImage(), vk::ImageLayout::eTransferDstOptimal, Blit(outputSize, Size(display)), vk::Filter::eLinear);
     display.MarkGpuModified();
+    if (!display.cached) transitSource(display, vk::ImageLayout::eGeneral,
+        vk::PipelineStageFlagBits2::eAllCommands,
+        vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
     nativeDirty = false;
 }
 
-vk::ImageView GtsDlssPass::PreparePresent(u64 frame, VideoCore::Image& display, vk::Format viewFormat) {
+vk::ImageView GtsDlssPass::PreparePresent(u64 frame, GtsSceneImage display, vk::Format viewFormat) {
     if (!isActive(frame, display.image_uid)) return {};
     if (nativeDirty) copyBack(display);
     transit(native, vk::ImageLayout::eShaderReadOnlyOptimal);

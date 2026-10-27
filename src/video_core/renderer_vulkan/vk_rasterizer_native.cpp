@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -40,6 +41,7 @@
 #include "ryty_gpu/native/job_walker.h"
 #include "ryty_gpu/native/rhi/rhi_vulkan.h"
 #include "ryty_gpu/ryty_ghost.h"
+#include "ryty_gpu/ryty_fsr3.h"
 #include "shader_recompiler/info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/direct_memory.h"
@@ -61,6 +63,7 @@ vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type);
 
 namespace Vulkan {
 bool RytyGtsInRace();
+extern std::atomic<u64> g_prepared_frames;
 bool RytyGtsMenuSnapshotsAllowed();
 namespace {
 
@@ -360,6 +363,190 @@ void NativeRenderer::DrawBindings::Clear() {
     fill_size = 0;
     writes_buffers = false;
     failed = false;
+}
+
+struct NativeRenderer::FsrComposition {
+    std::unique_ptr<Native::Rhi::Image> image;
+    vk::UniqueImageView view;
+    vk::Extent2D size{};
+    vk::Format format{};
+};
+
+GtsSceneImage NativeRenderer::TemporalImage(const Native::ImageEntry& entry) {
+    auto aspects = entry.info.props.is_depth ? vk::ImageAspectFlags{vk::ImageAspectFlagBits::eDepth}
+                                            : vk::ImageAspectFlags{vk::ImageAspectFlagBits::eColor};
+    if (entry.info.pixel_format == vk::Format::eD32SfloatS8Uint ||
+        entry.info.pixel_format == vk::Format::eD24UnormS8Uint)
+        aspects |= vk::ImageAspectFlagBits::eStencil;
+    return {entry.info, entry.image->NativeHandle(),
+            vk::Image{Handle<VkImage_T>(entry.image->NativeHandle())}, aspects,
+            [this, &entry](vk::Format format) {
+                VideoCore::ImageViewInfo view{};
+                view.format = format;
+                return View(entry, view, ViewUse::Sampled);
+            }, [this, &entry] { Written(&entry); }};
+}
+
+void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Targets& targets,
+                                     const DrawBindings& bindings) {
+    if (!RytyFsr3::TemporalRequested() || !r.temporalDlss.Enabled()) return;
+    const auto& regs = r.liverpool->DrawRegs();
+    const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
+    if (!fs || regs.num_indices > 6 ||
+        regs.num_instances.NumInstances() != 1 || targets.state.num_color_attachments != 2 ||
+        bindings.sampled.size() != 4 || !targets.colors[0] || !targets.colors[1]) { static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 1, fs {:#x}", fs ? fs->pgm_hash : 0); return; }
+    const auto* history_out = targets.colors[0];
+    const auto* resolved = targets.colors[1];
+    const vk::Extent2D size{resolved->info.size.width, resolved->info.size.height};
+    if (history_out->info.pixel_format != vk::Format::eR16G16B16A16Sfloat ||
+        resolved->info.pixel_format != vk::Format::eB10G11R11UfloatPack32 ||
+        history_out->info.size.width != size.width || history_out->info.size.height != size.height)
+        { static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 2, fs {:#x}", fs ? fs->pgm_hash : 0); return; }
+    const Native::ImageEntry *color{}, *depth{}, *motion{}, *history{};
+    for (const auto* e : bindings.sampled) {
+        const auto& i = e->info;
+        if (i.size.width != size.width || i.size.height != size.height || i.num_samples != 1 ||
+            i.resources.layers != 1 || i.resources.levels != 1) { static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 3, fs {:#x}", fs ? fs->pgm_hash : 0); return; }
+        // The sampled R32 descriptor may alias the real depth/stencil attachment.
+        // TemporalImage preserves its actual aspects; Capture extracts D32 through
+        // a buffer into FSR's separate R32 image instead of making a D32-only view.
+        if (i.pixel_format == vk::Format::eR32Sfloat ||
+            i.pixel_format == vk::Format::eD32Sfloat ||
+            i.pixel_format == vk::Format::eD32SfloatS8Uint) depth = e;
+        else if (i.pixel_format == vk::Format::eR16G16Sfloat) motion = e;
+        else if (i.pixel_format == vk::Format::eB10G11R11UfloatPack32) color = e;
+        else if (i.pixel_format == vk::Format::eR16G16B16A16Sfloat) history = e;
+        else { static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 4, fs {:#x}", fs ? fs->pgm_hash : 0); return; }
+    }
+    if (!color || !depth || !motion || !history || color == resolved || history == history_out) { static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 5, fs {:#x}", fs ? fs->pgm_hash : 0); return; }
+    std::array<float, 28> constants{};
+    bool valid = false;
+    for (const auto& buffer : fs->buffers) {
+        if (buffer.IsSpecial() || buffer.is_written) continue;
+        const auto sharp = buffer.GetSharp(*fs);
+        if (!sharp.base_address || sharp.GetSize() != sizeof(constants)) continue;
+        if (!Core::RytyMemory::GuardedCopy(constants.data(),
+                reinterpret_cast<const void*>(sharp.base_address), sizeof(constants))) { static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 6, fs {:#x}", fs ? fs->pgm_hash : 0); return; }
+        valid = std::ranges::all_of(constants, [](float v) { return std::isfinite(v); }) &&
+            std::abs(constants[14] - size.width * .5f) <= .01f &&
+            std::abs(constants[15] + size.height * .5f) <= .01f &&
+            constants[16] == size.width && constants[17] == size.height &&
+            std::abs(constants[20] * constants[14]) <= 1.f &&
+            std::abs(constants[21] * constants[15]) <= 1.f;
+        break;
+    }
+    if (!valid) { static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 7, fs {:#x}", fs ? fs->pgm_hash : 0); return; }
+    Splice();
+    const auto captured_frame = g_prepared_frames.load(std::memory_order_relaxed);
+    const bool captured = r.temporalDlss.Capture(captured_frame, TemporalImage(*color),
+        TemporalImage(*depth), TemporalImage(*motion), TemporalImage(*resolved), constants);
+    static u32 captured_logged{};
+    if (captured_logged++ < 12)
+        LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture frame {} fs {:#x} accepted {} resolved {:#x}",
+            captured_frame, fs->pgm_hash, captured, resolved->image->NativeHandle());
+}
+
+bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, const Targets& targets,
+                                   const DrawBindings& bindings) {
+    if (!RytyFsr3::TemporalRequested() || !r.temporalDlss.Enabled()) return false;
+    const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
+    const auto& regs = r.liverpool->DrawRegs();
+    if (!fs || fs->pgm_hash != 0xb33ec4df || regs.num_indices > 6 ||
+        regs.num_instances.NumInstances() != 1 || targets.depth ||
+        targets.state.num_color_attachments != 1 || !targets.colors[0] ||
+        regs.blend_control[0].enable || regs.color_target_mask.GetMask(0) != 0xf) return false;
+    const auto* target = targets.colors[0];
+    const auto& desc = target->image->Desc();
+    if (target->info.pixel_format != vk::Format::eA2B10G10R10UnormPack32 ||
+        desc.samples != 1 || desc.layers != 1 || desc.mips != 1 ||
+        targets.state.width != desc.width || targets.state.height != desc.height) return false;
+    const auto now = g_prepared_frames.load(std::memory_order_relaxed);
+    const auto scene = std::ranges::find_if(bindings.sampled, [&](const auto* e) {
+        return r.temporalDlss.HasScene(now, e->image->NativeHandle());
+    });
+    if (scene == bindings.sampled.end()) return false;
+    const auto size = r.temporalDlss.RenderSize();
+    if (size.width > desc.width || size.height > desc.height) return false;
+    const auto features = r.instance.GetPhysicalDevice().getFormatProperties(
+        target->info.pixel_format).optimalTilingFeatures;
+    const auto required = vk::FormatFeatureFlagBits::eBlitSrc | vk::FormatFeatureFlagBits::eBlitDst |
+                          vk::FormatFeatureFlagBits::eSampledImageFilterLinear;
+    if ((features & required) != required) return false;
+    // Startup-only scene dimensions: retain the scratch allocation until renderer teardown.
+    // Unexpected size/format changes fall back without destroying in-flight resources.
+    if (fsr_composition && (fsr_composition->size != size ||
+                           fsr_composition->format != target->info.pixel_format)) return false;
+    if (!fsr_composition) {
+        auto scratch = std::make_unique<FsrComposition>();
+        auto scratch_desc = desc;
+        scratch_desc.width = size.width; scratch_desc.height = size.height;
+        scratch_desc.usage = Native::Rhi::ImageUsageSampled | Native::Rhi::ImageUsageTransferSrc |
+                             Native::Rhi::ImageUsageTransferDst;
+        scratch_desc.name = "Native FSR scene composition";
+        scratch->image = device->CreateImage(scratch_desc);
+        if (!scratch->image) return false;
+        scratch->size = size; scratch->format = target->info.pixel_format;
+        const vk::Image image{Handle<VkImage_T>(scratch->image->NativeHandle())};
+        auto [result, view] = r.instance.GetDevice().createImageViewUnique({
+            .image = image, .viewType = vk::ImageViewType::e2D, .format = scratch->format,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}});
+        if (result != vk::Result::eSuccess) return false;
+        scratch->view = std::move(view);
+        fsr_composition = std::move(scratch);
+        PrepareImages();
+    }
+    Splice();
+    r.temporalDlss.PrepareScene(now, TemporalImage(**scene));
+    Begin();
+    UiHires::Get().scale = 0.f;
+    return true;
+}
+
+void NativeRenderer::FinishNativeFsr(const Targets& targets) {
+    EndRendering();
+    GlobalBarrier();
+    auto& s = Begin();
+    const auto* target = targets.colors[0];
+    const vk::Image source{Handle<VkImage_T>(target->image->NativeHandle())};
+    const vk::Image scratch{Handle<VkImage_T>(fsr_composition->image->NativeHandle())};
+    const auto size = fsr_composition->size;
+    const vk::ImageCopy copy{
+        .srcSubresource{vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .dstSubresource{vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .extent{size.width, size.height, 1}};
+    s.cmd.copyImage(source, vk::ImageLayout::eGeneral, scratch, vk::ImageLayout::eGeneral, copy);
+    Splice();
+    // This is a real scene-sized image, not a cropped view of the full-sized game target.
+    auto info = target->info;
+    info.size.width = size.width; info.size.height = size.height;
+    GtsSceneImage scene{info, target->image->NativeHandle(), scratch,
+        vk::ImageAspectFlagBits::eColor,
+        [this](vk::Format) { return *fsr_composition->view; }, [] {}};
+    const auto now = g_prepared_frames.load(std::memory_order_relaxed);
+    if (r.temporalDlss.ResolveNativeComposition(now, scene, TemporalImage(*target))) {
+        fsr_display_address = target->info.guest_address;
+        fsr_display_frame = frame;
+        fsr_display_backend = r.temporalDlss.BackendName();
+        static u32 logged{};
+        if (logged++ < 8)
+            LOG_INFO(Render_Vulkan, "NATIVE-FSR: reconstructed {}x{} to {}x{}, composed into {}x{} before HUD",
+                size.width, size.height, r.temporalDlss.OutputSize().width,
+                r.temporalDlss.OutputSize().height, target->info.size.width, target->info.size.height);
+    } else {
+        // Preserve a complete output picture even if the optional provider fails.
+        auto& fallback = Begin();
+        GlobalBarrier();
+        vk::ImageBlit blit{};
+        blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+        blit.dstSubresource = blit.srcSubresource;
+        blit.srcOffsets[1] = {s32(size.width), s32(size.height), 1};
+        blit.dstOffsets[1] = {s32(target->info.size.width), s32(target->info.size.height), 1};
+        fallback.cmd.blitImage(scratch, vk::ImageLayout::eGeneral, source,
+                               vk::ImageLayout::eGeneral, blit, vk::Filter::eLinear);
+        fallback.list->Barrier(Native::Rhi::ScopeAll, Native::Rhi::ScopeAll);
+    }
+    Written(target);
+    Begin(); // Direct backend commands invalidate cached Native pipeline/dynamic state.
 }
 
 NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
@@ -3607,7 +3794,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         PhaseClock clock{stats.phase_ns[6]};
         PrepareImages();
     }
-    if (!PrepareUiTarget(targets, *pipeline)) {
+    const bool native_fsr_composition = BeginNativeFsr(*pipeline, targets, b);
+    if (native_fsr_composition) scale_composition = false;
+    if (!native_fsr_composition && !PrepareUiTarget(targets, *pipeline)) {
         ++stats.skipped;
         return;
     }
@@ -3765,6 +3954,22 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 s.dynamic.SetScissors(scissors);
             }
         }
+        if (native_fsr_composition) {
+            auto viewports = s.dynamic.viewports;
+            auto scissors = s.dynamic.scissors;
+            const float sx = float(fsr_composition->size.width) / targets.state.width;
+            const float sy = float(fsr_composition->size.height) / targets.state.height;
+            for (auto& v : viewports) {
+                v.x *= sx; v.width *= sx; v.y *= sy; v.height *= sy;
+            }
+            for (auto& sc : scissors) {
+                sc.offset = {s32(std::floor(sc.offset.x * sx)), s32(std::floor(sc.offset.y * sy))};
+                sc.extent = {u32(std::ceil(sc.extent.width * sx)),
+                             u32(std::ceil(sc.extent.height * sy))};
+            }
+            s.dynamic.SetViewports(viewports);
+            s.dynamic.SetScissors(scissors);
+        }
         s.dynamic.Commit(r.instance, CmdBuf{s.cmd});
         Rasterizer::t_dynamic_state = saved;
     }
@@ -3814,6 +4019,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                         vk::ImageLayout::eGeneral);
         s.buffers_written = true;
     }
+
+    if (native_fsr_composition) FinishNativeFsr(targets);
+    else CaptureNativeFsr(*pipeline, targets, b);
 
     if (scale_composition) {
         EndRendering();
@@ -6068,6 +6276,14 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         display.output_size = shown->size;
         display.dlss_scaled = shown->dlss;
     }
+    if (!fsr_display_backend.empty()) {
+        static u32 fsr_present_logged{};
+        if (fsr_present_logged++ < 16)
+            LOG_INFO(Render_Vulkan, "NATIVE-FSR: present clock {} reconstruction clock {} buffer {:#x} reconstructed buffer {:#x}",
+                frame, fsr_display_frame, entry->info.guest_address, fsr_display_address);
+    }
+    if (fsr_display_frame + 1 == frame && fsr_display_address == entry->info.guest_address)
+        display.upscaler = fsr_display_backend;
     VerifyMirrors(); // FIX-176 (diagnosis)
     EvictImages(); // (the display picture was just used: it stays)
     ReleaseUnusedWatches();

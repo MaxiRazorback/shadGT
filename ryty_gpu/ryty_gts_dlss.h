@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <memory>
+#include <functional>
 #include "ryty_gpu/ryty_dlss.h"
 #include "ryty_gpu/ryty_fsr3.h"
 #include "ryty_gpu/ryty_xess.h"
@@ -15,6 +16,28 @@ namespace Vulkan {
 class Instance;
 class Runtime;
 
+// Non-owning image access for both texture-cache and Native images. Native callers splice
+// their secondary list before use; every Native image is restored to GENERAL on return.
+struct GtsSceneImage {
+    GtsSceneImage(VideoCore::Image& image);
+    GtsSceneImage(const VideoCore::ImageInfo& info, u64 uid, vk::Image image,
+                  vk::ImageAspectFlags aspects,
+                  std::function<vk::ImageView(vk::Format)> view,
+                  std::function<void()> modified);
+    const VideoCore::ImageInfo& info;
+    u64 image_uid;
+    vk::ImageAspectFlags aspect_mask;
+    VideoCore::Image* cached{};
+    vk::Image raw{};
+    std::function<vk::ImageView(vk::Format)> native_view;
+    std::function<void()> native_modified;
+    VideoCore::Image::State state{};
+    vk::Image GetImage() const;
+    vk::ImageView View(vk::Format format);
+    void MarkGpuModified();
+    VideoCore::Image::State State() const;
+};
+
 class GtsDlssPass {
 public:
     GtsDlssPass(const Instance& instance, Scheduler& scheduler, Runtime& runtime);
@@ -24,21 +47,23 @@ public:
         requestedSize = size;
         supportedDisplay = !hdrEncoded;
     }
-    bool Capture(u64 frame, VideoCore::Image& color, VideoCore::Image& depth,
-                 VideoCore::Image& motion, VideoCore::Image& resolved,
+    bool Capture(u64 frame, GtsSceneImage color, GtsSceneImage depth,
+                 GtsSceneImage motion, GtsSceneImage resolved,
                  const std::array<float, 28>& constants);
     bool HasScene(u64 frame, u64 resolvedUid) const;
-    void PrepareScene(u64 frame, VideoCore::Image& resolved);
-    void Resolve(u64 frame, VideoCore::Image& display);
+    void PrepareScene(u64 frame, GtsSceneImage resolved);
+    void Resolve(u64 frame, GtsSceneImage display);
+    bool ResolveNativeComposition(u64 frame, GtsSceneImage scene, GtsSceneImage display);
     bool OverrideHud(u64 frame, u64 uid, RenderState& state);
-    void FallbackHud(u64 frame, VideoCore::Image& display, vk::ImageLayout restoreLayout);
-    void SyncGuestRead(u64 frame, VideoCore::Image& display);
+    void FallbackHud(u64 frame, GtsSceneImage display, vk::ImageLayout restoreLayout);
+    void SyncGuestRead(u64 frame, GtsSceneImage display);
     void ScaleHud(u64 frame, u64 uid, Viewports& viewports, Scissors& scissors) const;
-    vk::ImageView PreparePresent(u64 frame, VideoCore::Image& display, vk::Format viewFormat);
+    vk::ImageView PreparePresent(u64 frame, GtsSceneImage display, vk::Format viewFormat);
     vk::Extent2D OutputSize() const { return outputSize; }
     vk::Extent2D RenderSize() const { return renderSize; }
     /// FSR-204: the temporal upscaler, for the window title.
     std::string BackendName() const;
+    RygtDlssQuality ActiveQuality() const { return quality; }
     bool HasDisplay(u64 frame, u64 uid) const { return isActive(frame, uid); }
 
 private:
@@ -55,8 +80,10 @@ private:
     void create(Texture& texture, vk::Format format, vk::Extent2D size,
                 vk::ImageAspectFlags aspects = vk::ImageAspectFlagBits::eColor);
     void transit(Texture& texture, vk::ImageLayout layout);
-    void copyInput(VideoCore::Image& source, Texture& dest);
-    void copyBack(VideoCore::Image& display);
+    void copyInput(GtsSceneImage source, Texture& dest);
+    void transitSource(GtsSceneImage& source, vk::ImageLayout layout,
+                       vk::PipelineStageFlags2 stage, vk::AccessFlags2 access);
+    void copyBack(GtsSceneImage display);
     void copyDepthForFsr();
     bool isActive(u64 frame, u64 uid) const;
 
