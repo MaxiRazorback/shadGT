@@ -6,6 +6,7 @@
 #include <atomic>
 #include <bitset>
 #include <span>
+#include <memory>
 #include <vector>
 #include <boost/container/static_vector.hpp>
 #include "common/assert.h"
@@ -27,6 +28,7 @@ struct Archive;
 }
 
 namespace Shader {
+namespace Gcn { struct FetchShaderData; }
 
 /// PB-1 (shader pre-build): a translation replayed outside the game. What the translator would
 /// read from guest memory comes from a stored shader record instead: the flattened user data
@@ -80,6 +82,9 @@ struct InfoPersistent {
 };
 
 struct Info : InfoPersistent {
+    // Parsed while translating; guest fetch code may be reused before async results are harvested.
+    std::shared_ptr<const Gcn::FetchShaderData> translated_fetch_shader;
+
     struct AttributeFlags {
         bool Get(IR::Attribute attrib, u32 comp = 0) const {
             return flags[Index(attrib)] & (1 << comp);

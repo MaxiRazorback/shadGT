@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <map>
 #include <mutex>
 
@@ -13,6 +14,9 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#ifdef RYTY_GPU
+#include "video_core/renderer_vulkan/vk_rasterizer_native.h"
+#endif
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
@@ -24,6 +28,20 @@ static constexpr u32 ShaderBinaryVersion = 15u;
 static constexpr u32 ShaderBinaryVersionQuadSampleMask = 16u;
 static constexpr u32 ShaderBinaryVersionMsaaRead = 17u;
 static constexpr u32 ShaderBinaryVersionMsaaReadQuadSampleMask = 18u;
+// Scalar-pointer compute loads support bounded prefixes and prologue table loads.
+static constexpr u32 ShaderBinaryVersionScalarPrefix = 19u;
+static constexpr u32 ShaderBinaryVersionScalarPrefixMsaaRead = 20u;
+// Vertex fetch conversion/swizzles must agree with the invalid-descriptor cache policy.
+static constexpr u32 ShaderBinaryVersionVertexFetch = 21u;
+// Fragment reflections use cube views; other stages keep their existing array path.
+static constexpr u32 ShaderBinaryVersionNativeCube = 23u;
+
+static bool UsesScalarPrefix(const Shader::Info& info) {
+    return info.hw_stage == Shader::HwStage::Compute &&
+           std::ranges::any_of(info.buffers, [](const auto& buffer) {
+               return buffer.post_op == Shader::SharpFetchPostOp::ReadConstPointer;
+           });
+}
 static_assert(sizeof(Shader::HwFragmentRuntimeInfo) == 248 && sizeof(Shader::RuntimeInfo) == 312,
               "Legacy metadata compatibility requires the runtime-info layout to stay unchanged");
 // Stored output metadata and runtime color-buffer flags include swizzled-alpha emulation.
@@ -55,7 +73,23 @@ static bool HasMsaaImage(const Shader::StageSpecialization& spec) {
     });
 }
 
-static u32 ShaderBinaryVersionFor(const Shader::StageSpecialization& spec) {
+static u32 ShaderBinaryVersionFor(const Shader::StageSpecialization& spec,
+                                  bool scalar_prefix = false) {
+#ifdef RYTY_GPU
+    if (NativeModeRequested() && spec.runtime_info.hw_stage == Shader::HwStage::Fragment &&
+        std::ranges::any_of(spec.images, [](const auto& image) {
+            return image.type == AmdGpu::ImageType::Cube;
+        })) {
+        return Serialization::ShaderBinaryVersionNativeCube;
+    }
+#endif
+    if (!spec.fetch_shader_data.Empty()) {
+        return Serialization::ShaderBinaryVersionVertexFetch;
+    }
+    if (scalar_prefix) {
+        return HasMsaaImage(spec) ? Serialization::ShaderBinaryVersionScalarPrefixMsaaRead
+                                  : Serialization::ShaderBinaryVersionScalarPrefix;
+    }
     const bool masked_fragment = spec.runtime_info.hw_stage == Shader::HwStage::Fragment &&
                                  spec.runtime_info.hw.fs.quad_sample_mask;
     if (HasMsaaImage(spec)) {
@@ -70,7 +104,11 @@ static bool IsKnownShaderBinaryVersion(u32 version) {
     return version == Serialization::ShaderBinaryVersion ||
            version == Serialization::ShaderBinaryVersionQuadSampleMask ||
            version == Serialization::ShaderBinaryVersionMsaaRead ||
-           version == Serialization::ShaderBinaryVersionMsaaReadQuadSampleMask;
+           version == Serialization::ShaderBinaryVersionMsaaReadQuadSampleMask ||
+           version == Serialization::ShaderBinaryVersionScalarPrefix ||
+           version == Serialization::ShaderBinaryVersionScalarPrefixMsaaRead ||
+           version == Serialization::ShaderBinaryVersionVertexFetch ||
+           version == Serialization::ShaderBinaryVersionNativeCube;
 }
 
 void RegisterPipelineData(const ComputePipelineKey& key,
@@ -285,7 +323,7 @@ void RegisterShaderMeta(const Shader::Info& info,
     Serialization::Writer meta{ar};
 
     meta.Write(Serialization::ShaderMetaVersion);
-    meta.Write(ShaderBinaryVersionFor(spec));
+    meta.Write(ShaderBinaryVersionFor(spec, Serialization::UsesScalarPrefix(info)));
 
     meta.Write(perm_hash);
     meta.Write(perm_idx);
@@ -336,11 +374,11 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
         // This byte was padding before quad-mask emulation, and need not have been zero.
         spec.runtime_info.hw.fs.quad_sample_mask = false;
     }
-    if (binary_version != ShaderBinaryVersionFor(spec)) {
-        return false;
-    }
     info.Deserialize(ar, perm_hash_ar,
                      meta_version != Serialization::ShaderMetaVersionWithoutAttributeFlags);
+    if (binary_version != ShaderBinaryVersionFor(spec, Serialization::UsesScalarPrefix(info))) {
+        return false;
+    }
     info.resource_usage_known = false;
     if (meta_version >= Serialization::ShaderMetaVersion) {
         ReadResourceUsage(meta, info);

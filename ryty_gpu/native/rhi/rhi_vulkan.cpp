@@ -20,6 +20,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/image_allocation.h"
 
 #include <vk_mem_alloc.h>
 
@@ -845,7 +846,8 @@ std::unique_ptr<Image> VulkanDevice::CreateImage(const ImageDesc& desc) {
 
 std::unique_ptr<Image> VulkanDevice::CreateImageFrom(const VkImageCreateInfo& image_ci,
                                                     const ImageDesc& desc) {
-    const VmaAllocationCreateInfo alloc_ci{.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VmaAllocationCreateInfo alloc_ci{.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    alloc_ci.pool = Vulkan::SmallImageAllocationPool(allocator, image_ci, alloc_ci);
     VkImage image{};
     VmaAllocation allocation{};
     struct AllocationResult {
@@ -855,8 +857,14 @@ std::unique_ptr<Image> VulkanDevice::CreateImageFrom(const VkImageCreateInfo& im
         [&] {
           image = VK_NULL_HANDLE;
           allocation = nullptr;
-          return AllocationResult{vmaCreateImage(
-              allocator, &image_ci, &alloc_ci, &image, &allocation, nullptr)};
+          VkResult status = vmaCreateImage(
+              allocator, &image_ci, &alloc_ci, &image, &allocation, nullptr);
+          if (status != VK_SUCCESS && alloc_ci.pool) {
+            alloc_ci.pool = VK_NULL_HANDLE;
+            status = vmaCreateImage(
+                allocator, &image_ci, &alloc_ci, &image, &allocation, nullptr);
+          }
+          return AllocationResult{status};
         },
         [&] {
           Collect();
@@ -1954,6 +1962,7 @@ std::unique_ptr<Device> CreateStandaloneVulkanDevice(std::string* error) {
         .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
         .physicalDevice = physical,
         .device = device,
+        .preferredLargeHeapBlockSize = 32ULL << 20,
         .pVulkanFunctions = &functions,
         .instance = instance,
         .vulkanApiVersion = VK_API_VERSION_1_3,
@@ -1984,6 +1993,7 @@ std::unique_ptr<Device> CreateStandaloneVulkanDevice(std::string* error) {
         .max_push_descriptors = max_push_descriptors,
         .destroy =
             [device, allocator, kept_instance] {
+                Vulkan::DestroySmallImageAllocationPools(allocator);
                 vmaDestroyAllocator(allocator);
                 device.destroy();
                 delete kept_instance;

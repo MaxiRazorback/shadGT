@@ -244,6 +244,20 @@ Id EmitContext::GetBufferSize(const u32 sharp_idx) {
 }
 
 void EmitContext::DefineBufferProperties() {
+    if (hw_stage == HwStage::Compute && info.uses_direct) {
+        // The per-dispatch table is immutable. Load scalar-pointer entries in the prologue
+        // so their IDs dominate all uses, including dynamic constant reads inside loops.
+        direct_table_words.resize(4 + info.buffers.size() * 4);
+        for (u32 i = 0; i < info.buffers.size(); ++i) {
+            if (!IsDirectBuffer(i) ||
+                info.buffers[i].post_op != SharpFetchPostOp::ReadConstPointer) {
+                continue;
+            }
+            for (u32 word = 4 + i * 4; word < 8 + i * 4; ++word) {
+                direct_table_words[word] = DirectTableWord(word);
+            }
+        }
+    }
     if (!profile.needs_buffer_offsets) {
         return;
     }
@@ -1001,6 +1015,10 @@ Id ImageType(EmitContext& ctx, const ImageResource& desc, Id sampled_type) {
     const auto format = desc.is_atomic ? GetFormat(image) : spv::ImageFormat::Unknown;
     const auto type = image.GetViewType(desc.is_array);
     const u32 sampled = desc.is_written ? 2 : 1;
+    if (desc.post_op == SharpFetchPostOp::NativeCubeSampling) {
+        ctx.AddCapability(spv::Capability::SampledCubeArray);
+        return ctx.TypeImage(sampled_type, spv::Dim::Cube, false, true, false, sampled, format);
+    }
     switch (type) {
     case AmdGpu::ImageType::Color1D:
     case AmdGpu::ImageType::Color2D:
@@ -1050,6 +1068,7 @@ void EmitContext::DefineImagesAndSamplers() {
             .view_type = sharp.GetViewType(image_desc.is_array),
             .is_integer = is_integer,
             .is_storage = is_storage,
+            .native_cube = image_desc.post_op == SharpFetchPostOp::NativeCubeSampling,
             .mip_fallback_mode = mip_fallback_mode,
         });
         interfaces.push_back(id);
@@ -1221,6 +1240,9 @@ Id EmitContext::DefineUfloatM5ToFloat32(u32 mantissa_bits, const std::string_vie
 }
 
 Id EmitContext::DirectTableWord(u32 index) {
+    if (index < direct_table_words.size() && Sirit::ValidId(direct_table_words[index])) {
+        return direct_table_words[index];
+    }
     const auto& table = buffers[direct_table_index];
     const auto [id, pointer_type] = table.Alias(PointerType::U32);
     return OpLoad(U32[1], OpAccessChain(pointer_type, id, u32_zero_value, ConstU32(index)));
@@ -1273,7 +1295,18 @@ Id EmitContext::EmitDirectLoad(u32 handle, Id byte_offset, u32 bytes, Id result_
     const Id direct_label = OpLabel();
     const Id fallback_label = OpLabel();
     const Id merge_label = OpLabel();
-    const Id valid = OpINotEqual(U1[1], DirectTableWord(entry + 3), u32_zero_value);
+    const Id mode = DirectTableWord(entry + 3);
+    Id valid = OpINotEqual(U1[1], mode, u32_zero_value);
+    if (info.hw_stage == HwStage::Compute &&
+        info.buffers[handle].post_op == SharpFetchPostOp::ReadConstPointer) {
+        // 0: ordinary SSBO, 1: direct guest reads, >1: SSBO prefix length. Reads beyond
+        // the prefix retain the original direct path and its full guest-buffer bounds.
+        const Id end = OpIAdd(U32[1], byte_offset, ConstU32(bytes));
+        const Id cached = OpLogicalAnd(U1[1], OpUGreaterThan(U1[1], mode, ConstU32(1U)),
+            OpLogicalAnd(U1[1], OpULessThanEqual(U1[1], end, mode),
+                          OpUGreaterThanEqual(U1[1], end, byte_offset)));
+        valid = OpLogicalAnd(U1[1], valid, OpLogicalNot(U1[1], cached));
+    }
     OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
     OpBranchConditional(valid, direct_label, fallback_label);
 

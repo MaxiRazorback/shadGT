@@ -32,6 +32,7 @@
 #ifdef RYTY_GPU
 #include "ryty_gpu/ryty_hdr_ui.h"
 #include "ryty_gpu/ryty_ghost.h"
+#include "video_core/renderer_vulkan/vk_rasterizer_native.h"
 #endif
 #include "common/read_capture.h"
 #include "common/scope_exit.h"
@@ -796,6 +797,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // D2: read-only guest buffers are read in place through the direct-memory page table.
     profile.direct_buffers =
         VideoCore::DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported();
+#ifdef RYTY_GPU
+    profile.native_cube_sampling = NativeModeRequested() && instance.IsImageCubeArraySupported();
+#endif
     CreateDriverCache();
     LoadElseScopeFixed();
     // PERF-032: the shader store is used again, without the startup precompile Lance had removed:
@@ -2242,6 +2246,7 @@ const GraphicsPipeline* PipelineCache::LookupBuiltPipeline(const DrawIndirectPar
         if (const auto it = graphics_pipelines.find(scratch.graphics_key);
             it != graphics_pipelines.end()) {
             found = it->second.get();
+            found->NoteRetentionUse(std::chrono::steady_clock::now());
         }
         if (!found) {
             scratch.lookup_miss = "pipeline not built";
@@ -2416,6 +2421,8 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 if (!S().key_uses_legacy) {
                     RegisterPipelineData(S().graphics_key, pipeline_hash, sdata);
                 }
+                retention_now = std::chrono::steady_clock::now();
+                pipeline_last_use[it->second.get()] = retention_now;
                 return it->second.get();
             }
             if ((stored->async || (CompileMode() == 2 && AsyncPipelines())) &&
@@ -2549,6 +2556,8 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             }
         }
     }
+    if (is_new) retention_now = std::chrono::steady_clock::now();
+    pipeline_last_use[it->second.get()] = retention_now;
     return it->second.get();
 }
 
@@ -2593,6 +2602,8 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             module_related_pipelines[m].emplace_back(compute_key);
         }
     }
+    if (is_new) retention_now = std::chrono::steady_clock::now();
+    pipeline_last_use[it->second.get()] = retention_now;
     return it->second.get();
 }
 
@@ -4109,7 +4120,8 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait) {
             return true;
         }
         translate_stats.translate_ms += job->translate_ms;
-        job->spec = Shader::StageSpecialization(*job->info, job->runtime_info, profile, job->start);
+        job->spec = Shader::StageSpecialization(*job->info, job->runtime_info, profile, job->start,
+                                               job->info->translated_fetch_shader.get());
         job->ready_since = now;
         ready.push_back(job);
         return true;
@@ -4794,3 +4806,66 @@ std::optional<std::vector<u32>> PipelineCache::GetShaderPatch(u64 hash, Shader::
     return code;
 }
 } // namespace Vulkan
+
+
+namespace Vulkan {
+std::shared_ptr<const void> PipelineCache::KeepAlive(const GraphicsPipeline* pipeline) const {
+    if (!pipeline) return {};
+    const auto it = graphics_pipelines.find(pipeline->GetGraphicsKey());
+    ASSERT(it != graphics_pipelines.end() && it->second.get() == pipeline);
+    return it->second;
+}
+std::shared_ptr<const void> PipelineCache::KeepAlive(const ComputePipeline* pipeline) const {
+    if (!pipeline) return {};
+    const auto it = compute_pipelines.find(compute_key);
+    ASSERT(it != compute_pipelines.end() && it->second.get() == pipeline);
+    return it->second;
+}
+void PipelineCache::TrimUnusedPipelines() {
+    using namespace std::chrono;
+    const auto now = steady_clock::now();
+    if (now - retention_last_scan < seconds{1}) return;
+    std::unique_lock lock{lookup_mutex, std::try_to_lock};
+    if (!lock.owns_lock()) return;
+    retention_last_scan = now;
+    retention_now = now;
+    // Keep the active working set even if a scene needs more than the soft limit.
+    // Queued selections hold a shared reference; retirement cannot invalidate them.
+    constexpr size_t soft_limit = 1024;
+    constexpr size_t retire_batch = 64;
+    const auto cutoff = now - seconds{60};
+    std::vector<std::shared_ptr<const void>> retired;
+    const auto trim = [&](auto& cache) {
+        using Entry = typename std::remove_reference_t<decltype(cache)>::value_type;
+        using Key = std::remove_const_t<typename Entry::first_type>;
+        std::vector<std::pair<steady_clock::time_point, Key>> candidates;
+        for (const auto& [key, pipeline] : cache) {
+            if (!pipeline || pipeline.use_count() != 1) continue;
+            if constexpr (std::is_same_v<Key, GraphicsPipelineKey>) {
+                if (!pipeline->CanRetire()) continue;
+            }
+            const auto found = pipeline_last_use.find(pipeline.get());
+            if (found != pipeline_last_use.end()) {
+                const auto last_use = std::max(found->second, pipeline->LastRetentionUse());
+                if (last_use < cutoff) candidates.emplace_back(last_use, key);
+            }
+        }
+        std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (const auto& [used, key] : candidates) {
+            if (retired.size() >= retire_batch || graphics_pipelines.size() + compute_pipelines.size() <= soft_limit) break;
+            auto it = cache.find(key);
+            pipeline_last_use.erase(it->second.get());
+            retired.emplace_back(std::move(it.value()));
+            cache.erase(it);
+        }
+    };
+    trim(graphics_pipelines);
+    trim(compute_pipelines);
+    if (retired.empty()) return;
+    const auto count = retired.size();
+    // Includes commands already recorded in the current, not-yet-submitted batch.
+    scheduler.DeferOperation([retired = std::move(retired)] {});
+    LOG_DEBUG(Render_Vulkan, "Retired {} unused pipelines; {} cached", count,
+              graphics_pipelines.size() + compute_pipelines.size());
+}
+}

@@ -2411,13 +2411,20 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     // FIX-075: 64-bit counts. GT Sport's showroom makes a range of 4 GB + 64 KB resident at once;
     // the 32-bit block loop below never reached its end and wrote past the staging buffer.
     u64 resident_blocks{};
-    IntervalList bind_ranges;
+    std::vector<Interval> bind_ranges;
+    const u64 max_allocation_blocks = std::max<u64>(1, 16_MB >> block_shift);
     resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
         resident_blocks += end - start;
-        bind_ranges.Add({start, end});
+        // Keep independently retired ranges in separate, bounded allocations.
+        // A small survivor must not pin hundreds of MiB from unrelated gaps.
+        while (start < end) {
+            const u64 chunk_end = std::min(end, start + max_allocation_blocks);
+            bind_ranges.push_back({start, chunk_end});
+            start = chunk_end;
+        }
     });
 
-    if (bind_ranges.Empty()) {
+    if (bind_ranges.empty()) {
         return;
     }
     if ((resident_blocks << block_shift) >= (1ull << 30)) {
@@ -2427,68 +2434,67 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
                     (last_block + 1) << block_shift, arena->CpuAddr(), arena->SizeBytes());
     }
 
-    const vk::MemoryAllocateInfo alloc_info = {
-        .allocationSize = resident_blocks << block_shift,
-        .memoryTypeIndex = arena_memory_type_index,
-    };
-    u32 allocation_attempt = 0;
-    const auto allocation = Common::AllocateWithPressureRetry(
-        [&] {
-            ++allocation_attempt;
-            auto result = instance.GetDevice().allocateMemory(alloc_info);
-            if (result.result != vk::Result::eSuccess) {
-                vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget{};
-                vk::PhysicalDeviceMemoryProperties2 properties{
-                    .pNext = instance.CanReportMemoryUsage() ? &budget : nullptr,
-                };
-                instance.GetPhysicalDevice().getMemoryProperties2(&properties);
-                const u32 heap =
-                    properties.memoryProperties.memoryTypes[arena_memory_type_index].heapIndex;
-                std::map<vk::DeviceMemory, bool> allocations;
-                u64 resident_bytes = 0;
-                for (const auto& range : resident_ranges) {
-                    allocations.emplace(range.memory, true);
-                    resident_bytes += (range.end - range.start) << block_shift;
-                }
-                LOG_ERROR(Render_Vulkan,
-                          "Sparse allocation failed: result={} attempt={} requested_bytes={} "
-                          "guest={:#x}..{:#x} arena={:#x}+{:#x} memory_type={} heap={} "
-                          "heap_usage_bytes={} heap_budget_bytes={} budget_available={} "
-                          "sparse_resident_bytes={} sparse_allocations={} recycled_bytes={}",
-                          vk::to_string(result.result), allocation_attempt,
-                          alloc_info.allocationSize, first_block << block_shift,
-                          (last_block + 1) << block_shift, arena->CpuAddr(), arena->SizeBytes(),
-                          arena_memory_type_index, heap, budget.heapUsage[heap],
-                          budget.heapBudget[heap], instance.CanReportMemoryUsage(), resident_bytes,
-                          allocations.size(), RecycledImageBytes());
-            }
-            return result;
-        },
-        [&] {
-            const u64 recycled = ReleaseRecycledImages(instance.GetAllocator());
-            const auto empty_blocks = Vulkan::TrimEmptyVmaBlocks(instance.GetAllocator());
-            LOG_WARNING(Render_Vulkan,
-                        "Sparse allocation recovery: released {} recycled bytes and {} empty "
-                        "VMA block bytes; retrying {} bytes once",
-                        recycled, empty_blocks, alloc_info.allocationSize);
-        },
-        vk::Result::eErrorOutOfDeviceMemory);
-    const auto device_memory = Vulkan::Check(allocation);
-
     boost::container::small_vector<vk::BufferCopy, 8> copies;
     const auto staging =
         staging_pool.Request(resident_blocks * sizeof(vk::DeviceAddress), MemoryType::HostUncached);
 
-    u64 memory_offset{};
     ArenaBinds* binds = BindsForArena(arena);
     auto* bda_addrs = reinterpret_cast<vk::DeviceAddress*>(staging.mapped);
     u64 offset = staging.offset;
     for (const auto& range : bind_ranges) {
+        const vk::MemoryAllocateInfo alloc_info = {
+            .allocationSize = (range.end - range.start) << block_shift,
+            .memoryTypeIndex = arena_memory_type_index,
+        };
+        u32 allocation_attempt = 0;
+        const auto allocation = Common::AllocateWithPressureRetry(
+            [&] {
+                ++allocation_attempt;
+                auto result = instance.GetDevice().allocateMemory(alloc_info);
+                if (result.result != vk::Result::eSuccess) {
+                    vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+                    vk::PhysicalDeviceMemoryProperties2 properties{
+                        .pNext = instance.CanReportMemoryUsage() ? &budget : nullptr,
+                    };
+                    instance.GetPhysicalDevice().getMemoryProperties2(&properties);
+                    const u32 heap =
+                        properties.memoryProperties.memoryTypes[arena_memory_type_index].heapIndex;
+                    std::map<vk::DeviceMemory, bool> allocations;
+                    u64 resident_bytes = 0;
+                    for (const auto& range : resident_ranges) {
+                        allocations.emplace(range.memory, true);
+                        resident_bytes += (range.end - range.start) << block_shift;
+                    }
+                    LOG_ERROR(Render_Vulkan,
+                              "Sparse allocation failed: result={} attempt={} requested_bytes={} "
+                              "guest={:#x}..{:#x} arena={:#x}+{:#x} memory_type={} heap={} "
+                              "heap_usage_bytes={} heap_budget_bytes={} budget_available={} "
+                              "sparse_resident_bytes={} sparse_allocations={} recycled_bytes={}",
+                              vk::to_string(result.result), allocation_attempt,
+                              alloc_info.allocationSize, range.start << block_shift,
+                              range.end << block_shift, arena->CpuAddr(), arena->SizeBytes(),
+                              arena_memory_type_index, heap, budget.heapUsage[heap],
+                              budget.heapBudget[heap], instance.CanReportMemoryUsage(), resident_bytes,
+                              allocations.size(), RecycledImageBytes());
+                }
+                return result;
+            },
+            [&] {
+                const u64 recycled = ReleaseRecycledImages(instance.GetAllocator());
+                const auto empty_blocks = Vulkan::TrimEmptyVmaBlocks(instance.GetAllocator());
+                LOG_WARNING(Render_Vulkan,
+                            "Sparse allocation recovery: released {} recycled bytes and {} empty "
+                            "VMA block bytes; retrying {} bytes once",
+                            recycled, empty_blocks, alloc_info.allocationSize);
+            },
+            vk::Result::eErrorOutOfDeviceMemory);
+        const auto device_memory = Vulkan::Check(allocation);
+
         Backing backing;
         backing.start = range.start;
         backing.end = range.end;
         backing.memory = device_memory;
-        backing.offset = memory_offset >> block_shift;
+        backing.offset = 0;
         resident_ranges.Add(backing);
 
         LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
@@ -2497,9 +2503,8 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
             .resourceOffset = (range.start << block_shift) - arena->cpu_addr,
             .size = (range.end - range.start) << block_shift,
             .memory = device_memory,
-            .memoryOffset = memory_offset,
+            .memoryOffset = 0,
         });
-        memory_offset += bind.size;
 
         for (u64 block = 0; block < bind.size; block += block_size) {
             *(bda_addrs++) = arena->BufferDeviceAddress() + bind.resourceOffset + block;

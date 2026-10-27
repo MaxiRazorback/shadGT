@@ -567,6 +567,7 @@ public:
     void OnDraw(const u32* packet, PM4ItOpcode opcode, const Regs& regs,
                 const JobExtents& extents) override {
         const void* pipeline = nullptr;
+        std::shared_ptr<const void> pipeline_keepalive;
         const char* miss = nullptr;
         bool looked_up = false;
         if ((g_lookups || g_prepare) && state != nullptr && liverpool &&
@@ -577,7 +578,8 @@ public:
             AmdGpu::Liverpool::SetThreadDrawState(state);
             const auto start = std::chrono::steady_clock::now();
             auto* rasterizer = liverpool->GetRasterizer();
-            const Vulkan::GraphicsPipeline* found = rasterizer->LookupJobPipeline(&miss);
+            const Vulkan::GraphicsPipeline* found =
+                rasterizer->LookupJobPipeline(pipeline_keepalive, &miss);
             pipeline = found;
             if (found && g_prepare) {
                 // OPT-010: the draw's bindings, worked out here for the recorder.
@@ -587,7 +589,7 @@ public:
                     const u32 index_offset =
                         opcode == PM4ItOpcode::DrawIndexOffset2 ? packet[2] : 0; // its body[1]
                     native->PrepareJobDraw(
-                        packet, epoch, regs, *found,
+                        packet, epoch, regs, *found, pipeline_keepalive,
                         std::span<const Shader::Info* const>{infos.data(),
                                                              Shader::MaxStageTypes - 1},
                         is_indexed, index_offset);

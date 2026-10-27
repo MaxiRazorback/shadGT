@@ -17,6 +17,7 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/image_allocation.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #ifdef RYTY_GPU
 #include "ryty_gpu/ryty_dlss.h"
@@ -256,6 +257,8 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
 
 Instance::~Instance() {
     ImGui::Core::Shutdown(GetDevice());
+    VideoCore::ClearRecycledImages(allocator);
+    DestroySmallImageAllocationPools(allocator);
     vmaDestroyAllocator(allocator);
 }
 
@@ -879,6 +882,9 @@ void Instance::CreateAllocator() {
         .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
         .physicalDevice = physical_device,
         .device = *device,
+        // Small persistent images must not pin mostly empty 256 MiB scene blocks.
+        // VMA still creates dedicated allocations for resources too large to pool.
+        .preferredLargeHeapBlockSize = 32_MB,
         .pVulkanFunctions = &functions,
         .instance = *instance,
         .vulkanApiVersion = TargetVulkanApiVersion,

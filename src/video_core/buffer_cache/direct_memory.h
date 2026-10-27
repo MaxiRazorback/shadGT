@@ -111,7 +111,8 @@ private:
     Vulkan::Scheduler& scheduler;
     mutable std::mutex mutex;
     std::map<VAddr, View> views; // by begin
-    std::vector<VAddr> failed;   // view bases that could not be imported (sorted)
+    std::map<VAddr, VAddr> failed; // failed view base -> committed end; invalidated on unmap
+    u64 failed_generation{};
     std::unique_ptr<Buffer> l1;
     std::unique_ptr<Buffer> l2_pool;
     std::unique_ptr<Buffer> zero_page;

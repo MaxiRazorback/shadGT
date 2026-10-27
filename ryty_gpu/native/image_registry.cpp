@@ -128,6 +128,7 @@ bool WatchedTexture(VAddr begin, VAddr end) {
             return true;
         }
     }
+
     return false;
 }
 
@@ -152,11 +153,24 @@ std::string WatchedBytes(VAddr address) {
 }
 
 bool SameLayout(const VideoCore::ImageInfo& a, const VideoCore::ImageInfo& b) {
-    return a.guest_address == b.guest_address && a.num_bits == b.num_bits &&
-           a.size == b.size && a.pitch == b.pitch && a.tile_mode == b.tile_mode &&
-           a.resources == b.resources && a.num_samples == b.num_samples &&
-           a.props.is_depth == b.props.is_depth && a.props.is_block == b.props.is_block &&
-           a.type == b.type;
+    if (a.guest_address != b.guest_address || a.num_bits != b.num_bits ||
+        a.size != b.size || a.pitch != b.pitch || a.tile_mode != b.tile_mode ||
+        a.array_mode != b.array_mode || a.bank_swizzle != b.bank_swizzle ||
+        a.alt_tile != b.alt_tile || a.resources != b.resources ||
+        a.num_samples != b.num_samples || a.props.is_depth != b.props.is_depth ||
+        a.props.is_block != b.props.is_block || a.type != b.type) {
+        return false;
+    }
+    // Equal dimensions do not imply equal byte offsets or padded mip footprints.
+    // Keep format reinterpretation, but only over the same guest-memory layout.
+    for (u32 level = 0; level < a.resources.levels; ++level) {
+        const auto& x = a.mips_layout[level];
+        const auto& y = b.mips_layout[level];
+        if (x.size != y.size || x.pitch != y.pitch || x.height != y.height || x.offset != y.offset) {
+            return false;
+        }
+    }
+    return true;
 }
 
 const Rhi::ImageView* ImageEntry::View(Rhi::Device& device, const ImageViewKey& key) {
@@ -246,7 +260,11 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                 const auto& c = it->second->info;
                 if (!it->second->from_cpu && it->second->image &&
                     !it->second->reused.load(std::memory_order_relaxed) && c.pitch == info.pitch &&
-                    c.tile_mode == info.tile_mode && c.num_bits == info.num_bits &&
+                    c.tile_mode == info.tile_mode && c.array_mode == info.array_mode &&
+                    c.bank_swizzle == info.bank_swizzle && c.alt_tile == info.alt_tile &&
+                    c.mips_layout[0].pitch == info.mips_layout[0].pitch &&
+                    (c.size != info.size || c.resources != info.resources || SameLayout(c, info)) &&
+                    c.num_bits == info.num_bits &&
                     c.num_samples == 1 && !c.props.is_depth && c.type == info.type &&
                     c.pixel_format == info.pixel_format && c.resources.levels == 1 &&
                     c.resources.layers == 1 && c.size.width >= info.size.width &&
@@ -309,7 +327,11 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                 const auto& c = it->second->info;
                 if (!it->second->from_cpu && it->second->image &&
                     !it->second->reused.load(std::memory_order_relaxed) && c.pitch == info.pitch &&
-                    c.tile_mode == info.tile_mode && c.num_bits == info.num_bits &&
+                    c.tile_mode == info.tile_mode && c.array_mode == info.array_mode &&
+                    c.bank_swizzle == info.bank_swizzle && c.alt_tile == info.alt_tile &&
+                    c.mips_layout[0].pitch == info.mips_layout[0].pitch &&
+                    (c.size != info.size || c.resources != info.resources || SameLayout(c, info)) &&
+                    c.num_bits == info.num_bits &&
                     c.num_samples == info.num_samples && c.props.is_depth == info.props.is_depth &&
                     c.props.has_stencil == info.props.has_stencil && c.type == info.type &&
                     c.resources.levels >= info.resources.levels &&
@@ -782,8 +804,11 @@ void ImageRegistry::Invalidate(VAddr address, u64 size, Stale why) {
     ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
         if (entry.from_cpu) {
             MarkStale(entry, why);
-        } else if (entry.kept.load(std::memory_order_relaxed)) {
-            MarkReused(entry); // FIX-157
+        } else {
+            entry.guest_modified.store(true, std::memory_order_seq_cst);
+            if (entry.kept.load(std::memory_order_seq_cst)) {
+                MarkReused(entry); // FIX-157
+            }
         }
     });
 }
@@ -936,7 +961,8 @@ void ImageRegistry::CpuWrite(VAddr address, u64 size, u64 exact) {
     const VAddr written_end = address + (exact != 0 ? exact : size);
     ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
         if (!entry.from_cpu) {
-            if (entry.kept.load(std::memory_order_relaxed)) {
+            entry.guest_modified.store(true, std::memory_order_seq_cst);
+            if (entry.kept.load(std::memory_order_seq_cst)) {
                 MarkReused(entry); // FIX-157
             }
             return;
@@ -1074,6 +1100,9 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list) {
         if (upload_source) {
             gpu_source = upload_source(*entry, list);
         }
+        if (entry->total_uploads.load(std::memory_order_relaxed) == 0) {
+            entry->guest_writes_tracked = gpu_source.guest_writes_tracked;
+        }
         std::unique_ptr<Rhi::Buffer> source;
         const Rhi::Buffer* bytes = gpu_source.buffer;
         u64 bytes_offset = gpu_source.offset;
@@ -1195,14 +1224,18 @@ bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, co
                                        .usage = Rhi::BufferUsageStorage |
                                                 Rhi::BufferUsageTransferDst,
                                        .memory = Rhi::MemoryKind::DeviceLocal});
-    if (!tile || !params_buffer || !linear) {
+    auto tiled = device.CreateBuffer({.size = size,
+                                      .usage = Rhi::BufferUsageStorage |
+                                               Rhi::BufferUsageTransferSrc,
+                                      .memory = Rhi::MemoryKind::DeviceLocal});
+    if (!tile || !params_buffer || !linear || !tiled) {
         return false;
     }
     list.CopyImageToBuffer(entry.image.get(), linear.get(), MipCopies(info));
     list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeCompute);
     list.BindPipeline(tile);
     const std::array<Rhi::Binding, 3> bindings{{
-        {.slot = 0, .type = Rhi::BindingType::StorageBuffer, .buffer = &out, .offset = out_offset,
+        {.slot = 0, .type = Rhi::BindingType::StorageBuffer, .buffer = tiled.get(), .offset = 0,
          .size = size},
         {.slot = 1, .type = Rhi::BindingType::StorageBuffer, .buffer = linear.get(), .size = size},
         {.slot = 2, .type = Rhi::BindingType::UniformBuffer, .buffer = params_buffer.get(),
@@ -1210,7 +1243,9 @@ bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, co
     }};
     list.PushBindings(bindings);
     list.Dispatch(static_cast<u32>((size / (info.num_bits / 8)) / 64), 1, 1);
-    list.Barrier(Rhi::ScopeCompute, Rhi::ScopeTransfer | Rhi::ScopeHost);
+    list.Barrier(Rhi::ScopeCompute, Rhi::ScopeTransfer);
+    list.CopyBuffer(tiled.get(), 0, &out, out_offset, size);
+    list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeCompute | Rhi::ScopeHost);
     return true; // the device frees the temporary buffers after the GPU used them
 }
 

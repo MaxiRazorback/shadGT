@@ -21,6 +21,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
+#include "video_core/renderer_vulkan/image_allocation.h"
 #include <chrono>
 
 #include <vk_mem_alloc.h>
@@ -320,6 +321,16 @@ u64 RecycledImageBytes() {
     return g_recycled_bytes;
 }
 
+void ClearRecycledImages(VmaAllocator allocator) {
+    std::scoped_lock lk{g_recycle_mutex};
+    for (auto& [key, images] : g_recycled) {
+        for (const auto& image : images) vmaDestroyImage(allocator, image.image, image.allocation);
+    }
+    g_recycled.clear();
+    g_recycle_order.clear();
+    g_recycled_bytes = 0;
+}
+
 void TrimUnusedRecycledImages(VmaAllocator allocator) {
     const auto cutoff = std::chrono::steady_clock::now() - std::chrono::seconds{30};
     std::scoped_lock lk{g_recycle_mutex};
@@ -383,7 +394,7 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
         size_bytes = recycled->size_bytes;
         return;
     }
-    const VmaAllocationCreateInfo alloc_ci = {
+    VmaAllocationCreateInfo alloc_ci = {
         .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         .requiredFlags = 0,
@@ -393,10 +404,16 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     };
 
     const VkImageCreateInfo image_ci_unsafe = static_cast<VkImageCreateInfo>(image_ci);
+    alloc_ci.pool = Vulkan::SmallImageAllocationPool(allocator, image_ci_unsafe, alloc_ci);
     VkImage unsafe_image{};
     VmaAllocationInfo alloc_info{};
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
                                      &allocation, &alloc_info);
+    if (result != VK_SUCCESS && alloc_ci.pool) {
+        alloc_ci.pool = VK_NULL_HANDLE;
+        result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
+                               &allocation, &alloc_info);
+    }
     ASSERT_MSG(result == VK_SUCCESS,
                "Failed allocating image: error={} format={} type={} extent={}x{}x{} "
                "mips={} layers={} samples={} flags={} usage={} tiling={}",

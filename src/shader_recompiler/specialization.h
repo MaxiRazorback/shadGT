@@ -97,9 +97,19 @@ struct StageSpecialization {
 
     StageSpecialization() = default;
     StageSpecialization(const Info& info_, RuntimeInfo runtime_info_, const Profile& profile_,
-                        Backend::Bindings start_)
+                        Backend::Bindings start_,
+                        const Gcn::FetchShaderData* translated_fetch = nullptr)
         : info{&info_}, runtime_info{runtime_info_}, start{start_} {
-        if (info_.sw_stage == SwStage::Vertex && Gcn::ParseFetchShader(info_, fetch_shader_data)) {
+        bool parsed_fetch = false;
+        if (info_.sw_stage == SwStage::Vertex) {
+            if (translated_fetch) {
+                fetch_shader_data = *translated_fetch;
+                parsed_fetch = true;
+            } else {
+                parsed_fetch = Gcn::ParseFetchShader(info_, fetch_shader_data);
+            }
+        }
+        if (parsed_fetch) {
             // Specialize shader on VS input number types to follow spec.
             ForEachSharp(vs_attribs, fetch_shader_data.attributes,
                          [this](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {

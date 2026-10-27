@@ -126,6 +126,10 @@ public:
     /// PERF-021: optimized relinks wait until no new pipeline has been needed for a while, so
     /// they never take cores from pipelines a draw is waiting for.
     static void NotePipelineMiss();
+    bool CanRetire() const {
+        return !library_link || !library_link->optimized.valid() ||
+               library_link->optimized.wait_for(std::chrono::seconds{0}) == std::future_status::ready;
+    }
 
     /// PERF-019: a pipeline built on a worker from copies of the shader infos points at the
     /// cached infos once it is used.
@@ -139,6 +143,7 @@ private:
     struct LibraryLink {
         /// Vertex input and fragment output libraries; the shader libraries are shared (PERF-018).
         std::array<vk::UniquePipeline, 2> owned_libraries;
+        std::array<std::shared_ptr<vk::UniquePipeline>, 2> shared_libraries;
         std::future<void> optimized;
     };
     /// PERF-018 / SHD-002: hashes of the stage set layouts' bindings, so a shader library is

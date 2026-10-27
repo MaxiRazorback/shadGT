@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/profile.h"
@@ -34,6 +35,15 @@ public:
              const Shader::Profile& profile, vk::PipelineCache pipeline_cache,
              bool is_compute = false);
     virtual ~Pipeline();
+
+    void NoteRetentionUse(std::chrono::steady_clock::time_point now) const {
+        retention_use.store(now.time_since_epoch().count(), std::memory_order_relaxed);
+    }
+
+    std::chrono::steady_clock::time_point LastRetentionUse() const {
+        return std::chrono::steady_clock::time_point{std::chrono::steady_clock::duration{
+            retention_use.load(std::memory_order_relaxed)}};
+    }
 
     vk::Pipeline Handle() const noexcept {
         // PERF-017: the fully optimized pipeline once a worker has linked it.
@@ -91,6 +101,7 @@ public:
                        const Shader::PushData& push_data) const;
 
 protected:
+    mutable std::atomic<std::chrono::steady_clock::duration::rep> retention_use{0};
     [[nodiscard]] std::string GetDebugString() const;
 
     const Instance& instance;

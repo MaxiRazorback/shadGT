@@ -3,6 +3,7 @@
 
 #include "common/io_file.h"
 #include "common/path_util.h"
+#include "common/perf_monitor.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -1160,6 +1161,7 @@ void Translator::EmitFetch(const GcnInst& inst) {
     info.has_fetch_shader = true;
     info.fetch_shader_sgpr_base = code_sgpr_base;
     ASSERT(ParseFetchShader(info, fetch_data));
+    info.translated_fetch_shader = std::make_shared<const FetchShaderData>(fetch_data);
 
     if (EmulatorSettings.IsDumpShaders()) {
         using namespace Common::FS;
@@ -1183,9 +1185,15 @@ void Translator::EmitFetch(const GcnInst& inst) {
         const auto values =
             ir.CompositeConstruct(ir.GetAttribute(attr, 0), ir.GetAttribute(attr, 1),
                                   ir.GetAttribute(attr, 2), ir.GetAttribute(attr, 3));
+        // StageSpecialization keys these descriptors as plain floats with identity swizzles.
+        // Emit that same interpretation: retaining the invalid V#'s conversion/swizzle here
+        // would cache different code under that key and reuse it for a later valid descriptor.
+        static const bool plain_garbage = Common::PerfFeatureEnabled(83);
+        const bool plain = plain_garbage && buffer.GetSize() >= (u64{1} << 30);
         const auto converted =
-            IR::ApplyReadNumberConversionVec4(ir, values, buffer.GetNumberConversion());
-        const auto swizzled = ApplySwizzle(ir, converted, buffer.DstSelect());
+            plain ? values : IR::ApplyReadNumberConversionVec4(ir, values,
+                                                              buffer.GetNumberConversion());
+        const auto swizzled = plain ? converted : ApplySwizzle(ir, converted, buffer.DstSelect());
         for (u32 i = 0; i < attrib.num_elements; i++) {
             ir.SetVectorReg(dst_reg++, IR::F32{ir.CompositeExtract(swizzled, i)});
         }

@@ -574,6 +574,10 @@ static AreaAnswer LookupAreaWalk(VAddr virtual_addr, VAddr limit) {
             answer.readable};
 }
 
+u64 MappingGeneration() {
+    return GetAreaCache().version.load(std::memory_order_acquire);
+}
+
 void NoteMappingChange(VAddr address, u64 size) {
     DropAliases(address, size); // PERF-080
     auto& cache = GetAreaCache();

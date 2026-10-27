@@ -14,6 +14,7 @@
 #endif
 
 #include "common/logging/log.h"
+#include "core/memory.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/direct_memory.h"
 #include "video_core/buffer_cache/proto_import.h"
@@ -220,12 +221,17 @@ bool DirectMemory::ImportView(VAddr address) {
     if (base == 0) {
         return false;
     }
-    if (std::ranges::binary_search(failed, base)) {
+    if (failed.contains(base)) {
         return false;
     }
     const VAddr end = GuestViewEnd(base, 1ULL << 32);
     const auto fail = [&](const char* why) {
-        failed.insert(std::ranges::upper_bound(failed, base), base);
+        // An unmap/remap can leave the allocation temporarily uncommitted or split
+        // before the requested page. That is not a permanent import failure.
+        if (end > address && (base & (PageSize - 1)) == 0 &&
+            ((end - base) & (PageSize - 1)) == 0) {
+            failed.emplace(base, end);
+        }
         if (++failed_count <= 40) {
             LOG_WARNING(Render_Vulkan, "D1: view {:#x}+{:#x} not imported: {}", base, end - base,
                         why);
@@ -355,7 +361,22 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
         }
     }
     std::scoped_lock lk{mutex};
+#ifdef RYTY_GPU
+    // OnUnmap is reported before the host remap. A lookup during that window can
+    // fail, so discard negative results after the completed mapping is reported too.
+    const u64 mapping_generation = Core::RytyMemory::MappingGeneration();
+    if (failed_generation != mapping_generation) {
+        failed.clear();
+        failed_generation = mapping_generation;
+    }
+#endif
     for (VAddr page = address & ~(PageSize - 1); page < end;) {
+        // A failed view is retried by many draws (and again by the gather fallback).
+        // Its bounds are already known: avoid querying Windows for its base each time.
+        const auto failure = failed.upper_bound(page);
+        if (failure != failed.begin() && page < std::prev(failure)->second) {
+            return false;
+        }
         auto it = views.upper_bound(page);
         if (it != views.begin()) {
             const auto& view = std::prev(it)->second;
@@ -408,8 +429,10 @@ void DirectMemory::OnUnmap(VAddr address, u64 size) {
         }
         it = views.erase(it);
     }
-    // A view base unmapped may be mapped again with other memory.
-    std::erase_if(failed, [&](VAddr base) { return base >= address && base < end; });
+    // Even a partial unmap can replace part of a failed view with importable memory.
+    std::erase_if(failed, [&](const auto& view) {
+        return view.first < end && (view.second > address || view.first >= address);
+    });
 }
 
 DirectMemory::Stats DirectMemory::GetStats() const {

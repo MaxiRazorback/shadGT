@@ -24,6 +24,8 @@ namespace Core::RytyMemory {
 VAddr MappedAreaEnd(VAddr virtual_addr, VAddr limit = ~VAddr{0});
 /// Called when Ryty maps or unmaps guest memory, so cached MappedAreaEnd answers are dropped.
 void NoteMappingChange(VAddr address, u64 size);
+/// Changes whenever Ryty reports a mapping or protection update.
+u64 MappingGeneration();
 /// A guarded direct read of guest memory is running on this thread (see ryty_core_shims.cpp).
 bool InGuardedRead();
 /// Whether page tracking, rather than the game, made the page of address unreadable.

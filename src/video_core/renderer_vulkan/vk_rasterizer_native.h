@@ -121,11 +121,12 @@ public:
     /// bindings worked out ahead for the recorder (see PreparedDraw).
     void PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu::Regs& regs,
                         const GraphicsPipeline& pipeline,
+                        std::shared_ptr<const void> pipeline_keepalive,
                         std::span<const Shader::Info* const> stages, bool is_indexed,
                         u32 index_offset);
 
 private:
-    enum class ViewUse : u8 { Sampled, Storage, Attachment };
+    enum class ViewUse : u8 { Sampled, Storage, Attachment, CubeSampled };
 
     struct Chunk {
         std::unique_ptr<Native::Rhi::Buffer> buffer;
@@ -232,6 +233,7 @@ private:
         VAddr end = 0;
         std::unique_ptr<Native::Rhi::Buffer> buffer;
         std::vector<VAddr> dirty_pages; ///< written by the CPU since the last use
+        bool dirty_sorted = true;
     };
     std::map<VAddr, Region> regions; ///< by begin; guarded by mutex
     std::mutex region_dirty_mutex;   ///< pending_region_writes (CPU write faults: any thread)
@@ -244,7 +246,7 @@ private:
     void SortRegionWrites();
     Region* RegionOver(VAddr address, u64 size);
     Region* MakeRegion(VAddr address, u64 size);
-    void RefreshRegion(Region& region);
+    void RefreshRegion(Region& region, VAddr address, u64 size);
     /// NAT-150: copies in video memory of guest memory the GPU reads as vertices and indices
     /// and the CPU leaves alone (meshes), instead of reading it over PCIe at every draw. A range
     /// bound in a second frame is copied at the start of the next list; CPU writes to its pages
@@ -394,6 +396,9 @@ private:
     void WatchPages(VAddr address, u64 size);
     /// NAT-105, FIX-153: the watched pages of [begin, end) (page aligned) are watched no more.
     void UnwatchPages(VAddr begin, VAddr end);
+    /// Retired resources must not leave write protection on memory reused by the CPU.
+    std::vector<std::pair<VAddr, VAddr>> retired_watch_ranges;
+    void ReleaseUnusedWatches();
     /// NAT-112: small render targets drawn into are written back to guest memory (GT Sport's
     /// CPU reads its brightness chain there for auto exposure).
     void FlushWritebacks();
@@ -466,6 +471,7 @@ private:
         const void* packet = nullptr;
         u32 epoch = 0;
         const GraphicsPipeline* pipeline = nullptr;
+        std::shared_ptr<const void> pipeline_keepalive;
         std::array<u64, Shader::MaxStageTypes> stage_hashes{};
         u64 image_generation = 0;
         u64 buffer_seq = 0;

@@ -127,6 +127,11 @@ public:
 
     void Sync();
 
+    /// Recorder only, between draws. Retires unused pipelines after GPU completion.
+    void TrimUnusedPipelines();
+    std::shared_ptr<const void> KeepAlive(const GraphicsPipeline* pipeline) const;
+    std::shared_ptr<const void> KeepAlive(const ComputePipeline* pipeline) const;
+
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
     /// The pipeline of the key RefreshGraphicsKey made (built if needed).
     const GraphicsPipeline* PipelineForCurrentKey(const DrawIndirectParams params);
@@ -336,8 +341,11 @@ private:
         std::chrono::steady_clock::time_point since{};
     } legacy_stats;
     void ReportLegacy();
-    tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
-    tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
+    tsl::robin_map<ComputePipelineKey, std::shared_ptr<ComputePipeline>> compute_pipelines;
+    tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<GraphicsPipeline>> graphics_pipelines;
+    std::unordered_map<const Pipeline*, std::chrono::steady_clock::time_point> pipeline_last_use;
+    std::chrono::steady_clock::time_point retention_now{std::chrono::steady_clock::now()};
+    std::chrono::steady_clock::time_point retention_last_scan{};
     /// NAT-031: what a key is computed in. The command and recorder threads use the cache's own
     /// (scratch_, under the exclusive lock); a game job thread looking a pipeline up uses its
     /// own (under the shared lock), so job threads look pipelines up at the same time.

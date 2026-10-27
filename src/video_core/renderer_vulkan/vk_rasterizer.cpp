@@ -267,6 +267,7 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead() {
         .instance_sgpr_offset = 0,
         .tessellate_quads = false,
     });
+    selected.keepalive[0] = pipeline_cache.KeepAlive(selected.pipeline);
     if (selected.pipeline) {
         CopySelectedStages(selected.stages);
     }
@@ -276,6 +277,7 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead() {
             .instance_sgpr_offset = 0,
             .tessellate_quads = true,
         });
+        selected.keepalive[2] = pipeline_cache.KeepAlive(selected.quad_tess_pipeline);
         if (selected.quad_tess_pipeline) {
             CopySelectedStages(selected.quad_tess_stages);
         }
@@ -305,7 +307,9 @@ void Rasterizer::CopyComputeStage(std::array<SelectedStage, Shader::MaxStageType
     selected.flattened = info->flattened_ud_buf;
 }
 
-const GraphicsPipeline* Rasterizer::LookupJobPipeline(const char** miss) {
+const GraphicsPipeline* Rasterizer::LookupJobPipeline(std::shared_ptr<const void>& keepalive,
+                                                      const char** miss) {
+    keepalive.reset();
     const auto& regs = liverpool->DrawRegs();
     bool depth_copy;
     bool stencil_copy;
@@ -319,6 +323,7 @@ const GraphicsPipeline* Rasterizer::LookupJobPipeline(const char** miss) {
     // both and the recorder picks); its tessellated twin is looked up the same way when needed.
     std::shared_lock lk{pipeline_cache.LookupMutex()}; // NAT-031: job threads at once
     const auto* pipeline = pipeline_cache.LookupBuiltPipeline({});
+    keepalive = pipeline_cache.KeepAlive(pipeline);
     if (!pipeline && miss) {
         *miss = pipeline_cache.LookupMiss();
     }
@@ -373,6 +378,7 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectComputePipelineAhe
     selected.is_compute = true;
     std::scoped_lock lk{pipeline_cache.LookupMutex()};
     selected.compute = pipeline_cache.GetComputePipeline();
+    selected.keepalive[1] = pipeline_cache.KeepAlive(selected.compute);
     if (selected.compute) {
         CopyComputeStage(selected.stages);
     }
@@ -2617,6 +2623,7 @@ void Rasterizer::OnSubmit() {
     buffer_cache.TickFrame();
     ProcessDownloadsTimed(DrainSource::Submit);
     texture_cache.RunGarbageCollector();
+    pipeline_cache.TrimUnusedPipelines();
     runtime.TickFrame();
 }
 

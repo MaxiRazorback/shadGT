@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <map>
 #include <algorithm>
 #include <filesystem>
 #include <chrono>
@@ -313,28 +314,32 @@ private:
 // PERF-018: shader stage libraries (pre-rasterization and fragment shader) of runtime
 // pipelines, shared by every pipeline whose stages, layout and stage state are the same. Many new
 // pipelines differ from an earlier one only in blending, targets or vertex input, so they reuse
-// both compiled shader libraries and only link. Libraries live until exit.
+// both compiled shader libraries and only link. Pipelines own their shared libraries.
 class StageLibraryCache {
 public:
-    static StageLibraryCache& Instance() {
-        static StageLibraryCache cache;
-        return cache;
+    static StageLibraryCache& Instance() { static StageLibraryCache cache; return cache; }
+    std::shared_ptr<vk::UniquePipeline> Find(vk::Device device, u64 key) {
+        std::scoped_lock lock{mutex};
+        const auto it = libraries.find({device, key});
+        return it != libraries.end() ? it->second.lock() : nullptr;
     }
-
-    vk::Pipeline Find(u64 key) {
-        std::scoped_lock lk{mutex};
-        const auto it = libraries.find(key);
-        return it != libraries.end() ? it->second : vk::Pipeline{};
+    std::shared_ptr<vk::UniquePipeline> Insert(vk::Device device, u64 key, vk::Pipeline library, bool share) {
+        auto owned = std::make_shared<vk::UniquePipeline>(library, device);
+        if (!share) return owned;
+        std::scoped_lock lock{mutex};
+        auto& cached = libraries[{device, key}];
+        if (auto existing = cached.lock()) return existing;
+        cached = owned;
+        // Weak entries own no GPU resources; remove expired keys as scenes change.
+        if (++insertions % 128 == 0) {
+            std::erase_if(libraries, [](const auto& entry) { return entry.second.expired(); });
+        }
+        return owned;
     }
-
-    void Insert(u64 key, vk::Pipeline library) {
-        std::scoped_lock lk{mutex};
-        libraries.emplace(key, library);
-    }
-
 private:
     std::mutex mutex;
-    std::unordered_map<u64, vk::Pipeline> libraries;
+    std::map<std::pair<vk::Device, u64>, std::weak_ptr<vk::UniquePipeline>> libraries;
+    size_t insertions{};
 };
 
 class LibraryKey {
@@ -488,6 +493,9 @@ GraphicsPipeline::GraphicsPipeline(
         vk::DynamicState::eLineWidth,          vk::DynamicState::ePrimitiveRestartEnable,
     };
 
+    if (instance.IsAttachmentFeedbackLoopLayoutSupported()) {
+        dynamic_states.push_back(vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);
+    }
     if (instance.IsDepthBoundsSupported()) {
         dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
         dynamic_states.push_back(vk::DynamicState::eDepthBounds);
@@ -944,10 +952,10 @@ GraphicsPipeline::GraphicsPipeline(
         const u64 fragment_hash = fragment_key.Hash();
         // -DisablePerf 18 compiles every library for every pipeline, one after another.
         const bool share_libraries = Common::PerfFeatureEnabled(18);
-        vk::Pipeline pre_raster_library =
-            share_libraries ? library_cache.Find(pre_raster_hash) : vk::Pipeline{};
-        vk::Pipeline fragment_library =
-            share_libraries ? library_cache.Find(fragment_hash) : vk::Pipeline{};
+        auto pre_raster_owner = share_libraries ? library_cache.Find(device, pre_raster_hash) : nullptr;
+        auto fragment_owner = share_libraries ? library_cache.Find(device, fragment_hash) : nullptr;
+        vk::Pipeline pre_raster_library = pre_raster_owner ? **pre_raster_owner : vk::Pipeline{};
+        vk::Pipeline fragment_library = fragment_owner ? **fragment_owner : vk::Pipeline{};
         const bool pre_raster_reused = bool(pre_raster_library);
         const bool fragment_reused = bool(fragment_library);
         // PERF-018: the two shader libraries are compiled at the same time, the fragment one
@@ -960,7 +968,8 @@ GraphicsPipeline::GraphicsPipeline(
         library_handles[0] = create_library(0);
         if (!pre_raster_library) {
             pre_raster_library = create_library(1);
-            library_cache.Insert(pre_raster_hash, pre_raster_library);
+            pre_raster_owner = library_cache.Insert(device, pre_raster_hash, pre_raster_library, share_libraries);
+            pre_raster_library = **pre_raster_owner;
         }
         library_handles[3] = create_library(3);
         if (fragment_future.valid()) {
@@ -969,8 +978,10 @@ GraphicsPipeline::GraphicsPipeline(
             fragment_library = create_library(2);
         }
         if (!fragment_reused) {
-            library_cache.Insert(fragment_hash, fragment_library);
+            fragment_owner = library_cache.Insert(device, fragment_hash, fragment_library, share_libraries);
+            fragment_library = **fragment_owner;
         }
+        library_link->shared_libraries = {pre_raster_owner, fragment_owner};
         library_handles[1] = pre_raster_library;
         library_handles[2] = fragment_library;
         library_link->owned_libraries[0] = vk::UniquePipeline{library_handles[0], device};

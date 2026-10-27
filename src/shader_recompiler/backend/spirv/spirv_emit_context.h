@@ -308,6 +308,7 @@ public:
         AmdGpu::ImageType view_type;
         bool is_integer = false;
         bool is_storage = false;
+        bool native_cube = false;
         MipStorageFallbackMode mip_fallback_mode{};
     };
 
@@ -367,6 +368,7 @@ public:
     Id physical_pointer_type_u8;
     Id physical_pointer_type_u16;
     size_t direct_table_index{}; // D2
+    std::vector<Id> direct_table_words; ///< entry-point IDs; helpers are emitted before these
     Id direct_translate{};
     bool IsDirectBuffer(u32 handle) const;
     Id EmitDirectLoad(u32 handle, Id byte_offset, u32 bytes, Id result_type,

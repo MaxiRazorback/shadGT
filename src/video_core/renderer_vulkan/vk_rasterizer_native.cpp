@@ -18,6 +18,7 @@
 #include <bit>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 
 #include <fmt/ranges.h>
 #include <magic_enum/magic_enum.hpp>
@@ -58,6 +59,7 @@ vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type);
 }
 
 namespace Vulkan {
+bool RytyGtsInRace();
 namespace {
 
 /// Logs the first few times and then every 1000th.
@@ -171,6 +173,9 @@ vk::ImageUsageFlags UsageOf(const Instance& instance, const VideoCore::ImageInfo
                                 vk::ImageUsageFlagBits::eTransferDst |
                                 vk::ImageUsageFlagBits::eSampled;
     if (!info.props.is_block) {
+        if (instance.IsAttachmentFeedbackLoopLayoutSupported()) {
+            usage |= vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
+        }
         if (info.props.is_depth) {
             usage |= vk::ImageUsageFlagBits::eDepthStencilAttachment;
         } else {
@@ -322,14 +327,17 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
         }
         // NAT-146: the GPU's bytes there are in a region (shader-written memory lives in video
         // memory): the upload reads the region.
-        if (Region* region = RegionOver(address, size);
+        Region* overlap = RegionOver(address, size);
+        if (Region* region = overlap;
             region && address >= region->begin && address + size <= region->end &&
             (address - region->begin) % r.instance.StorageMinAlignment() == 0) {
-            RefreshRegion(*region);
+            RefreshRegion(*region, address, size);
             auto wrapped = device->WrapBuffer(region->buffer->NativeHandle(), region->buffer->Size());
             source.buffer = wrapped.get();
             source.offset = address - region->begin;
             source.kind = 1;
+            // MakeRegion watches the complete range before any target is initialized from it.
+            source.guest_writes_tracked = true;
             source.keep.push_back(std::move(wrapped));
             return source;
         }
@@ -337,7 +345,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
             return source;
         }
         if (const auto found = direct->FindBuffer(address, size);
-            found && found->second % r.instance.StorageMinAlignment() == 0) {
+            !overlap && found && found->second % r.instance.StorageMinAlignment() == 0) {
             auto wrapped = device->WrapBuffer(
                 reinterpret_cast<u64>(static_cast<VkBuffer>(found->first->Handle())),
                 found->first->SizeBytes());
@@ -365,6 +373,32 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
                                               .size = bytes});
             });
         if (all) {
+            if (overlap) {
+                // The texture can straddle several GPU-written regions and imported guest
+                // memory. Keep guest bytes in the gaps, but use the GPU's current bytes for
+                // every overlap. Reading the whole range from the import loses those writes.
+                for (auto& [base, region] : regions) {
+                    const VAddr begin = std::max(address, region.begin);
+                    const VAddr end = std::min(address + size, region.end);
+                    if (begin < end) {
+                        RefreshRegion(region, begin, end - begin);
+                    }
+                }
+                list.Barrier(Native::Rhi::ScopeDraw | Native::Rhi::ScopeCompute |
+                                 Native::Rhi::ScopeTransfer,
+                             Native::Rhi::ScopeTransfer);
+                for (auto& [base, region] : regions) {
+                    const VAddr begin = std::max(address, region.begin);
+                    const VAddr end = std::min(address + size, region.end);
+                    if (begin < end) {
+                        cmd.copyBuffer(
+                            vk::Buffer{Handle<VkBuffer_T>(region.buffer->NativeHandle())}, dst,
+                            vk::BufferCopy{.srcOffset = begin - region.begin,
+                                           .dstOffset = begin - address,
+                                           .size = end - begin});
+                    }
+                }
+            }
             list.Barrier(Native::Rhi::ScopeTransfer,
                          Native::Rhi::ScopeCompute | Native::Rhi::ScopeTransfer);
             source.buffer = gathered.get();
@@ -414,6 +448,11 @@ Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bo
     const Instance& instance = r.instance;
     vk::ImageCreateFlags flags{vk::ImageCreateFlagBits::eMutableFormat |
                                vk::ImageCreateFlagBits::eExtendedUsage};
+    if (r.instance.IsImageCubeArraySupported() && !info.props.is_volume &&
+        info.size.width == info.size.height &&
+        info.resources.layers >= 6 && info.num_samples == 1) {
+        flags |= vk::ImageCreateFlagBits::eCubeCompatible;
+    }
     if (info.props.is_volume) {
         flags |= vk::ImageCreateFlagBits::e2DArrayCompatible;
         if (instance.Is2dViewOf3dSupported()) {
@@ -534,6 +573,9 @@ vk::ImageView NativeRenderer::View(const Native::ImageEntry& entry,
         format = r.instance.GetSupportedFormat(format, vk::FormatFeatureFlags2{entry.backend_features});
     }
     vk::ImageViewType view_type = VideoCore::ConvertImageViewType(info.type);
+    if (use == ViewUse::CubeSampled) {
+        view_type = vk::ImageViewType::eCubeArray;
+    }
     if (volume) {
         view_type = vk::ImageViewType::e3D;
     } else if (view_type == vk::ImageViewType::e3D) {
@@ -631,7 +673,7 @@ void NativeRenderer::BeginRendering(const RenderState& state) {
         const auto& cb = state.color_attachments[i];
         colors[i] = vk::RenderingAttachmentInfo{
             .imageView = cb.image_view,
-            .imageLayout = vk::ImageLayout::eGeneral,
+            .imageLayout = cb.image_layout,
             .loadOp = cb.is_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
             .storeOp = vk::AttachmentStoreOp::eStore,
             .clearValue = vk::ClearValue{.color = vk::ClearColorValue{.uint32 = cb.clear_value}},
@@ -734,12 +776,43 @@ void NativeRenderer::FlushWritebacks() {
             found->first->SizeBytes());
         if (registry->RecordDownload(*s.list, *entry, *out, found->second)) {
             ++stats.writebacks;
+            if (RegionOver(address, size)) {
+                // Image writes are authoritative for their entire byte range. A CPU-page
+                // delta cannot represent them: its saved baseline can already contain the
+                // same image bytes while an older native region contains something else.
+                // Order the image download before copying its exact overlap into each region.
+                const vk::MemoryBarrier2 downloaded{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                    .dstAccessMask = vk::AccessFlagBits2::eTransferRead |
+                                     vk::AccessFlagBits2::eTransferWrite,
+                };
+                s.cmd.pipelineBarrier2(vk::DependencyInfo{
+                    .memoryBarrierCount = 1,
+                    .pMemoryBarriers = &downloaded,
+                });
+                for (auto& [base, region] : regions) {
+                    const VAddr begin = std::max(address, region.begin);
+                    const VAddr end = std::min(address + size, region.end);
+                    if (begin >= end) {
+                        continue;
+                    }
+                    s.cmd.copyBuffer(found->first->Handle(),
+                                     vk::Buffer{Handle<VkBuffer_T>(region.buffer->NativeHandle())},
+                                     vk::BufferCopy{.srcOffset = found->second + begin - address,
+                                                    .dstOffset = begin - region.begin,
+                                                    .size = end - begin});
+                }
+
+            }
             // NAT-146: regions over the picture's memory copy it in before their next use.
             if (Region* region = RegionOver(address, size)) {
                 for (VAddr page = Common::AlignDown(std::max<VAddr>(address, region->begin), 4096);
                      page < std::min<VAddr>(address + size, region->end); page += 4096) {
                     region->dirty_pages.push_back(page);
                 }
+                region->dirty_sorted = false;
             }
             // NAT-150: so do mirrors.
             for (auto it = FirstMirror(address);
@@ -899,6 +972,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
             if (it->second.begin < end && it->second.end > begin) {
                 begin = std::min(begin, it->second.begin);
                 end = std::max(end, it->second.end);
+                retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
                 merged.push_back(std::move(it->second));
                 it = regions.erase(it);
             } else {
@@ -963,6 +1037,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
         // FIX-173: CPU writes to it not copied in yet are copied in at the new one's next use.
         region.dirty_pages.insert(region.dirty_pages.end(), old.dirty_pages.begin(),
                                   old.dirty_pages.end());
+        region.dirty_sorted = false;
     }
     s.buffers_written = true;
     // CPU writes to it from now on are copied in before its next use.
@@ -992,6 +1067,7 @@ void NativeRenderer::SortRegionWrites() {
                      page += 4096) {
                     region.dirty_pages.push_back(page);
                 }
+                region.dirty_sorted = false;
             }
         }
         // FIX-173: copies of pages no region holds are not needed.
@@ -1033,6 +1109,7 @@ void NativeRenderer::SortRegionWrites() {
                 ++stats.mirrors_dropped;
                 ++buffer_generation; // OPT-003
                 buffer_log.Note(mirror.begin, mirror.end); // OPT-010
+                retired_watch_ranges.emplace_back(mirror.begin, mirror.end);
                 std::unique_lock map_lock{buffer_map_mutex};
                 it = mirrors.erase(it); // freed once the GPU is done with it
                 continue;
@@ -1238,6 +1315,7 @@ void NativeRenderer::MakePendingMirrors() {
                     mirror_bytes -= it->second.end - it->second.begin;
                     ++stats.mirrors_evicted;
                     buffer_log.Note(it->second.begin, it->second.end);
+                    retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
                     it = mirrors.erase(it);
                 } else {
                     ++it;
@@ -1266,6 +1344,7 @@ void NativeRenderer::MakePendingMirrors() {
             std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
             for (auto it = FirstMirror(begin); it != mirrors.end() && it->second.begin < end;) {
                 mirror_bytes -= it->second.end - it->second.begin;
+                retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
                 it = mirrors.erase(it); // freed once the GPU is done with it
             }
         }
@@ -1302,18 +1381,35 @@ void NativeRenderer::DropMirrors(VAddr address, u64 size) {
         mirror_bytes -= it->second.end - it->second.begin;
         ++buffer_generation; // OPT-003
         buffer_log.Note(it->second.begin, it->second.end); // OPT-010
+        retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
         std::unique_lock map_lock{buffer_map_mutex};
         it = mirrors.erase(it); // freed once the GPU is done with it
     }
 }
 
-void NativeRenderer::RefreshRegion(Region& region) {
+void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
     SortRegionWrites();
-    std::vector<VAddr> pages;
-    pages.swap(region.dirty_pages);
-    if (pages.empty()) {
+    auto& dirty = region.dirty_pages;
+    if (dirty.empty() || size == 0) {
         return;
     }
+    if (!region.dirty_sorted) {
+        std::ranges::sort(dirty);
+        dirty.erase(std::unique(dirty.begin(), dirty.end()), dirty.end());
+        region.dirty_sorted = true;
+    }
+    // Regions survive scene changes and may hold unrelated allocations. Refresh only the
+    // pages this operation uses; the rest stay pending, with their original CPU snapshots,
+    // until a later operation uses them. GPU-written bytes still come from the region.
+    const VAddr begin = Common::AlignDown(std::max(address, region.begin), 4096);
+    const VAddr end = std::min(region.end, address + size);
+    const auto first = std::lower_bound(dirty.begin(), dirty.end(), begin);
+    const auto last = std::lower_bound(first, dirty.end(), end);
+    if (first == last) {
+        return;
+    }
+    std::vector<VAddr> pages(first, last);
+    dirty.erase(first, last);
     const auto refresh_start = std::chrono::steady_clock::now();
     struct Timed {
         std::chrono::steady_clock::time_point start;
@@ -1332,8 +1428,31 @@ void NativeRenderer::RefreshRegion(Region& region) {
     Stream& s = Begin();
     GlobalBarrier();
     const vk::Buffer dst{Handle<VkBuffer_T>(region.buffer->NativeHandle())};
-    std::ranges::sort(pages);
-    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    // The selected dirty pages are already sorted and unique. Detach their old snapshots
+    // before rearming protection: a write fault after that must save a new snapshot for the
+    // next refresh, rather than have its snapshot consumed by this one.
+    std::vector<std::unique_ptr<std::array<u8, 4096>>> snapshots(pages.size());
+    {
+        std::scoped_lock lock{region_dirty_mutex};
+        for (size_t i = 0; i < pages.size(); ++i) {
+            if (const auto it = page_snapshots.find(pages[i]); it != page_snapshots.end()) {
+                snapshots[i] = std::move(it->second);
+                page_snapshots.erase(it);
+            }
+        }
+    }
+    // One protection operation per contiguous run, instead of one per dirty page. All pages
+    // are watched before comparing guest bytes, so writes racing with the comparison still
+    // fault and remain pending for the next use.
+    for (size_t first = 0; first < pages.size();) {
+        size_t last = first + 1;
+        while (last < pages.size() && pages[last] == pages[last - 1] + 4096) {
+            ++last;
+        }
+        const VAddr end = std::min(region.end, pages[last - 1] + 4096);
+        WatchPages(pages[first], end - pages[first]);
+        first = last;
+    }
     const auto copy_in = [&](VAddr from, u64 size) {
         direct->ForEachPart(from, size,
                             [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset,
@@ -1345,25 +1464,13 @@ void NativeRenderer::RefreshRegion(Region& region) {
                                                                 .size = bytes});
                             });
     };
-    for (const VAddr page : pages) {
+    for (size_t i = 0; i < pages.size(); ++i) {
+        const VAddr page = pages[i];
         if (page < region.begin || page >= region.end) {
             continue;
         }
         const u64 page_bytes = std::min<u64>(4096, region.end - page);
-        // FIX-173: the page as it was before the CPU wrote it (taken at the write fault).
-        std::unique_ptr<std::array<u8, 4096>> before;
-        {
-            std::scoped_lock lock{region_dirty_mutex};
-            if (const auto it = page_snapshots.find(page); it != page_snapshots.end()) {
-                before = std::move(it->second);
-                page_snapshots.erase(it);
-            }
-        }
-        // NAT-145: only the pages copied in are watched again (the region was watched whole
-        // when made; re-watching all of it at each refresh cost ~9 us a draw with big regions).
-        // FIX-173: watched before guest memory is compared, so a CPU write from now on faults
-        // (and takes a new copy) instead of slipping in between the compare and the watch.
-        WatchPages(page, page_bytes);
+        const auto& before = snapshots[i];
         std::array<u8, 4096> now;
         if (!before || !Core::RytyMemory::GuardedCopy(now.data(),
                                                       reinterpret_cast<const void*>(page),
@@ -1411,9 +1518,10 @@ void NativeRenderer::RefreshRegion(Region& region) {
 u64 NativeRenderer::SnapshotBelow() {
     static const u64 below = [] {
         const char* env = std::getenv("RYGT_NATIVE_SNAPSHOT_BELOW");
-        return env && *env ? std::strtoull(env, nullptr, 0) : u64{0};
+        return env && *env ? std::strtoull(env, nullptr, 0) : u64{1_MB};
     }();
-    return below;
+    // Race buffers can depend on GPU writes not yet visible to a CPU snapshot.
+    return RytyGtsInRace() ? 0 : below;
 }
 
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr address, u64 size,
@@ -1484,7 +1592,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
             region = MakeRegion(address, size);
         }
         if (region) {
-            RefreshRegion(*region);
+            RefreshRegion(*region, address, size);
             ++stats.region_binds;
             memo_kind = MemoKind::Region; // OPT-003
             memo_region = region;
@@ -1962,6 +2070,14 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
                             u32(regs.depth_render_control.stencil_clear_enable), frame);
             }
             db.image_view = view;
+            if (r.FrameDumpCollecting() && entry->info.guest_address == 0x100ca70000) {
+                r.FrameDumpEvent(fmt::format(
+                    "shadow binding: target {}x{} layers {}, view layer {}+{}, instances {}, "
+                    "indices {}, depth clear {}, stencil clear {}",
+                    entry->info.size.width, entry->info.size.height, entry->info.resources.layers,
+                    desc.view_info.range.base.layer, desc.view_info.range.extent.layers,
+                    regs.num_instances.NumInstances(), regs.num_indices, depth_clear, stencil_clear));
+            }
             if (regs.depth_buffer.DepthValid()) {
                 db.clear_value[0] = depth_clear ? std::bit_cast<u32>(regs.depth_clear) : 0u;
                 db.has_depth = true;
@@ -2024,6 +2140,16 @@ void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
 void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& regs, bool compute,
                                  Shader::Backend::Bindings& binding, DrawBindings& b) {
     const u64 alignment = r.instance.StorageMinAlignment();
+    if (r.FrameDumpCollecting() && !compute &&
+        regs.depth_buffer.DepthAddress() == 0x100ca70000 &&
+        stage.sw_stage == Shader::SwStage::Vertex) {
+        std::string values;
+        for (size_t i = 0; i < std::min<size_t>(stage.flattened_ud_buf.size(), 64); ++i) {
+            values += fmt::format(" {}:{:08x}@{:x}", i, stage.flattened_ud_buf[i],
+                i < stage.flattened_ud_src.size() ? stage.flattened_ud_src[i] : 0);
+        }
+        r.FrameDumpEvent(fmt::format("shadow constants vs {:#x}:{}", stage.pgm_hash, values));
+    }
     // DIAG-150 (SHADGT_WATCH_SHADERS=<hex,...>): a watched shader's buffers, how they are bound
     // and the first bytes guest memory holds there, and its flattened user data.
     if (Rasterizer::ExposureLogOn()) {
@@ -2205,6 +2331,30 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                     !RegionOver(base, size) && direct->EnsureImported(base, size)) {
                     // D3: read in place through the page table; nothing bound.
                     direct_entries[buffer_index] = {u32(base), u32(base >> 32), u32(size), 1u};
+                    if (SnapshotBelow() >= 4_KB && stage.hw_stage == Shader::HwStage::Compute &&
+                        size >= 4_KB &&
+                        desc.post_op == Shader::SharpFetchPostOp::ReadConstPointer) {
+                        constexpr u64 PrefixSize = 4_KB;
+                        const auto [source, offset] = SnapshotRange(base, PrefixSize).value();
+                        auto prefix = device->CreateBuffer({
+                            .size = PrefixSize,
+                            .usage = Native::Rhi::BufferUsageStorage |
+                                     Native::Rhi::BufferUsageTransferDst,
+                            .memory = Native::Rhi::MemoryKind::DeviceLocal,
+                            .name = "native scalar prefix"});
+                        if (prefix) {
+                            EndRendering();
+                            const vk::Buffer target{Handle<VkBuffer_T>(prefix->NativeHandle())};
+                            stream.cmd.copyBuffer(source, target,
+                                vk::BufferCopy{.srcOffset = offset, .dstOffset = 0,
+                                               .size = PrefixSize});
+                            stream.list->Barrier(Native::Rhi::ScopeTransfer,
+                                                 Native::Rhi::ScopeCompute);
+                            info = {target, 0, PrefixSize};
+                            direct_entries[buffer_index][3] = u32(PrefixSize);
+                            stream.keep.push_back(std::move(prefix));
+                        }
+                    }
                     if (InPlaceSampled()) {
                         in_place.Note(2, base, size); // NAT-142
                     }
@@ -2246,6 +2396,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                                   Shader::Backend::Bindings& binding, DrawBindings& b) {
     for (const auto& image_desc : stage.images) {
         const auto tsharp = image_desc.GetSharp(stage);
+        const bool cube_sampling = image_desc.post_op == Shader::SharpFetchPostOp::NativeCubeSampling;
         const u32 num_bindings = image_desc.NumBindings(stage);
         const u32 first = static_cast<u32>(b.images.size());
         const bool storage = image_desc.is_written;
@@ -2280,7 +2431,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                                (u32(image_desc.is_depth) << 2) |
                                (u32(image_desc.mip_fallback_mode) << 3) |
                                ((image_desc.constant_mip_index & 0xff) << 6) |
-                               (num_bindings << 16);
+                               (num_bindings << 16) | (u32(cube_sampling) << 31);
         if (num_bindings <= 4 && stage.pgm_hash != 0xaa3822a3 && !r.FrameDumpCollecting()) {
             memo = &texture_memos[XXH3_64bits_withSeed(raw_sharp.data(), sizeof(raw_sharp),
                                                        memo_flags) &
@@ -2354,12 +2505,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                 const char* env = std::getenv("RYGT_FRAME_DUMP_ALL_TEXTURES");
                 return env && env[0] == '1';
             }();
-            bool gpu_written = dump_all || !entry->from_cpu;
-            if (!gpu_written) {
-                std::scoped_lock lock{entry->sources_mutex};
-                gpu_written = !entry->sources.empty();
-            }
-            if (gpu_written) {
+            if (dump_all || !entry->from_cpu) {
                 auto key = Rasterizer::FrameDumpTextureKey(desc.info); // NAT-123
                 if (std::ranges::find(dump_textures, key, &decltype(dump_textures)::value_type::first) ==
                     dump_textures.end()) {
@@ -2383,7 +2529,9 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                 view_info.range.extent.levels = 1;
             }
             const vk::ImageView view =
-                View(*entry, view_info, storage ? ViewUse::Storage : ViewUse::Sampled);
+                View(*entry, view_info, storage ? ViewUse::Storage
+                                               : cube_sampling ? ViewUse::CubeSampled
+                                                           : ViewUse::Sampled);
             b.images.push_back({VK_NULL_HANDLE, view, vk::ImageLayout::eGeneral});
         }
         if (memo) {
@@ -2857,8 +3005,11 @@ void NativeRenderer::Written(const Native::ImageEntry* entry, u64 at) {
         return;
     }
     auto* written = const_cast<Native::ImageEntry*>(entry);
+    const bool watched = Native::WatchedTexture(entry->info.guest_address,
+                                                entry->info.guest_address + 1);
+    const bool first_write = watched && written->write_version.load(std::memory_order_relaxed) == 0;
     written->write_version.store(at != 0 ? at : ++write_clock, std::memory_order_relaxed);
-    if (Native::WatchedTexture(entry->info.guest_address, entry->info.guest_address + 1)) {
+    if (watched) {
         // FIX-159 (diagnosis, RYGT_FRAME_DUMP_ON_STORE=<seconds>): from that long after start,
         // the first write of a watched picture starts a frame dump there (the frames a
         // time-triggered dump never lands on).
@@ -2874,7 +3025,7 @@ void NativeRenderer::Written(const Native::ImageEntry* entry, u64 at) {
             dumped = true;
             Native::g_dump_request = true;
         }
-        if (Native::WatchSample()) {
+        if (first_write || Native::WatchSample()) {
             LOG_WARNING(Render_Vulkan, "FIX-157 watch: {} {:#x} {}x{} layers {} written, version {} "
                         "(frame {})", entry->from_cpu ? "texture" : "target",
                         entry->info.guest_address, entry->info.size.width,
@@ -2917,17 +3068,33 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
         if (version == 0 || !source->image || source->reused.load(std::memory_order_relaxed)) {
             continue; // FIX-157: a reused one is stale
         }
-        const u32 key = (u32(place.mip) << 16) | u32(place.layer);
-        if (version <= std::max(held[key], own)) {
+        const u32 source_layers = std::max(source->image->Desc().layers, 1u);
+        if (place.src_layer < 0 || place.layer < 0 ||
+            u32(place.src_layer) >= source_layers ||
+            u32(place.layer) >= std::max(texture.image->Desc().layers, 1u)) {
             continue;
         }
-        const auto same = std::ranges::find_if(picks, [&](const Pick& pick) {
-            return pick.place.mip == place.mip && pick.place.layer == place.layer;
-        });
-        if (same == picks.end()) {
-            picks.push_back({source, place, version});
-        } else if (version > same->version) {
-            *same = {source, place, version};
+        const u32 layers = std::min(source_layers - u32(place.src_layer),
+                                    std::max(texture.image->Desc().layers, 1u) - u32(place.layer));
+        // A layered target and individual faces can overlap. Choose and remember the newest
+        // source for each face; choosing only the first face lets an older array overwrite a
+        // newer face later in the copy list (or after that face was already copied).
+        for (u32 layer = 0; layer < layers; ++layer) {
+            auto face = place;
+            face.layer += s32(layer);
+            face.src_layer += s32(layer);
+            const u32 key = (u32(face.mip) << 16) | u32(face.layer);
+            if (version <= std::max(held[key], own)) {
+                continue;
+            }
+            const auto same = std::ranges::find_if(picks, [&](const Pick& pick) {
+                return pick.place.mip == face.mip && pick.place.layer == face.layer;
+            });
+            if (same == picks.end()) {
+                picks.push_back({source, face, version});
+            } else if (version > same->version) {
+                *same = {source, face, version};
+            }
         }
     }
     if (picks.empty()) {
@@ -2940,7 +3107,11 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
     PrepareImages();  // the texture's own upload goes first
     GlobalBarrier();  // the sources' pictures are written
     const vk::Image dst{Handle<VkImage_T>(texture.image->NativeHandle())};
-    for (const auto& pick : picks) {
+    std::ranges::sort(picks, {}, [](const Pick& pick) {
+        return std::pair{pick.place.mip, pick.place.layer};
+    });
+    for (size_t index = 0; index < picks.size();) {
+        const auto& pick = picks[index];
         const auto& place = pick.place;
         const u32 width = std::min(
             {place.width, std::max(texture.info.size.width >> place.mip, 1u),
@@ -2948,12 +3119,20 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
         const u32 height = std::min(
             {place.height, std::max(texture.info.size.height >> place.mip, 1u),
              std::max(pick.source->info.size.height >> place.src_mip, 1u)});
-        // NAT-125: a layered target (a cube's faces drawn in one pass, the layer from the
-        // vertex shader) gives all its layers; NAT-131: from the layer the texture starts at.
-        const u32 layers = std::max<u32>(
-            1u, std::min<u32>(std::max<u32>(pick.source->image->Desc().layers, 1u) -
-                                  u32(place.src_layer),
-                              std::max<u32>(texture.image->Desc().layers, 1u) - u32(place.layer)));
+        // Keep contiguous faces from the same source in one GPU copy, without crossing a
+        // face selected from a newer source.
+        u32 layers = 1;
+        while (index + layers < picks.size()) {
+            const auto& next = picks[index + layers];
+            if (next.source != pick.source || next.version != pick.version ||
+                next.place.mip != place.mip || next.place.src_mip != place.src_mip ||
+                next.place.layer != place.layer + s32(layers) ||
+                next.place.src_layer != place.src_layer + s32(layers) ||
+                next.place.width != place.width || next.place.height != place.height) {
+                break;
+            }
+            ++layers;
+        }
         const vk::ImageCopy region{
             .srcSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
                             .mipLevel = u32(place.src_mip),
@@ -2980,7 +3159,10 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
                         pick.source->info.resources.layers, place.mip, place.layer, layers,
                         pick.version);
         }
-        held[(u32(place.mip) << 16) | u32(place.layer)] = pick.version;
+        for (u32 layer = 0; layer < layers; ++layer) {
+            held[(u32(place.mip) << 16) | (u32(place.layer) + layer)] = pick.version;
+        }
+        index += layers;
     }
     s.written.push_back(&texture); // read after the next barrier
     stats.source_copies += picks.size();
@@ -3192,6 +3374,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         PhaseClock clock{stats.phase_ns[1]};
         ResolveTargets(regs, *pipeline, targets);
     }
+
     if (r.FrameDumpActive() || Rasterizer::ExposureLogOn()) {
         r.FrameDumpPass(regs, targets.state, pipeline); // NAT-117
     }
@@ -3238,6 +3421,83 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
     Begin();
+    // A color image sampled while this draw writes it is a feedback attachment. Native
+    // images normally stay in GENERAL, but that does not make an overlapping attachment
+    // read legal. Enter the feedback layout for this draw and restore GENERAL afterward.
+    boost::container::small_vector<const Native::ImageEntry*, 8> feedback;
+    if (r.instance.IsAttachmentFeedbackLoopLayoutSupported()) {
+        for (u32 cb = 0; cb < targets.colors.size(); ++cb) {
+            const auto* target = targets.colors[cb];
+            if (target && std::ranges::find(b.sampled, target) != b.sampled.end() &&
+                std::ranges::find(feedback, target) == feedback.end()) {
+                // Output-resolution UI can redirect this attachment to a separate proxy.
+                // Only the original image's own attachment views form a feedback loop.
+                std::scoped_lock lock{views_mutex};
+                const auto found = views.find(target);
+                if (found != views.end() && std::ranges::any_of(found->second, [&](const auto& view) {
+                        return view.use == ViewUse::Attachment &&
+                               *view.view == targets.state.color_attachments[cb].image_view;
+                    })) {
+                    feedback.push_back(target);
+                }
+            }
+        }
+    }
+    const auto feedback_layout = [&](vk::ImageLayout from, vk::ImageLayout to) {
+        boost::container::static_vector<vk::ImageMemoryBarrier2, 8> barriers;
+        for (const auto* entry : feedback) {
+            barriers.push_back(vk::ImageMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                .oldLayout = from,
+                .newLayout = to,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())},
+                .subresourceRange{
+                    .aspectMask = vk::ImageAspectFlagBits::eColor,
+                    .baseMipLevel = 0,
+                    .levelCount = VK_REMAINING_MIP_LEVELS,
+                    .baseArrayLayer = 0,
+                    .layerCount = VK_REMAINING_ARRAY_LAYERS,
+                },
+            });
+        }
+        s.cmd.pipelineBarrier2(vk::DependencyInfo{
+            .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
+            .pImageMemoryBarriers = barriers.data(),
+        });
+    };
+    if (!feedback.empty()) {
+        GlobalBarrier();
+        feedback_layout(vk::ImageLayout::eGeneral,
+                        vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT);
+        for (u32 cb = 0; cb < targets.colors.size(); ++cb) {
+            if (std::ranges::find(feedback, targets.colors[cb]) != feedback.end()) {
+                targets.state.color_attachments[cb].image_layout =
+                    vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
+            }
+        }
+        std::scoped_lock lock{views_mutex};
+        for (const auto* entry : feedback) {
+            const auto found = views.find(entry);
+            if (found == views.end()) {
+                continue;
+            }
+            for (const auto& view : found->second) {
+                if (view.use != ViewUse::Sampled && view.use != ViewUse::CubeSampled) {
+                    continue;
+                }
+                for (auto& image : b.images) {
+                    if (image.imageView == *view.view) {
+                        image.imageLayout = vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
+                    }
+                }
+            }
+        }
+    }
     PhaseClock record_clock{stats.phase_ns[7]};
     {
         PhaseClock part{stats.record_ns[0]}; // OPT-011
@@ -3290,7 +3550,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         PhaseClock part{stats.record_ns[2]};
         DynamicState* const saved = Rasterizer::t_dynamic_state;
         Rasterizer::t_dynamic_state = &s.dynamic;
-        r.ctx->attachment_feedback_loop = {};
+        r.ctx->attachment_feedback_loop = feedback.empty() ? vk::ImageAspectFlags{}
+                                                           : vk::ImageAspectFlagBits::eColor;
         r.UpdateViewportScissorState();
         r.UpdateDepthStencilState();
         r.UpdatePrimitiveState(is_indexed, quad_triangles);
@@ -3322,6 +3583,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         const auto [vertex_offset, instance_offset] =
             DrawOffsets(regs, vs_info, pipeline->GetFetchShader());
         const u32 instances = regs.num_instances.NumInstances();
+        const auto* fs = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
         if (quad_triangles) {
             if (index_count != 0) {
                 cmdbuf.drawIndexed(index_count, instances, 0, s32(vertex_offset),
@@ -3338,6 +3600,13 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         PhaseClock part{stats.record_ns[7]};
         NoteWrites(&targets, b);
     }
+    if (!feedback.empty()) {
+        EndRendering();
+        feedback_layout(vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT,
+                        vk::ImageLayout::eGeneral);
+        s.buffers_written = true;
+    }
+
     ++stats.draws;
     ++s.commands;
     ChunkFlushCheck();
@@ -3356,6 +3625,7 @@ void NativeRenderer::PreparedDraw::Reset() {
     packet = nullptr;
     epoch = 0;
     pipeline = nullptr;
+    pipeline_keepalive.reset();
     stage_hashes = {};
     bindings.Clear();
     regions.clear();
@@ -3496,6 +3766,7 @@ u64 NativeRenderer::StageHash(const Shader::Info& info) {
 
 void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu::Regs& regs,
                                     const GraphicsPipeline& pipeline,
+                                    std::shared_ptr<const void> pipeline_keepalive,
                                     std::span<const Shader::Info* const> stages, bool is_indexed,
                                     u32 index_offset) {
     const auto start = std::chrono::steady_clock::now();
@@ -3503,6 +3774,7 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
     p->packet = packet;
     p->epoch = epoch;
     p->pipeline = &pipeline;
+    p->pipeline_keepalive = std::move(pipeline_keepalive);
     // What the lookups depend on, read before them.
     p->image_generation = registry->Generation();
     p->buffer_seq = buffer_log.Seq();
@@ -3747,6 +4019,7 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
     static thread_local std::array<TextureMemo, 4096> memos{};
     for (const auto& image_desc : stage.images) {
         const auto tsharp = image_desc.GetSharp(stage);
+        const bool cube_sampling = image_desc.post_op == Shader::SharpFetchPostOp::NativeCubeSampling;
         const u32 num_bindings = image_desc.NumBindings(stage);
         const u32 first = static_cast<u32>(b.images.size());
         const bool storage = image_desc.is_written;
@@ -3777,7 +4050,7 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
                                (u32(image_desc.is_depth) << 2) |
                                (u32(image_desc.mip_fallback_mode) << 3) |
                                ((image_desc.constant_mip_index & 0xff) << 6) |
-                               (num_bindings << 16);
+                               (num_bindings << 16) | (u32(cube_sampling) << 31);
         if (num_bindings > 4 || stage.pgm_hash == 0xaa3822a3) {
             return false; // the recorder (FIX-081's grass shader, long arrays)
         }
@@ -3829,7 +4102,9 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
                 view_info.range.extent.levels = 1;
             }
             const vk::ImageView view =
-                View(*entry, view_info, storage ? ViewUse::Storage : ViewUse::Sampled);
+                View(*entry, view_info, storage ? ViewUse::Storage
+                                               : cube_sampling ? ViewUse::CubeSampled
+                                                               : ViewUse::Sampled);
             b.images.push_back({VK_NULL_HANDLE, view, vk::ImageLayout::eGeneral});
         }
         memo.sharp = raw_sharp;
@@ -4079,7 +4354,7 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     }
     // The ordered part, as BindBuffers and BindTextures do it.
     for (Region* region : p.regions) {
-        RefreshRegion(*region);
+        RefreshRegion(*region, region->begin, region->end - region->begin);
         ++stats.region_binds;
     }
     const u64 alignment = r.instance.StorageMinAlignment();
@@ -4766,6 +5041,7 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
         for (auto it = regions.begin(); it != regions.end();) {
             if (it->second.begin < address + size && it->second.end > address) {
                 buffer_log.Note(it->second.begin, it->second.end);
+                retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
                 it = regions.erase(it);
             } else {
                 ++it;
@@ -5014,7 +5290,7 @@ void NativeRenderer::EvictImages() {
     if (frame <= KeepFrames || frame % 30 != 0) {
         return;
     }
-    // FIX-157: a picture the GPU wrote and used for a second or more stays past its idle time
+    // FIX-157: a picture the GPU wrote stays past its idle time
     // while nothing else writes its memory: its pixels exist nowhere else (the GPU's writes stay
     // in the picture, not in guest memory). GT Sport bakes its light probes (two cube arrays of
     // 322 32x32 cubes, at 0x107aee1400 and 0x108626d400) with compute shaders while a race
@@ -5025,9 +5301,12 @@ void NativeRenderer::EvictImages() {
     // keeping pictures whose memory the CPU had reused drew stale pictures, and writing them
     // back overwrote shader code the game had loaded there), no newer picture overlaps it, and
     // GPU work wrote no part of its memory since; from then on its pages are watched, and a CPU
-    // write, an unmap or GPU work there lets it go. Pictures in use for less than a second (the
-    // scratch pool's) go as before; kept ones take at most 256 MB.
-    constexpr u64 KeptBudget = 256ull << 20;
+    // write, an unmap or GPU work there lets it go. A baked image may be written in just one
+    // frame and sampled much later; its short initial use does not make its GPU contents
+    // disposable. Include room for the persistent 221 MB terrain shadow map alongside the
+    // lighting probes; dropping that map makes its texture reload only the initial clear.
+    // Kept images take at most 512 MB.
+    constexpr u64 KeptBudget = 512ull << 20;
     u32 newly_kept = 0;
     const auto keep = [&](Native::ImageEntry& entry) {
         if (entry.from_cpu || !entry.image || entry.reused.load(std::memory_order_relaxed)) {
@@ -5051,11 +5330,23 @@ void NativeRenderer::EvictImages() {
         if (entry.kept.load(std::memory_order_relaxed)) {
             return true;
         }
-        if (entry.last_use.load(std::memory_order_relaxed) < entry.made_frame + 60 ||
-            kept_bytes + size > KeptBudget || !registry->MemoryUnchanged(entry)) {
+        // A persistent depth map may live in GPU-only guest memory: there is no complete CPU
+        // hash, and the region still holds its initial clear rather than the rendered depth.
+        // Keep that authoritative image only when its backing has been watched since the first
+        // upload and no CPU write or unmap occurred. The foreign-write and budget guards above
+        // still apply; ordinary CPU-backed images continue to require an unchanged hash.
+        const bool tracked_depth = entry.info.props.is_depth && entry.content_hash == 0 &&
+                                   entry.guest_writes_tracked &&
+                                   !entry.guest_modified.load(std::memory_order_seq_cst);
+        if (kept_bytes + size > KeptBudget ||
+            (!tracked_depth && !registry->MemoryUnchanged(entry))) {
             return false;
         }
-        entry.kept.store(true, std::memory_order_relaxed);
+        entry.kept.store(true, std::memory_order_seq_cst);
+        if (tracked_depth && entry.guest_modified.load(std::memory_order_seq_cst)) {
+            entry.kept.store(false, std::memory_order_relaxed);
+            return false;
+        }
         kept_bytes += size;
         WatchPages(address, size);
         ++newly_kept;
@@ -5066,6 +5357,10 @@ void NativeRenderer::EvictImages() {
         return true;
     };
     registry->Evict(frame - KeepFrames, [&](Native::ImageEntry& entry) {
+        retired_watch_ranges.emplace_back(
+            VideoCore::PageManager::GetPageAddr(entry.info.guest_address),
+            VideoCore::PageManager::GetNextPageAddr(
+                entry.info.guest_address + std::max<u64>(entry.info.guest_size, 1) - 1));
         if (entry.kept.load(std::memory_order_relaxed)) {
             kept_bytes -= std::min<u64>(kept_bytes, std::max<u64>(entry.info.guest_size, 1));
         }
@@ -5148,6 +5443,57 @@ void NativeRenderer::UnwatchPages(VAddr begin, VAddr end) {
     }
     if (run != 0) {
         r.page_manager.UpdatePageWatchers(run, end - run, VideoCore::PageOp::Untrack);
+    }
+}
+
+void NativeRenderer::ReleaseUnusedWatches() {
+    if (retired_watch_ranges.empty()) {
+        return;
+    }
+    // WatchPages coalesces every native owner into one page-manager watch. Removing one
+    // resource may open only pages that no other image, region or mirror still needs.
+    // In particular, retired mesh/texture memory can become a fiber stack: leaving its
+    // unused pages read-only can prevent Windows from dispatching a subsequent write fault.
+    std::vector<std::pair<VAddr, VAddr>> pending;
+    pending.swap(retired_watch_ranges);
+    std::ranges::sort(pending);
+    std::vector<std::pair<VAddr, VAddr>> ranges;
+    for (const auto& range : pending) {
+        if (!ranges.empty() && range.first <= ranges.back().second) {
+            ranges.back().second = std::max(ranges.back().second, range.second);
+        } else {
+            ranges.push_back(range);
+        }
+    }
+    for (const auto& [begin, end] : ranges) {
+        std::vector<std::pair<VAddr, VAddr>> live;
+        const auto retain = [&](VAddr base, VAddr limit) {
+            if (base < end && limit > begin) {
+                live.emplace_back(std::max(begin, VideoCore::PageManager::GetPageAddr(base)),
+                                  std::min(end, VideoCore::PageManager::GetNextPageAddr(limit - 1)));
+            }
+        };
+        registry->ForEachOverlapping(begin, end, [&](Native::ImageEntry& entry) {
+            retain(entry.info.guest_address,
+                   entry.info.guest_address + std::max<u64>(entry.info.guest_size, 1));
+        });
+        for (const auto& [base, region] : regions) {
+            retain(region.begin, region.end);
+        }
+        for (const auto& [base, mirror] : mirrors) {
+            retain(mirror.begin, mirror.end);
+        }
+        std::ranges::sort(live);
+        VAddr cursor = begin;
+        for (const auto& [base, limit] : live) {
+            if (base > cursor) {
+                UnwatchPages(cursor, base);
+            }
+            cursor = std::max(cursor, limit);
+        }
+        if (cursor < end) {
+            UnwatchPages(cursor, end);
+        }
     }
 }
 
@@ -5371,6 +5717,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     }
     VerifyMirrors(); // FIX-176 (diagnosis)
     EvictImages(); // (the display picture was just used: it stays)
+    ReleaseUnusedWatches();
     return display;
 }
 

@@ -78,6 +78,7 @@ public:
         std::shared_ptr<const Shader::Info> seed;
     };
     struct SelectedPipeline {
+        std::array<std::shared_ptr<const void>, 3> keepalive;
         const GraphicsPipeline* pipeline{};
         /// PERF-055: a direct dispatch's compute pipeline (then `pipeline` is unused).
         bool is_compute{};
@@ -99,7 +100,8 @@ public:
     std::optional<SelectedPipeline> SelectComputePipelineAhead();
     /// NAT-030: on a game job thread whose registers Liverpool::SetThreadDrawState installed,
     /// the built pipeline of its draw, or nullptr (special draws, quad lists, not built yet).
-    const GraphicsPipeline* LookupJobPipeline(const char** miss = nullptr);
+    const GraphicsPipeline* LookupJobPipeline(std::shared_ptr<const void>& keepalive,
+                                              const char** miss = nullptr);
     /// NAT-032: a hash of the resource descriptors (V#, T#, S#) the stages read for a draw.
     static u64 SharpsHash(std::span<const Shader::Info* const> stages);
     /// NAT-032: right after LookupJobPipeline found a pipeline, the sharps its draw reads, as
@@ -213,6 +215,7 @@ public:
     }
     /// PERF-056: a used selection goes back for reuse with its vectors' capacity.
     void RecycleSelectedPipeline(SelectedPipeline&& selected) {
+        selected.keepalive = {};
         selected_recycler.Give(std::move(selected));
     }
 

@@ -91,6 +91,10 @@ public:
     /// NAT-109: hash of the guest bytes last uploaded (small textures; 0: none), so a texture
     /// made stale by a write to its page that left its bytes alone is not uploaded again.
     u64 content_hash = 0;
+    /// A GPU-only target cannot be checked against a CPU hash. Its initial upload can instead
+    /// establish that CPU writes to the complete backing range are already being watched.
+    bool guest_writes_tracked = false;
+    std::atomic<bool> guest_modified{false};
     /// FIX-153 (diagnosis): uploads in all, and where the last one read its bytes (0: none,
     /// 1: a region, 2: an imported buffer, 3: a gathered copy, 4: a CPU copy).
     std::atomic<u32> total_uploads{0};
@@ -172,6 +176,7 @@ public:
         const Rhi::Buffer* buffer = nullptr;
         u64 offset = 0;
         u8 kind = 0; ///< FIX-153 (diagnosis): see ImageEntry::upload_kind
+        bool guest_writes_tracked = false;
         std::vector<std::unique_ptr<Rhi::Buffer>> keep; ///< alive until the GPU used them
     };
     void SetUploadSource(std::function<UploadSource(const ImageEntry&, Rhi::CommandList&)> source) {
