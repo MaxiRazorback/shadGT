@@ -83,8 +83,15 @@ Id EmitFPMedTri32(EmitContext& ctx, Id a, Id b, Id c) {
         return ctx.OpSelect(ctx.F32[1], any_nan, nan_result,
                             ctx.OpFMid3AMD(ctx.F32[1], a, b, c));
     }
+    const Id min_ab{ctx.OpNMin(ctx.F32[1], a, b)};
     const Id mmx{ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], a, b), c)};
-    return ctx.OpNMax(ctx.F32[1], ctx.OpNMin(ctx.F32[1], a, b), mmx);
+    const Id median{ctx.OpNMax(ctx.F32[1], min_ab, mmx)};
+    // GCN MED3 with a quiet NaN returns the minimum of the numeric operands.
+    // A numeric-only median network instead picks their maximum, turning the
+    // game's (65000, NaN, 0) HDR clamp into a maximum-brightness reflection.
+    const Id any_nan{ctx.OpLogicalOr(ctx.U1[1], ctx.OpIsNan(ctx.U1[1], a),
+        ctx.OpLogicalOr(ctx.U1[1], ctx.OpIsNan(ctx.U1[1], b), ctx.OpIsNan(ctx.U1[1], c)))};
+    return ctx.OpSelect(ctx.F32[1], any_nan, ctx.OpNMin(ctx.F32[1], min_ab, c), median);
 }
 
 Id EmitFPMul32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {

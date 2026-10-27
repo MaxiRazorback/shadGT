@@ -22,19 +22,20 @@ namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 // Synthetic dual-source exports change the fragment shader interface. Version 13 adds the
 // general swizzled factor blend, which also changes the runtime color-buffer layout.
-static constexpr u32 ShaderBinaryVersion = 15u;
+static constexpr u32 ShaderBinaryVersion = 271u;
 // Only masked fragment permutations need the extra push constants. Keep ordinary cached
 // shaders compatible; older renderers must skip the new permutations on rollback.
-static constexpr u32 ShaderBinaryVersionQuadSampleMask = 16u;
-static constexpr u32 ShaderBinaryVersionMsaaRead = 17u;
-static constexpr u32 ShaderBinaryVersionMsaaReadQuadSampleMask = 18u;
+static constexpr u32 ShaderBinaryVersionQuadSampleMask = 272u;
+static constexpr u32 ShaderBinaryVersionMsaaRead = 273u;
+static constexpr u32 ShaderBinaryVersionMsaaReadQuadSampleMask = 274u;
 // Scalar-pointer compute loads support bounded prefixes and prologue table loads.
-static constexpr u32 ShaderBinaryVersionScalarPrefix = 19u;
-static constexpr u32 ShaderBinaryVersionScalarPrefixMsaaRead = 20u;
+static constexpr u32 ShaderBinaryVersionScalarPrefix = 275u;
+static constexpr u32 ShaderBinaryVersionScalarPrefixMsaaRead = 276u;
 // Vertex fetch conversion/swizzles must agree with the invalid-descriptor cache policy.
-static constexpr u32 ShaderBinaryVersionVertexFetch = 21u;
+static constexpr u32 ShaderBinaryVersionVertexFetch = 277u;
+// Shader semantic revision 0x100 invalidates binaries emitted before the MED3 quiet-NaN fix.
 // Fragment reflections use cube views; other stages keep their existing array path.
-static constexpr u32 ShaderBinaryVersionNativeCube = 23u;
+static constexpr u32 ShaderBinaryVersionNativeCube = 279u;
 
 static bool UsesScalarPrefix(const Shader::Info& info) {
     return info.hw_stage == Shader::HwStage::Compute &&
@@ -101,6 +102,9 @@ static u32 ShaderBinaryVersionFor(const Shader::StageSpecialization& spec,
 }
 
 static bool IsKnownShaderBinaryVersion(u32 version) {
+    // Recognize old metadata for prewarm discovery, but LoadShaderMeta below rejects its
+    // binary revision and retranslates it. Never relabel an old binary as corrected.
+    version |= 0x100u;
     return version == Serialization::ShaderBinaryVersion ||
            version == Serialization::ShaderBinaryVersionQuadSampleMask ||
            version == Serialization::ShaderBinaryVersionMsaaRead ||
@@ -369,7 +373,7 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     meta.Read(perm_idx);
 
     spec.Deserialize(ar);
-    if (binary_version == Serialization::ShaderBinaryVersion &&
+    if ((binary_version | 0x100u) == Serialization::ShaderBinaryVersion &&
         spec.runtime_info.hw_stage == Shader::HwStage::Fragment) {
         // This byte was padding before quad-mask emulation, and need not have been zero.
         spec.runtime_info.hw.fs.quad_sample_mask = false;
