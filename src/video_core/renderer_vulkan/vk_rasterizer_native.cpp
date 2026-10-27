@@ -60,6 +60,7 @@ vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type);
 
 namespace Vulkan {
 bool RytyGtsInRace();
+bool RytyGtsMenuSnapshotsAllowed();
 namespace {
 
 /// Logs the first few times and then every 1000th.
@@ -1532,8 +1533,9 @@ u64 NativeRenderer::SnapshotBelow() {
         const char* env = std::getenv("RYGT_NATIVE_SNAPSHOT_BELOW");
         return env && *env ? std::strtoull(env, nullptr, 0) : u64{1_MB};
     }();
-    // Race buffers can depend on GPU writes not yet visible to a CPU snapshot.
-    return RytyGtsInRace() ? 0 : below;
+    // Race/replay buffers can depend on GPU writes not visible to a CPU snapshot.
+    // The native session guard also covers attract replays using cached menu scripts.
+    return RytyGtsMenuSnapshotsAllowed() ? below : 0;
 }
 
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr address, u64 size,

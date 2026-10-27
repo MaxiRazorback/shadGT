@@ -32,6 +32,7 @@
 #include "core/debug_state.h"
 #include "core/memory.h"
 #include "ryty_gpu/native/entry_hook.h"
+#include "ryty_gpu/native/menu_snapshot_session.h"
 #include "input/trigger_feedback.h"
 #include "ryty_gpu/ryty_dlssg.h"
 
@@ -1326,7 +1327,33 @@ void InstallIdleKeyboardClose(u8* base) {
         "idle keyboard close"));
 }
 
+// Menu CPU snapshots are unsafe during every native race session, including
+// attract replays which can reuse scripts without updating the project hint.
+using SnapshotSessionFn = void(PS4_SYSV_ABI*)(u64, u64, s32, u64);
+Native::MenuSnapshotSession g_snapshot_session;
+SnapshotSessionFn g_snapshot_start{}, g_snapshot_end{};
+bool g_snapshot_session_ready = false; // Installed before game threads start.
+void PS4_SYSV_ABI SnapshotStart(u64 result, u64 self, s32 argc, u64 argv) {
+    g_snapshot_session.Begin();
+    g_snapshot_start(result, self, argc, argv);
+}
+void PS4_SYSV_ABI SnapshotEnd(u64 result, u64 self, s32 argc, u64 argv) {
+    const auto token = g_snapshot_session.Ending();
+    g_snapshot_end(result, self, argc, argv);
+    g_snapshot_session.End(token);
+}
+void InstallMenuSnapshotSessionGuard(u8* base) {
+    Native::NearCode code{base};
+    constexpr u8 prologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
+    g_snapshot_start = reinterpret_cast<SnapshotSessionFn>(Native::HookEntry(
+        code, base, 0x3e1900, prologue, reinterpret_cast<void*>(&SnapshotStart), "menu snapshot session start"));
+    g_snapshot_end = reinterpret_cast<SnapshotSessionFn>(Native::HookEntry(
+        code, base, 0x3e1b00, prologue, reinterpret_cast<void*>(&SnapshotEnd), "menu snapshot session end"));
+    g_snapshot_session_ready = g_snapshot_start && g_snapshot_end;
+}
+
 void RytyApplyGamePatches() {
+    InstallMenuSnapshotSessionGuard(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallIdleKeyboardClose(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallWideCamera(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallTriggerTelemetry(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
@@ -1373,5 +1400,8 @@ namespace Vulkan {
 // FIX-110: true while a race project runs (see NoteProjectScript).
 bool RytyGtsInRace() {
     return g_in_race.load(std::memory_order_relaxed);
+}
+bool RytyGtsMenuSnapshotsAllowed() {
+    return g_snapshot_session_ready && g_snapshot_session.Idle() && !RytyGtsInRace();
 }
 } // namespace Vulkan
