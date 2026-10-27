@@ -879,8 +879,15 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
         semaphore->Refresh();
     }
     const u64 known = semaphore->KnownGpuTick();
+    // Loading can briefly need hundreds of MiB of upload chunks. Keep a bounded
+    // reserve once their GPU work finishes instead of retaining that peak forever.
+    constexpr size_t MaxCachedChunks = 128_MB / ChunkSize;
+    while (free_chunks.size() > MaxCachedChunks) {
+        free_chunks.pop_back();
+    }
     while (!retiring_chunks.empty() && retiring_chunks.front().retire_tick <= known) {
-        if (retiring_chunks.front().buffer->Size() == ChunkSize) {
+        if (retiring_chunks.front().buffer->Size() == ChunkSize &&
+            free_chunks.size() < MaxCachedChunks) {
             free_chunks.push_back(std::move(retiring_chunks.front()));
         }
         retiring_chunks.pop_front(); // larger ones are freed (after the GPU, by the device)
