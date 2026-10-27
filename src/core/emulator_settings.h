@@ -440,8 +440,8 @@ struct GPUSettings {
     // ryGT: when a new pipeline compiles during play (PERF-103): 0 the game pauses until it is
     // compiled, 1 short compiles pause and long ones (over 100 ms) continue in slow motion with
     // the objects that need them missing until they are compiled, 2 the game keeps going at
-    // full speed with those objects missing.
-    Setting<int> compile_mode{1};
+    // full speed with those objects missing. Required side effects and one-shot outputs still wait.
+    Setting<int> compile_mode{2};
     // ryGT: CPU accesses keep fresh GPU results (FIX-076), which GT Sport's sparks and tire smoke
     // need; costs frames in races, so it can be turned off.
     Setting<bool> particle_effects{true};

@@ -806,8 +806,8 @@ GraphicsPipeline::GraphicsPipeline(
     };
 
     const auto create_start = std::chrono::steady_clock::now();
-    // PERF-038: a background build compiles the whole pipeline at once (no libraries to link
-    // and optimize again later).
+    // Warm-up can reuse the same stage libraries as live draws when LTO is off.
+    // With LTO enabled, retain whole background builds instead of scheduling another link.
     // FIX-057: tessellated pipelines are compiled whole, not from libraries: on GT Sport's race
     // summary their library compiles (with link-time optimization info kept) took the process
     // from 11 GB to over 50 GB with only two running. -DisablePerf 80 builds them from libraries.
@@ -818,13 +818,20 @@ GraphicsPipeline::GraphicsPipeline(
         const char* env = std::getenv("SHADGT_NO_LIBRARIES");
         return env && env[0] == '1';
     }();
-    if (!preloading && !no_libraries && instance.IsGraphicsPipelineLibrarySupported() &&
+    if ((!preloading || !LinkTimeOptimization()) && !no_libraries &&
+        instance.IsGraphicsPipelineLibrarySupported() &&
         !(tessellated && whole_tessellated)) {
         // PERF-017: a pipeline first needed during play is built from four separately compiled
         // libraries and linked without cross-stage optimization, which the driver does in a
         // fraction of a full compile. A worker then links the same libraries with link-time
         // optimization, and draws switch to that pipeline once it exists. Both pipelines come
         // from the same create info, so they render the same.
+        if (preloading) {
+            static const bool logged = [] {
+                LOG_INFO(Render_Vulkan, "SHADER-WARMUP: using shared stage libraries; LTO off, heavy limit unchanged");
+                return true;
+            }();
+        }
         library_link = std::make_unique<LibraryLink>();
         boost::container::static_vector<vk::PipelineShaderStageCreateInfo, MaxShaderStages>
             pre_raster_stages;

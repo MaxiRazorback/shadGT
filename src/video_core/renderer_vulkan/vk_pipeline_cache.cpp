@@ -1907,7 +1907,9 @@ std::chrono::microseconds PipelineCache::QuickWait() {
 }
 
 bool PipelineCache::MenusWait() {
-    // Keep going: rendering must not wait for a cosmetic pipeline.
+    // Match shadgt7: keep-going skips ordinary menu draws while their
+    // pipeline builds, then installs it when a later draw finds it ready.
+    // Required memory writes and depth-only bakes retain their separate guards.
     if (CompileMode() == 2) return false;
     // FIX-110: in GT Sport's menus a draw waits for its new pipeline (the guest clocks are held
     // meanwhile, as in the "pause" compile mode); only races skip draws. Some menu scenes draw
