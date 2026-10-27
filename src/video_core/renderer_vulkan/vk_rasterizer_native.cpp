@@ -332,6 +332,10 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
             region && address >= region->begin && address + size <= region->end &&
             (address - region->begin) % r.instance.StorageMinAlignment() == 0) {
             RefreshRegion(*region, address, size);
+            // RefreshRegion may record transfer writes after FlushUploads' initial barrier.
+            // The upload or untiling dispatch must read those refreshed bytes.
+            list.Barrier(Native::Rhi::ScopeTransfer,
+                         Native::Rhi::ScopeTransfer | Native::Rhi::ScopeCompute);
             auto wrapped = device->WrapBuffer(region->buffer->NativeHandle(), region->buffer->Size());
             source.buffer = wrapped.get();
             source.offset = address - region->begin;
