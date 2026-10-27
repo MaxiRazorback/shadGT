@@ -22,6 +22,9 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
+#ifdef RYTY_GPU
+#include "ryty_gpu/ryty_gts_dlss.h"
+#endif
 
 namespace AmdGpu {
 struct Liverpool;
@@ -58,6 +61,9 @@ public:
     [[nodiscard]] VideoCore::TextureCache& GetTextureCache() noexcept {
         return texture_cache;
     }
+#ifdef RYTY_GPU
+    GtsDlssPass& GetTemporalDlss() { return temporalDlss; }
+#endif
 
     /// PERF-047: a direct draw's pipeline, selected on the command thread as it decodes the
     /// draw, with the user data each stage's specialization was decided on.
@@ -543,6 +549,8 @@ private:
     /// MT-001: the per-draw state of one recording thread. The recorder thread uses main_ctx;
     /// worker threads of the multithreaded recorder get their own.
     struct DrawContext {
+        bool dlssNativeDraw{};
+        u64 dlssNativeUid{};
         std::array<ImageBinding, Shader::NUM_IMAGES> image_bindings;
         u32 image_binding_base = 0; // PERF-121: next free entry across the draw's stages
         /// PERF-123: each hardware stage's last image bindings, reused when the next draw's
@@ -576,6 +584,12 @@ private:
         bool needs_barrier{};
     };
     DrawContext main_ctx;
+#ifdef RYTY_GPU
+    GtsDlssPass temporalDlss;
+    void applyTemporalDlss(const GraphicsPipeline* pipeline, const RenderState& state,
+                           bool beforeDraw = false);
+    void prepareNativeHud(RenderState& state);
+#endif
     DrawContext* ctx = &main_ctx;
     /// DIAG-041: buffers and images of the current draw that were bound empty.
     /// DIAG-044: records the current draw or dispatch in the dependency history.

@@ -856,7 +856,7 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
 
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
-    g_prepared_frames.fetch_add(1, std::memory_order_relaxed); // DIAG-137
+    const u64 guestFrame = g_prepared_frames.fetch_add(1, std::memory_order_relaxed);
     rasterizer->FrameDumpFlip(); // NAT-116
 #ifdef RYTY_GPU
     if (auto* native = rasterizer->Native()) {
@@ -902,8 +902,15 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     auto& image = texture_cache.GetImage(image_id);
     auto image_view = *image.FindView(view_info).image_view;
-    const vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
+    vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
+
+#ifdef RYTY_GPU
+    auto& temporalDlss = rasterizer->GetTemporalDlss();
+    temporalDlss.SetOutputSize({frame->width, frame->height}, attribute.attrib.pixel_format ==
+        Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq);
+    const auto temporalView = temporalDlss.PreparePresent(guestFrame, image, view_info.format);
+#endif
 
     const u32 capture_game_only_count = VideoCore::ConsumeGameOnlyScreenshotRequests();
     std::optional<ScreenshotReadback> pending_screenshot;
@@ -955,6 +962,11 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     const vk::CommandBuffer pass_cmdbuf = draw_scheduler.DirectCommandBuffer();
     bool scaled = false;
 #ifdef RYTY_GPU
+    if (temporalView) {
+        image_view = temporalView;
+        image_size = temporalDlss.OutputSize();
+        scaled = true;
+    }
     // ryGT: DLSS (when its plugin is on and can scale to the window size) replaces FSR.
     if (const auto dlss_view =
             dlss_pass.Render(pass_cmdbuf, image.GetImage(), image_view, view_info.format,

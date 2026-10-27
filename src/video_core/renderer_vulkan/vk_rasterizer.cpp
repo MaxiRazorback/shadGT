@@ -67,7 +67,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       liverpool{liverpool_}, memory{Core::Memory::Instance()},
       pipeline_cache{instance, scheduler, liverpool, buffer_cache.GetSparsePageShift()},
       host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
-      guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
+      guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()}
+#ifdef RYTY_GPU
+      , temporalDlss{instance, scheduler, runtime}
+#endif
+{
     // R5: buffer stage workers use their own rings.
     AmdGpu::DrawPipe::worker_init = [](u32 index) { VideoCore::BufferCache::SetStageWorker(index); };
     if (!EmulatorSettings.IsNullGPU()) {
@@ -1729,6 +1733,85 @@ void NoteDrawKey(std::pair<u64, u64> key, int outcome) {
 static void NoteMenuBarDraw(u64 vs, u64 ps); // FIX-127
 static thread_local bool t_frosted_rt = false; // DIAG-139: the draw renders the bar's blur
 
+#ifdef RYTY_GPU
+bool RytyGtsInRace();
+
+void Rasterizer::applyTemporalDlss(const GraphicsPipeline* pipeline, const RenderState& state,
+                                 bool beforeDraw) {
+    if (!RytyGtsInRace() || Scheduler::ThreadRing() || ctx->dlssNativeDraw) return;
+    const u64 frame = g_prepared_frames.load(std::memory_order_relaxed);
+    const auto& regs = liverpool->DrawRegs();
+    if (regs.num_indices > 6 || regs.num_instances.NumInstances() != 1) return;
+    const auto* fragmentStage = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+    if (!fragmentStage || state.num_color_attachments == 0) return;
+    const auto& fragment = *fragmentStage;
+    const auto parameterAddress = [&](u64 size) -> VAddr {
+        for (const auto& buffer : fragment.buffers) {
+            if (buffer.IsSpecial() || buffer.is_written) continue;
+            const auto sharp = buffer.GetSharp(fragment);
+            if (sharp.base_address && sharp.GetSize() == size && IsMappedStart(sharp.base_address)) {
+                return sharp.base_address;
+            }
+        }
+        return 0;
+    };
+    const auto imageAt = [&](u32 index) -> VideoCore::Image* {
+        const auto id = ctx->cb_descs[index].image_id;
+        return id ? &texture_cache.GetImage(id) : nullptr;
+    };
+    auto* target = imageAt(0);
+    if (!target) return;
+    const auto size = vk::Extent2D{target->info.size.width, target->info.size.height};
+    if (state.num_color_attachments == 2 && ctx->bound_textures.size() == 4 &&
+        target->info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
+        if (beforeDraw) return;
+        auto* resolved = imageAt(1);
+        if (!resolved || resolved->info.pixel_format != vk::Format::eB10G11R11UfloatPack32 ||
+            resolved->info.size.width != size.width || resolved->info.size.height != size.height) return;
+        VideoCore::Image *color{}, *depth{}, *motion{}, *history{};
+        for (const auto& binding : ctx->bound_textures) {
+            auto& image = texture_cache.GetImage(binding.image_id);
+            if (image.info.size.width != size.width || image.info.size.height != size.height ||
+                image.info.num_samples != 1 || image.info.resources.layers != 1) return;
+            if (image.info.props.is_depth || image.info.pixel_format == vk::Format::eR32Sfloat) depth = &image;
+            else if (image.info.pixel_format == vk::Format::eR16G16Sfloat) motion = &image;
+            else if (image.info.pixel_format == vk::Format::eB10G11R11UfloatPack32) color = &image;
+            else if (image.info.pixel_format == vk::Format::eR16G16B16A16Sfloat) history = &image;
+            else return;
+        }
+        if (!color || !depth || !motion || !history || color == resolved || history == target) return;
+        std::array<float, 28> constants{};
+        bool found = false;
+        if (const VAddr address = parameterAddress(sizeof(constants))) {
+            Common::CopyGuest(constants.data(), reinterpret_cast<const void*>(address),
+                              sizeof(constants));
+            if (!std::ranges::all_of(constants, [](float x) { return std::isfinite(x); })) return;
+            if (std::abs(constants[14] - size.width*.5f) > .01f ||
+                std::abs(constants[15] + size.height*.5f) > .01f ||
+                constants[16] != size.width || constants[17] != size.height ||
+                std::abs(constants[20]*constants[14]) > 1.f ||
+                std::abs(constants[21]*constants[15]) > 1.f) return;
+            found = true;
+        }
+        if (found) temporalDlss.Capture(frame, *color, *depth, *motion, *resolved, constants);
+        return;
+    }
+
+    if (state.num_color_attachments != 1 || !target->usage.vo_surface ||
+        ctx->db_desc.first || regs.blend_control[0].enable ||
+        target->info.pixel_format != vk::Format::eA2B10G10R10UnormPack32 ||
+        (!parameterAddress(304) && !parameterAddress(288))) return;
+    for (const auto& binding : ctx->bound_textures) {
+        auto& image = texture_cache.GetImage(binding.image_id);
+        if (temporalDlss.HasScene(frame, image.image_uid)) {
+            if (beforeDraw) temporalDlss.PrepareScene(frame, image);
+            else temporalDlss.Resolve(frame, *target);
+            return;
+        }
+    }
+}
+#endif
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
     ++Common::GetWorkCounters().draws;
@@ -1973,6 +2056,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         if (FrameDumpActive() || ExposureLogOn()) {
             FrameDumpPass(regs, state, pipeline); // NAT-117
         }
+#ifdef RYTY_GPU
+        if (RytyDlss::TemporalEnabled()) applyTemporalDlss(pipeline, state, true);
+        prepareNativeHud(state);
+#endif
 
         if (ctx->needs_barrier) {
             runtime.FlushBarriers();
@@ -2012,6 +2099,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                     instance_offset);
     }
     DebugState.IncDrawCall();
+#ifdef RYTY_GPU
+    if (RytyDlss::TemporalEnabled()) applyTemporalDlss(pipeline, state);
+#endif
 
     // DIAG-041: draws into GT Sport's car thumbnail (448x126 linear targets) and into the watched
     // images of its chain: the shaders, every image and buffer they touch, and empty bindings.
@@ -2274,6 +2364,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
     auto state = BeginRendering(pipeline);
     FinalizeTextureLayouts(&state);
+#ifdef RYTY_GPU
+    prepareNativeHud(state);
+#endif
 
     if (ctx->needs_barrier) {
         runtime.FlushBarriers();
@@ -3592,6 +3685,19 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         Common::PhaseTimer t{Common::Phase::TextureRebind};
         RebindTextures(pipeline->IsCompute(), num_color_targets);
     }
+#ifdef RYTY_GPU
+    if (RytyDlss::TemporalEnabled()) {
+        const u64 frame = g_prepared_frames.load(std::memory_order_relaxed);
+        for (const auto& binding : ctx->bound_textures) {
+            auto& image = texture_cache.GetImage(binding.image_id);
+            if (binding.desc->type == VideoCore::TextureCache::BindingType::Storage) {
+                temporalDlss.FallbackHud(frame, image, image.backing->state.layout);
+            } else {
+                temporalDlss.SyncGuestRead(frame, image);
+            }
+        }
+    }
+#endif
     if (pipeline->IsCompute()) {
         FinalizeTextureLayouts();
     }
@@ -4397,6 +4503,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     return !env || env[0] != '0';
                 }();
                 const bool read_in_place = [&] {
+#ifdef RYTY_GPU
+                    if (RytyDlss::TemporalEnabled() && stage.sw_stage == Shader::SwStage::Fragment &&
+                        stage.images.size() == 4 && size == 112) return false;
+#endif
                     // DIAG-128 bisect: SHADGT_DIRECT_READS_STAGES=<hex mask of SwStage bits>,
                     // SHADGT_DIRECT_READS_MAX=<bytes> (larger ranges take the usual path),
                     // SHADGT_DIRECT_READS_MIN=<bytes> (smaller ranges take the usual path).
@@ -5379,6 +5489,7 @@ void Rasterizer::FinalizeTextureLayouts(RenderState* render_state) {
 }
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
+    ctx->dlssNativeDraw = false;
     ctx->attachment_feedback_loop = {};
     const auto& regs = liverpool->DrawRegs();
     const auto& key = pipeline->GetGraphicsKey();
@@ -5566,6 +5677,23 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
 
     return state;
 }
+
+#ifdef RYTY_GPU
+void Rasterizer::prepareNativeHud(RenderState& state) {
+    if (!RytyDlss::TemporalEnabled() || !ctx->cb_descs[0].image_id) return;
+    auto& display = texture_cache.GetImage(ctx->cb_descs[0].image_id);
+    const u64 frame = g_prepared_frames.load(std::memory_order_relaxed);
+    if (state.num_color_attachments == 1 && !ctx->db_desc.first) {
+        ctx->dlssNativeDraw = temporalDlss.OverrideHud(frame, display.image_uid, state);
+    } else {
+        temporalDlss.FallbackHud(frame, display, state.color_attachments[0].image_layout);
+    }
+    if (ctx->dlssNativeDraw) {
+        ctx->dlssNativeUid = display.image_uid;
+        ctx->attachment_feedback_loop &= ~vk::ImageAspectFlagBits::eColor;
+    }
+}
+#endif
 
 void Rasterizer::Resolve() {
     const auto& mrt0_hint = liverpool->DrawCbExtent(0);
@@ -6028,6 +6156,12 @@ void Rasterizer::UpdateViewportScissorState() const {
     }
 
     auto& dynamic_state = DynState(); // NAT-101
+#ifdef RYTY_GPU
+    if (ctx->dlssNativeDraw) {
+        temporalDlss.ScaleHud(g_prepared_frames.load(std::memory_order_relaxed),
+            ctx->dlssNativeUid, viewports, scissors);
+    }
+#endif
     dynamic_state.SetViewports(viewports);
     dynamic_state.SetScissors(scissors);
 }

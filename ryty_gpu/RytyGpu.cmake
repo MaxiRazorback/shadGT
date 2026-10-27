@@ -109,6 +109,7 @@ ryty_add_library(ryty_gpu libSceVideoOut
         ryty_gpu/ryty_diag.cpp
         # NVIDIA DLSS through the optional plugin dlss\ryGT_dlss.dll (ryty_dlss.h).
         ryty_gpu/ryty_dlss.cpp
+        ryty_gpu/ryty_gts_dlss.cpp
         # AMD FSR 3.1 through amd_fidelityfx_vk.dll (ryty_fsr3.h).
         ryty_gpu/ryty_fsr3.cpp
         # AMD FSR 3.1 frame generation (ryty_framegen.h).

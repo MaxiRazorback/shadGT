@@ -1,4 +1,4 @@
-﻿// SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -421,6 +421,7 @@ struct GPUSettings {
     Setting<int> rcas_attenuation{250};
     // ryGT: scale with NVIDIA DLSS through the optional plugin (dlss\ryGT_dlss.dll).
     Setting<bool> dlss_enabled{false};
+    Setting<std::string> dlss_quality{"performance"};
     // ryGT: with fsr_enabled, scale with AMD FSR 3.1 (amd_fidelityfx_vk.dll) instead of FSR 1.
     Setting<bool> fsr3_enabled{true};
     // ryGT: AMD FSR 3.1 frame generation (amd_fidelityfx_vk.dll) adds a generated frame between
@@ -463,6 +464,7 @@ struct GPUSettings {
             make_override<GPUSettings>("rcas_enabled", &GPUSettings::rcas_enabled),
             make_override<GPUSettings>("rcas_attenuation", &GPUSettings::rcas_attenuation),
             make_override<GPUSettings>("dlss_enabled", &GPUSettings::dlss_enabled),
+            make_override<GPUSettings>("dlss_quality", &GPUSettings::dlss_quality),
             make_override<GPUSettings>("fsr3_enabled", &GPUSettings::fsr3_enabled),
             make_override<GPUSettings>("framegen_enabled", &GPUSettings::framegen_enabled),
             make_override<GPUSettings>("dlssg_enabled", &GPUSettings::dlssg_enabled),
@@ -491,7 +493,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    vblank_frequency, full_screen, full_screen_mode,
                                    fullscreen_refresh_rate, present_mode,
                                    hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
-                                   dlss_enabled, fsr3_enabled, framegen_enabled, dlssg_enabled,
+                                   dlss_enabled, dlss_quality, fsr3_enabled, framegen_enabled, dlssg_enabled,
                                    precompile_shaders,
                                    compile_freeze, compile_batch_ms, compile_mode,
                                    particle_effects,
@@ -761,6 +763,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, RcasEnabled, rcas_enabled)
     SETTING_FORWARD(m_gpu, RcasAttenuation, rcas_attenuation)
     SETTING_FORWARD_BOOL(m_gpu, DlssEnabled, dlss_enabled)
+    SETTING_FORWARD(m_gpu, DlssQuality, dlss_quality)
     SETTING_FORWARD_BOOL(m_gpu, Fsr3Enabled, fsr3_enabled)
     SETTING_FORWARD_BOOL(m_gpu, FrameGenEnabled, framegen_enabled)
     SETTING_FORWARD_BOOL(m_gpu, DlssgEnabled, dlssg_enabled)

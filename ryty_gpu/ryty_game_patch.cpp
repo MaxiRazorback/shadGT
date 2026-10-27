@@ -1098,6 +1098,14 @@ void InstallMirrorHalfRate(u8* base) {
     if (!wanted) {
         return;
     }
+    bool temporal = ConfigFlag("dlss_enabled", false);
+    if (const char* overrideMode = std::getenv("SHADGT_DLSS_TEMPORAL")) {
+        temporal = std::strcmp(overrideMode, "1") == 0;
+    }
+    if (temporal) {
+        std::fprintf(stderr, "[patch] GTS-008: half-rate mirror disabled for temporal DLSS motion continuity\n");
+        return;
+    }
     constexpr u64 kSite = 0x111011a; // RVA of "cmp byte ptr [r13+0x5a8], 0"
     static const u8 kOriginal[] = {0x41, 0x80, 0xbd, 0xa8, 0x05, 0x00, 0x00, 0x00};
     u8* site = base + kSite;
