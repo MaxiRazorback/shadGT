@@ -79,6 +79,27 @@ bool CompilationInProgress() {
            g_shader_translations_running.load(std::memory_order_relaxed) != 0;
 }
 
+#ifdef RYTY_GPU
+bool RytyGtsInRace(); // FIX-110, ryty_game_patch.cpp
+#endif
+
+// PERF-310: in a race, shader translations and pipeline builds run below the game's priority.
+// On CPUs without efficiency cores PERF-097 keeps nothing apart: a burst of new shaders on a
+// 6-core Ryzen took 3-4 threads from GT Sport's 12 job threads and the recorder, and the race
+// fell from 30 to 12-17 fps until it was done. Draws are skipped while their pipeline builds
+// (PERF-076), so the compiles only take longer. RYGT_COMPILE_PRIORITY=normal keeps them level.
+static bool CompileBelowGame() {
+#ifdef RYTY_GPU
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_COMPILE_PRIORITY");
+        return !(env && std::string_view{env} == "normal");
+    }();
+    return enabled && RytyGtsInRace();
+#else
+    return false;
+#endif
+}
+
 static void ReportShaderAllocationFailure(Shader::HwStage stage, u64 hash, VAddr base,
                                            size_t words, const char* phase) {
     static thread_local u64 failures = 0;
@@ -126,6 +147,7 @@ private:
     void Run(std::stop_token stop, u32 index) {
         Common::SetCurrentThreadName(fmt::format("shadGT:ShaderTranslate{}", index).c_str());
         Common::PreferEfficiencyCores(); // PERF-097
+        bool below_game = false;
         while (!stop.stop_requested()) {
             std::shared_ptr<TranslateJob> job;
             {
@@ -136,6 +158,11 @@ private:
                 }
                 job = std::move(queue.front());
                 queue.pop_front();
+            }
+            if (const bool low = CompileBelowGame(); low != below_game) { // PERF-310
+                below_game = low;
+                Common::SetCurrentThreadPriority(low ? Common::ThreadPriority::Low
+                                                     : Common::ThreadPriority::Normal);
             }
             try {
                 // Release temporary IR allocations after each job, including failed jobs.
@@ -394,7 +421,7 @@ private:
                     Common::PreferEfficiencyCores();
                 }
             }
-            const bool low = !boosted && (background || backlog);
+            const bool low = !boosted && (background || backlog || CompileBelowGame());
             if (low != low_priority) {
                 low_priority = low;
                 Common::SetCurrentThreadPriority(low_priority ? Common::ThreadPriority::Low
