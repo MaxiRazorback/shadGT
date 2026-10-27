@@ -176,22 +176,32 @@ bool GtsDlssPass::Capture(u64 frame, GtsSceneImage color, GtsSceneImage sourceDe
     const float ratio = RytyFsr3::UpscaleRatio();
     const auto scaled = vk::Extent2D{std::min(u32(std::lround(input.width * ratio)), 8192u),
                                      std::min(u32(std::lround(input.height * ratio)), 8192u)};
-    const auto output = (quality != RYGT_DLSS_QUALITY_DLAA || useFsr || useXess)
+    auto output = (quality != RYGT_DLSS_QUALITY_DLAA || useFsr || useXess)
                             ? ratio >= 1.0f ? scaled
                                             : vk::Extent2D{std::max(requestedSize.width, input.width),
                                                            std::max(requestedSize.height, input.height)}
                         : input;
+    // Window resizing changes presentation, not the fixed guest scene resolution.
+    // Keep the established DLSS reconstruction extent for an unchanged input;
+    // the presenter already scales that image to the current swapchain extent.
+    if (!useFsr && !useXess && input == renderSize && outputSize.width && outputSize.height)
+        output = outputSize;
     if (input != renderSize || output != outputSize || depth.format != sourceDepth.info.pixel_format) {
         RygtDlssOptimalSettings settings{};
         if (!useFsr && !useXess &&
             (!RytyDlss::GetOptimalSettings(output.width, output.height, quality, settings) ||
              input.width < settings.minimum_width || input.height < settings.minimum_height ||
              input.width > settings.maximum_width || input.height > settings.maximum_height)) {
-            LOG_WARNING(Render_Vulkan, "Temporal DLSS: {}x{} is outside mode {} for {}x{}; keeping game TAA",
-                        input.width, input.height, u32(quality), output.width, output.height);
-            failed = true;
+            if (input != rejectedInput || output != rejectedOutput) {
+                LOG_WARNING(Render_Vulkan, "Temporal DLSS: {}x{} is outside mode {} for {}x{}; keeping game TAA until a supported extent is available",
+                            input.width, input.height, u32(quality), output.width, output.height);
+                rejectedInput = input;
+                rejectedOutput = output;
+            }
             return false;
         }
+        rejectedInput = {};
+        rejectedOutput = {};
         scheduler.EndRendering();
         runtime.FlushBarriers();
         scheduler.Finish();

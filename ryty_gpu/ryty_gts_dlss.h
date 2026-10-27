@@ -96,6 +96,7 @@ private:
     Texture color, depth, motion, reconstruction, native;
     std::unique_ptr<VideoCore::BlitHelper> colorCopy;
     vk::Extent2D requestedSize{}, renderSize{}, outputSize{};
+    vk::Extent2D rejectedInput{}, rejectedOutput{};
     RygtDlssQuality quality{RYGT_DLSS_QUALITY_PERFORMANCE};
     u64 sceneFrame{~u64{}}, sceneUid{}, displayUid{}, outputFrame{~u64{}};
     float jitterX{}, jitterY{}, frameTimeMs{1000.f / 60};
