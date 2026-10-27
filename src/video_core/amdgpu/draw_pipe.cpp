@@ -46,7 +46,14 @@ DrawPipe::DrawPipe(std::function<void()> thread_init_, size_t max_pending_)
     bool stage_wanted = stage_env && *stage_env ? stage_env[0] == '1'
                                                 : VideoCore::DirectMemory::Enabled();
 #ifdef RYTY_GPU
-    stage_wanted = stage_wanted && !Vulkan::NativeModeRequested(); // NAT-100
+    if (Vulkan::NativeModeRequested()) {
+        const char* native_workers = std::getenv("RYGT_NATIVE_RECORD_WORKERS");
+        // Native preparation is automatic; =0 retains a diagnostic fallback.
+        worker_count = native_workers ? static_cast<u32>(std::clamp(std::atoi(native_workers), 0, 4)) : 2;
+        stage_wanted = worker_count != 0;
+        max_stage_pending = stage_wanted ? 64 : 0;
+        if (stage_wanted) LOG_INFO(Render, "NATIVE-RECORD: {} preparation workers; ordered recorder", worker_count);
+    }
 #endif
     if (stage_wanted && Common::PerfFeatureEnabled(74)) {
         stage_enabled = true;
@@ -97,8 +104,12 @@ void DrawPipe::Push(Work&& work) {
 void DrawPipe::Push(Work&& work, JobKind kind, Prepare&& prepare, Work&& order) {
     if (stage_enabled) {
         {
-            std::scoped_lock lk{mutex};
+            std::unique_lock lk{mutex};
             exclusive = false;
+            if (max_stage_pending && pushed - finished >= max_stage_pending) {
+                ++stats.push_waits;
+                done_cv.wait(lk, [this] { return pushed - finished < max_stage_pending; });
+            }
             ++pushed;
             pushed_jobs.store(pushed, std::memory_order_release);
             ++stats.pushed;
@@ -156,9 +167,10 @@ void DrawPipe::Forward(Work&& work) {
 }
 
 void DrawPipe::WaitFinished(u64 jobs) {
-    // A short spin (the recorder is often about to finish), then the stage sleeps until the
-    // recorder has finished the job (it wakes the stage when one waits).
-    for (u32 spins = 0; spins < 256; ++spins) {
+    // A bounded handoff spin, then use the existing checked sleep/wake protocol.
+    // CPU sampling found this loop consuming seconds at frequent recorder barriers;
+    // long spins compete with the recorder and game jobs on the same cores.
+    for (u32 spins = 0; spins < 16; ++spins) {
         if (finished_jobs.load(std::memory_order_acquire) >= jobs) {
             return;
         }

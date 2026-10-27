@@ -758,6 +758,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     // recorder checks the selection against the memory it sees before using it.
     std::optional<Vulkan::Rasterizer::SelectedPipeline> selected;
     bool prepared_draw = false;
+    const void* native_prepare_packet = decode_draw_packet;
 #ifdef RYTY_GPU
     // OPT-012: a draw a game job thread prepared is selected there (the recorder installs
     // that selection).
@@ -824,6 +825,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     struct StagedDraw {
         std::optional<Vulkan::Rasterizer::SelectedPipeline> selected;
         Vulkan::Rasterizer::BufferPlan plan;
+        std::unique_ptr<Regs> native_regs;
     };
     std::shared_ptr<StagedDraw> staged;
     DrawPipe::Prepare prepare;
@@ -836,15 +838,29 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
                                u64(*staged_index_offset) * index_size;
         staged_index_bytes = regs.num_indices * index_size;
     }
+    const bool native_indexed = staged_index_offset.has_value();
+    const u32 native_index_offset = staged_index_offset.value_or(0);
     staged_index_offset.reset();
     if (draw_pipe->HasStage() && selected) {
         staged = std::make_shared<StagedDraw>();
         staged->selected = std::move(selected);
         selected.reset();
-        prepare = [this, staged, staged_index_address, staged_index_bytes] {
-            return rasterizer->PrepareBuffersAhead(*staged->selected, staged->plan,
-                                                   staged_index_address, staged_index_bytes);
-        };
+#ifdef RYTY_GPU
+        if (rasterizer->Native() && !compute && direct_draw && native_prepare_packet) {
+            // Bounded by the dispatcher's in-flight window; do not hand workers live registers.
+            staged->native_regs = std::make_unique<Regs>(regs);
+            prepare = [this, staged, native_prepare_packet, decode_epoch, native_indexed, native_index_offset] {
+                return rasterizer->PrepareNativeDrawAhead(*staged->selected, *staged->native_regs,
+                    native_prepare_packet, decode_epoch, native_indexed, native_index_offset);
+            };
+        } else if (!rasterizer->Native())
+#endif
+        {
+            prepare = [this, staged, staged_index_address, staged_index_bytes] {
+                return rasterizer->PrepareBuffersAhead(*staged->selected, staged->plan,
+                                                       staged_index_address, staged_index_bytes);
+            };
+        }
     }
     // A draw whose buffers the stage does not obtain is obtained by the recorder: the stage
     // must not run past it.
@@ -856,15 +872,18 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     }();
     const bool neutral_filtered =
         filtered_neutral && !staged && direct_draw && !compute && FilteredDraw(regs);
-    const auto kind = staged || neutral_filtered ? DrawPipe::JobKind::Neutral
-                                                 : DrawPipe::JobKind::Barrier;
+    // Native job-thread snapshots have already done the preparation. They need no
+    // stage-side plan and are validated again by CommitPrepared on the recorder.
+    // Keep recording order, but do not stop later preparation behind every such draw.
+    const auto kind = prepared_draw || (staged && bool(prepare)) || neutral_filtered
+                          ? DrawPipe::JobKind::Neutral : DrawPipe::JobKind::Barrier;
     if (!staged) {
         // DIAG-069
         DrawPipe::SetPushTag(compute ? (direct_draw ? "dispatch not selected" : "indirect dispatch")
                                      : (direct_draw ? "draw not selected" : "indirect draw"));
     }
     DrawPipe::Work order;
-    if (staged) {
+    if (staged && !staged->native_regs && bool(prepare)) {
         order = [this, staged] { rasterizer->OrderBuffersAhead(*staged->selected, staged->plan); };
     }
     draw_pipe->Push([this, delta = std::move(delta), cs, cb_extent = last_cb_extent,
