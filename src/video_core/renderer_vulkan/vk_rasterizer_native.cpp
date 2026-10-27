@@ -13,6 +13,7 @@
 // own threads with this code (ryty_gpu/native/DESIGN.md, N4).
 
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
+#include "video_core/renderer_vulkan/scene_region_scale.h"
 
 #include <algorithm>
 #include <bit>
@@ -67,7 +68,12 @@ extern std::atomic<u64> g_prepared_frames;
 bool RytyGtsMenuSnapshotsAllowed();
 namespace {
 
-// The experimental 540p scene leaves GT Sport's final composition T# at output size.
+constexpr bool IsSceneCompositionShader(u64 hash) {
+    // Race composition and the transmission-selection menu variant, captured at 540p.
+    return hash == 0xb33ec4df || hash == 0xcc4e73c3;
+}
+
+// The experimental scene leaves GT Sport's final composition T# at output size.
 // Resolve that one sampled view against a matching, already-rendered physical target.
 // False means a preparing worker must defer to the ordered recorder, where earlier
 // draws have registered their targets. No descriptor or registry entry is mutated.
@@ -88,7 +94,7 @@ bool MatchExperimentalCompositionTexture(AmdGpu::Image& sharp, const Shader::Inf
     }();
     if (scene_width < 320 || scene_width > 3840 || scene_height < 180 || scene_height > 2160 ||
         (scene_width == 1920 && scene_height == 1080)) return true;
-    if (enabled && stage.pgm_hash == 0xb33ec4df && !resource.is_written && !resource.is_depth &&
+    if (enabled && IsSceneCompositionShader(stage.pgm_hash) && !resource.is_written && !resource.is_depth &&
         sharp.GetType() == AmdGpu::ImageType::Color2D && sharp.width + 1 == scene_width &&
         sharp.height + 1 == scene_height) {
         // Already-correct descriptors need no resolution fix, but still identify the
@@ -101,9 +107,15 @@ bool MatchExperimentalCompositionTexture(AmdGpu::Image& sharp, const Shader::Inf
         }, true);
         if (observed) RytyUpscalerStatus::ObserveScene(observed->info.size.width, observed->info.size.height);
     }
-    if (!enabled || stage.pgm_hash != 0xb33ec4df || resource.is_written || resource.is_depth ||
-        sharp.GetType() != AmdGpu::ImageType::Color2D || sharp.width != 1919 ||
-        sharp.height != 1079 || sharp.NumLevels() != 1 ||
+    const bool full_scene = sharp.width == 1919 && sharp.height == 1079;
+    // This menu path builds sampled T# dimensions in 1080p logical coordinates.
+    // Its scene setter already scales the viewport; repair only the sampled region,
+    // and only after finding the known physical scene allocation below.
+    const bool menu_region = stage.pgm_hash == 0xcc4e73c3 &&
+        sharp.width < 1920 && sharp.height < 1080;
+    if (!enabled || !IsSceneCompositionShader(stage.pgm_hash) || resource.is_written || resource.is_depth ||
+        sharp.GetType() != AmdGpu::ImageType::Color2D || (!full_scene && !menu_region) ||
+        sharp.NumLevels() != 1 ||
         sharp.NumLayers() != 1 || sharp.base_level != 0) {
         return true;
     }
@@ -116,15 +128,31 @@ bool MatchExperimentalCompositionTexture(AmdGpu::Image& sharp, const Shader::Inf
                info.pitch == sharp.Pitch() && info.tile_mode == tile_mode && info.num_samples == 1 &&
                info.resources.levels == 1 && info.resources.layers == 1;
     }, true);
-    if (!target) return false;
-    sharp.width = target->info.size.width - 1;
-    sharp.height = target->info.size.height - 1;
+    // Auxiliary menu textures are not scene regions. Leave them untouched when
+    // there is no matching physical scene allocation at their address.
+    if (!target) return menu_region && !full_scene;
+    const auto extent = menu_region
+        ? ScaleSceneRegion(sharp.width + 1, sharp.height + 1, scene_width, scene_height)
+        : SceneRegionExtent{scene_width, scene_height};
+    const auto [width, height] = extent;
+    if (!width || !height || width > target->info.size.width || height > target->info.size.height)
+        return false;
+    // Keep the real tiled row pitch. ImageRegistry::PlaceOf links this corner crop
+    // to the rendered target, rather than uploading a second interpretation of RAM.
+    sharp.width = width - 1;
+    sharp.height = height - 1;
     RytyUpscalerStatus::ObserveScene(target->info.size.width, target->info.size.height);
-    static std::atomic<u32> logged{};
-    if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
-        LOG_WARNING(Render_Vulkan,
-            "RES-COMP: sampled view {:#x} matched rendered target {}x{} (game composition 1920x1080)",
-            sharp.Address(), scene_width, scene_height);
+    static std::mutex log_mutex;
+    static std::unordered_set<u64> logged_regions;
+    {
+        std::scoped_lock lock{log_mutex};
+        const u64 key = (u64(width) << 32) | height;
+        if (logged_regions.size() < 32 && logged_regions.insert(key).second) {
+            LOG_WARNING(Render_Vulkan,
+                "RES-COMP: shader {:#x} sampled region {}x{} in allocation {}x{}, pitch {} at {:#x}",
+                stage.pgm_hash, width, height, scene_width, scene_height,
+                target->info.pitch, sharp.Address());
+        }
     }
     return true;
 }
@@ -451,7 +479,7 @@ bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, const Targ
     if (!r.temporalDlss.Enabled()) return false;
     const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
     const auto& regs = r.liverpool->DrawRegs();
-    if (!fs || fs->pgm_hash != 0xb33ec4df || regs.num_indices > 6 ||
+    if (!fs || !IsSceneCompositionShader(fs->pgm_hash) || regs.num_indices > 6 ||
         regs.num_instances.NumInstances() != 1 || targets.depth ||
         targets.state.num_color_attachments != 1 || !targets.colors[0] ||
         regs.blend_control[0].enable || regs.color_target_mask.GetMask(0) != 0xf) return false;
@@ -2489,7 +2517,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
         return env && *env ? env[0] == '1' : r.instance.GetVendorID() == 0x1002;
     }();
     const bool descriptor_composition = composition_descriptors &&
-        stage.sw_stage == Shader::SwStage::Fragment && stage.pgm_hash == 0xb33ec4df;
+        stage.sw_stage == Shader::SwStage::Fragment && IsSceneCompositionShader(stage.pgm_hash);
     static const bool postprocess_descriptors = [&] {
         const char* env = std::getenv("RYGT_POSTPROCESS_BUFFER_DESCRIPTORS");
         return env && *env ? env[0] == '1' : r.instance.GetVendorID() == 0x1002;
