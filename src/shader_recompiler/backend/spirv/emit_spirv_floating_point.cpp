@@ -58,17 +58,15 @@ Id EmitFPMin64(EmitContext& ctx, Id a, Id b) {
     return ctx.OpNMin(ctx.F64[1], a, b);
 }
 
+// FIX-216: MIN3 and MAX3 use NMin/NMax on every GPU: a NaN operand is ignored, as on GCN.
+// FMin3AMD/FMax3AMD (AMD GPUs) leave a NaN operand undefined; a tester's Radeon showed red and
+// yellow glows and banded skies, as NaNs in GT Sport's bloom and exposure do. The driver still
+// compiles the pair into one min3/max3 instruction.
 Id EmitFPMinTri32(EmitContext& ctx, Id a, Id b, Id c) {
-    if (ctx.profile.supports_trinary_minmax) {
-        return ctx.OpFMin3AMD(ctx.F32[1], a, b, c);
-    }
     return ctx.OpNMin(ctx.F32[1], a, ctx.OpNMin(ctx.F32[1], b, c));
 }
 
 Id EmitFPMaxTri32(EmitContext& ctx, Id a, Id b, Id c) {
-    if (ctx.profile.supports_trinary_minmax) {
-        return ctx.OpFMax3AMD(ctx.F32[1], a, b, c);
-    }
     return ctx.OpNMax(ctx.F32[1], a, ctx.OpNMax(ctx.F32[1], b, c));
 }
 
