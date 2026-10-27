@@ -2410,6 +2410,26 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                             stream.keep.push_back(std::move(prefix));
                         }
                     }
+                    // Bounded zero-copy scalar prefix: alias an existing imported view.
+                    // No gather, snapshot or new buffer allocation; out-of-prefix reads
+                    // retain the existing direct translation and its full bounds.
+                    static const bool prefix_descriptor = [] {
+                        const char* env = std::getenv("RYGT_COMPUTE_PREFIX_DESCRIPTOR");
+                        return env && env[0] == '1';
+                    }();
+                    if (prefix_descriptor && stage.sw_stage == Shader::SwStage::Compute &&
+                        stage.pgm_hash == 0xd0af5a54 && !desc.is_written && size >= 4_KB &&
+                        direct_entries[buffer_index][3] == 1u &&
+                        desc.post_op == Shader::SharpFetchPostOp::ReadConstPointer) {
+                        constexpr u64 PrefixSize = 4_KB;
+                        if (const auto found = direct->FindBuffer(base, PrefixSize)) {
+                            const u64 aligned = Common::AlignDown(found->second, alignment);
+                            const u64 adjust = found->second - aligned;
+                            b.push.AddOffset(binding.buffer, static_cast<u32>(adjust));
+                            info = {found->first->Handle(), aligned, PrefixSize + adjust};
+                            direct_entries[buffer_index][3] = u32(PrefixSize);
+                        }
+                    }
                     if (InPlaceSampled()) {
                         in_place.Note(2, base, size); // NAT-142
                     }
