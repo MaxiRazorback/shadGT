@@ -33,6 +33,7 @@
 #include "core/memory.h"
 #include "ryty_gpu/native/entry_hook.h"
 #include "ryty_gpu/native/menu_snapshot_session.h"
+#include "ryty_gpu/native/scene_history_origin.h"
 #include "input/trigger_feedback.h"
 #include "ryty_gpu/ryty_dlssg.h"
 
@@ -1390,9 +1391,56 @@ void PS4_SYSV_ABI MatchExperimentalSceneViewport(
     g_scene_viewport(self, output, auxiliary, scene, depth, motion,
                      x, y, width, height, scene_x, scene_y, extra_a, extra_b);
 }
+// GTSport's history builder scales its region dimensions but keeps the output
+// origin in 1080p coordinates. Scale those local X/Y values before history writes
+// and copy UVs are generated; leave the output object's UI placement unchanged.
+void InstallSceneHistoryOrigins(u8* base) {
+    const auto read_size = [](const char* name, u32 fallback) {
+        const char* value = std::getenv(name);
+        return value ? u32(std::strtoul(value, nullptr, 10)) : fallback;
+    };
+    const u32 width = read_size("RYGT_SCENE_WIDTH", 960);
+    const u32 height = read_size("RYGT_SCENE_HEIGHT", 540);
+    if (width < 320 || width > 3840 || height < 180 || height > 2160 ||
+        (width == 1920 && height == 1080)) return;
+    const std::array<u8, 6> original_x{0x48,0x8b,0x03,0x48,0x89,0xdf};
+    const std::array<u8, 8> original_y{0x48,0x89,0x84,0x24,0xb0,0,0,0};
+    constexpr u64 x_rva = Native::kEbootToExe + 0x197f3bc;
+    constexpr u64 y_rva = Native::kEbootToExe + 0x197f3cc;
+    if (std::memcmp(base + x_rva, original_x.data(), original_x.size()) ||
+        std::memcmp(base + y_rva, original_y.data(), original_y.size())) {
+        std::fprintf(stderr, "[resolution] history origin signatures differ; not applied\n");
+        return;
+    }
+    Native::NearCode origin_code{base};
+    const auto prepare = [&](u64 rva, std::span<const u8> original, float scale, bool y) {
+        auto bytes = Native::SceneHistoryOriginCode((height << 16) | width, scale, y);
+        bytes.insert(bytes.end(), original.begin(), original.end());
+        bytes.insert(bytes.end(), {0xff,0x25,0,0,0,0});
+        const u64 back = reinterpret_cast<u64>(base + rva + original.size());
+        const auto* address = reinterpret_cast<const u8*>(&back);
+        bytes.insert(bytes.end(), address, address + 8);
+        u8* stub = origin_code.Alloc(bytes.size());
+        if (!stub) return std::vector<u8>{};
+        std::memcpy(stub, bytes.data(), bytes.size());
+        FlushInstructionCache(GetCurrentProcess(), stub, bytes.size());
+        const s64 distance = stub - (base + rva + 5);
+        if (distance != s32(distance)) return std::vector<u8>{};
+        std::vector<u8> jump(original.size(), 0x90); jump[0] = 0xe9;
+        const s32 relative = s32(distance); std::memcpy(jump.data() + 1, &relative, 4);
+        return jump;
+    };
+    const auto x = prepare(x_rva, original_x, float(width) / 1920.f, false);
+    const auto y = prepare(y_rva, original_y, float(height) / 1080.f, true);
+    if (x.empty() || y.empty()) return;
+    if (!Apply(base, {x_rva, {original_x.begin(),original_x.end()}, x, "scene history X origin"})) return;
+    if (!Apply(base, {y_rva, {original_y.begin(),original_y.end()}, y, "scene history Y origin"}))
+        Apply(base, {x_rva, x, {original_x.begin(),original_x.end()}, "restore history X origin"});
+}
 void InstallExperimentalSceneViewport(u8* base) {
     const char* enabled = std::getenv("RYGT_EXPERIMENTAL_SCENE_VIEWPORT");
     if (!enabled || std::strcmp(enabled, "1") != 0) return;
+    InstallSceneHistoryOrigins(base);
     Native::NearCode code{base};
     constexpr std::array<u8, 6> original{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
     g_scene_viewport = reinterpret_cast<SceneViewportFn>(Native::HookEntry(
