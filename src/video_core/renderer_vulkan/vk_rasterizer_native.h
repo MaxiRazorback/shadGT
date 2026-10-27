@@ -154,6 +154,7 @@ private:
         boost::container::small_vector<std::pair<VAddr, u64>, 8> gpu_writes;
         /// NAT-120: the dispatch is GT Sport's fill shader: what it fills, with what.
         std::optional<std::array<u32, 2>> fill_pattern;
+        std::optional<std::array<u32, 3>> fill_arguments_snapshot;
         VAddr fill_address = 0;
         u64 fill_size = 0;
         bool writes_buffers = false;

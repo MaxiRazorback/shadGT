@@ -291,6 +291,7 @@ void NativeRenderer::DrawBindings::Clear() {
     stored.clear();
     gpu_writes.clear();
     fill_pattern.reset();
+    fill_arguments_snapshot.reset();
     fill_address = 0;
     fill_size = 0;
     writes_buffers = false;
@@ -2337,7 +2338,15 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                                                    head[2], head[3])
                                      : std::string{"unreadable"});
                 };
-                if (direct && desc.IsDirectEligible() && size < (u64{1} << 32) &&
+                // This known shader's 12-byte arguments are CPU command parameters. Freeze
+                // them once for both the shader fallback and transfer path; GPU-backed
+                // arguments retain the normal shader path and are never read as CPU values.
+                const bool freeze_fill_args = stage.pgm_hash == 0x8aa6e00c &&
+                    !desc.is_written && size >= 12 &&
+                    (size == 12 || size == 16 ||
+                     desc.post_op == Shader::SharpFetchPostOp::ReadConstPointer) &&
+                    !RegionOver(base, 12);
+                if (!freeze_fill_args && direct && desc.IsDirectEligible() && size < (u64{1} << 32) &&
                     (desc.is_written || size > SnapshotBelow()) && // FIX-170
                     !RegionOver(base, size) && direct->EnsureImported(base, size)) {
                     // D3: read in place through the page table; nothing bound.
@@ -2370,14 +2379,33 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                         in_place.Note(2, base, size); // NAT-142
                     }
                     log_buffer("in place through the page table (D3)");
-                } else if (const auto found = GuestBuffer(base, size, desc.is_written)) {
+                } else if (const auto found = freeze_fill_args
+                                                  ? SnapshotRange(base, 12)
+                                                  : GuestBuffer(base, size, desc.is_written)) {
                     log_buffer(last_bound == Bound::Region   ? "region"
                                : last_bound == Bound::Mirror ? "mirror"
                                                              : "in place");
+                    // A transfer fill may only use the exact CPU-owned argument snapshot
+                    // already bound to this dispatch, never a later read of guest memory.
+                    if (stage.pgm_hash == 0x8aa6e00c && !desc.is_written && size >= 12) {
+                        for (const auto& chunk : stream.chunks) {
+                            if (chunk.buffer->Mapped() &&
+                                vk::Buffer{Handle<VkBuffer_T>(chunk.buffer->NativeHandle())} ==
+                                    found->first && found->second <= chunk.buffer->Size() &&
+                                12 <= chunk.buffer->Size() - found->second) {
+                                std::array<u32, 3> words{};
+                                std::memcpy(words.data(), chunk.buffer->Mapped() + found->second,
+                                            sizeof(words));
+                                b.fill_arguments_snapshot = words;
+                                break;
+                            }
+                        }
+                    }
                     const u64 aligned = Common::AlignDown(found->second, alignment);
                     const u64 adjust = found->second - aligned;
                     b.push.AddOffset(binding.buffer, static_cast<u32>(adjust));
-                    info = {found->first, aligned, size + adjust};
+                    const u64 bound_size = freeze_fill_args ? 12 : size;
+                    info = {found->first, aligned, bound_size + adjust};
                     b.writes_buffers |= desc.is_written;
                     if (InPlaceSampled()) {
                         in_place.Note(BoundKind(desc.is_written ? 4 : 3), base, size); // NAT-142
@@ -4695,7 +4723,11 @@ void NativeRenderer::ReadFillShader(const Shader::Info& cs, DrawBindings& b) {
         return;
     }
     std::array<u32, 3> words{};
-    std::memcpy(words.data(), arguments, sizeof(words));
+    if (b.fill_arguments_snapshot) {
+        words = *b.fill_arguments_snapshot;
+    } else {
+        std::memcpy(words.data(), arguments, sizeof(words));
+    }
     b.fill_pattern = std::array<u32, 2>{words[0], words[1]};
     b.fill_address = out_sharp.base_address;
     b.fill_size = std::min<u64>(u64(words[2]) * 4, out_sharp.GetSize());
@@ -4771,13 +4803,45 @@ void NativeRenderer::DispatchDirect() {
     PrepareImages();
     GlobalBarrier();
     const CmdBuf cmdbuf{s.cmd};
-    // FIX-188: Intel Arc (#65) binds the pipeline every time (tile work runs between).
-    if (r.instance.IsIntel() || s.pipeline != pipeline->Handle()) {
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
-        s.pipeline = pipeline->Handle();
+    bool transferred = false;
+    const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
+    if (b.fill_arguments_snapshot && b.fill_pattern && b.fill_size != 0 &&
+        cs.pgm_hash == 0x8aa6e00c && cs.flattened_ud_buf.size() > 2 &&
+        cs_program.dim_y == 1 && cs_program.dim_z == 1 &&
+        cs_program.start_x == 0 && cs_program.start_y == 0 && cs_program.start_z == 0 &&
+        cs_program.num_thread_x.full == 256 && cs_program.num_thread_y.full == 1 &&
+        cs_program.num_thread_z.full == 1) {
+        const auto& words = *b.fill_arguments_snapshot;
+        // This shader writes two 256-word halves per group. Require the complete
+        // range, with equal argument/output bounds. Two-word patterns use the
+        // existing bounded GPU pattern cache; no fill or invalidation is omitted.
+        if (words[2] == cs.flattened_ud_buf[2] &&
+            b.fill_size == u64(words[2]) * 4 && u64(cs_program.dim_x) * 512 >= words[2] &&
+            (b.fill_address & 3) == 0 && RegionOver(b.fill_address, b.fill_size)) {
+            if (const auto target = GuestBuffer(b.fill_address, b.fill_size, true);
+                target && (target->second & 3) == 0) {
+                if (words[0] == words[1]) {
+                    cmdbuf.fillBuffer(target->first, target->second, b.fill_size, words[0]);
+                    transferred = true;
+                } else if (const auto* pattern = PatternBuffer(words[0], words[1], b.fill_size);
+                           pattern && pattern->Size() >= b.fill_size) {
+                    cmdbuf.copyBuffer(vk::Buffer{Handle<VkBuffer_T>(pattern->NativeHandle())},
+                                     target->first, vk::BufferCopy{.srcOffset = 0,
+                                         .dstOffset = target->second, .size = b.fill_size});
+                    transferred = true;
+                }
+            }
+        }
     }
-    PushBindings(*pipeline, vk::PipelineBindPoint::eCompute, b);
-    cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    if (!transferred) {
+        // FIX-188: Intel Arc (#65) binds the pipeline every time (tile work runs between).
+        if (r.instance.IsIntel() || s.pipeline != pipeline->Handle()) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+            s.pipeline = pipeline->Handle();
+        }
+        PushBindings(*pipeline, vk::PipelineBindPoint::eCompute, b);
+        cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    }
     NoteWrites(nullptr, b);
     if (Native::g_dump_request.exchange(false)) {
         r.StartFrameDumpNow(); // FIX-156 (diagnosis): a watched fill
