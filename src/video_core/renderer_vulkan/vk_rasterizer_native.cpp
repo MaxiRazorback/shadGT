@@ -718,24 +718,44 @@ Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bo
     if (info.props.is_block && instance.IsBlockTexelViewSupported()) {
         flags |= vk::ImageCreateFlagBits::eBlockTexelViewCompatible;
     }
-    const vk::ImageUsageFlags usage = UsageOf(instance, info);
-    const vk::FormatFeatureFlags2 features = FeaturesOf(usage);
+    vk::ImageUsageFlags usage = UsageOf(instance, info);
+    vk::FormatFeatureFlags2 features = FeaturesOf(usage);
     const vk::Format format = instance.GetSupportedFormat(info.pixel_format, features);
     const vk::ImageType type = TypeOf(info.type);
-    const auto properties =
-        instance.GetPhysicalDevice().getImageFormatProperties2(vk::PhysicalDeviceImageFormatInfo2{
-            .format = format,
-            .type = type,
-            .tiling = vk::ImageTiling::eOptimal,
-            .usage = usage,
-            .flags = flags,
-        });
+    vk::PhysicalDeviceImageFormatInfo2 format_info{
+        .format = format,
+        .type = type,
+        .tiling = vk::ImageTiling::eOptimal,
+        .usage = usage,
+        .flags = flags,
+    };
+    auto properties = instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
+    // Compressed textures are sampled directly. Storage is optional for compatible
+    // uncompressed views, and some drivers reject that combination for BC6H.
+    // Keep the original usage when accepted, including NVIDIA's extended-usage path.
+    if (properties.result == vk::Result::eErrorFormatNotSupported && info.props.is_block &&
+        (usage & vk::ImageUsageFlagBits::eStorage)) {
+        format_info.usage &= ~vk::ImageUsageFlagBits::eStorage;
+        auto sampled = instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
+        if (sampled.result == vk::Result::eSuccess) {
+            usage = format_info.usage;
+            features = FeaturesOf(usage);
+            properties = std::move(sampled);
+            static std::atomic<u32> fallbacks{};
+            if (Sample(fallbacks)) {
+                LOG_INFO(Render_Vulkan,
+                         "NAT-100: compressed image {} uses sampled-only fallback at {:#x}",
+                         vk::to_string(format), info.guest_address);
+            }
+        }
+    }
     if (properties.result != vk::Result::eSuccess) {
         static std::atomic<u32> logged{};
         if (Sample(logged)) {
-            LOG_ERROR(Render_Vulkan, "NAT-100: no image of format {} ({}x{}) at {:#x}",
+            LOG_ERROR(Render_Vulkan, "NAT-100: no image of format {} ({}x{}) at {:#x}: {}, usage={}, flags={}",
                       vk::to_string(format), info.size.width, info.size.height,
-                      info.guest_address);
+                      info.guest_address, vk::to_string(properties.result),
+                      vk::to_string(usage), vk::to_string(flags));
         }
         return made;
     }
@@ -2840,6 +2860,12 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             bind_null(6);
             continue;
         }
+        // A sampled-only fallback must never become a writable storage image.
+        if (storage && !(vk::ImageUsageFlags{entry->backend_usage} &
+                         vk::ImageUsageFlagBits::eStorage)) {
+            bind_null(7);
+            continue;
+        }
         if (Native::WatchedTexture(desc.info.guest_address, desc.info.guest_address + 1)) {
             WatchBind(*entry, tsharp, storage, false, stage.pgm_hash); // FIX-157 (diagnosis)
         }
@@ -4573,6 +4599,10 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
         Native::ImageEntry* entry = registry->Find(desc.info, storage, now_frame, false);
         if (!entry) {
             return false; // made by the recorder, in GPU order
+        }
+        if (storage && !(vk::ImageUsageFlags{entry->backend_usage} &
+                         vk::ImageUsageFlagBits::eStorage)) {
+            return false; // Let the recorder handle the unsupported storage binding.
         }
         const auto fallback = image_desc.mip_fallback_mode;
         for (u32 i = 0; i < num_bindings; ++i) {
