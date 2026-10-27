@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -19,6 +21,12 @@ namespace Vulkan::RytyUpscalerStatus {
 inline std::mutex g_mutex;
 inline std::string g_status;
 inline bool g_changed{};
+// Observed rendered scene extent, not the full-resolution composition attachment.
+inline std::atomic<std::uint64_t> g_scene_extent{};
+inline void ObserveScene(unsigned width, unsigned height) {
+    g_scene_extent.store((std::uint64_t(width) << 32) | height, std::memory_order_relaxed);
+}
+
 
 /// Presenter (any thread): the upscaler used for this frame.
 inline void Report(std::string status) {
@@ -33,6 +41,15 @@ inline void Report(std::string status) {
     SDL_Event wake{};
     wake.type = SDL_EVENT_USER;
     SDL_PushEvent(&wake);
+}
+
+inline void ReportResolution(unsigned output_width, unsigned output_height,
+                             unsigned fallback_width, unsigned fallback_height) {
+    const auto scene = g_scene_extent.load(std::memory_order_relaxed);
+    const unsigned width = scene ? unsigned(scene >> 32) : fallback_width;
+    const unsigned height = scene ? unsigned(scene) : fallback_height;
+    Report(std::to_string(output_width) + "x" + std::to_string(output_height) +
+           " -> " + std::to_string(width) + "x" + std::to_string(height));
 }
 
 /// Window thread: the new status once, after it changed.

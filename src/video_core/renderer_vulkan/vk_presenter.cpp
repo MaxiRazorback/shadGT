@@ -1019,8 +1019,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         upscaler = image_view != before ? "FSR 1" : "no upscaling";
     }
 #ifdef RYTY_GPU
-    RytyUpscalerStatus::Report(fmt::format("{} {}x{} -> {}x{}", upscaler, game_size.width,
-                                           game_size.height, frame->width, frame->height));
+    RytyUpscalerStatus::ReportResolution(frame->width, frame->height,
+                                          game_size.width, game_size.height);
 #endif
 
     // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
@@ -1151,8 +1151,8 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
                                      {frame->width, frame->height}, fsr_settings, frame->is_hdr);
         upscaler = image_view != before ? "FSR 1" : "no upscaling";
     }
-    RytyUpscalerStatus::Report(fmt::format("{} {}x{} -> {}x{}", upscaler, game_size.width,
-                                           game_size.height, frame->width, frame->height));
+    RytyUpscalerStatus::ReportResolution(frame->width, frame->height,
+                                          game_size.width, game_size.height);
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
     pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, pp_settings, ui_layer_view,

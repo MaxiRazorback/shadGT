@@ -24,6 +24,7 @@
 #include <magic_enum/magic_enum.hpp>
 #include <xxhash.h>
 
+#include "ryty_gpu/ryty_upscaler_status.h"
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -84,6 +85,19 @@ bool MatchExperimentalCompositionTexture(AmdGpu::Image& sharp, const Shader::Inf
     }();
     if (scene_width < 320 || scene_width > 3840 || scene_height < 180 || scene_height > 2160 ||
         (scene_width == 1920 && scene_height == 1080)) return true;
+    if (enabled && stage.pgm_hash == 0xb33ec4df && !resource.is_written && !resource.is_depth &&
+        sharp.GetType() == AmdGpu::ImageType::Color2D && sharp.width + 1 == scene_width &&
+        sharp.height + 1 == scene_height) {
+        // Already-correct descriptors need no resolution fix, but still identify the
+        // actual scene separately from the full-resolution composition attachment.
+        const auto format = LiverpoolToVK::TrySurfaceFormat(sharp.GetDataFmt(), sharp.GetNumberFmt());
+        const auto* observed = registry.FindExisting(sharp.Address(), [&](const Native::ImageEntry& entry) {
+            return !entry.from_cpu && !entry.info.props.is_depth &&
+                entry.info.pixel_format == format && entry.info.size.width == scene_width &&
+                entry.info.size.height == scene_height && entry.info.pitch == sharp.Pitch();
+        }, true);
+        if (observed) RytyUpscalerStatus::ObserveScene(observed->info.size.width, observed->info.size.height);
+    }
     if (!enabled || stage.pgm_hash != 0xb33ec4df || resource.is_written || resource.is_depth ||
         sharp.GetType() != AmdGpu::ImageType::Color2D || sharp.width != 1919 ||
         sharp.height != 1079 || sharp.NumLevels() != 1 ||
@@ -102,6 +116,7 @@ bool MatchExperimentalCompositionTexture(AmdGpu::Image& sharp, const Shader::Inf
     if (!target) return false;
     sharp.width = target->info.size.width - 1;
     sharp.height = target->info.size.height - 1;
+    RytyUpscalerStatus::ObserveScene(target->info.size.width, target->info.size.height);
     static std::atomic<u32> logged{};
     if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
         LOG_WARNING(Render_Vulkan,
