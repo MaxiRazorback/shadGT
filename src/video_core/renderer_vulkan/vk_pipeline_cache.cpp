@@ -2325,102 +2325,107 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
     const auto [it, is_new] = graphics_pipelines.try_emplace(S().graphics_key);
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(S().graphics_key);
-        LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
-        // DIAG-050: the parts of new keys of tessellated pipelines (GT Sport's race summary built
-        // hundreds of keys for the same few programs).
-        // DIAG-051: which part of a new key differs from the last key with the same stages
-        // (GT Sport's race summary asks for thousands of new pipelines).
-        {
-            static std::unordered_map<u64, GraphicsPipelineKey> last_by_stages;
-            static std::unordered_map<std::string, u32> diff_counts;
-            static u32 keys_seen = 0;
-            const u64 stages_hash = XXH3_64bits(S().graphics_key.stage_hashes.data(),
-                                                sizeof(S().graphics_key.stage_hashes));
-            auto [prev, first] = last_by_stages.try_emplace(stages_hash, S().graphics_key);
-            std::string fields = first ? "new stages" : "";
-            if (!first) {
-                const auto& a = prev->second;
-                const auto& b = S().graphics_key;
-                const auto differs = [&](const auto& x, const auto& y) {
-                    return std::memcmp(&x, &y, sizeof(x)) != 0;
-                };
-                const auto add = [&](const char* name) {
-                    fields += fields.empty() ? name : std::string(",") + name;
-                };
-                if (differs(a.vertex_buffer_formats, b.vertex_buffer_formats)) add("vtx");
-                if (a.patch_control_points != b.patch_control_points) add("pcp");
-                if (a.num_color_attachments != b.num_color_attachments) add("ncb");
-                if (differs(a.color_buffers, b.color_buffers)) add("cb");
-                if (differs(a.blend_controls, b.blend_controls)) add("blend");
-                if (differs(a.write_masks, b.write_masks)) add("mask");
-                if (differs(a.cb_shader_mask, b.cb_shader_mask)) add("shmask");
-                if (a.logic_op != b.logic_op) add("logic");
-                if (a.num_samples != b.num_samples || a.depth_samples != b.depth_samples ||
-                    differs(a.color_samples, b.color_samples)) add("samples");
-                if (a.mrt_mask != b.mrt_mask) add("mrt");
-                if (a.z_format != b.z_format || a.stencil_format != b.stencil_format ||
-                    a.depth_clamp_enable != b.depth_clamp_enable) add("depth");
-                if (a.prim_type != b.prim_type || a.polygon_mode != b.polygon_mode ||
-                    a.clip_space != b.clip_space || a.provoking_vtx_last != b.provoking_vtx_last ||
-                    a.depth_clip_enable != b.depth_clip_enable) add("raster");
-                if (fields.empty()) {
-                    add("padding");
-                    static u32 logged = 0;
-                    if (logged++ < 10) {
-                        const auto* x = reinterpret_cast<const u8*>(&a);
-                        const auto* y = reinterpret_cast<const u8*>(&b);
-                        std::string offsets;
-                        for (size_t i = 0; i < sizeof(GraphicsPipelineKey); ++i) {
-                            if (x[i] != y[i]) {
-                                offsets += fmt::format(" {}:{:02x}/{:02x}", i, x[i], y[i]);
+        // An async draw retries an empty map slot until its existing build completes.
+        // Do not repeat new-key diagnostics (or megabytes of logs) for those polls.
+        if (!pending_builds.contains(S().graphics_key)) {
+            LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
+            // DIAG-050: the parts of new keys of tessellated pipelines (GT Sport's race summary built
+            // hundreds of keys for the same few programs).
+            // DIAG-051: which part of a new key differs from the last key with the same stages
+            // (GT Sport's race summary asks for thousands of new pipelines).
+            {
+                static std::unordered_map<u64, GraphicsPipelineKey> last_by_stages;
+                static std::unordered_map<std::string, u32> diff_counts;
+                static u32 keys_seen = 0;
+                const u64 stages_hash = XXH3_64bits(S().graphics_key.stage_hashes.data(),
+                                                    sizeof(S().graphics_key.stage_hashes));
+                auto [prev, first] = last_by_stages.try_emplace(stages_hash, S().graphics_key);
+                std::string fields = first ? "new stages" : "";
+                if (!first) {
+                    const auto& a = prev->second;
+                    const auto& b = S().graphics_key;
+                    const auto differs = [&](const auto& x, const auto& y) {
+                        return std::memcmp(&x, &y, sizeof(x)) != 0;
+                    };
+                    const auto add = [&](const char* name) {
+                        fields += fields.empty() ? name : std::string(",") + name;
+                    };
+                    if (differs(a.vertex_buffer_formats, b.vertex_buffer_formats)) add("vtx");
+                    if (a.patch_control_points != b.patch_control_points) add("pcp");
+                    if (a.num_color_attachments != b.num_color_attachments) add("ncb");
+                    if (differs(a.color_buffers, b.color_buffers)) add("cb");
+                    if (differs(a.blend_controls, b.blend_controls)) add("blend");
+                    if (differs(a.write_masks, b.write_masks)) add("mask");
+                    if (differs(a.cb_shader_mask, b.cb_shader_mask)) add("shmask");
+                    if (a.logic_op != b.logic_op) add("logic");
+                    if (a.num_samples != b.num_samples || a.depth_samples != b.depth_samples ||
+                        differs(a.color_samples, b.color_samples)) add("samples");
+                    if (a.mrt_mask != b.mrt_mask) add("mrt");
+                    if (a.z_format != b.z_format || a.stencil_format != b.stencil_format ||
+                        a.depth_clamp_enable != b.depth_clamp_enable) add("depth");
+                    if (a.prim_type != b.prim_type || a.polygon_mode != b.polygon_mode ||
+                        a.clip_space != b.clip_space || a.provoking_vtx_last != b.provoking_vtx_last ||
+                        a.depth_clip_enable != b.depth_clip_enable) add("raster");
+                    if (fields.empty()) {
+                        add("padding");
+                        static u32 logged = 0;
+                        if (logged++ < 10) {
+                            const auto* x = reinterpret_cast<const u8*>(&a);
+                            const auto* y = reinterpret_cast<const u8*>(&b);
+                            std::string offsets;
+                            for (size_t i = 0; i < sizeof(GraphicsPipelineKey); ++i) {
+                                if (x[i] != y[i]) {
+                                    offsets += fmt::format(" {}:{:02x}/{:02x}", i, x[i], y[i]);
+                                }
                             }
+                            LOG_WARNING(Render_Vulkan,
+                                        "DIAG-051: keys differ only outside named fields (size {}, "
+                                        "color_buffers at {}, mrt_mask at {}):{}",
+                                        sizeof(GraphicsPipelineKey),
+                                        offsetof(GraphicsPipelineKey, color_buffers),
+                                        offsetof(GraphicsPipelineKey, mrt_mask), offsets);
                         }
-                        LOG_WARNING(Render_Vulkan,
-                                    "DIAG-051: keys differ only outside named fields (size {}, "
-                                    "color_buffers at {}, mrt_mask at {}):{}",
-                                    sizeof(GraphicsPipelineKey),
-                                    offsetof(GraphicsPipelineKey, color_buffers),
-                                    offsetof(GraphicsPipelineKey, mrt_mask), offsets);
                     }
+                    prev->second = S().graphics_key;
                 }
-                prev->second = S().graphics_key;
-            }
-            ++diff_counts[fields];
-            if (++keys_seen % 250 == 0) {
-                std::string summary;
-                for (const auto& [name, count] : diff_counts) {
-                    summary += fmt::format(" {}={}", name, count);
+                ++diff_counts[fields];
+                if (++keys_seen % 250 == 0) {
+                    std::string summary;
+                    for (const auto& [name, count] : diff_counts) {
+                        summary += fmt::format(" {}={}", name, count);
+                    }
+                    LOG_WARNING(Render_Vulkan, "DIAG-051: {} new keys; differences from the last "
+                                "key with the same stages:{}", keys_seen, summary);
                 }
-                LOG_WARNING(Render_Vulkan, "DIAG-051: {} new keys; differences from the last "
-                            "key with the same stages:{}", keys_seen, summary);
             }
-        }
-        // SHADGT_LOG_KEYS=1 logs every new key the same way (up to 5000).
-        static const bool log_all_keys = [] {
-            const char* env = std::getenv("SHADGT_LOG_KEYS");
-            return env && env[0] == '1';
-        }();
-        if (log_all_keys ||
-            S().graphics_key.stage_hashes[u32(Shader::SwStage::TessellationControl)] != 0) {
-            static std::atomic<u32> logged{};
-            if (const u32 n = ++logged; n <= (log_all_keys ? 5000u : 80u)) {
-                const auto& k = S().graphics_key;
-                const auto part = [](const auto& field) {
-                    return XXH3_64bits(&field, sizeof(field)) & 0xffff;
-                };
-                LOG_WARNING(Render_Vulkan,
-                            "DIAG-050: new key {} {:#x}: stages {:#x} {:#x} {:#x} {:#x} {:#x}; "
-                            "pcp {} prim {} vtx {:#x} cb {:#x} blend {:#x} mask {:#x} "
-                            "shmask {:#x} samples {} {} mrt {:#x} z {} clip {}; all {:#x}",
-                            n, pipeline_hash, k.stage_hashes[0], k.stage_hashes[1],
-                            k.stage_hashes[2], k.stage_hashes[3], k.stage_hashes[4],
-                            k.patch_control_points,
-                            u32(k.prim_type), part(k.vertex_buffer_formats), part(k.color_buffers),
-                            part(k.blend_controls), part(k.write_masks), part(k.cb_shader_mask),
-                            k.num_samples, k.depth_samples, k.mrt_mask, u32(k.z_format),
-                            u32(k.depth_clip_enable),
-                            XXH3_64bits(&k, sizeof(k)) & 0xffffff);
+            // SHADGT_LOG_KEYS=1 logs every new key the same way (up to 5000).
+            static const bool log_all_keys = [] {
+                const char* env = std::getenv("SHADGT_LOG_KEYS");
+                return env && env[0] == '1';
+            }();
+            if (log_all_keys ||
+                S().graphics_key.stage_hashes[u32(Shader::SwStage::TessellationControl)] != 0) {
+                static std::atomic<u32> logged{};
+                if (const u32 n = ++logged; n <= (log_all_keys ? 5000u : 80u)) {
+                    const auto& k = S().graphics_key;
+                    const auto part = [](const auto& field) {
+                        return XXH3_64bits(&field, sizeof(field)) & 0xffff;
+                    };
+                    LOG_WARNING(Render_Vulkan,
+                                "DIAG-050: new key {} {:#x}: stages {:#x} {:#x} {:#x} {:#x} {:#x}; "
+                                "pcp {} prim {} vtx {:#x} cb {:#x} blend {:#x} mask {:#x} "
+                                "shmask {:#x} samples {} {} mrt {:#x} z {} clip {}; all {:#x}",
+                                n, pipeline_hash, k.stage_hashes[0], k.stage_hashes[1],
+                                k.stage_hashes[2], k.stage_hashes[3], k.stage_hashes[4],
+                                k.patch_control_points,
+                                u32(k.prim_type), part(k.vertex_buffer_formats), part(k.color_buffers),
+                                part(k.blend_controls), part(k.write_masks), part(k.cb_shader_mask),
+                                k.num_samples, k.depth_samples, k.mrt_mask, u32(k.z_format),
+                                u32(k.depth_clip_enable),
+                                XXH3_64bits(&k, sizeof(k)) & 0xffffff);
+                }
             }
+
         }
 
         GraphicsPipeline::SerializationSupport sdata{};
