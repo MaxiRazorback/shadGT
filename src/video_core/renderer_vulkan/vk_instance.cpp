@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <cstdlib>
 
 #include <boost/container/static_vector.hpp>
@@ -19,6 +20,7 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 #ifdef RYTY_GPU
 #include "ryty_gpu/ryty_dlss.h"
+#include "ryty_gpu/ryty_xess.h"
 #endif
 
 #include <vk_mem_alloc.h>
@@ -394,6 +396,19 @@ bool Instance::CreateDevice() {
     RytyDlss::AddDeviceExtensions(*instance, physical_device,
                                   [&](std::string_view name) { return add_extension(name); });
 #endif
+    // DIAG-206: the driver's report of what faulted when the device is lost.
+    device_fault = add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+    // XESS-200: Intel XeSS's device extensions and features, only when it is the upscaler.
+    bool xess = false;
+    bool xess_mutable_descriptor = false;
+#ifdef RYTY_GPU
+    xess = RytyXess::Load();
+    RytyXess::AddDeviceExtensions(*instance, physical_device, [&](std::string_view name) {
+        const bool added = add_extension(name);
+        xess_mutable_descriptor |= added && name == VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME;
+        return added;
+    });
+#endif
 
     const auto family_properties = physical_device.getQueueFamilyProperties();
     if (family_properties.empty()) {
@@ -461,6 +476,8 @@ bool Instance::CreateDevice() {
                 .shaderImageGatherExtended = features.shaderImageGatherExtended,
                 .shaderStorageImageExtendedFormats = features.shaderStorageImageExtendedFormats,
                 .shaderStorageImageMultisample = features.shaderStorageImageMultisample,
+                .shaderStorageImageWriteWithoutFormat =
+                    xess && features.shaderStorageImageWriteWithoutFormat,
                 .shaderClipDistance = features.shaderClipDistance,
                 .shaderFloat64 = features.shaderFloat64,
                 .shaderInt64 = features.shaderInt64,
@@ -501,6 +518,7 @@ bool Instance::CreateDevice() {
             .computeFullSubgroups = IsIntel() && vk13_features.computeFullSubgroups,
             .synchronization2 = vk13_features.synchronization2,
             .dynamicRendering = vk13_features.dynamicRendering,
+            .shaderIntegerDotProduct = xess && vk13_features.shaderIntegerDotProduct, // XESS-200
             .maintenance4 = vk13_features.maintenance4,
         },
         // Extensions
@@ -586,7 +604,19 @@ bool Instance::CreateDevice() {
         vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT{
             .pageableDeviceLocalMemory = pageable_memory,
         },
+        vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT{
+            .mutableDescriptorType = true, // XESS-200
+        },
+        vk::PhysicalDeviceFaultFeaturesEXT{
+            .deviceFault = true, // DIAG-206
+        },
     };
+    if (!device_fault) {
+        device_chain.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
+    }
+    if (!xess_mutable_descriptor) {
+        device_chain.unlink<vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT>();
+    }
     if (!pageable_memory) {
         device_chain.unlink<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>();
         device_chain.unlink<vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>();
@@ -921,6 +951,43 @@ vk::Format Instance::GetSupportedFormat(const vk::Format format,
         }
     }
     return format;
+}
+
+void Instance::LogDeviceFault() const {
+    // DIAG-206: once, after the device was lost.
+    static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+    if (!device_fault || logged.test_and_set()) {
+        return;
+    }
+    const auto get_fault = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(
+        VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr(static_cast<VkDevice>(*device),
+                                                          "vkGetDeviceFaultInfoEXT"));
+    if (!get_fault) {
+        return;
+    }
+    VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    if (get_fault(static_cast<VkDevice>(*device), &counts, nullptr) != VK_SUCCESS &&
+        counts.addressInfoCount == 0 && counts.vendorInfoCount == 0) {
+        LOG_CRITICAL(Render_Vulkan, "DIAG-206: the driver has no fault report");
+        return;
+    }
+    std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+    std::vector<VkDeviceFaultVendorInfoEXT> vendor(counts.vendorInfoCount);
+    VkDeviceFaultInfoEXT info{VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+    info.pAddressInfos = addresses.data();
+    info.pVendorInfos = vendor.data();
+    counts.vendorBinarySize = 0;
+    get_fault(static_cast<VkDevice>(*device), &counts, &info);
+    LOG_CRITICAL(Render_Vulkan, "DIAG-206: device fault: {}", info.description);
+    for (const auto& address : addresses) {
+        LOG_CRITICAL(Render_Vulkan, "DIAG-206: address type {} at {:#x} (precision {:#x})",
+                     int(address.addressType), address.reportedAddress,
+                     address.addressPrecision);
+    }
+    for (const auto& entry : vendor) {
+        LOG_CRITICAL(Render_Vulkan, "DIAG-206: vendor fault {:#x} data {:#x}: {}",
+                     entry.vendorFaultCode, entry.vendorFaultData, entry.description);
+    }
 }
 
 } // namespace Vulkan

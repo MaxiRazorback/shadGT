@@ -6,12 +6,19 @@
 // loaded at run time from next to GTSport.exe when the GT Sport config has "fsr_enabled" (and
 // "fsr3_enabled", on by default); without the DLL the renderer keeps using FSR 1.
 //
-// FSR 3.1 is a temporal upscaler, but the renderer only has the finished game picture, without
-// motion vectors, depth or camera jitter. It runs with zero motion vectors, a flat depth image and
-// its history reset every frame, which leaves FSR 3.1's spatial upsampling and RCAS sharpening.
+// Pass scales the finished game picture, without motion vectors, depth or camera jitter: it runs
+// with zero motion vectors, a flat depth image and its history reset every frame, which leaves
+// FSR 3.1's spatial upsampling and RCAS sharpening. Temporal (FSR-200) takes GT Sport's scene
+// before its TAA instead, with its depth, motion vectors and jitter, through the temporal scene
+// capture of the default renderer (GtsDlssPass), when DLSS is not doing it.
+//
+// FSR-201: GPU.fsr_upscaler picks the upscaler version inside amd_fidelityfx_vk.dll: "fsr3" (the
+// newest 3.x, the default) or "fsr4" (the newest 4.x, once AMD's Vulkan DLL has one; until then
+// 3.x). SHADGT_FSR_UPSCALER overrides it.
 
 #pragma once
 
+#include <string>
 #include <vector>
 
 #include "common/types.h"
@@ -65,6 +72,61 @@ private:
     VideoCore::UniqueImage depth;
     vk::Extent2D aux_size{};
     bool failed{};
+};
+
+/// FSR-204: the FSR upscaler created last ("FSR 3.1.4"), for the window title.
+std::string ActiveVersionName();
+
+/// FSR-200: temporal FSR of the captured scene (GPU.fsr_temporal, on by default with FSR 3.1;
+/// SHADGT_FSR_TEMPORAL=0/1 overrides). Not with DLSS, which has the scene first.
+bool TemporalRequested();
+
+/// FSR-209: the temporal upscalers' output as a multiple of the scene's size (GPU.upscale_ratio,
+/// the launcher's preset: 1 native anti-aliasing, 1.5 FSR Quality, 2 FSR Performance, ...;
+/// SHADGT_UPSCALE_RATIO overrides). 0, the default: the window's size.
+float UpscaleRatio();
+
+/// One frame of the captured scene. Images are readable by compute shaders (color, depth, motion)
+/// and the output is in the general layout. Motion vectors and jitter follow the DLSS pass.
+struct TemporalFrame {
+    vk::Image color;
+    vk::Format color_format;
+    vk::Image depth;
+    vk::Format depth_format;
+    vk::Image motion;
+    vk::Format motion_format;
+    vk::Image output;
+    vk::Format output_format;
+    // XESS-200: XeSS takes image views (FSR makes its own).
+    vk::ImageView color_view;
+    vk::ImageView depth_view;
+    vk::ImageView motion_view;
+    vk::ImageView output_view;
+    vk::Extent2D render_size;
+    vk::Extent2D output_size;
+    float jitter_x;
+    float jitter_y;
+    float motion_scale_x;
+    float motion_scale_y;
+    float frame_time_ms;
+    float sharpness; // RCAS 0..1, negative for none
+    bool reset;
+};
+
+class Temporal {
+public:
+    ~Temporal();
+
+    /// Loads amd_fidelityfx_vk.dll; false when it is missing (the scene keeps the game's TAA).
+    bool Available();
+    /// Records the upscale; false when it failed (the caller stops using FSR for the scene).
+    bool Evaluate(vk::PhysicalDevice physical_device, vk::Device device, vk::CommandBuffer cmdbuf,
+                  const TemporalFrame& frame);
+
+private:
+    void* context{}; // ffxContext
+    vk::Extent2D context_input{};
+    vk::Extent2D context_output{};
 };
 
 /// vkGetDeviceProcAddr for AMD's backend: extension names fall back to core functions, debug

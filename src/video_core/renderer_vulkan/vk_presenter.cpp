@@ -52,6 +52,8 @@
 #include <stb_image_write.h>
 #include <vk_mem_alloc.h>
 #include "ryty_gpu/ryty_diag.h"
+#include "ryty_gpu/ryty_fsr3.h"
+#include "ryty_gpu/ryty_upscaler_status.h"
 
 namespace Vulkan {
 
@@ -964,6 +966,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     bool scaled = false;
     bool dlss_scaled = false;
     vk::ImageView ui_layer_view{}; // HDR-UI
+    std::string upscaler; // FSR-204: for the window title
+    const vk::Extent2D game_size = image_size;
 #ifdef RYTY_GPU
     const auto shown = UiHires::TakeFrame(instance, pass_cmdbuf, cpu_address, image_size,
                                           {frame->width, frame->height}, view_info.format);
@@ -972,12 +976,14 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         image_size = temporalDlss.OutputSize();
         dlss_scaled = true;
         scaled = true;
+        upscaler = fmt::format("{} temporal", temporalDlss.BackendName());
     } else if (shown) {
         image_view = shown->view;
         image_size = shown->size;
         ui_layer_view = shown->ui;
         dlss_scaled = shown->dlss;
         scaled = true;
+        upscaler = shown->dlss ? "DLSS" : "high-resolution UI";
     }
     // ryGT: DLSS (when its plugin is on and can scale to the window size) replaces FSR.
     if (const auto dlss_view = scaled ? image_view :
@@ -987,6 +993,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         image_view = dlss_view;
         scaled = true;
         dlss_scaled = true;
+        upscaler = "DLSS";
     }
     // ryGT: FSR 3.1 replaces FSR 1 when it is on; the RCAS settings carry over (FSR 3.1 turns
     // RCAS attenuation 0..2 into sharpness 1..0).
@@ -1001,13 +1008,20 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             fsr3_view != image_view) {
             image_view = fsr3_view;
             scaled = true;
+            upscaler = RytyFsr3::ActiveVersionName();
         }
     }
 #endif
     if (!scaled) {
+        const auto before = image_view;
         image_view = fsr_pass.Render(pass_cmdbuf, image_view, image_size,
                                      {frame->width, frame->height}, fsr_settings, frame->is_hdr);
+        upscaler = image_view != before ? "FSR 1" : "no upscaling";
     }
+#ifdef RYTY_GPU
+    RytyUpscalerStatus::Report(fmt::format("{} {}x{} -> {}x{}", upscaler, game_size.width,
+                                           game_size.height, frame->width, frame->height));
+#endif
 
     // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
     // the post process pass still sRGB encoded and has to be decoded there instead.
@@ -1097,12 +1111,15 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     bool scaled = false;
     bool dlss_scaled = false;
     vk::ImageView ui_layer_view{};
+    std::string upscaler; // FSR-204: for the window title
+    const vk::Extent2D game_size = image_size;
     if (display->output_view) {
         image_view = display->output_view;
         image_size = display->output_size;
         ui_layer_view = display->ui_layer;
         dlss_scaled = display->dlss_scaled;
         scaled = true;
+        upscaler = display->dlss_scaled ? "DLSS" : "high-resolution UI";
     }
     if (const auto dlss_view =
             scaled ? image_view
@@ -1112,6 +1129,7 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
         image_view = dlss_view;
         scaled = true;
         dlss_scaled = true;
+        upscaler = "DLSS";
     }
     if (!scaled && fsr_settings.enable) {
         const float sharpness =
@@ -1124,12 +1142,17 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
             fsr3_view != image_view) {
             image_view = fsr3_view;
             scaled = true;
+            upscaler = RytyFsr3::ActiveVersionName();
         }
     }
     if (!scaled) {
+        const auto before = image_view;
         image_view = fsr_pass.Render(pass_cmdbuf, image_view, image_size,
                                      {frame->width, frame->height}, fsr_settings, frame->is_hdr);
+        upscaler = image_view != before ? "FSR 1" : "no upscaling";
     }
+    RytyUpscalerStatus::Report(fmt::format("{} {}x{} -> {}x{}", upscaler, game_size.width,
+                                           game_size.height, frame->width, frame->height));
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
     pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, pp_settings, ui_layer_view,

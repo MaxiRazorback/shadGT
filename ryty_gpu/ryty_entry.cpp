@@ -33,6 +33,7 @@
 #include "ryty_gpu/ryty_input_bridge.h"
 #include "ryty_gpu/ryty_camera.h"
 #include "ryty_gpu/ryty_library.h"
+#include "ryty_gpu/ryty_upscaler_status.h"
 #include "ryty_gpu/native/gts_hooks.h"
 #include "ryty_gpu/native/image_registry.h"
 #include "sdl_window.h"
@@ -81,6 +82,10 @@ void RunWindowThread() {
     window.InitTimers();
     while (window.IsOpen()) {
         window.WaitEvent();
+        if (const auto status = Vulkan::RytyUpscalerStatus::Take()) { // FSR-204
+            const std::string title = "ryGT - Gran Turismo Sport | " + *status;
+            SDL_SetWindowTitle(window.GetSDLWindow(), title.c_str());
+        }
     }
     // The window was closed: end the game without DLL teardown (see Emulator::Shutdown).
     // Stop trigger effects before the deliberate TerminateProcess skips SDL cleanup.

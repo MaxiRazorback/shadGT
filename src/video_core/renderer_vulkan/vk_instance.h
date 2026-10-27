@@ -33,6 +33,9 @@ public:
     [[nodiscard]] vk::Format GetSupportedFormat(vk::Format format,
                                                 vk::FormatFeatureFlags2 flags) const;
 
+    /// DIAG-206: logs the driver's report of what faulted, once, after the device was lost.
+    void LogDeviceFault() const;
+
     /// Returns the Vulkan instance
     vk::Instance GetInstance() const {
         return *instance;
@@ -557,6 +560,7 @@ private:
     bool custom_border_color{};
     bool fragment_shader_barycentric{};
     bool amd_shader_explicit_vertex_parameter{};
+    bool device_fault{}; // DIAG-206
     bool depth_clip_control{};
     bool depth_clip_enable{};
     bool dynamic_state_3{};

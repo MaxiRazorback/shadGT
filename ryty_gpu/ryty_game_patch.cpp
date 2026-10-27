@@ -1103,8 +1103,15 @@ void InstallMirrorHalfRate(u8* base) {
     if (const char* overrideMode = std::getenv("SHADGT_DLSS_TEMPORAL")) {
         temporal = std::strcmp(overrideMode, "1") == 0;
     }
-    if (temporal) {
-        std::fprintf(stderr, "[patch] GTS-008: half-rate mirror disabled for temporal DLSS motion continuity\n");
+    // FSR-200: temporal FSR reconstructs from the same scene, so it needs the same continuity.
+    bool fsrTemporal = ConfigFlag("fsr_enabled", false) && ConfigFlag("fsr3_enabled", true) &&
+                       ConfigFlag("fsr_temporal", true);
+    if (const char* overrideMode = std::getenv("SHADGT_FSR_TEMPORAL")) {
+        fsrTemporal = overrideMode[0] == '1';
+    }
+    if (temporal || fsrTemporal) {
+        std::fprintf(stderr, "[patch] GTS-008: half-rate mirror disabled for temporal %s motion continuity\n",
+                     temporal ? "DLSS" : "FSR");
         return;
     }
     constexpr u64 kSite = 0x111011a; // RVA of "cmp byte ptr [r13+0x5a8], 0"

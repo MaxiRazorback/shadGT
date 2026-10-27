@@ -112,6 +112,8 @@ ryty_add_library(ryty_gpu libSceVideoOut
         ryty_gpu/ryty_gts_dlss.cpp
         # AMD FSR 3.1 through amd_fidelityfx_vk.dll (ryty_fsr3.h).
         ryty_gpu/ryty_fsr3.cpp
+        # Intel XeSS-SR through libxess.dll (ryty_xess.h).
+        ryty_gpu/ryty_xess.cpp
         # AMD FSR 3.1 frame generation (ryty_framegen.h).
         ryty_gpu/ryty_framegen.cpp
         # NVIDIA DLSS frame generation through Streamline (ryty_dlssg.h).

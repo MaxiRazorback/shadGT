@@ -24,6 +24,7 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 #ifdef RYTY_GPU
 #include "ryty_gpu/ryty_dlss.h"
+#include "ryty_gpu/ryty_xess.h"
 #include "ryty_gpu/ryty_dlssg.h"
 #endif
 
@@ -210,6 +211,8 @@ std::vector<const char*> GetInstanceExtensions(Frontend::WindowSystemType window
 #ifdef RYTY_GPU
     // ryGT: the instance extensions NVIDIA DLSS needs, when the DLSS plugin is used.
     RytyDlss::AddInstanceExtensions(extensions, properties);
+    // XESS-200: and Intel XeSS's, when it is the temporal upscaler.
+    RytyXess::AddInstanceExtensions(extensions, properties);
 #endif
 
     // Sanitize extension list

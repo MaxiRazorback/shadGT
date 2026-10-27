@@ -5,11 +5,17 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "common/logging/log.h"
+#include "common/ryty_config.h"
 #include "core/emulator_settings.h"
+#include "ryty_gpu/ryty_dlss.h"
 #include "ryty_gpu/ryty_fsr3.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
@@ -30,6 +36,16 @@ struct Api {
     bool tried{};
 };
 Api g_api;
+
+// FSR-204: the provider version of the upscaler created last.
+std::mutex g_version_mutex;
+std::string g_version_name{"FSR"};
+
+void NoteVersion(const char* name) {
+    std::scoped_lock lock{g_version_mutex};
+    const std::string_view view{name ? name : ""};
+    g_version_name = view.empty() ? "FSR" : view.starts_with("FSR") ? std::string{view} : "FSR " + std::string{view};
+}
 
 // The context is created for windows up to this size, so resizing rarely recreates it.
 constexpr vk::Extent2D MinUpscaleSize{3840, 2160};
@@ -94,17 +110,7 @@ FfxApiResource Resource(vk::Image image, vk::Format format, vk::Extent2D size, u
     return ffxApiGetResourceVK(static_cast<VkImage>(image), description, state);
 }
 
-} // namespace
-
-PFN_vkGetDeviceProcAddr DeviceProcAddrShim() {
-    return &GetDeviceProcAddr;
-}
-
-Pass::~Pass() {
-    DestroyContext();
-}
-
-bool Pass::Load() {
+bool LoadApi() {
     if (g_api.tried) {
         return g_api.module != nullptr;
     }
@@ -140,6 +146,94 @@ bool Pass::Load() {
     return true;
 }
 
+// FSR-201: the upscaler major version GPU.fsr_upscaler asks for (3 or 4).
+u32 RequestedMajor() {
+    static const u32 major = [] {
+        std::string value;
+        if (const char* env = std::getenv("SHADGT_FSR_UPSCALER")) {
+            value = env;
+        } else if (const auto config = Common::RytyGameConfigValue("fsr_upscaler")) {
+            value = *config;
+        }
+        return value.find('4') != std::string::npos ? 4u : 3u;
+    }();
+    return major;
+}
+
+// FSR-201: the version id to create upscalers with: the newest one of the requested major version
+// in the DLL, else the newest 3.x. Zero leaves the DLL's default.
+uint64_t SelectedVersion() {
+    static const uint64_t selected = [] {
+        uint64_t count = 0;
+        ffxQueryDescGetVersions query{};
+        query.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+        query.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+        query.outputCount = &count;
+        if (g_api.query(nullptr, &query.header) != FFX_API_RETURN_OK || count == 0) {
+            return uint64_t{0};
+        }
+        std::vector<uint64_t> ids(count);
+        std::vector<const char*> names(count);
+        query.versionIds = ids.data();
+        query.versionNames = names.data();
+        if (g_api.query(nullptr, &query.header) != FFX_API_RETURN_OK) {
+            return uint64_t{0};
+        }
+        const auto major_of = [](const char* name) {
+            return name ? static_cast<u32>(std::strtoul(name, nullptr, 10)) : 0u;
+        };
+        // The DLL lists its versions newest first.
+        const auto newest = [&](u32 major) {
+            for (u64 i = 0; i < count; ++i) {
+                if (major_of(names[i]) == major) {
+                    return static_cast<int>(i);
+                }
+            }
+            return -1;
+        };
+        std::string listed;
+        for (u64 i = 0; i < count; ++i) {
+            listed += fmt::format("{}{}", i ? ", " : "", names[i] ? names[i] : "?");
+        }
+        int pick = newest(RequestedMajor());
+        if (pick < 0 && RequestedMajor() == 4) {
+            LOG_WARNING(Render_Vulkan,
+                        "FSR-201: FSR 4 is not in this amd_fidelityfx_vk.dll (it has {}); AMD has "
+                        "not released it for Vulkan yet, so FSR 3.1 is used",
+                        listed);
+        }
+        if (pick < 0) {
+            pick = newest(3);
+        }
+        if (pick < 0) {
+            return uint64_t{0};
+        }
+        LOG_INFO(Render_Vulkan, "FSR-201: upscaler versions in the DLL: {}; using {}", listed,
+                 names[pick] ? names[pick] : "?");
+        return ids[pick];
+    }();
+    return selected;
+}
+
+} // namespace
+
+std::string ActiveVersionName() {
+    std::scoped_lock lock{g_version_mutex};
+    return g_version_name;
+}
+
+PFN_vkGetDeviceProcAddr DeviceProcAddrShim() {
+    return &GetDeviceProcAddr;
+}
+
+Pass::~Pass() {
+    DestroyContext();
+}
+
+bool Pass::Load() {
+    return LoadApi();
+}
+
 void Pass::Create(vk::Instance, vk::PhysicalDevice physical_device_, vk::Device device_,
                   VmaAllocator allocator_, u32 num_images) {
     physical_device = physical_device_;
@@ -164,9 +258,14 @@ bool Pass::CreateContext(vk::Extent2D input_size, vk::Extent2D output_size) {
     backend.vkPhysicalDevice = static_cast<VkPhysicalDevice>(physical_device);
     backend.vkDeviceProcAddr = &GetDeviceProcAddr;
 
+    ffxOverrideVersion version_override{};
+    version_override.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+    version_override.header.pNext = &backend.header;
+    version_override.versionId = SelectedVersion();
+
     ffxCreateContextDescUpscale desc{};
     desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
-    desc.header.pNext = &backend.header;
+    desc.header.pNext = version_override.versionId ? &version_override.header : &backend.header;
     desc.flags = 0; // the game picture is display-ready (LDR) color
     desc.maxRenderSize = {input_size.width, input_size.height};
     desc.maxUpscaleSize = {max_output.width, max_output.height};
@@ -191,6 +290,7 @@ bool Pass::CreateContext(vk::Extent2D input_size, vk::Extent2D output_size) {
     memory_query.gpuMemoryUsageUpscaler = &memory;
     g_api.query(&context, &version.header);
     g_api.query(&context, &memory_query.header);
+    NoteVersion(version.versionName);
     LOG_INFO(Render_Vulkan, "FSR 3.1: upscaler {} ready for {}x{} to {}x{} ({} MB of GPU memory)",
              version.versionName ? version.versionName : "(unknown version)", input_size.width,
              input_size.height, max_output.width, max_output.height,
@@ -451,6 +551,162 @@ void Pass::CreateAuxImages(vk::CommandBuffer cmdbuf, vk::Extent2D input_size) {
         .imageMemoryBarrierCount = static_cast<u32>(to_read.size()),
         .pImageMemoryBarriers = to_read.data(),
     });
+}
+
+float UpscaleRatio() {
+    static const float ratio = [] {
+        std::string value;
+        if (const char* env = std::getenv("SHADGT_UPSCALE_RATIO")) {
+            value = env;
+        } else if (const auto config = Common::RytyGameConfigValue("upscale_ratio")) {
+            value = *config;
+        }
+        std::erase(value, '"');
+        const float parsed = value.empty() ? 0.0f : std::strtof(value.c_str(), nullptr);
+        return parsed >= 1.0f ? std::min(parsed, 4.0f) : 0.0f;
+    }();
+    return ratio;
+}
+
+bool TemporalRequested() {
+    static const bool requested = [] {
+        if (const char* env = std::getenv("SHADGT_FSR_TEMPORAL")) {
+            return env[0] == '1';
+        }
+        const auto config = Common::RytyGameConfigValue("fsr_temporal");
+        return EmulatorSettings.IsFsrEnabled() && EmulatorSettings.IsFsr3Enabled() &&
+               !(config && *config == "false") && !RytyDlss::TemporalRequested();
+    }();
+    return requested;
+}
+
+Temporal::~Temporal() {
+    if (context && g_api.destroy_context) {
+        g_api.destroy_context(&context, nullptr);
+    }
+}
+
+bool Temporal::Available() {
+    return LoadApi();
+}
+
+bool Temporal::Evaluate(vk::PhysicalDevice physical_device, vk::Device device,
+                        vk::CommandBuffer cmdbuf, const TemporalFrame& frame) {
+    if (!LoadApi()) {
+        return false;
+    }
+    const auto format_of = [](vk::Format format) {
+        return ffxApiGetSurfaceFormatVK(static_cast<VkFormat>(format));
+    };
+    if (format_of(frame.color_format) == FFX_API_SURFACE_FORMAT_UNKNOWN ||
+        format_of(frame.depth_format) == FFX_API_SURFACE_FORMAT_UNKNOWN ||
+        format_of(frame.motion_format) == FFX_API_SURFACE_FORMAT_UNKNOWN) {
+        LOG_WARNING(Render_Vulkan,
+                    "FSR-200: scene formats {} / {} / {} are not supported; keeping the game's TAA",
+                    vk::to_string(frame.color_format), vk::to_string(frame.depth_format),
+                    vk::to_string(frame.motion_format));
+        return false;
+    }
+    if (!context || frame.render_size != context_input || frame.output_size != context_output) {
+        if (context) {
+            g_api.destroy_context(&context, nullptr);
+            context = nullptr;
+        }
+        ffxCreateBackendVKDesc backend{};
+        backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+        backend.vkDevice = static_cast<VkDevice>(device);
+        backend.vkPhysicalDevice = static_cast<VkPhysicalDevice>(physical_device);
+        backend.vkDeviceProcAddr = &GetDeviceProcAddr;
+        ffxOverrideVersion version_override{};
+        version_override.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+        version_override.header.pNext = &backend.header;
+        version_override.versionId = SelectedVersion();
+        ffxCreateContextDescUpscale desc{};
+        desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+        desc.header.pNext = version_override.versionId ? &version_override.header : &backend.header;
+        // Like the DLSS pass: display-encoded color, depth not inverted, motion vectors at the
+        // render size without jitter.
+        desc.flags = 0;
+        desc.maxRenderSize = {frame.render_size.width, frame.render_size.height};
+        desc.maxUpscaleSize = {frame.output_size.width, frame.output_size.height};
+        desc.fpMessage = OnMessage;
+        ffxContext new_context{};
+        if (const auto result = g_api.create_context(&new_context, &desc.header, nullptr);
+            result != FFX_API_RETURN_OK) {
+            LOG_ERROR(Render_Vulkan, "FSR-200: creating the temporal upscaler failed (code {})",
+                      result);
+            return false;
+        }
+        context = new_context;
+        context_input = frame.render_size;
+        context_output = frame.output_size;
+        ffxQueryGetProviderVersion version{};
+        version.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
+        g_api.query(&context, &version.header);
+        NoteVersion(version.versionName);
+        LOG_INFO(Render_Vulkan, "FSR-200: temporal FSR {} for the scene, {}x{} to {}x{}",
+                 version.versionName ? version.versionName : "(unknown version)",
+                 frame.render_size.width, frame.render_size.height, frame.output_size.width,
+                 frame.output_size.height);
+    }
+
+    const vk::MemoryBarrier2 inputs_ready{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &inputs_ready,
+    });
+    // DIAG-202 (SHADGT_FSR_JITTER=<x sign><y sign>, e.g. "+-"): jitter signs, to compare.
+    static const std::array<float, 2> jitter_sign = [] {
+        const char* env = std::getenv("SHADGT_FSR_JITTER");
+        if (!env || std::strlen(env) < 2) {
+            return std::array<float, 2>{1.0f, 1.0f};
+        }
+        return std::array<float, 2>{env[0] == '-' ? -1.0f : 1.0f, env[1] == '-' ? -1.0f : 1.0f};
+    }();
+    ffxDispatchDescUpscale dispatch{};
+    dispatch.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
+    dispatch.commandList = static_cast<VkCommandBuffer>(cmdbuf);
+    dispatch.color = Resource(frame.color, frame.color_format, frame.render_size,
+                              FFX_API_RESOURCE_USAGE_READ_ONLY,
+                              FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    // FSR-205: depth arrives as R32_SFLOAT; a depth format is described as a depth target, so
+    // the backend views it with its depth format.
+    const bool depth_format = frame.depth_format == vk::Format::eD32Sfloat ||
+                              frame.depth_format == vk::Format::eD16Unorm;
+    dispatch.depth = Resource(frame.depth, frame.depth_format, frame.render_size,
+                              depth_format ? FFX_API_RESOURCE_USAGE_DEPTHTARGET
+                                           : FFX_API_RESOURCE_USAGE_READ_ONLY,
+                              FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    dispatch.motionVectors = Resource(frame.motion, frame.motion_format, frame.render_size,
+                                      FFX_API_RESOURCE_USAGE_READ_ONLY,
+                                      FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    dispatch.output = Resource(frame.output, frame.output_format, frame.output_size,
+                               FFX_API_RESOURCE_USAGE_UAV, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+    dispatch.jitterOffset = {frame.jitter_x * jitter_sign[0], frame.jitter_y * jitter_sign[1]};
+    dispatch.motionVectorScale = {frame.motion_scale_x, frame.motion_scale_y};
+    dispatch.renderSize = {frame.render_size.width, frame.render_size.height};
+    dispatch.upscaleSize = {frame.output_size.width, frame.output_size.height};
+    dispatch.enableSharpening = frame.sharpness >= 0.0f;
+    dispatch.sharpness = std::clamp(frame.sharpness, 0.0f, 1.0f);
+    dispatch.frameTimeDelta = frame.frame_time_ms;
+    dispatch.preExposure = 1.0f;
+    dispatch.reset = frame.reset;
+    dispatch.cameraNear = 0.1f;
+    dispatch.cameraFar = 1000.0f;
+    dispatch.cameraFovAngleVertical = 1.0f;
+    dispatch.viewSpaceToMetersFactor = 1.0f;
+    dispatch.flags = FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;
+    if (const auto result = g_api.dispatch(&context, &dispatch.header);
+        result != FFX_API_RETURN_OK) {
+        LOG_ERROR(Render_Vulkan, "FSR-200: temporal upscaling failed (code {})", result);
+        return false;
+    }
+    return true;
 }
 
 } // namespace Vulkan::RytyFsr3

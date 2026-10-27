@@ -2,7 +2,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <string_view>
 #include "common/logging/log.h"
+#include "core/emulator_settings.h"
 #include "ryty_gpu/ryty_gts_dlss.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -27,6 +29,21 @@ vk::ImageBlit Blit(vk::Extent2D from, vk::Extent2D to) {
 GtsDlssPass::GtsDlssPass(const Instance& gpuInstance, Scheduler& gpuScheduler, Runtime& gpuRuntime)
     : instance{gpuInstance}, scheduler{gpuScheduler}, runtime{gpuRuntime} {
     quality = RytyDlss::Quality();
+    // FSR-200: without temporal DLSS, FSR 3.1 (or 4) reconstructs the scene from the same inputs;
+    // XESS-200: or Intel XeSS, when the launcher picked it and libxess.dll is there.
+    useXess = !RytyDlss::TemporalEnabled() && RytyXess::Requested() && RytyXess::Load();
+    useFsr = !RytyDlss::TemporalEnabled() && !useXess && RytyFsr3::TemporalRequested() &&
+             fsr.Available();
+    if (useXess) {
+        LOG_INFO(Render_Vulkan, "XESS-200: temporal XeSS armed; waiting for a matching scene");
+    } else if (RytyFsr3::TemporalRequested()) {
+        LOG_INFO(Render_Vulkan, "FSR-200: temporal FSR {}", useFsr ? "armed; waiting for a matching "
+                 "scene" : "unavailable (amd_fidelityfx_vk.dll); FSR stays spatial");
+    }
+}
+
+std::string GtsDlssPass::BackendName() const {
+    return useXess ? RytyXess::VersionName() : useFsr ? RytyFsr3::ActiveVersionName() : "DLSS";
 }
 
 RygtDlssImage GtsDlssPass::Texture::Descriptor() const {
@@ -98,15 +115,28 @@ void GtsDlssPass::copyInput(VideoCore::Image& source, Texture& dest) {
 bool GtsDlssPass::Capture(u64 frame, VideoCore::Image& color, VideoCore::Image& sourceDepth,
                          VideoCore::Image& sourceMotion, VideoCore::Image& resolved,
                          const std::array<float, 28>& constants) {
-    if (!RytyDlss::TemporalEnabled() || failed || !supportedDisplay || requestedSize.width == 0 ||
+    if (!Enabled() || failed || !supportedDisplay || requestedSize.width == 0 ||
         scheduler.ThreadRing() || sceneFrame == frame) return false;
     const auto input = Size(color);
-    const auto output = quality == RYGT_DLSS_QUALITY_DLAA ? input : requestedSize;
+    // FSR-200: FSR upscales to the window, or (a window smaller than the scene) anti-aliases at the
+    // scene's size and the presenter scales down.
+    // FSR-209: or the launcher's preset sets it as a multiple of the scene (the presenter then
+    // scales it to the window: supersampling when the window is smaller).
+    const float ratio = RytyFsr3::UpscaleRatio();
+    const auto scaled = vk::Extent2D{std::min(u32(std::lround(input.width * ratio)), 8192u),
+                                     std::min(u32(std::lround(input.height * ratio)), 8192u)};
+    const auto output = (useFsr || useXess)
+                            ? ratio >= 1.0f ? scaled
+                                            : vk::Extent2D{std::max(requestedSize.width, input.width),
+                                                           std::max(requestedSize.height, input.height)}
+                        : quality == RYGT_DLSS_QUALITY_DLAA ? input
+                                                            : requestedSize;
     if (input != renderSize || output != outputSize || depth.format != sourceDepth.info.pixel_format) {
         RygtDlssOptimalSettings settings{};
-        if (!RytyDlss::GetOptimalSettings(output.width, output.height, quality, settings) ||
-            input.width < settings.minimum_width || input.height < settings.minimum_height ||
-            input.width > settings.maximum_width || input.height > settings.maximum_height) {
+        if (!useFsr && !useXess &&
+            (!RytyDlss::GetOptimalSettings(output.width, output.height, quality, settings) ||
+             input.width < settings.minimum_width || input.height < settings.minimum_height ||
+             input.width > settings.maximum_width || input.height > settings.maximum_height)) {
             LOG_WARNING(Render_Vulkan, "Temporal DLSS: {}x{} is outside mode {} for {}x{}; keeping game TAA",
                         input.width, input.height, u32(quality), output.width, output.height);
             failed = true;
@@ -120,6 +150,15 @@ bool GtsDlssPass::Capture(u64 frame, VideoCore::Image& color, VideoCore::Image& 
         create(this->color, color.info.pixel_format, input);
         create(depth, sourceDepth.info.pixel_format, input, sourceDepth.aspect_mask);
         create(motion, sourceMotion.info.pixel_format, input);
+        if (useFsr || useXess) {
+            create(fsrDepth, vk::Format::eR32Sfloat, input);
+            depthCopy = std::make_unique<VideoCore::UniqueBuffer>(instance.GetDevice(),
+                                                                  instance.GetAllocator());
+            vk::BufferCreateInfo bufferInfo{
+                .size = vk::DeviceSize{input.width} * input.height * 4,
+                .usage = vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst};
+            depthCopy->Create(bufferInfo, VideoCore::MemoryType::DeviceLocal, nullptr);
+        }
         create(reconstruction, vk::Format::eR16G16B16A16Sfloat, output);
         create(native, vk::Format::eA2B10G10R10UnormPack32, output);
         reconstruction.presentView = Check<"create DLSS BGR copy view">(
@@ -132,8 +171,13 @@ bool GtsDlssPass::Capture(u64 frame, VideoCore::Image& color, VideoCore::Image& 
                                      .levelCount = 1, .layerCount = 1}}));
         if (!colorCopy) colorCopy = std::make_unique<VideoCore::BlitHelper>(instance, scheduler);
         reset = true;
-        LOG_INFO(Render_Vulkan, "Temporal DLSS: actual scene {}x{} -> {}x{}, preset M, mode {}",
-                 input.width, input.height, output.width, output.height, u32(quality));
+        if (useFsr || useXess) {
+            LOG_INFO(Render_Vulkan, "FSR-200: actual scene {}x{} -> {}x{}", input.width,
+                     input.height, output.width, output.height);
+        } else {
+            LOG_INFO(Render_Vulkan, "Temporal DLSS: actual scene {}x{} -> {}x{}, preset M, mode {}",
+                     input.width, input.height, output.width, output.height, u32(quality));
+        }
     }
     const auto now = std::chrono::steady_clock::now();
     if (lastScene.time_since_epoch().count()) {
@@ -150,9 +194,39 @@ bool GtsDlssPass::Capture(u64 frame, VideoCore::Image& color, VideoCore::Image& 
     jitterX = constants[20] * constants[14];
     jitterY = constants[21] * constants[15];
     copyInput(sourceDepth, depth);
+    if (useFsr || useXess) copyDepthForFsr();
     copyInput(sourceMotion, motion);
     copyInput(color, this->color);
     return true;
+}
+
+void GtsDlssPass::copyDepthForFsr() {
+    // FSR-205: depth plane of the scene depth -> buffer -> R32_SFLOAT image (32-bit float depth
+    // copies out of D32_SFLOAT and D32_SFLOAT_S8_UINT alike).
+    transit(depth, vk::ImageLayout::eTransferSrcOptimal);
+    const vk::BufferImageCopy region{
+        .imageSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 1},
+        .imageExtent = {renderSize.width, renderSize.height, 1}};
+    auto cmdbuf = scheduler.CommandBuffer();
+    cmdbuf.copyImageToBuffer(depth.image, vk::ImageLayout::eTransferSrcOptimal,
+                             depthCopy->buffer, region);
+    const vk::BufferMemoryBarrier2 written{
+        .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+        .buffer = depthCopy->buffer,
+        .size = VK_WHOLE_SIZE};
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{.bufferMemoryBarrierCount = 1,
+                                               .pBufferMemoryBarriers = &written});
+    transit(fsrDepth, vk::ImageLayout::eTransferDstOptimal);
+    const vk::BufferImageCopy toImage{
+        .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .imageExtent = {renderSize.width, renderSize.height, 1}};
+    cmdbuf.copyBufferToImage(depthCopy->buffer, fsrDepth.image,
+                             vk::ImageLayout::eTransferDstOptimal, toImage);
+    transit(fsrDepth, vk::ImageLayout::eShaderReadOnlyOptimal);
+    transit(depth, vk::ImageLayout::eShaderReadOnlyOptimal);
 }
 
 bool GtsDlssPass::HasScene(u64 frame, u64 uid) const {
@@ -184,6 +258,64 @@ void GtsDlssPass::Resolve(u64 frame, VideoCore::Image& display) {
                     vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);
     runtime.FlushBarriers();
     transit(reconstruction, vk::ImageLayout::eGeneral);
+    if (useFsr || useXess) {
+        // FSR-200: FSR reads the picture in its own A2B10G10R10 layout, so its output needs no
+        // red/blue swap (the DLSS path reads it swapped and swaps back when copying).
+        VideoCore::ImageViewInfo colorInfo{};
+        colorInfo.format = display.info.pixel_format;
+        const RytyFsr3::TemporalFrame fsrFrame{
+            .color = display.GetImage(),
+            .color_format = display.info.pixel_format,
+            .depth = fsrDepth.image,
+            .depth_format = fsrDepth.format,
+            .motion = motion.image,
+            .motion_format = motion.format,
+            .output = reconstruction.image,
+            .output_format = reconstruction.format,
+            .color_view = useXess ? *display.FindView(colorInfo).image_view : vk::ImageView{},
+            .depth_view = fsrDepth.view.get(),
+            .motion_view = motion.view.get(),
+            .output_view = reconstruction.view.get(),
+            .render_size = renderSize,
+            .output_size = outputSize,
+            .jitter_x = jitterX,
+            .jitter_y = jitterY,
+            .motion_scale_x = -float(renderSize.width) * .5f,
+            .motion_scale_y = float(renderSize.height) * .5f,
+            .frame_time_ms = frameTimeMs,
+            .sharpness = EmulatorSettings.IsRcasEnabled()
+                             ? 1.f - EmulatorSettings.GetRcasAttenuation() / 2000.f
+                             : -1.f,
+            .reset = reset,
+        };
+        const bool ok =
+            useXess ? xess.Evaluate(instance.GetInstance(), instance.GetPhysicalDevice(),
+                                    instance.GetDevice(), scheduler.DirectCommandBuffer(), fsrFrame)
+                    : fsr.Evaluate(instance.GetPhysicalDevice(), instance.GetDevice(),
+                                   scheduler.DirectCommandBuffer(), fsrFrame);
+        scheduler.GetDynamicState().Invalidate();
+        if (!ok) { failed = true; return; }
+        ++evaluatedFrames;
+        static u32 loggedFrames = 0;
+        if (loggedFrames++ < 8) {
+            LOG_INFO(Render_Vulkan, "{}: frame {} reset {} jitter ({}, {})",
+                     useXess ? "XESS-200" : "FSR-200", frame, reset, jitterX, jitterY);
+        }
+        reset = false;
+        // FSR-208: a transfer blit into the HUD image instead of the copy draw (FSR and XeSS need
+        // no red/blue swap); the draw faulted the GPU on an RX 7600.
+        transit(reconstruction, vk::ImageLayout::eTransferSrcOptimal);
+        transit(native, vk::ImageLayout::eTransferDstOptimal);
+        scheduler.DirectCommandBuffer().blitImage(
+            reconstruction.image, vk::ImageLayout::eTransferSrcOptimal, native.image,
+            vk::ImageLayout::eTransferDstOptimal, Blit(outputSize, outputSize), vk::Filter::eNearest);
+        transit(reconstruction, vk::ImageLayout::eShaderReadOnlyOptimal);
+        transit(native, vk::ImageLayout::eColorAttachmentOptimal);
+        displayUid = display.image_uid;
+        outputFrame = frame;
+        nativeDirty = true;
+        return;
+    }
     VideoCore::ImageViewInfo viewInfo{};
     viewInfo.format = vk::Format::eA2R10G10B10UnormPack32;
     const auto view = *display.FindView(viewInfo).image_view;

@@ -1822,7 +1822,14 @@ void Rasterizer::applyTemporalDlss(const GraphicsPipeline* pipeline, const Rende
         return;
     }
 
-    if (state.num_color_attachments != 1 || !target->usage.vo_surface ||
+    // FSR-203: the race's display buffers are not always marked vo_surface by the time the game
+    // draws the scene into them (seen on an RX 7600 with 0062); a draw that reads this frame's
+    // captured scene at the scene's size is the display draw.
+    const bool readsScene = std::ranges::any_of(ctx->bound_textures, [&](const auto& binding) {
+        return temporalDlss.HasScene(frame, texture_cache.GetImage(binding.image_id).image_uid);
+    });
+    const bool display = target->usage.vo_surface || readsScene;
+    if (state.num_color_attachments != 1 || !display ||
         ctx->db_desc.first || regs.blend_control[0].enable ||
         target->info.pixel_format != vk::Format::eA2B10G10R10UnormPack32 ||
         (!parameterAddress(304) && !parameterAddress(288))) return;
@@ -2091,7 +2098,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
             FrameDumpPass(regs, state, pipeline); // NAT-117
         }
 #ifdef RYTY_GPU
-        if (RytyDlss::TemporalEnabled()) applyTemporalDlss(pipeline, state, true);
+        if (temporalDlss.Enabled()) applyTemporalDlss(pipeline, state, true);
         prepareNativeHud(state);
 #endif
 
@@ -2135,7 +2142,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
     DebugState.IncDrawCall();
 #ifdef RYTY_GPU
-    if (RytyDlss::TemporalEnabled()) applyTemporalDlss(pipeline, state);
+    if (temporalDlss.Enabled()) applyTemporalDlss(pipeline, state);
 #endif
 
     // DIAG-041: draws into GT Sport's car thumbnail (448x126 linear targets) and into the watched
@@ -3731,7 +3738,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         RebindTextures(pipeline->IsCompute(), num_color_targets);
     }
 #ifdef RYTY_GPU
-    if (RytyDlss::TemporalEnabled()) {
+    if (temporalDlss.Enabled()) {
         const u64 frame = g_prepared_frames.load(std::memory_order_relaxed);
         for (const auto& binding : ctx->bound_textures) {
             auto& image = texture_cache.GetImage(binding.image_id);
@@ -4549,7 +4556,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 }();
                 const bool read_in_place = [&] {
 #ifdef RYTY_GPU
-                    if (RytyDlss::TemporalEnabled() && stage.sw_stage == Shader::SwStage::Fragment &&
+                    if (temporalDlss.Enabled() && stage.sw_stage == Shader::SwStage::Fragment &&
                         stage.images.size() == 4 && size == 112) return false;
 #endif
                     // DIAG-128 bisect: SHADGT_DIRECT_READS_STAGES=<hex mask of SwStage bits>,
@@ -5743,7 +5750,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
 
 #ifdef RYTY_GPU
 void Rasterizer::prepareNativeHud(RenderState& state) {
-    if (!RytyDlss::TemporalEnabled() || !ctx->cb_descs[0].image_id) return;
+    if (!temporalDlss.Enabled() || !ctx->cb_descs[0].image_id) return;
     auto& display = texture_cache.GetImage(ctx->cb_descs[0].image_id);
     const u64 frame = g_prepared_frames.load(std::memory_order_relaxed);
     if (state.num_color_attachments == 1 && !ctx->db_desc.first) {
