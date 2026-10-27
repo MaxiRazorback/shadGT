@@ -28,6 +28,12 @@
 
 namespace Vulkan {
 
+static StoreGpuFamily g_store_gpu_family{StoreGpuFamily::Other}; // AMD-312
+
+StoreGpuFamily GetStoreGpuFamily() {
+    return g_store_gpu_family;
+}
+
 namespace {
 
 std::vector<vk::PhysicalDevice> EnumeratePhysicalDevices(vk::UniqueInstance& instance) {
@@ -923,6 +929,11 @@ void Instance::CollectDeviceParameters() {
 
     LOG_INFO(Render_Vulkan, "GPU_Vendor: {}", vendor_name);
     LOG_INFO(Render_Vulkan, "GPU_Model: {}", model_name);
+    // AMD-312: Radeon RX 9000 cards (RDNA4) get a shader store of their own version.
+    if (driver_id == vk::DriverId::eAmdProprietary &&
+        model_name.find("Radeon RX 9") != std::string::npos) {
+        g_store_gpu_family = StoreGpuFamily::AmdRdna4;
+    }
     LOG_INFO(Render_Vulkan, "GPU_Integrated: {}", IsIntegrated() ? "Yes" : "No");
     LOG_INFO(Render_Vulkan, "GPU_Vulkan_Driver: {}", driver_name);
     LOG_INFO(Render_Vulkan, "GPU_Vulkan_Version: {}", api_version);

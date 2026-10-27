@@ -127,9 +127,14 @@ void DataBase::Open() {
         // goes with it, so the next Play prepares the pack into the new store. Raise the
         // version whenever a change makes stored translations wrong.
         // AMD-311: each vertex order of AMD's per-vertex reads has a store of its own version.
+        // AMD-312: Radeon RX 9000 cards (RDNA4) use store 4: an RX 9060 XT drew the road at
+        // Brands Hatch as streaks with a store made earlier and right once it was translated
+        // again. Other GPUs (the RX 7000 series) keep store 3, so their store stays in use.
         const char* order_env = std::getenv("SHADGT_AMD_VERTEX_ORDER");
+        const bool rdna4 = Vulkan::GetStoreGpuFamily() == Vulkan::StoreGpuFamily::AmdRdna4;
         const std::string StoreVersion =
-            std::string{"RyGT shader store 4 (FIX-215/216 NaN on AMD, AMD-311 vertex order)"} +
+            std::string{rdna4 ? "RyGT shader store 4 (FIX-215/216 NaN on AMD, AMD-311 vertex order)"
+                              : "RyGT shader store 3 (FIX-215/216 MED3, MIN3, MAX3 NaN on AMD)"} +
             (order_env && *order_env ? fmt::format(", SHADGT_AMD_VERTEX_ORDER={}", order_env[0])
                                      : std::string{});
         const auto version_path = cache_path / "store-version.txt";

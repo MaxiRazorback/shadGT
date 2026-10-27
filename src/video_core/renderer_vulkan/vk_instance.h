@@ -601,4 +601,8 @@ private:
     std::vector<size_t> valid_heaps;
 };
 
+/// AMD-312: which shader store version the selected GPU uses (see cache_storage.cpp).
+enum class StoreGpuFamily { Other, AmdRdna4 };
+StoreGpuFamily GetStoreGpuFamily();
+
 } // namespace Vulkan
