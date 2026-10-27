@@ -74,7 +74,16 @@ Id EmitFPMaxTri32(EmitContext& ctx, Id a, Id b, Id c) {
 
 Id EmitFPMedTri32(EmitContext& ctx, Id a, Id b, Id c) {
     if (ctx.profile.supports_trinary_minmax) {
-        return ctx.OpFMid3AMD(ctx.F32[1], a, b, c);
+        // FIX-215: GCN MED3 with a quiet NaN returns the minimum of the numeric operands.
+        // SPV_AMD_shader_trinary_minmax leaves FMid3AMD with a NaN operand undefined; GT Sport's
+        // (65000, NaN, 0) HDR clamp then drew white car materials and too much bloom on Radeons,
+        // so the NaN case is selected explicitly.
+        const Id any_nan{ctx.OpLogicalOr(ctx.U1[1], ctx.OpIsNan(ctx.U1[1], a),
+            ctx.OpLogicalOr(ctx.U1[1], ctx.OpIsNan(ctx.U1[1], b), ctx.OpIsNan(ctx.U1[1], c)))};
+        const Id nan_result{
+            ctx.OpNMin(ctx.F32[1], ctx.OpNMin(ctx.F32[1], a, b), c)};
+        return ctx.OpSelect(ctx.F32[1], any_nan, nan_result,
+                            ctx.OpFMid3AMD(ctx.F32[1], a, b, c));
     }
     const Id mmx{ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], a, b), c)};
     return ctx.OpNMax(ctx.F32[1], ctx.OpNMin(ctx.F32[1], a, b), mmx);
