@@ -37,6 +37,7 @@ struct Profile {
     bool support_fp64_signed_zero_inf_nan_preserve{};
     bool supports_image_load_store_lod{};
     bool supports_native_cube_calc{};
+    bool native_cube_sampling{};
     bool supports_trinary_minmax{};
     bool supports_buffer_fp32_atomic_min_max{};
     bool supports_image_fp32_atomic_min_max{};
@@ -46,10 +47,18 @@ struct Profile {
     bool supports_amd_shader_explicit_vertex_parameter{};
     bool supports_fragment_shader_barycentric{};
     bool supports_shader_subgroup_clock{};
+    /// AMD-311: which of the six vertex orders per-vertex reads use with AMD's explicit vertex
+    /// parameter extension (index into AmdVertexOrders in spirv_emit_context.cpp; 0 as before).
+    u32 amd_vertex_order{};
+    /// AMD-313: FIX-215/216's NaN rules for MED3/MIN3/MAX3 on AMD's trinary path (default on).
+    bool amd_nan_rules{true};
     bool has_broken_spirv_clamp{};
     bool lower_left_origin_mode{};
     bool needs_manual_interpolation{};
     bool needs_lds_barriers{};
+    /// FIX-188: #65's Intel Arc translation (memory-only compute barriers, 64-bit shared memory
+    /// as two 32-bit halves); other GPUs keep the translation they had before it.
+    bool intel_arc_workarounds{};
     bool needs_buffer_offsets{};
     bool needs_unorm_fixup{};
     bool needs_clip_distance_emulation{};

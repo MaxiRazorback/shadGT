@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <cstdlib>
+
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -14,14 +17,22 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/image_allocation.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #ifdef RYTY_GPU
 #include "ryty_gpu/ryty_dlss.h"
+#include "ryty_gpu/ryty_xess.h"
 #endif
 
 #include <vk_mem_alloc.h>
 
 namespace Vulkan {
+
+static StoreGpuFamily g_store_gpu_family{StoreGpuFamily::Other}; // AMD-312
+
+StoreGpuFamily GetStoreGpuFamily() {
+    return g_store_gpu_family;
+}
 
 namespace {
 
@@ -89,6 +100,73 @@ std::unordered_map<vk::Format, vk::FormatProperties3> GetFormatProperties(
 std::string GetReadableVersion(u32 version) {
     return fmt::format("{}.{}.{}", VK_VERSION_MAJOR(version), VK_VERSION_MINOR(version),
                        VK_VERSION_PATCH(version));
+}
+
+// AMD-300 (SHADGT_SIMULATE_GPU=gcn|rdna1|rdna2): the device reports only what an older Radeon's
+// Windows driver offers (gpuinfo.org: RX 580/RX Vega 2.0.283, RX 5700 XT/RX 6800 2.0.353), so a
+// newer card exercises the paths those cards take. It cannot change the hardware's wave size.
+enum class SimulatedGpu { None, Gcn, Rdna1, Rdna2 };
+
+SimulatedGpu GetSimulatedGpu() {
+    static const SimulatedGpu simulated = [] {
+        const char* env = std::getenv("SHADGT_SIMULATE_GPU");
+        const std::string_view name = env ? env : "";
+        if (name == "gcn" || name == "polaris" || name == "vega") {
+            return SimulatedGpu::Gcn;
+        }
+        if (name == "rdna1") {
+            return SimulatedGpu::Rdna1;
+        }
+        if (name == "rdna2") {
+            return SimulatedGpu::Rdna2;
+        }
+        return SimulatedGpu::None;
+    }();
+    return simulated;
+}
+
+/// AMD-300: SHADGT_SIMULATE_SKIP=<item>,... keeps items real: extension names, f16, gpl, v3d,
+/// af2, sub, push.
+bool Simulates(std::string_view item) {
+    static const std::string skip = [] {
+        const char* env = std::getenv("SHADGT_SIMULATE_SKIP");
+        return std::string{env ? env : ""};
+    }();
+    for (size_t pos = 0; pos <= skip.size();) {
+        const size_t end = std::min(skip.find(',', pos), skip.size());
+        if (std::string_view{skip}.substr(pos, end - pos) == item) {
+            return false;
+        }
+        pos = end + 1;
+    }
+    return true;
+}
+
+void HideSimulatedExtensions(std::vector<std::string>& extensions) {
+    std::vector<std::string_view> hidden;
+    switch (GetSimulatedGpu()) {
+    case SimulatedGpu::Gcn:
+        hidden = {VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME,
+                  VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME,
+                  VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME,
+                  VK_EXT_SHADER_ATOMIC_FLOAT_2_EXTENSION_NAME,
+                  VK_EXT_IMAGE_2D_VIEW_OF_3D_EXTENSION_NAME,
+                  VK_EXT_SHADER_OBJECT_EXTENSION_NAME,
+                  VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME,
+                  VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME};
+        break;
+    case SimulatedGpu::Rdna1:
+        hidden = {VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME};
+        break;
+    default:
+        return;
+    }
+    std::erase_if(extensions, [&](const std::string& name) {
+        const bool driver_side = name == VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME ||
+                                 name == VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME;
+        return std::ranges::find(hidden, std::string_view{name}) != hidden.end() &&
+               Simulates(name) && (!driver_side || Simulates("driver"));
+    });
 }
 
 } // Anonymous namespace
@@ -167,6 +245,7 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
     }
 
     available_extensions = GetSupportedExtensions(physical_device);
+    HideSimulatedExtensions(available_extensions); // AMD-300
     format_properties = GetFormatProperties(physical_device);
     properties = physical_device.getProperties();
     memory_properties = physical_device.getMemoryProperties();
@@ -184,6 +263,8 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
 
 Instance::~Instance() {
     ImGui::Core::Shutdown(GetDevice());
+    VideoCore::ClearRecycledImages(allocator);
+    DestroySmallImageAllocationPools(allocator);
     vmaDestroyAllocator(allocator);
 }
 
@@ -207,7 +288,7 @@ std::string Instance::GetDriverVersionName() {
 }
 
 bool Instance::CreateDevice() {
-    const vk::StructureChain feature_chain = physical_device.getFeatures2<
+    vk::StructureChain feature_chain = physical_device.getFeatures2<
         vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features,
         vk::PhysicalDeviceVulkan12Features, vk::PhysicalDeviceVulkan13Features,
         vk::PhysicalDeviceRobustness2FeaturesEXT,
@@ -216,8 +297,39 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT,
         vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
         vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR,
-        vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>();
+        vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT,
+        vk::PhysicalDeviceMemoryPriorityFeaturesEXT,
+        vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>();
     features = feature_chain.get().features;
+    // AMD-300: the features an older Radeon's driver turns off.
+    if (const auto simulated = GetSimulatedGpu(); simulated != SimulatedGpu::None) {
+        auto& vk11 = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
+        auto& vk12 = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
+        vk11.storagePushConstant16 = false;
+        if (simulated == SimulatedGpu::Gcn) {
+            vk12.shaderFloat16 = vk12.shaderFloat16 && !Simulates("f16");
+            if (Simulates("gpl")) {
+                feature_chain.get<vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>()
+                    .graphicsPipelineLibrary = false;
+            }
+            if (Simulates("v3d")) {
+                auto& view_of_3d = feature_chain.get<vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT>();
+                view_of_3d.image2DViewOf3D = false;
+                view_of_3d.sampler2DViewOf3D = false;
+            }
+            if (Simulates("af2")) {
+                auto& atomic_float2 =
+                    feature_chain.get<vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT>();
+                atomic_float2.shaderBufferFloat32AtomicMinMax = false;
+                atomic_float2.shaderSharedFloat32AtomicMinMax = false;
+                atomic_float2.shaderImageFloat32AtomicMinMax = false;
+            }
+        }
+        LOG_WARNING(Render_Vulkan, "AMD-300: simulating an older Radeon ({})",
+                    simulated == SimulatedGpu::Gcn     ? "GCN: RX 400/500, Vega"
+                    : simulated == SimulatedGpu::Rdna1 ? "RDNA 1: RX 5000"
+                                                       : "RDNA 2: RX 6000");
+    }
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
         vk::PhysicalDeviceProperties2, vk::PhysicalDeviceVulkan11Properties,
@@ -227,6 +339,18 @@ bool Instance::CreateDevice() {
     vk12_props = properties_chain.get<vk::PhysicalDeviceVulkan12Properties>();
     vk13_props = properties_chain.get<vk::PhysicalDeviceVulkan13Properties>();
     push_descriptor_props = properties_chain.get<vk::PhysicalDevicePushDescriptorPropertiesKHR>();
+    if (const auto simulated = GetSimulatedGpu(); simulated != SimulatedGpu::None) {
+        // AMD-300: before RDNA 3 only compute takes a required subgroup size, and GCN runs 64 only.
+        if (Simulates("sub")) {
+            vk13_props.requiredSubgroupSizeStages = vk::ShaderStageFlagBits::eCompute;
+        }
+        if (simulated == SimulatedGpu::Gcn && Simulates("sub")) {
+            vk13_props.minSubgroupSize = 64;
+        }
+        if (simulated == SimulatedGpu::Gcn && Simulates("push")) {
+            properties.limits.maxPushConstantsSize = 128;
+        }
+    }
     LOG_INFO(Render_Vulkan, "Physical device subgroup size {}", vk11_props.subgroupSize);
 
     if (available_extensions.empty()) {
@@ -316,6 +440,14 @@ bool Instance::CreateDevice() {
         LOG_INFO(Render_Vulkan, "- primitiveTopologyPatchListRestart: {}",
                  list_restart_features.primitiveTopologyPatchListRestart);
     }
+    // AMD-311: SHADGT_AMD_VERTEX_ORDER=0..5 picks the vertex order of AMD's per-vertex reads
+    // (see spirv_emit_context.cpp); 0, the order an RX 7600 uses, unless set.
+    if (const char* order_env = std::getenv("SHADGT_AMD_VERTEX_ORDER");
+        order_env && order_env[0] >= '0' && order_env[0] <= '5') {
+        amd_vertex_order = u32(order_env[0] - '0');
+    }
+    LOG_INFO(Render_Vulkan, "AMD-311: vertex order of AMD per-vertex reads: {}",
+             amd_vertex_order);
     amd_shader_explicit_vertex_parameter =
         add_extension(VK_AMD_SHADER_EXPLICIT_VERTEX_PARAMETER_EXTENSION_NAME);
     if (!amd_shader_explicit_vertex_parameter) {
@@ -327,6 +459,11 @@ bool Instance::CreateDevice() {
     image_load_store_lod = add_extension(VK_AMD_SHADER_IMAGE_LOAD_STORE_LOD_EXTENSION_NAME);
     amd_gcn_shader = add_extension(VK_AMD_GCN_SHADER_EXTENSION_NAME);
     amd_shader_trinary_minmax = add_extension(VK_AMD_SHADER_TRINARY_MINMAX_EXTENSION_NAME);
+    // AMD-302: translated shaders that use 16-bit floats declare Float16, which needs
+    // shaderFloat16 or AMD's half-float extension. RX 400/500 (Polaris) have only the extension.
+    if (!feature_chain.get<vk::PhysicalDeviceVulkan12Features>().shaderFloat16) {
+        add_extension(VK_AMD_GPU_SHADER_HALF_FLOAT_EXTENSION_NAME);
+    }
     nv_framebuffer_mixed_samples = add_extension(VK_NV_FRAMEBUFFER_MIXED_SAMPLES_EXTENSION_NAME);
     amd_mixed_attachment_samples = add_extension(VK_AMD_MIXED_ATTACHMENT_SAMPLES_EXTENSION_NAME);
     shader_atomic_float = add_extension(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
@@ -366,6 +503,17 @@ bool Instance::CreateDevice() {
     }
     image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    const char* paging_setting = std::getenv("RYGT_PAGEABLE_VRAM");
+    const bool pageable_memory =
+        (!paging_setting || paging_setting[0] != '0') &&
+        feature_chain.get<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>().memoryPriority &&
+        feature_chain.get<vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>()
+            .pageableDeviceLocalMemory &&
+        add_extension(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME) &&
+        add_extension(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
+    LOG_INFO(Render_Vulkan,
+             "VRAM paging enabled={}: supported device-local allocations may spill to system RAM",
+             pageable_memory);
     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     if (shader_clock) {
         shader_clock_features = feature_chain.get<vk::PhysicalDeviceShaderClockFeaturesKHR>();
@@ -378,6 +526,19 @@ bool Instance::CreateDevice() {
     // ryGT: the device extensions NVIDIA DLSS needs, when the DLSS plugin is used.
     RytyDlss::AddDeviceExtensions(*instance, physical_device,
                                   [&](std::string_view name) { return add_extension(name); });
+#endif
+    // DIAG-206: the driver's report of what faulted when the device is lost.
+    device_fault = add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+    // XESS-200: Intel XeSS's device extensions and features, only when it is the upscaler.
+    bool xess = false;
+    bool xess_mutable_descriptor = false;
+#ifdef RYTY_GPU
+    xess = RytyXess::Load();
+    RytyXess::AddDeviceExtensions(*instance, physical_device, [&](std::string_view name) {
+        const bool added = add_extension(name);
+        xess_mutable_descriptor |= added && name == VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME;
+        return added;
+    });
 #endif
 
     const auto family_properties = physical_device.getQueueFamilyProperties();
@@ -446,6 +607,8 @@ bool Instance::CreateDevice() {
                 .shaderImageGatherExtended = features.shaderImageGatherExtended,
                 .shaderStorageImageExtendedFormats = features.shaderStorageImageExtendedFormats,
                 .shaderStorageImageMultisample = features.shaderStorageImageMultisample,
+                .shaderStorageImageWriteWithoutFormat =
+                    xess && features.shaderStorageImageWriteWithoutFormat,
                 .shaderClipDistance = features.shaderClipDistance,
                 .shaderFloat64 = features.shaderFloat64,
                 .shaderInt64 = features.shaderInt64,
@@ -478,10 +641,15 @@ bool Instance::CreateDevice() {
         },
         vk::PhysicalDeviceVulkan13Features{
             .robustImageAccess = vk13_features.robustImageAccess,
+            // FIX-188: Intel Arc (#65).
+            .pipelineCreationCacheControl =
+                IsIntel() && vk13_features.pipelineCreationCacheControl,
             .shaderDemoteToHelperInvocation = vk13_features.shaderDemoteToHelperInvocation,
             .subgroupSizeControl = vk13_features.subgroupSizeControl,
+            .computeFullSubgroups = IsIntel() && vk13_features.computeFullSubgroups,
             .synchronization2 = vk13_features.synchronization2,
             .dynamicRendering = vk13_features.dynamicRendering,
+            .shaderIntegerDotProduct = xess && vk13_features.shaderIntegerDotProduct, // XESS-200
             .maintenance4 = vk13_features.maintenance4,
         },
         // Extensions
@@ -561,7 +729,29 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT{
             .graphicsPipelineLibrary = true,
         },
+        vk::PhysicalDeviceMemoryPriorityFeaturesEXT{
+            .memoryPriority = pageable_memory,
+        },
+        vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT{
+            .pageableDeviceLocalMemory = pageable_memory,
+        },
+        vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT{
+            .mutableDescriptorType = true, // XESS-200
+        },
+        vk::PhysicalDeviceFaultFeaturesEXT{
+            .deviceFault = true, // DIAG-206
+        },
     };
+    if (!device_fault) {
+        device_chain.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
+    }
+    if (!xess_mutable_descriptor) {
+        device_chain.unlink<vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT>();
+    }
+    if (!pageable_memory) {
+        device_chain.unlink<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>();
+        device_chain.unlink<vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>();
+    }
     if (!graphics_pipeline_library) {
         device_chain.unlink<vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>();
     }
@@ -618,10 +808,39 @@ bool Instance::CreateDevice() {
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {
+        // ryGT: on some NVIDIA driver and setup combinations the driver rejects the device once
+        // VK_NVX_binary_import (DLSS) is enabled. The game then runs without DLSS, on FSR.
+        const auto is_nvx = [](const char* name) {
+            return std::string_view{name} == VK_NVX_BINARY_IMPORT_EXTENSION_NAME ||
+                   std::string_view{name} == VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME;
+        };
+        const auto nvx = std::remove_if(enabled_extensions.begin(), enabled_extensions.end(), is_nvx);
+        if (nvx != enabled_extensions.end()) {
+            LOG_WARNING(Render_Vulkan,
+                        "Device creation failed ({}) with the DLSS extensions; retrying without them",
+                        vk::to_string(device_result));
+            enabled_extensions.erase(nvx, enabled_extensions.end());
+            auto& create_info = device_chain.get<vk::DeviceCreateInfo>();
+            create_info.enabledExtensionCount = static_cast<u32>(enabled_extensions.size());
+            create_info.ppEnabledExtensionNames = enabled_extensions.data();
+            auto retry = physical_device.createDeviceUnique(device_chain.get());
+            device_result = retry.result;
+            dev = std::move(retry.value);
+        }
+    }
+    if (device_result != vk::Result::eSuccess) {
         LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}", vk::to_string(device_result));
         return false;
     }
     device = std::move(dev);
+    // AMD-300: with "driver" skipped, the driver keeps both extensions on while the renderer
+    // takes the paths a card without them takes (renderer path or driver mode?).
+    if (GetSimulatedGpu() == SimulatedGpu::Gcn && !Simulates("driver")) {
+        graphics_pipeline_library = graphics_pipeline_library && !Simulates(
+                                        VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+        vertex_input_dynamic_state = vertex_input_dynamic_state && !Simulates(
+                                         VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
+    }
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
 
@@ -677,6 +896,9 @@ void Instance::CreateAllocator() {
         .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
         .physicalDevice = physical_device,
         .device = *device,
+        // Small persistent images must not pin mostly empty 256 MiB scene blocks.
+        // VMA still creates dedicated allocations for resources too large to pool.
+        .preferredLargeHeapBlockSize = 32_MB,
         .pVulkanFunctions = &functions,
         .instance = *instance,
         .vulkanApiVersion = TargetVulkanApiVersion,
@@ -707,6 +929,15 @@ void Instance::CollectDeviceParameters() {
 
     LOG_INFO(Render_Vulkan, "GPU_Vendor: {}", vendor_name);
     LOG_INFO(Render_Vulkan, "GPU_Model: {}", model_name);
+    // AMD-312: Radeon RX 9000 cards (RDNA4) and RX 7000 cards (RDNA3) get shader stores of
+    // their own versions; RX 7000 cards also leave FIX-215/216 out (AMD-313).
+    if (driver_id == vk::DriverId::eAmdProprietary) {
+        if (model_name.find("Radeon RX 9") != std::string::npos) {
+            g_store_gpu_family = StoreGpuFamily::AmdRdna4;
+        } else if (model_name.find("Radeon RX 7") != std::string::npos) {
+            g_store_gpu_family = StoreGpuFamily::AmdRdna3;
+        }
+    }
     LOG_INFO(Render_Vulkan, "GPU_Integrated: {}", IsIntegrated() ? "Yes" : "No");
     LOG_INFO(Render_Vulkan, "GPU_Vulkan_Driver: {}", driver_name);
     LOG_INFO(Render_Vulkan, "GPU_Vulkan_Version: {}", api_version);
@@ -871,6 +1102,43 @@ vk::Format Instance::GetSupportedFormat(const vk::Format format,
         }
     }
     return format;
+}
+
+void Instance::LogDeviceFault() const {
+    // DIAG-206: once, after the device was lost.
+    static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+    if (!device_fault || logged.test_and_set()) {
+        return;
+    }
+    const auto get_fault = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(
+        VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr(static_cast<VkDevice>(*device),
+                                                          "vkGetDeviceFaultInfoEXT"));
+    if (!get_fault) {
+        return;
+    }
+    VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    if (get_fault(static_cast<VkDevice>(*device), &counts, nullptr) != VK_SUCCESS &&
+        counts.addressInfoCount == 0 && counts.vendorInfoCount == 0) {
+        LOG_CRITICAL(Render_Vulkan, "DIAG-206: the driver has no fault report");
+        return;
+    }
+    std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+    std::vector<VkDeviceFaultVendorInfoEXT> vendor(counts.vendorInfoCount);
+    VkDeviceFaultInfoEXT info{VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+    info.pAddressInfos = addresses.data();
+    info.pVendorInfos = vendor.data();
+    counts.vendorBinarySize = 0;
+    get_fault(static_cast<VkDevice>(*device), &counts, &info);
+    LOG_CRITICAL(Render_Vulkan, "DIAG-206: device fault: {}", info.description);
+    for (const auto& address : addresses) {
+        LOG_CRITICAL(Render_Vulkan, "DIAG-206: address type {} at {:#x} (precision {:#x})",
+                     int(address.addressType), address.reportedAddress,
+                     address.addressPrecision);
+    }
+    for (const auto& entry : vendor) {
+        LOG_CRITICAL(Render_Vulkan, "DIAG-206: vendor fault {:#x} data {:#x}: {}",
+                     entry.vendorFaultCode, entry.vendorFaultData, entry.description);
+    }
 }
 
 } // namespace Vulkan

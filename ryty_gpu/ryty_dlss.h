@@ -14,6 +14,7 @@
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/image.h"
+#include "ryty_gpu/rygt_dlss_api.h"
 
 namespace Vulkan::RytyDlss {
 
@@ -33,6 +34,21 @@ bool Init(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Device 
 
 /// Releases DLSS; the device must be idle.
 void Shutdown();
+
+bool TemporalRequested();
+bool TemporalEnabled();
+RygtDlssQuality Quality();
+bool GetOptimalSettings(u32 width, u32 height, RygtDlssQuality quality,
+                        RygtDlssOptimalSettings& settings);
+bool EvaluateTemporal(vk::CommandBuffer cmdbuf, const RygtDlssFrame& frame);
+/// Whether DLSS can scale input_size to output_size now.
+bool CanScale(vk::Extent2D input_size, vk::Extent2D output_size);
+
+/// UI-HIRES: scales the game picture (readable by shaders) into an R16G16B16A16 output image
+/// with storage usage, left in the general layout. False when DLSS is off or failed.
+bool ScaleInto(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::ImageView input,
+               vk::Format input_format, vk::Extent2D input_size, vk::Image output_image,
+               vk::ImageView output, vk::Extent2D output_size);
 
 /// Scales the game picture into an output image at the window size, like the FSR pass.
 class Pass {

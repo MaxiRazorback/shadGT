@@ -205,6 +205,9 @@ void GameController::SetTouchpadState(int touch_index, bool touch_down, float x,
 void GameController::ConnectController(SDL_Gamepad* pad) {
     std::lock_guard lock{m_state_mutex};
     m_sdl_gamepad = pad;
+    m_trigger_initialized = false;
+    m_trigger_failed = false;
+    m_trigger_sent = 0;
     if (override_colour) {
         SetLightBarRGB({});
     }
@@ -222,8 +225,19 @@ void GameController::ConnectController(SDL_Gamepad* pad) {
 
 void GameController::DisconnectController() {
     std::lock_guard lock{m_state_mutex};
+    if (m_sdl_gamepad) {
+        if (SDL_GetGamepadType(m_sdl_gamepad) == SDL_GAMEPAD_TYPE_PS5) {
+            const auto stop = TriggerFeedback::DualSensePacket(TriggerFeedback::Vibration(0),
+                                                               TriggerFeedback::Vibration(0));
+            SDL_SendGamepadEffect(m_sdl_gamepad, stop.data(), static_cast<int>(stop.size()));
+        } else if (SDL_GetBooleanProperty(SDL_GetGamepadProperties(m_sdl_gamepad),
+                       SDL_PROP_GAMEPAD_CAP_TRIGGER_RUMBLE_BOOLEAN, false)) {
+            SDL_RumbleGamepadTriggers(m_sdl_gamepad, 0, 0, 0);
+        }
+    }
     m_states_queue.Clear();
     m_sdl_gamepad = nullptr;
+    m_trigger_initialized = false;
 
     const u8 connected_count = m_state.connected_count;
     m_state = {};
@@ -317,6 +331,38 @@ bool GameController::SetVibration(u8 smallMotor, u8 largeMotor) {
     return true;
 }
 
+void GameController::SetTriggerFeedback(const TriggerFeedback::Effect& left,
+                                       const TriggerFeedback::Effect& right,
+                                       u8 leftRumble, u8 rightRumble) {
+    std::lock_guard lock{m_state_mutex};
+    if (!m_sdl_gamepad) return;
+    const bool dualsense = SDL_GetGamepadType(m_sdl_gamepad) == SDL_GAMEPAD_TYPE_PS5;
+    if (!dualsense && !SDL_GetBooleanProperty(SDL_GetGamepadProperties(m_sdl_gamepad),
+                           SDL_PROP_GAMEPAD_CAP_TRIGGER_RUMBLE_BOOLEAN, false)) return;
+    const auto packet = TriggerFeedback::DualSensePacket(left, right);
+    const u16 low = u16{leftRumble} * 257, high = u16{rightRumble} * 257;
+    const u64 now = SDL_GetTicks();
+    const bool stopping = TriggerFeedback::stopping.load();
+    // Failed output retries once per second, never once per 4 ms input tick.
+    if (!stopping && m_trigger_failed && now - m_trigger_sent < 1000) return;
+    const bool changed = !m_trigger_initialized || (dualsense ? packet != m_trigger_packet
+                                        : low != m_trigger_left || high != m_trigger_right);
+    const bool refresh = !dualsense && (low || high) && now - m_trigger_sent >= 250;
+    if (!changed && !refresh) return;
+    const bool sent = dualsense
+        ? SDL_SendGamepadEffect(m_sdl_gamepad, packet.data(), static_cast<int>(packet.size()))
+        : SDL_RumbleGamepadTriggers(m_sdl_gamepad, low, high, 500);
+    m_trigger_sent = now;
+    if (!sent && !m_trigger_failed) LOG_DEBUG(Input, "Trigger feedback unavailable: {}", SDL_GetError());
+    m_trigger_failed = !sent;
+    if (sent) {
+        m_trigger_packet = packet;
+        m_trigger_left = low;
+        m_trigger_right = high;
+        m_trigger_initialized = true;
+    }
+}
+
 static bool is_first_check = true;
 
 int (*g_preferred_controller_slot)(u16 vendor, u16 product, int nth) = nullptr;
@@ -329,6 +375,13 @@ void GameControllers::TryOpenSDLControllers() {
 
     std::unordered_set<SDL_JoystickID> assigned_ids;
     std::array<bool, 4> slot_taken{false, false, false, false};
+#ifdef RYTY_GPU
+    // ryGT: GT Sport's Split Screen is for 2 players, so only 2 controller ports; more controllers
+    // stay unassigned until a port is free.
+    constexpr int slots = 2;
+#else
+    constexpr int slots = 4;
+#endif
 
     for (int i = 0; i < 4; i++) {
         SDL_Gamepad* pad = controllers[i]->m_sdl_gamepad;
@@ -344,8 +397,8 @@ void GameControllers::TryOpenSDLControllers() {
                 }
             }
             if (!still_connected) {
-                SDL_CloseGamepad(pad);
                 controllers[i]->DisconnectController();
+                SDL_CloseGamepad(pad);
                 controllers[i]->user_id = -1;
                 slot_taken[i] = false;
             }
@@ -384,8 +437,9 @@ void GameControllers::TryOpenSDLControllers() {
             continue;
         }
 
-        const int first = preferred[j] >= 0 && preferred[j] < 4 ? preferred[j] : 0;
-        for (int k = 0; k < 5; k++) {
+        const int first = preferred[j] >= 0 && preferred[j] < slots ? preferred[j] : 0;
+        bool assigned = false;
+        for (int k = 0; k < slots + 1; k++) {
             const int i = k == 0 ? first : k - 1;
             if (!slot_taken[i]) {
                 auto u = UserManagement.GetUserByPlayerIndex(i + 1);
@@ -402,25 +456,35 @@ void GameControllers::TryOpenSDLControllers() {
                 UserManagement.LoginUser(u, i + 1);
                 c->ConnectController(pad);
                 if (EmulatorSettings.IsMotionControlsEnabled()) {
-                    if (SDL_SetGamepadSensorEnabled(c->m_sdl_gamepad, SDL_SENSOR_GYRO, true)) {
+                    // Motion sensors are optional; only report failures for sensors the pad has.
+                    const bool has_gyro = SDL_GamepadHasSensor(c->m_sdl_gamepad, SDL_SENSOR_GYRO);
+                    if (has_gyro &&
+                        SDL_SetGamepadSensorEnabled(c->m_sdl_gamepad, SDL_SENSOR_GYRO, true)) {
                         const float poll_rate =
                             SDL_GetGamepadSensorDataRate(c->m_sdl_gamepad, SDL_SENSOR_GYRO);
                         LOG_INFO(Input, "Gyro initialized, poll rate: {}", poll_rate);
-                    } else {
+                    } else if (has_gyro) {
                         LOG_ERROR(Input, "Failed to initialize gyro controls for gamepad {}",
                                   c->user_id);
                     }
-                    if (SDL_SetGamepadSensorEnabled(c->m_sdl_gamepad, SDL_SENSOR_ACCEL, true)) {
+                    const bool has_accel = SDL_GamepadHasSensor(c->m_sdl_gamepad, SDL_SENSOR_ACCEL);
+                    if (has_accel &&
+                        SDL_SetGamepadSensorEnabled(c->m_sdl_gamepad, SDL_SENSOR_ACCEL, true)) {
                         const float poll_rate =
                             SDL_GetGamepadSensorDataRate(c->m_sdl_gamepad, SDL_SENSOR_ACCEL);
                         LOG_INFO(Input, "Accel initialized, poll rate: {}", poll_rate);
-                    } else {
+                    } else if (has_accel) {
                         LOG_ERROR(Input, "Failed to initialize accel controls for gamepad {}",
                                   c->user_id);
                     }
                 }
+                assigned = true;
                 break;
             }
+        }
+        if (!assigned) {
+            // No free port (ryGT has 2): closed again, so it can take a port that frees up.
+            SDL_CloseGamepad(pad);
         }
     }
     if (is_first_check) [[unlikely]] {
@@ -434,6 +498,26 @@ void GameControllers::TryOpenSDLControllers() {
     }
     SDL_free(new_joysticks);
 }
+// ryGT: the player ports changed (the in-game Controllers window): every gamepad leaves its port
+// and the ports are filled again with the new choices. A port left without a gamepad keeps the
+// keyboard (player 1).
+void GameControllers::ReassignAll() {
+    for (int i = 0; i < 4; i++) {
+        if (SDL_Gamepad* pad = controllers[i]->m_sdl_gamepad) {
+            controllers[i]->DisconnectController();
+            SDL_CloseGamepad(pad);
+            controllers[i]->user_id = -1;
+        }
+    }
+    TryOpenSDLControllers();
+    if (controllers[0]->m_sdl_gamepad == nullptr) {
+        if (auto* u = UserManagement.GetUserByPlayerIndex(1)) {
+            controllers[0]->user_id = u->user_id;
+            controllers[0]->ConnectController(nullptr);
+        }
+    }
+}
+
 u8 GameControllers::GetGamepadIndexFromJoystickId(SDL_JoystickID id) {
     auto g = SDL_GetGamepadFromID(id);
     ASSERT(g != nullptr);

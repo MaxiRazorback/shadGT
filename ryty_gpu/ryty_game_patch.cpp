@@ -10,6 +10,8 @@
 
 #include <cstdio>
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -28,6 +30,11 @@
 #include "common/perf_monitor.h"
 #include "common/types.h"
 #include "core/debug_state.h"
+#include "core/memory.h"
+#include "ryty_gpu/native/entry_hook.h"
+#include "ryty_gpu/native/menu_snapshot_session.h"
+#include "input/trigger_feedback.h"
+#include "ryty_gpu/ryty_dlssg.h"
 
 namespace Vulkan {
 void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label); // DIAG-067
@@ -618,6 +625,45 @@ void NoteProjectScript(const u8* data, s64 read) {
     }
 }
 
+// DIAG-163: the first 60 scripts the game loads, with their source path and the time since the
+// first one, so a boot that ends early shows how far its scripts got. RYGT_LOG_BOOT=0 turns it off.
+void NoteBootScript(const u8* data, s64 read) {
+    static const bool off = std::getenv("RYGT_LOG_BOOT") && std::getenv("RYGT_LOG_BOOT")[0] == '0';
+    static std::atomic<int> count{0};
+    static const auto first = std::chrono::steady_clock::now();
+    if (off || read < 16 || std::memcmp(data, "ADCH012", 8) != 0) {
+        return;
+    }
+    const int number = ++count;
+    if (number > 60) {
+        return;
+    }
+    // After the header: the symbol count (one byte, plus one more per leading 1 bit of the first,
+    // as ScriptKey reads it), then length-prefixed names; the first is the compiled unit
+    // (_build/.works/gt7sp/network/network.adl, out/.work/projects/gt7sp/gallery/_tmp_gallery.adi).
+    size_t at = 9;
+    for (u8 b = data[8]; b & 0x80; b <<= 1) {
+        ++at;
+    }
+    std::string name = "?";
+    if (at < size_t(read) && !(data[at] & 0x80) && at + 1 + data[at] <= size_t(read)) {
+        name.assign(reinterpret_cast<const char*>(data + at + 1), data[at]);
+    }
+    for (const std::string_view prefix : {"_build/.works/", "out/.work/"}) {
+        if (name.starts_with(prefix)) {
+            name.erase(0, prefix.size());
+        }
+    }
+    for (char& c : name) {
+        c = (c >= 32 && c < 127) ? c : '.';
+    }
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - first)
+                        .count();
+    std::fprintf(stderr, "[boot] script %d (+%lld ms): %s\n", number, static_cast<long long>(ms),
+                 name.c_str());
+}
+
 s64 PS4_SYSV_ABI StreamRefillHook(void* file, GuestIoVec* iov) {
     const s64 read = g_file_read(file, iov);
     if (read <= 0 || !iov || !iov->base) {
@@ -628,6 +674,7 @@ s64 PS4_SYSV_ABI StreamRefillHook(void* file, GuestIoVec* iov) {
     if (!g_script_replacements.empty()) {
         ServeReplacement(file, begin, read);
     }
+    NoteBootScript(begin, read); // DIAG-163
     NoteProjectScript(begin, read); // FIX-110
     static const bool log_scripts = std::getenv("RYGT_LOG_SCRIPTS") != nullptr;
     if (log_scripts) {
@@ -958,12 +1005,147 @@ bool ConfigFlag(const char* key, bool fallback) {
     return text.compare(value, 4, "true") == 0;
 }
 
+// Disable the two motion-blur inputs while retaining the game's normal effect graph.
+// CUSA03220 v1.69: EffectParameter.motionblur.enable (+0x264) and
+// fixmotionblur.enable (+0x288) are read when scheduling the post-process jobs.
+// The combined scene-motion-blur/depth-of-field job must still run for defocus.
+void InstallMotionBlurOption(u8* base) {
+    if (!ConfigFlag("disable_motion_blur", false)) return;
+    const Patch patches[] = {
+        {0x1146c00, {0x80, 0xb8, 0x64, 0x02, 0x00, 0x00, 0x00, 0x0f, 0x95, 0xc1},
+         {0xb9, 0x00, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90, 0x90, 0x90},
+         "motion blur: scene effect disabled"},
+        {0x1146c1b, {0x8a, 0x90, 0x88, 0x02, 0x00, 0x00},
+         {0xb2, 0x00, 0x90, 0x90, 0x90, 0x90}, "motion blur: fixed effect disabled"},
+    };
+    // Check both sites before changing either; other executable versions stay untouched.
+    for (const auto& patch : patches) {
+        MEMORY_BASIC_INFORMATION info{};
+        const auto* target = base + patch.rva;
+        if (!VirtualQuery(target, &info, sizeof(info)) || info.State != MEM_COMMIT ||
+            reinterpret_cast<uintptr_t>(target) + patch.original.size() >
+                reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize ||
+            (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
+            std::memcmp(target, patch.original.data(), patch.original.size()) != 0) {
+            std::fprintf(stderr, "[patch] motion blur: unsupported executable; option not applied\n");
+            return;
+        }
+    }
+    for (const auto& patch : patches) {
+        if (!Apply(base, patch)) return;
+    }
+}
+
+// A setting of the GT Sport config as written (a string without its quotes, a number), or "".
+static std::string ConfigValue(const char* key) {
+    char path[MAX_PATH];
+    const DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) {
+        return {};
+    }
+    std::string config{path, length};
+    config = config.substr(0, config.find_last_of("\\/") + 1) + "user\\custom_configs\\CUSA03220.json";
+    std::FILE* file = std::fopen(config.c_str(), "rb");
+    if (!file) {
+        return {};
+    }
+    std::string text;
+    char chunk[4096];
+    while (const size_t n = std::fread(chunk, 1, sizeof(chunk), file)) {
+        text.append(chunk, n);
+    }
+    std::fclose(file);
+    const std::string quoted = std::string{"\""} + key + "\"";
+    const size_t at = text.find(quoted);
+    if (at == std::string::npos) {
+        return {};
+    }
+    const size_t value = text.find_first_not_of(" \t\r\n:", at + quoted.size());
+    if (value == std::string::npos) {
+        return {};
+    }
+    if (text[value] == '"') {
+        const size_t end = text.find('"', value + 1);
+        return end == std::string::npos ? std::string{} : text.substr(value + 1, end - value - 1);
+    }
+    const size_t end = text.find_first_of(",}\r\n", value);
+    return text.substr(value, end == std::string::npos ? std::string::npos : end - value);
+}
+
+// GTS-009: the camera's aspect ratio for a screen wider (or narrower) than 16:9, from
+// GPU.aspect_ratio: "auto" (the shape of the game's window or screen, from the display settings),
+// "21:9", "32:9", another width:height or a number. 0 when the game's own 16:9 applies.
+// RYGT_ASPECT overrides it.
+namespace Vulkan {
+float RytyDisplayAspect() {
+    static const float aspect = [] {
+        std::string value = ConfigValue("aspect_ratio");
+        if (const char* env = std::getenv("RYGT_ASPECT")) {
+            value = env;
+        }
+        double ratio = 0.0;
+        if (value == "auto") {
+            const bool full = ConfigValue("full_screen") == "true";
+            const bool exclusive = ConfigValue("full_screen_mode") == "Fullscreen";
+            double width = std::atof(ConfigValue("window_width").c_str());
+            double height = std::atof(ConfigValue("window_height").c_str());
+            if (full && !exclusive) { // borderless: the desktop's resolution
+                width = GetSystemMetrics(SM_CXSCREEN);
+                height = GetSystemMetrics(SM_CYSCREEN);
+            }
+            ratio = height > 0.0 ? width / height : 0.0;
+        } else if (const size_t colon = value.find(':'); colon != std::string::npos) {
+            const double height = std::atof(value.substr(colon + 1).c_str());
+            ratio = height > 0.0 ? std::atof(value.substr(0, colon).c_str()) / height : 0.0;
+        } else {
+            ratio = std::atof(value.c_str());
+        }
+        if (!(ratio > 0.5 && ratio < 6.0) || std::abs(ratio - 16.0 / 9.0) < 0.01) {
+            return 0.0f;
+        }
+        return static_cast<float>(ratio);
+    }();
+    return aspect;
+}
+} // namespace Vulkan
+
+// GTS-009: the race camera's view is set up with a 16:9 aspect
+// (eboot 0x5e717f: mov dword [rbx+0x8d464], 1.7777778f); the wider aspect widens its view.
+static void InstallWideCamera(u8* base) {
+    const float aspect = Vulkan::RytyDisplayAspect();
+    if (aspect <= 0.0f) {
+        return;
+    }
+    const float original = 16.0f / 9.0f;
+    std::vector<u8> from(4), to(4);
+    std::memcpy(from.data(), &original, 4);
+    std::memcpy(to.data(), &aspect, 4);
+    if (Apply(base, Patch{0x5f7185, from, to, fmt::format("GTS-009 camera aspect {:.3f}", aspect)})) {
+        std::fprintf(stderr, "[patch] GTS-009: picture stretched to the window\n");
+    }
+}
+
 void InstallMirrorHalfRate(u8* base) {
     bool wanted = ConfigFlag("mirror_half_rate", false);
     if (const char* env = std::getenv("RYGT_MIRROR_HALF")) {
         wanted = env[0] == '1';
     }
     if (!wanted) {
+        return;
+    }
+    bool temporal = ConfigFlag("dlss_enabled", false);
+    if (const char* overrideMode = std::getenv("SHADGT_DLSS_TEMPORAL")) {
+        temporal = std::strcmp(overrideMode, "1") == 0;
+    }
+    // FSR-200: temporal FSR reconstructs from the same scene, so it needs the same continuity.
+    bool fsrTemporal = ConfigFlag("fsr_enabled", false) && ConfigFlag("fsr3_enabled", true) &&
+                       ConfigFlag("fsr_temporal", true);
+    if (const char* overrideMode = std::getenv("SHADGT_FSR_TEMPORAL")) {
+        fsrTemporal = overrideMode[0] == '1';
+    }
+    if (temporal || fsrTemporal) {
+        std::fprintf(stderr, "[patch] GTS-008: half-rate mirror disabled for temporal %s motion continuity\n",
+                     temporal ? "DLSS" : "FSR");
         return;
     }
     constexpr u64 kSite = 0x111011a; // RVA of "cmp byte ptr [r13+0x5a8], 0"
@@ -993,8 +1175,240 @@ void InstallMirrorHalfRate(u8* base) {
                       {std::begin(call), std::end(call)}, "GTS-008 rear-view mirror at half rate"});
 }
 
+namespace {
+using TelemetryUpdateFn = void(PS4_SYSV_ABI*)(void*, void*);
+TelemetryUpdateFn g_telemetry_update{};
+void PS4_SYSV_ABI TelemetryUpdateHook(void* service, void* context) {
+    g_telemetry_update(service, context);
+    const auto* packet = static_cast<const u8*>(service) + 0x1dc;
+    Vulkan::RytyDlssG::PublishTelemetry(packet);
+    Input::TriggerFeedback::Publish(packet);
+}
+void InstallTriggerTelemetry(u8* base) {
+    // CUSA03220 v1.69: SimulatorInterface::update virtual slot, converter RVA.
+    // Validate both the slot and packet-builder magic before touching the table.
+    auto* slot = reinterpret_cast<TelemetryUpdateFn*>(base + 0x2858390);
+    auto original = reinterpret_cast<TelemetryUpdateFn>(base + 0x68cf20);
+    const u8 magic[] = {0xc7, 0x87, 0xdc, 0x01, 0, 0, 0x30, 0x53, 0x37, 0x47};
+    if (*slot != original || std::memcmp(base + 0x68cf53, magic, sizeof(magic)) != 0) return;
+    const char* enabled = std::getenv("RYGT_ADAPTIVE_TRIGGERS");
+    if (enabled && enabled[0] == '0' && !ConfigFlag("dlssg_enabled", false)) return;
+    DWORD protection;
+    if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &protection)) return;
+    g_telemetry_update = original;
+    *slot = &TelemetryUpdateHook;
+    DWORD ignored;
+    VirtualProtect(slot, sizeof(*slot), protection, &ignored);
+}
+} // namespace
+
+namespace {
+// DIAG-161: GT Sport's fatal-error routine (eboot 0x1796f70: source file, line, message) throws the
+// error that ends the game: a script's System.ErrorAbort, a failed native assert. The game shows
+// the message nowhere and then shuts down as if the player quit (a player's window closed right
+// after the boot screen with nothing in the logs). Its entry now prints the message to stderr
+// first. The message is the game's string: an 8-byte header, then the text inline (capacity under
+// 16) or a pointer to it, the size at +0x18 and the capacity at +0x20.
+constexpr u64 kFatalError = 0x1796f70;
+constexpr u8 kFatalErrorPrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41,
+                                      0x56, 0x41, 0x55, 0x41, 0x54, 0x53};
+
+void PS4_SYSV_ABI FatalErrorHook(const char* file, s32 line, const u8* message) {
+    static std::atomic<u32> reported{0};
+    if (reported++ >= 20) {
+        return;
+    }
+    char where[256] = "?";
+    if (file) {
+        for (size_t i = 0; i + 1 < sizeof(where) && Core::RytyMemory::GuardedCopy(where + i, file + i, 1); ++i) {
+            if (where[i] == 0) {
+                break;
+            }
+            where[i + 1] = 0;
+        }
+    }
+    char text[2048] = "";
+    u64 header[5] = {};
+    if (message && Core::RytyMemory::GuardedCopy(header, message, sizeof(header))) {
+        const u64 size = std::min<u64>(header[3], sizeof(text) - 1);
+        const char* data = header[4] >= 0x10 ? reinterpret_cast<const char*>(header[1])
+                                             : reinterpret_cast<const char*>(message + 8);
+        if (size != 0 && Core::RytyMemory::GuardedCopy(text, data, size)) {
+            text[size] = 0;
+        }
+    }
+    std::fprintf(stderr, "[game] fatal error at %s(%d): %s\n", where, line, text);
+    std::fflush(stderr);
+}
+
+void InstallFatalErrorDiag(u8* base) {
+    u8* entry = base + kFatalError + kTextRvaShift;
+    if (std::memcmp(entry, kFatalErrorPrologue, sizeof(kFatalErrorPrologue)) != 0) {
+        std::fprintf(stderr, "[patch] DIAG-161: original bytes differ, not applied\n");
+        return;
+    }
+    u8* stub = AllocNear(base);
+    if (!stub) {
+        std::fprintf(stderr, "[patch] DIAG-161: no memory near the game's code\n");
+        return;
+    }
+    // Saves the argument registers, calls the hook with the stack aligned, restores them, runs the
+    // 13 prologue bytes the jump replaced and jumps back after them.
+    std::vector<u8> code = {0x57, 0x56, 0x52, 0x51, 0x41, 0x50, 0x41, 0x51, // push rdi..r9
+                            0x48, 0x83, 0xec, 0x08,                         // sub rsp, 8
+                            0x48, 0xb8};                                    // mov rax, imm64
+    const u64 hook = reinterpret_cast<u64>(&FatalErrorHook);
+    code.insert(code.end(), reinterpret_cast<const u8*>(&hook), reinterpret_cast<const u8*>(&hook) + 8);
+    code.insert(code.end(), {0xff, 0xd0,                                    // call rax
+                             0x48, 0x83, 0xc4, 0x08,                        // add rsp, 8
+                             0x41, 0x59, 0x41, 0x58, 0x59, 0x5a, 0x5e, 0x5f}); // pop r9..rdi
+    code.insert(code.end(), std::begin(kFatalErrorPrologue), std::end(kFatalErrorPrologue));
+    code.insert(code.end(), {0xff, 0x25, 0, 0, 0, 0});                      // jmp [rip]
+    const u64 back = reinterpret_cast<u64>(entry + sizeof(kFatalErrorPrologue));
+    code.insert(code.end(), reinterpret_cast<const u8*>(&back), reinterpret_cast<const u8*>(&back) + 8);
+    std::memcpy(stub, code.data(), code.size());
+    FlushInstructionCache(GetCurrentProcess(), stub, code.size());
+    u8 jump[sizeof(kFatalErrorPrologue)];
+    std::memset(jump, 0x90, sizeof(jump));
+    jump[0] = 0xe9;
+    const s32 rel = static_cast<s32>(stub - (entry + 5));
+    std::memcpy(jump + 1, &rel, 4);
+    DWORD old_protect = 0;
+    if (!VirtualProtect(entry, sizeof(jump), PAGE_EXECUTE_READWRITE, &old_protect)) {
+        return;
+    }
+    std::memcpy(entry, jump, sizeof(jump));
+    DWORD ignored = 0;
+    VirtualProtect(entry, sizeof(jump), old_protect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), entry, sizeof(jump));
+    std::fprintf(stderr, "[patch] DIAG-161 fatal-error message applied at %#llx\n",
+                 static_cast<unsigned long long>(kFatalError));
+}
+} // namespace
+
+// GTS-009 (UI-HIRES): the game's 4K UI images. The UI resolution flag ([0x143056f29], "4K output
+// and not the override at [0x143056f2b]") is set at its two writers instead, so the menus and the
+// HUD load their _4K packs (twice the image detail) while the game renders at 1080 Pro. Drawn at
+// the window size by UI-HIRES, they are sharp at 1440 and above. With GPU.ui_hires or
+// RYGT_UI_4K_IMAGES=1 (=0 off).
+void InstallUi4kImages(u8* base) {
+    bool wanted = ConfigFlag("ui_hires", false);
+    if (const char* env = std::getenv("RYGT_UI_4K_IMAGES")) {
+        wanted = env[0] == '1';
+    }
+    if (!wanted) {
+        return;
+    }
+    // and al, dl -> mov al, 1; and cl, dl -> mov cl, 1
+    Apply(base, Patch{0xe548e2, {0x20, 0xd0}, {0xb0, 0x01}, "GTS-009 4K UI images (1/2)"});
+    Apply(base, Patch{0xf387b2, {0x20, 0xd1}, {0xb1, 0x01}, "GTS-009 4K UI images (2/2)"});
+}
+
+// The page handoff closes the keyboard even when no dialog was opened.
+// Calling the original close in state zero waits 300 yields before cleanup.
+using OskCloseFn = void(PS4_SYSV_ABI*)(u64);
+OskCloseFn g_osk_close{};
+
+void PS4_SYSV_ABI CloseOskIfActive(u64 keyboard) {
+    u32 state{};
+    if (Core::RytyMemory::GuardedCopy(&state,
+            reinterpret_cast<const void*>(keyboard + 0xf4), sizeof(state)) && state == 0) {
+        return;
+    }
+    // Preserve active, pending and error-state shutdown, including unreadable state.
+    g_osk_close(keyboard);
+}
+
+void InstallIdleKeyboardClose(u8* base) {
+    Native::NearCode code{base};
+    constexpr std::array<u8, 6> prologue{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
+    g_osk_close = reinterpret_cast<OskCloseFn>(Native::HookEntry(
+        code, base, 0xf345a0, prologue, reinterpret_cast<void*>(&CloseOskIfActive),
+        "idle keyboard close"));
+}
+
+// Menu CPU snapshots are unsafe during every native race session, including
+// attract replays which can reuse scripts without updating the project hint.
+using SnapshotSessionFn = void(PS4_SYSV_ABI*)(u64, u64, s32, u64);
+Native::MenuSnapshotSession g_snapshot_session;
+SnapshotSessionFn g_snapshot_start{}, g_snapshot_end{};
+bool g_snapshot_session_ready = false; // Installed before game threads start.
+void PS4_SYSV_ABI SnapshotStart(u64 result, u64 self, s32 argc, u64 argv) {
+    g_snapshot_session.Begin();
+    g_snapshot_start(result, self, argc, argv);
+}
+void PS4_SYSV_ABI SnapshotEnd(u64 result, u64 self, s32 argc, u64 argv) {
+    const auto token = g_snapshot_session.Ending();
+    g_snapshot_end(result, self, argc, argv);
+    g_snapshot_session.End(token);
+}
+void InstallMenuSnapshotSessionGuard(u8* base) {
+    Native::NearCode code{base};
+    constexpr u8 prologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
+    g_snapshot_start = reinterpret_cast<SnapshotSessionFn>(Native::HookEntry(
+        code, base, 0x3e1900, prologue, reinterpret_cast<void*>(&SnapshotStart), "menu snapshot session start"));
+    g_snapshot_end = reinterpret_cast<SnapshotSessionFn>(Native::HookEntry(
+        code, base, 0x3e1b00, prologue, reinterpret_cast<void*>(&SnapshotEnd), "menu snapshot session end"));
+    g_snapshot_session_ready = g_snapshot_start && g_snapshot_end;
+}
+
+// Diagnostic comparison: keep output/UI at 1080p while the allocator experiment
+// supplies 540p scene targets. This scoped helper already supports separate scene
+// scale inputs; its default 1:1 scale otherwise expands scene logical viewports.
+using SceneViewportFn = void(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64,
+                                         float, float, float, float, float, float, u64, u64);
+SceneViewportFn g_scene_viewport{};
+void PS4_SYSV_ABI MatchExperimentalSceneViewport(
+    u64 self, u64 output, u64 auxiliary, u64 scene, u64 depth, u64 motion,
+    float x, float y, float width, float height, float scene_x, float scene_y,
+    u64 extra_a, u64 extra_b) {
+    static const u32 scene_width = [] {
+        const char* value = std::getenv("RYGT_SCENE_WIDTH");
+        return value ? u32(std::strtoul(value, nullptr, 10)) : 960u;
+    }();
+    static const u32 scene_height = [] {
+        const char* value = std::getenv("RYGT_SCENE_HEIGHT");
+        return value ? u32(std::strtoul(value, nullptr, 10)) : 540u;
+    }();
+    u32 output_extent{}, scene_extent{};
+    // These are verified color-target hint fields, not guessed ImageInfo offsets.
+    if (output && scene && scene_x == 1.0f && scene_y == 1.0f &&
+        Core::RytyMemory::GuardedCopy(&output_extent,
+            reinterpret_cast<const void*>(output + 0x44), sizeof(output_extent)) &&
+        Core::RytyMemory::GuardedCopy(&scene_extent,
+            reinterpret_cast<const void*>(scene + 0x44), sizeof(scene_extent)) &&
+        output_extent == 0x04380780 && scene_width >= 320 && scene_width <= 3840 &&
+        scene_height >= 180 && scene_height <= 2160 &&
+        scene_extent == ((scene_height << 16) | scene_width)) {
+        scene_x = float(scene_width) / 1920.f;
+        scene_y = float(scene_height) / 1080.f;
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+            std::fprintf(stderr, "[resolution] scene viewport %ux%u; game composition 1920x1080\n", scene_width, scene_height);
+        }
+    }
+    g_scene_viewport(self, output, auxiliary, scene, depth, motion,
+                     x, y, width, height, scene_x, scene_y, extra_a, extra_b);
+}
+void InstallExperimentalSceneViewport(u8* base) {
+    const char* enabled = std::getenv("RYGT_EXPERIMENTAL_SCENE_VIEWPORT");
+    if (!enabled || std::strcmp(enabled, "1") != 0) return;
+    Native::NearCode code{base};
+    constexpr std::array<u8, 6> original{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
+    g_scene_viewport = reinterpret_cast<SceneViewportFn>(Native::HookEntry(
+        code, base, 0x18d2cb0, original,
+        reinterpret_cast<void*>(&MatchExperimentalSceneViewport), "experimental scene viewport scale"));
+}
+
 void RytyApplyGamePatches() {
+    InstallExperimentalSceneViewport(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    InstallMenuSnapshotSessionGuard(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    InstallIdleKeyboardClose(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    InstallWideCamera(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    InstallTriggerTelemetry(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    InstallUi4kImages(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallMirrorHalfRate(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    InstallMotionBlurOption(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     if (!WetReflectionsWanted()) {
         // jne (reflect when wet) -> two nops
         Apply(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)),
@@ -1004,6 +1418,7 @@ void RytyApplyGamePatches() {
     InstallLewisChallenge(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallScriptPatches(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallTextEntryDiag(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    InstallFatalErrorDiag(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     if (!(std::getenv("RYGT_DECALS") && std::getenv("RYGT_DECALS")[0] == '0')) {
         SyncDecals();
     }
@@ -1034,5 +1449,8 @@ namespace Vulkan {
 // FIX-110: true while a race project runs (see NoteProjectScript).
 bool RytyGtsInRace() {
     return g_in_race.load(std::memory_order_relaxed);
+}
+bool RytyGtsMenuSnapshotsAllowed() {
+    return g_snapshot_session_ready && g_snapshot_session.Idle() && !RytyGtsInRace();
 }
 } // namespace Vulkan

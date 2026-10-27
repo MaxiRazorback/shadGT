@@ -58,6 +58,18 @@ struct ImageInfo {
 
     bool IsCompatible(const ImageInfo& info) const;
 
+    bool IsVideoOutSource(const ImageInfo& surface) const {
+        return guest_address == surface.guest_address && type == AmdGpu::ImageType::Color2D &&
+               type == surface.type && size == surface.size && pitch == surface.pitch &&
+               pixel_format == surface.pixel_format && num_bits == surface.num_bits &&
+               num_samples == 1 && surface.num_samples == 1 && resources.levels == 1 &&
+               resources.layers == 1 && surface.resources.levels == 1 &&
+               surface.resources.layers == 1 && tile_mode == surface.tile_mode &&
+               array_mode == surface.array_mode && props.is_tiled == surface.props.is_tiled &&
+               !props.is_depth && !surface.props.is_depth && !props.is_block &&
+               !surface.props.is_block && !props.is_volume && !surface.props.is_volume;
+    }
+
     /// Whether this single-level color image is an origin-aligned crop of the same layout.
     bool IsSubrectOf(const ImageInfo& info) const {
         // Vulkan image views cannot restrict a mip's dimensions. Cropped descriptors need their

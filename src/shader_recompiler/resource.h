@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include "common/types.h"
 #include "shader_recompiler/ir/type.h"
 #include "video_core/amdgpu/resource.h"
@@ -90,6 +91,8 @@ enum class SharpFetchPostOp : u8 {
     ClearAnisoRatioAndThreshold,
     // A scalar-memory base pointer, rather than a guest V# descriptor.
     ReadConstPointer,
+    // Sample a cube through a native cube-array view, retaining cross-face filtering.
+    NativeCubeSampling,
 };
 
 enum class BufferType : u8 {
@@ -272,18 +275,23 @@ struct PushData {
     static constexpr u32 XScaleIndex = 2;
     static constexpr u32 YScaleIndex = 3;
     static constexpr u32 BufOffsetIndex = 4;
+    /// After the four buffer-offset vectors (SHD-002).
+    static constexpr u32 QuadSampleMaskIndex = 8;
 
     float xoffset;
     float yoffset;
     float xscale;
     float yscale;
-    std::array<u8, NUM_BUFFERS> buf_offsets;
+    /// SHD-002: 64 offsets, each stage with its own range (Backend::StageBufferOffsetBase).
+    std::array<u8, 64> buf_offsets;
+    std::array<u32, 2> quad_sample_mask{~0u, ~0u};
 
     void AddOffset(u32 binding, u32 offset) {
         ASSERT(offset < 256 && binding < buf_offsets.size());
         buf_offsets[binding] = offset;
     }
 };
+static_assert(offsetof(PushData, quad_sample_mask) == 80 && sizeof(PushData) == 88);
 static_assert(sizeof(PushData) <= 128,
               "PushData size is greater than minimum size guaranteed by Vulkan spec");
 

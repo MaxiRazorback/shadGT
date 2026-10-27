@@ -20,6 +20,8 @@
 #include <xxhash.h>
 
 #include "common/alignment.h"
+#include "common/allocation_pressure_retry.h"
+#include "common/unmapped_allocations.h"
 #include "common/io_file.h"
 #include "common/perf_monitor.h"
 #include "core/emulator_settings.h"
@@ -47,6 +49,12 @@
 #include <windows.h>
 #include "core/guest_hash.h"
 #include "ryty_gpu/ryty_diag.h"
+#endif
+
+#ifdef RYTY_GPU
+namespace Vulkan {
+bool NativeModeRequested();
+}
 #endif
 
 namespace VideoCore {
@@ -180,6 +188,10 @@ static bool ReadbackHashEnabled() {
 
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
 static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
+// FIX-188: Intel Arc (#65) gets twice the stream rings, against ring wraps in heavy frames.
+static size_t StreamBufferSize(const Vulkan::Instance& instance) {
+    return instance.IsIntel() ? 2 * STREAM_BUFFER_SIZE : STREAM_BUFFER_SIZE;
+}
 
 // PERF-094: the stream ring (small read-only buffers copied for each draw) is in system memory,
 // which the GPU reads over PCIe, instead of video memory the recorder writes over PCIe. Each copy
@@ -219,9 +231,6 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       staging_pool{runtime_.GetStagingPool()}, liverpool{liverpool_},
       memory{Core::Memory::Instance()}, texture_cache{texture_cache_},
       memory_tracker{std::make_unique<MemoryTracker>(tracker)}, page_manager{tracker},
-      stream_buffer{instance, scheduler, StreamRingType(), STREAM_BUFFER_SIZE},
-      ahead_stream{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
-      ahead_staging{instance, scheduler, MemoryType::HostUncached, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       memory_semaphore{instance},
       // PERF-011 is disabled: skipping GPU-written bytes in uploads loses CPU stores to those
@@ -237,11 +246,18 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     if (DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported()) { // D1
         direct_memory = std::make_unique<DirectMemory>(instance, scheduler);
     }
-    for (u32 i = 1; i < StageWorkerCount(); ++i) { // R5
-        worker_streams[i] = std::make_unique<StreamBuffer>(instance, scheduler, MemoryType::Stream,
-                                                           STREAM_BUFFER_SIZE / 2);
-        worker_stagings[i] = std::make_unique<StreamBuffer>(
-            instance, scheduler, MemoryType::HostUncached, STREAM_BUFFER_SIZE / 2);
+    bool lazy_stage_rings = false;
+#ifdef RYTY_GPU
+    // Native disables the buffer-stage worker and has its own timeline-owned uploads.
+    // Keep the old full-size rings available on demand, rather than allocating unused ones.
+    lazy_stage_rings = Vulkan::NativeModeRequested();
+#endif
+    if (!lazy_stage_rings) {
+        GetStreamBuffer();
+        for (u32 i = 0; i < StageWorkerCount(); ++i) {
+            StageStream(i);
+            StageStaging(i);
+        }
     }
     const vk::BufferCreateInfo probe_ci = {
         .flags =
@@ -321,6 +337,24 @@ BufferCache::~BufferCache() {
     g_upload_epoch_listener.store(nullptr, std::memory_order_release);
     s_prehasher.store(nullptr, std::memory_order_release);
     prehasher.reset();
+}
+
+u64 BufferCache::SparseResidentBytes() {
+    std::scoped_lock buffer_lock{mutex};
+    u64 bytes = 0;
+    for (const auto& range : resident_ranges) bytes += (range.end - range.start) << block_shift;
+    return bytes;
+}
+
+u64 BufferCache::SparseFreedBytes() {
+    std::scoped_lock buffer_lock{mutex};
+    return sparse_freed_bytes;
+}
+
+void BufferCache::NoteArenaMapping(VAddr address, u64 size) {
+    if (!size || address > ~u64{0} - size) return;
+    std::scoped_lock lock{arena_unmap_mutex};
+    unmapped_arena_bytes.Subtract(address, size);
 }
 
 void BufferCache::TickFrame() {
@@ -1257,8 +1291,12 @@ bool BufferCache::CpuRewroteReadbackRange(VAddr start, VAddr end) {
         }
         const VAddr s = std::max(start, page);
         const VAddr e = std::min<VAddr>(end, page + 4_KB);
-        if (std::memcmp(std::bit_cast<const void*>(s), it->second->data() + (s - page), e - s) !=
-            0) {
+        // Page tracking can protect the guest view while GPU data is pending.
+        // Match RefreshReadbackPageHashes: read through the sparse/alias copy path
+        // instead of faulting in memcmp while the recorder holds cache locks.
+        std::array<u8, 4096> current;
+        memory->CopySparseMemory(s, current.data(), e - s);
+        if (std::memcmp(current.data(), it->second->data() + (s - page), e - s) != 0) {
             return true;
         }
     }
@@ -1719,7 +1757,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     if (diag_time) {
         const u64 start = __rdtsc();
         const auto result = ObtainBufferImpl(device_addr, size, is_written, is_texel_buffer);
-        const int kind = result.first == &stream_buffer ? 0
+        const int kind = result.first == allocated_stream.load(std::memory_order_acquire) ? 0
                          : result.first->mem_type == MemoryType::HostUncached ? 3 // P2 in place
                          : is_written ? 2 : 1;
         g_obtain_cycles[kind] += __rdtsc() - start;
@@ -1827,6 +1865,7 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferShared(
     ApplyCompletedReadbacks();
     ++Common::GetWorkCounters().obtain_buffer;
     if (stream && !IsRegionGpuModified(device_addr, size)) {
+        auto& stream_buffer = GetStreamBuffer();
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         memory->CopySparseMemory(device_addr, data, size, read_capture);
         stream_buffer.Commit();
@@ -2021,6 +2060,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferImpl(VAddr device_addr, u
         return env && env[0] == '1';
     }();
     if (ceil_stream && !is_written && size <= STREAM_THRESHOLD && !read_capture) {
+        auto& stream_buffer = GetStreamBuffer();
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         memory->CopySparseMemory(device_addr, data, size);
         stream_buffer.Commit();
@@ -2138,6 +2178,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferImpl(VAddr device_addr, u
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size) &&
         ((skip_alias_walk && !images_overlap) || !HasGpuImageAlias(device_addr, size))) {
+        auto& stream_buffer = GetStreamBuffer();
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         memory->CopySparseMemory(device_addr, data, size, read_capture);
         stream_buffer.Commit();
@@ -2324,6 +2365,8 @@ void BufferCache::SynchronizeDmaBuffers() {
 }
 
 const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
+    // Conservatively cancel retirement if a range is used again through any obtain path.
+    NoteArenaMapping(first_block << block_shift, (last_block - first_block + 1) << block_shift);
     const u64 first_page = first_block >> blocks_per_arena_page_shift;
     const u64 last_page = last_block >> blocks_per_arena_page_shift;
     ASSERT_MSG(last_page - first_page <= 1,
@@ -2381,13 +2424,20 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     // FIX-075: 64-bit counts. GT Sport's showroom makes a range of 4 GB + 64 KB resident at once;
     // the 32-bit block loop below never reached its end and wrote past the staging buffer.
     u64 resident_blocks{};
-    IntervalList bind_ranges;
+    std::vector<Interval> bind_ranges;
+    const u64 max_allocation_blocks = std::max<u64>(1, 16_MB >> block_shift);
     resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
         resident_blocks += end - start;
-        bind_ranges.Add({start, end});
+        // Keep independently retired ranges in separate, bounded allocations.
+        // A small survivor must not pin hundreds of MiB from unrelated gaps.
+        while (start < end) {
+            const u64 chunk_end = std::min(end, start + max_allocation_blocks);
+            bind_ranges.push_back({start, chunk_end});
+            start = chunk_end;
+        }
     });
 
-    if (bind_ranges.Empty()) {
+    if (bind_ranges.empty()) {
         return;
     }
     if ((resident_blocks << block_shift) >= (1ull << 30)) {
@@ -2397,26 +2447,67 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
                     (last_block + 1) << block_shift, arena->CpuAddr(), arena->SizeBytes());
     }
 
-    const vk::MemoryAllocateInfo alloc_info = {
-        .allocationSize = resident_blocks << block_shift,
-        .memoryTypeIndex = arena_memory_type_index,
-    };
-    const auto device_memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
-
     boost::container::small_vector<vk::BufferCopy, 8> copies;
     const auto staging =
         staging_pool.Request(resident_blocks * sizeof(vk::DeviceAddress), MemoryType::HostUncached);
 
-    u64 memory_offset{};
     ArenaBinds* binds = BindsForArena(arena);
     auto* bda_addrs = reinterpret_cast<vk::DeviceAddress*>(staging.mapped);
     u64 offset = staging.offset;
     for (const auto& range : bind_ranges) {
+        const vk::MemoryAllocateInfo alloc_info = {
+            .allocationSize = (range.end - range.start) << block_shift,
+            .memoryTypeIndex = arena_memory_type_index,
+        };
+        u32 allocation_attempt = 0;
+        const auto allocation = Common::AllocateWithPressureRetry(
+            [&] {
+                ++allocation_attempt;
+                auto result = instance.GetDevice().allocateMemory(alloc_info);
+                if (result.result != vk::Result::eSuccess) {
+                    vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+                    vk::PhysicalDeviceMemoryProperties2 properties{
+                        .pNext = instance.CanReportMemoryUsage() ? &budget : nullptr,
+                    };
+                    instance.GetPhysicalDevice().getMemoryProperties2(&properties);
+                    const u32 heap =
+                        properties.memoryProperties.memoryTypes[arena_memory_type_index].heapIndex;
+                    std::map<vk::DeviceMemory, bool> allocations;
+                    u64 resident_bytes = 0;
+                    for (const auto& range : resident_ranges) {
+                        allocations.emplace(range.memory, true);
+                        resident_bytes += (range.end - range.start) << block_shift;
+                    }
+                    LOG_ERROR(Render_Vulkan,
+                              "Sparse allocation failed: result={} attempt={} requested_bytes={} "
+                              "guest={:#x}..{:#x} arena={:#x}+{:#x} memory_type={} heap={} "
+                              "heap_usage_bytes={} heap_budget_bytes={} budget_available={} "
+                              "sparse_resident_bytes={} sparse_allocations={} recycled_bytes={}",
+                              vk::to_string(result.result), allocation_attempt,
+                              alloc_info.allocationSize, range.start << block_shift,
+                              range.end << block_shift, arena->CpuAddr(), arena->SizeBytes(),
+                              arena_memory_type_index, heap, budget.heapUsage[heap],
+                              budget.heapBudget[heap], instance.CanReportMemoryUsage(), resident_bytes,
+                              allocations.size(), RecycledImageBytes());
+                }
+                return result;
+            },
+            [&] {
+                const u64 recycled = ReleaseRecycledImages(instance.GetAllocator());
+                const auto empty_blocks = Vulkan::TrimEmptyVmaBlocks(instance.GetAllocator());
+                LOG_WARNING(Render_Vulkan,
+                            "Sparse allocation recovery: released {} recycled bytes and {} empty "
+                            "VMA block bytes; retrying {} bytes once",
+                            recycled, empty_blocks, alloc_info.allocationSize);
+            },
+            vk::Result::eErrorOutOfDeviceMemory);
+        const auto device_memory = Vulkan::Check(allocation);
+
         Backing backing;
         backing.start = range.start;
         backing.end = range.end;
         backing.memory = device_memory;
-        backing.offset = memory_offset >> block_shift;
+        backing.offset = 0;
         resident_ranges.Add(backing);
 
         LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
@@ -2425,9 +2516,8 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
             .resourceOffset = (range.start << block_shift) - arena->cpu_addr,
             .size = (range.end - range.start) << block_shift,
             .memory = device_memory,
-            .memoryOffset = memory_offset,
+            .memoryOffset = 0,
         });
-        memory_offset += bind.size;
 
         for (u64 block = 0; block < bind.size; block += block_size) {
             *(bda_addrs++) = arena->BufferDeviceAddress() + bind.resourceOffset + block;
@@ -2649,6 +2739,35 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
         }
     }
     return std::pair<const Buffer*, u64>{arena, arena->Offset(device_addr)};
+}
+
+StreamBuffer& BufferCache::GetStreamBuffer() {
+    std::call_once(stream_init, [this] {
+        const u64 bytes = StreamBufferSize(instance);
+        stream_buffer = std::make_unique<StreamBuffer>(instance, scheduler, StreamRingType(), bytes);
+        allocated_stream.store(stream_buffer.get(), std::memory_order_release);
+    });
+    return *stream_buffer;
+}
+
+StreamBuffer& BufferCache::StageStream(u32 index) {
+    ASSERT(index < MaxStageWorkers);
+    std::call_once(worker_stream_init[index], [this, index] {
+        const u64 bytes = StreamBufferSize(instance) / (index == 0 ? 1 : 2);
+        worker_streams[index] = std::make_unique<StreamBuffer>(
+            instance, scheduler, MemoryType::Stream, bytes);
+    });
+    return *worker_streams[index];
+}
+
+StreamBuffer& BufferCache::StageStaging(u32 index) {
+    ASSERT(index < MaxStageWorkers);
+    std::call_once(worker_staging_init[index], [this, index] {
+        const u64 bytes = StreamBufferSize(instance) / (index == 0 ? 1 : 2);
+        worker_stagings[index] = std::make_unique<StreamBuffer>(
+            instance, scheduler, MemoryType::HostUncached, bytes);
+    });
+    return *worker_stagings[index];
 }
 
 u32 BufferCache::StageWorkerCount() {
@@ -3784,7 +3903,107 @@ bool BufferCache::SynchronizeMemoryFromImage(VAddr device_addr, u32 size) {
     return true;
 }
 
+void BufferCache::ReleaseUnmappedArenaMemory(VAddr address, u64 size) {
+    if (size == 0 || address > ~u64{0} - size) return;
+    std::scoped_lock buffer_lock{mutex};
+    {
+        std::scoped_lock lock{arena_unmap_mutex};
+        // Preserve byte coverage: several 16 KiB guest unmaps can retire a larger
+        // Vulkan sparse page. Remember only ranges actually backed by this cache.
+        resident_ranges.ForEachInRange(address >> block_shift,
+            ((address + size - 1) >> block_shift) + 1, [&](const Backing& range) {
+                const u64 begin = std::max(address, range.start << block_shift);
+                const u64 end = std::min(address + size, range.end << block_shift);
+                if (begin < end) unmapped_arena_bytes.Add(begin, end - begin);
+            });
+    }
+    std::map<vk::DeviceMemory, bool> whole;
+    std::vector<Backing> released;
+    IntervalList<Backing> retained;
+    const auto collect = [&] {
+        std::scoped_lock lock{arena_unmap_mutex};
+        whole = Common::FullyUnmappedAllocations(resident_ranges, [&](const Backing& range) {
+            return unmapped_arena_bytes.Contains(range.start << block_shift,
+                                                (range.end - range.start) << block_shift);
+        });
+        released.clear();
+        retained.Clear();
+        for (const auto& range : resident_ranges) {
+            if (whole[range.memory]) released.push_back(range);
+            else retained.Add(range);
+        }
+        return !released.empty();
+    };
+    if (!collect()) return;
+    // No marker lock across GPU submission/wait: map callbacks hold the guest registry.
+    scheduler.Finish();
+    // Submission callbacks may have changed cache residency; revalidate after finishing.
+    if (!collect()) return;
+    std::vector<ArenaBinds> unbinds;
+    unbinds.reserve(arenas.size());
+    for (const auto& arena : arenas) {
+        ArenaBinds item{&arena};
+        for (const auto& range : released) {
+            const u64 begin_addr = std::max(range.start << block_shift, arena.cpu_addr);
+            const u64 end_addr = std::min(range.end << block_shift,
+                                         arena.cpu_addr + arena.size_bytes);
+            if (begin_addr < end_addr) {
+                item.binds.push_back(vk::SparseMemoryBind{
+                    .resourceOffset = begin_addr - arena.cpu_addr,
+                    .size = end_addr - begin_addr,
+                    .memory = {},
+                });
+            }
+        }
+        if (!item.binds.empty()) unbinds.push_back(std::move(item));
+    }
+    std::vector<vk::SparseBufferMemoryBindInfo> infos;
+    for (const auto& item : unbinds) {
+        infos.push_back({item.arena->Handle(), static_cast<u32>(item.binds.size()), item.binds.data()});
+    }
+    const auto device = instance.GetDevice();
+    const auto fence = Vulkan::Check(device.createFence({}));
+    const vk::BindSparseInfo sparse_info{
+        .bufferBindCount = static_cast<u32>(infos.size()),
+        .pBufferBinds = infos.data(),
+    };
+    {
+        std::scoped_lock queue_lock{Vulkan::Scheduler::submit_mutex};
+        const auto result = instance.GetGraphicsQueue().bindSparse(sparse_info, fence);
+        ASSERT_MSG(result == vk::Result::eSuccess, "Sparse unbind failed: {}", vk::to_string(result));
+    }
+    const auto waited = device.waitForFences(fence, true, ~u64{0});
+    ASSERT_MSG(waited == vk::Result::eSuccess, "Sparse unbind wait failed: {}", vk::to_string(waited));
+    device.destroyFence(fence);
+    resident_ranges = std::move(retained);
+    u64 freed_bytes = 0;
+    for (const auto& range : released) {
+        const VAddr start = range.start << block_shift;
+        const u64 bytes = (range.end - range.start) << block_shift;
+        freed_bytes += bytes;
+        NoteArenaMapping(start, bytes);
+        runtime.FillBuffer(bda_pagetable_buffer.get(), range.start * sizeof(vk::DeviceAddress),
+                           (range.end - range.start) * sizeof(vk::DeviceAddress), 0u);
+        gpu_modified_ranges.Subtract(start, bytes);
+        memory_tracker->UnmarkRegionAsGpuModified(start, bytes, false);
+        memory_tracker->MarkRegionAsCpuModified(start, bytes);
+        std::scoped_lock uploaded_lock{uploaded_pages_mutex};
+        for (VAddr page = start; page < start + bytes; page += 4_KB) {
+            uploaded_page_contents.Forget(page);
+        }
+    }
+    for (auto& memo : arena_memos) memo = {};
+    for (const auto& [allocation, complete] : whole) {
+        if (complete) device.freeMemory(allocation);
+    }
+    sparse_freed_bytes += freed_bytes;
+    LOG_DEBUG(Render_Vulkan, "Released {} MiB of unmapped sparse buffer backing", freed_bytes >> 20);
+}
+
 void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
+    if (instance.IsIntel()) {
+        scheduler.SyncCommandThread(); // FIX-188: Intel Arc (#65)
+    }
     std::scoped_lock buffer_lock{mutex}; // PERF-067
     if (pending_binds.empty()) {
         return;

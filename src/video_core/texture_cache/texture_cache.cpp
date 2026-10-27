@@ -3,6 +3,7 @@
 
 #include <map>
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <boost/container/small_vector.hpp>
 #include <atomic>
@@ -31,6 +32,7 @@
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
+#include <vk_mem_alloc.h>
 
 namespace VideoCore {
 
@@ -45,7 +47,7 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       buffer_cache{buffer_cache_}, tracker{tracker_}, slot_images{MAX_IMAGES},
       slot_image_views{MAX_IMAGE_VIEWS}, slot_samplers{MAX_SAMPLERS},
       blit_helper{instance, scheduler},
-      tile_manager{instance, scheduler, runtime, buffer_cache.GetStreamBuffer()},
+      tile_manager{instance, scheduler, runtime, buffer_cache},
       readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()} {
 
     u32 max_samplers = instance.GetMaxSamplerAllocationCount();
@@ -95,13 +97,22 @@ void TextureCache::ProcessDownloadImages() {
 
 bool TextureCache::DumpImage(ImageId image_id, const std::filesystem::path& path) {
     Image& image = slot_images[image_id];
-    const u32 bytes_per_texel = image.info.num_bits / 8;
-    if (image.info.props.is_depth || image.info.props.is_block || bytes_per_texel == 0) {
+    // NAT-116: depth images give their depth aspect (32-bit float, or 16-bit).
+    const bool depth = image.info.props.is_depth;
+    const bool depth16 = depth && (image.info.pixel_format == vk::Format::eD16Unorm ||
+                                   image.info.pixel_format == vk::Format::eD16UnormS8Uint);
+    const u32 bytes_per_texel = depth ? (depth16 ? 2u : 4u) : image.info.num_bits / 8;
+    if (bytes_per_texel == 0) {
         return false;
     }
-    const u32 width = image.info.size.width;
-    const u32 height = image.info.size.height;
-    const u32 size = width * height * bytes_per_texel;
+    // FIX-152 (diagnosis): block-compressed images give their blocks (4x4 texels each).
+    const bool block = image.info.props.is_block;
+    const u32 width = block ? Common::AlignUp(image.info.size.width, 4u) : image.info.size.width;
+    const u32 height = block ? Common::AlignUp(image.info.size.height, 4u) : image.info.size.height;
+    // NAT-125: every layer of the first mip, one after another.
+    const u32 layers = image.info.props.is_volume ? 1u : std::max<u32>(image.info.resources.layers, 1u);
+    const u32 size = block ? (width / 4) * (height / 4) * bytes_per_texel * layers
+                           : width * height * bytes_per_texel * layers;
     const auto download = runtime.GetStagingPool().Request(size, MemoryType::HostCached, 16);
     const vk::BufferImageCopy copy = {
         .bufferOffset = download.offset,
@@ -109,13 +120,14 @@ bool TextureCache::DumpImage(ImageId image_id, const std::filesystem::path& path
         .bufferImageHeight = height,
         .imageSubresource =
             {
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .aspectMask = depth ? vk::ImageAspectFlagBits::eDepth
+                                    : vk::ImageAspectFlagBits::eColor,
                 .mipLevel = 0,
                 .baseArrayLayer = 0,
-                .layerCount = 1,
+                .layerCount = layers,
             },
         .imageOffset = {0, 0, 0},
-        .imageExtent = {width, height, 1},
+        .imageExtent = {image.info.size.width, image.info.size.height, 1},
     };
     runtime.DownloadImage(&image, download.buffer, std::span{&copy, 1});
     scheduler.Finish();
@@ -544,6 +556,8 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
 }
 
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
+    if (empty_block_trim_after == std::chrono::steady_clock::time_point{})
+        empty_block_trim_after = std::chrono::steady_clock::now() + std::chrono::seconds{30};
     SmallVector<ImageId, 16> deleted_images;
     ForEachImageInRegion(cpu_addr, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
     for (const ImageId id : deleted_images) {
@@ -634,7 +648,8 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
     // Equal address
     if (image_info.guest_address == cache_image.info.guest_address) {
         // Cropped descriptors need their own image because views cannot change dimensions.
-        if (image_info.IsSubrectOf(cache_image.info)) {
+        const bool to_subrect = image_info.IsSubrectOf(cache_image.info);
+        if (to_subrect || cache_image.info.IsSubrectOf(image_info)) {
             ImageId result_id = merged_image_id;
             if (!result_id) {
                 result_id = slot_images.Insert(instance, runtime, slot_image_views, image_info);
@@ -642,7 +657,8 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             }
             auto& source = slot_images[cache_image_id];
             auto& destination = slot_images[result_id];
-            if (source.contents_version > destination.contents_version && source.SafeToDownload()) {
+            if (to_subrect && source.contents_version > destination.contents_version &&
+                source.SafeToDownload()) {
                 runtime.CopySubrect(&source, &destination);
             }
             return {result_id, -1, -1};
@@ -922,33 +938,62 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt, FindMemo* memo)
     // address; only then are they collected again below.
     bool registry_changed = false;
 
+    if (desc.type == BindingType::VideoOut) {
+        for (const auto cache_id : same_address) {
+            const auto& source = slot_images[cache_id];
+            if ((source.usage.render_target || source.usage.storage) &&
+                source.info.IsVideoOutSource(info) &&
+                (!image_id ||
+                 source.contents_version > slot_images[image_id].contents_version)) {
+                image_id = cache_id;
+            }
+        }
+        if (image_id) {
+            const auto& source = slot_images[image_id].info;
+            if (info.alt_tile != source.alt_tile || info.bank_swizzle != source.bank_swizzle ||
+                info.guest_size != source.guest_size) {
+                static thread_local u32 layout_adoptions{};
+                if (++layout_adoptions <= 3 || std::has_single_bit(layout_adoptions)) {
+                    LOG_INFO(Render_Vulkan,
+                             "VideoOut uses the rendered surface layout at {:#x}: alt {} -> {}, "
+                             "size {:#x} -> {:#x}",
+                             info.guest_address, info.alt_tile, source.alt_tile,
+                             info.guest_size, source.guest_size);
+                }
+            }
+            desc.info = source;
+        }
+    }
+
     // Check for a perfect match first
-    for (const auto& cache_id : same_address) {
-        auto& cache_image = slot_images[cache_id];
-        if (cache_image.info.guest_address != info.guest_address) {
-            continue;
+    if (!image_id) {
+        for (const auto& cache_id : same_address) {
+            auto& cache_image = slot_images[cache_id];
+            if (cache_image.info.guest_address != info.guest_address) {
+                continue;
+            }
+            if (cache_image.info.guest_size != info.guest_size) {
+                continue;
+            }
+            if (cache_image.info.size != info.size) {
+                continue;
+            }
+            // Depth attachment formats must agree with the pipeline, even when their sampled
+            // aspects are compatible. Let overlap resolution preserve and convert their contents.
+            if (desc.type == BindingType::DepthTarget &&
+                (cache_image.info.pixel_format != info.pixel_format ||
+                 cache_image.info.props.has_stencil != info.props.has_stencil)) {
+                continue;
+            }
+            if (!IsVulkanFormatCompatible(cache_image.info.pixel_format, info.pixel_format) ||
+                (cache_image.info.type != info.type && info.size != Extent3D{1, 1, 1})) {
+                continue;
+            }
+            if (exact_fmt && info.pixel_format != cache_image.info.pixel_format) {
+                continue;
+            }
+            image_id = cache_id;
         }
-        if (cache_image.info.guest_size != info.guest_size) {
-            continue;
-        }
-        if (cache_image.info.size != info.size) {
-            continue;
-        }
-        // Depth attachment formats must agree with the pipeline, even when their sampled
-        // aspects are compatible. Let overlap resolution preserve and convert their contents.
-        if (desc.type == BindingType::DepthTarget &&
-            (cache_image.info.pixel_format != info.pixel_format ||
-             cache_image.info.props.has_stencil != info.props.has_stencil)) {
-            continue;
-        }
-        if (!IsVulkanFormatCompatible(cache_image.info.pixel_format, info.pixel_format) ||
-            (cache_image.info.type != info.type && info.size != Extent3D{1, 1, 1})) {
-            continue;
-        }
-        if (exact_fmt && info.pixel_format != cache_image.info.pixel_format) {
-            continue;
-        }
-        image_id = cache_id;
     }
     const bool perfect_match = static_cast<bool>(image_id);
 
@@ -1572,7 +1617,6 @@ void TextureCache::GarbageCollectImages() {
         if (num_deletions == 0) {
             return true;
         }
-        --num_deletions;
         const bool download = image.SafeToDownload();
         const bool tiled = image.info.IsTiled();
         if (tiled && download) {
@@ -1582,6 +1626,7 @@ void TextureCache::GarbageCollectImages() {
         if (download && !pressured) {
             return false;
         }
+        --num_deletions;
         const auto image_id = slot_images.GetSlotId(image);
         if (download) {
             DownloadImageMemory(image_id);
@@ -1652,7 +1697,105 @@ void TextureCache::GarbageCollectSamplers() {
     }
 }
 
+void TextureCache::GarbageCollectUnusedImages() {
+    using namespace std::chrono;
+    const auto now = steady_clock::now();
+    if (now - idle_gc_epoch >= seconds{30}) {
+        // At least 30 seconds old, regardless of submission rate. Two epochs avoid
+        // querying a clock for every texture touch on the hot draw path.
+        idle_gc_cutoff_tick = idle_gc_previous_tick;
+        idle_gc_previous_tick = gc_tick;
+        idle_gc_epoch = now;
+    }
+    if (now - idle_gc_last_scan < seconds{1}) return;
+    idle_gc_last_scan = now;
+    TrimUnusedRecycledImages(instance.GetAllocator());
+    if (empty_block_trim_after != steady_clock::time_point{} && now >= empty_block_trim_after) {
+        Vulkan::TrimEmptyVmaBlocks(instance.GetAllocator());
+        empty_block_trim_after = {};
+    }
+    if (idle_gc_cutoff_tick == 0) return;
+
+    u32 freed = 0;
+    image_lru_cache.ForEachItemBelow(idle_gc_cutoff_tick, [&](Image& image) {
+        // Never discard the only GPU-written copy. These remain under the existing
+        // readback-aware pressure collector or explicit guest-unmap path.
+        if (True(image.flags & ImageFlagBits::GpuModified)) return false;
+        FreeImage(slot_images.GetSlotId(image));
+        return ++freed >= 64;
+    });
+    if (freed != 0) {
+        LOG_DEBUG(Render_Vulkan, "Reclaimed {} long-unused reloadable textures", freed);
+    }
+}
+
+void TextureCache::ReportMemoryBreakdown() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("RYGT_VRAM_DIAGNOSTICS");
+        return value && value[0] == '1';
+    }();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - memory_report_last < std::chrono::seconds{5}) return;
+    memory_report_last = now;
+    if (!enabled && (!instance.CanReportMemoryUsage() ||
+                     instance.GetDeviceMemoryUsage() < pressure_gc_memory)) {
+        return;
+    }
+    u64 textures = 0, gpu_written = 0, images = 0;
+    u64 protected_tiled_bytes = 0, protected_tiled_images = 0;
+    image_lru_cache.ForEachItemBelow(gc_tick, [&](Image& image) {
+        ++images;
+        const bool protected_tiled = image.SafeToDownload() && image.info.IsTiled();
+        protected_tiled_images += protected_tiled;
+        for (const auto& backing : image.backing_images) {
+            textures += backing.image.size_bytes;
+            if (True(image.flags & ImageFlagBits::GpuModified))
+                gpu_written += backing.image.size_bytes;
+            if (protected_tiled) protected_tiled_bytes += backing.image.size_bytes;
+        }
+    });
+    VmaBudget heaps[VK_MAX_MEMORY_HEAPS]{};
+    vmaGetHeapBudgets(instance.GetAllocator(), heaps);
+    const auto& props = instance.GetMemoryProperties();
+    u64 allocations = 0, blocks = 0, usage = 0, budget = 0;
+    for (u32 i = 0; i < props.memoryHeapCount; ++i) {
+        if (!(props.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal)) continue;
+        allocations += heaps[i].statistics.allocationBytes;
+        blocks += heaps[i].statistics.blockBytes;
+        usage += heaps[i].usage;
+        budget += heaps[i].budget;
+    }
+    if (instance.CanReportMemoryUsage()) {
+        vk::PhysicalDeviceMemoryBudgetPropertiesEXT current_budget{};
+        vk::PhysicalDeviceMemoryProperties2 current_properties{.pNext = &current_budget};
+        instance.GetPhysicalDevice().getMemoryProperties2(&current_properties);
+        usage = budget = 0;
+        for (u32 i = 0; i < current_properties.memoryProperties.memoryHeapCount; ++i) {
+            if (!(current_properties.memoryProperties.memoryHeaps[i].flags &
+                  vk::MemoryHeapFlagBits::eDeviceLocal)) continue;
+            usage += current_budget.heapUsage[i];
+            budget += current_budget.heapBudget[i];
+        }
+    }
+    const u64 sparse = buffer_cache.SparseResidentBytes();
+    const auto* direct = buffer_cache.GetDirectMemory();
+    LOG_DEBUG(Render_Vulkan,
+              "VRAM snapshot MiB: heap_usage={} budget={} sparse={} textures={} "
+              "gpu_written_textures={} recycled={} vma_alloc={} vma_blocks={} "
+              "vma_slack={} unattributed={} imported_host={} images={} sparse_freed_total={} "
+              "empty_blocks_freed_total={} protected_tiled_textures={} protected_tiled_images={}",
+              usage >> 20, budget >> 20, sparse >> 20, textures >> 20, gpu_written >> 20,
+              RecycledImageBytes() >> 20, allocations >> 20, blocks >> 20,
+              (blocks > allocations ? blocks - allocations : 0) >> 20,
+              (usage > blocks + sparse ? usage - blocks - sparse : 0) >> 20,
+              direct ? direct->ImportedHostBytes() >> 20 : 0, images,
+              buffer_cache.SparseFreedBytes() >> 20, Vulkan::EmptyVmaBytesFreed() >> 20,
+              protected_tiled_bytes >> 20, protected_tiled_images);
+}
+
 void TextureCache::RunGarbageCollector() {
+    ReportMemoryBreakdown();
+    GarbageCollectUnusedImages();
     GarbageCollectImages();
     GarbageCollectSamplers();
     ++gc_tick;

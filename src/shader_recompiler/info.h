@@ -6,11 +6,13 @@
 #include <atomic>
 #include <bitset>
 #include <span>
+#include <memory>
 #include <vector>
 #include <boost/container/static_vector.hpp>
 #include "common/assert.h"
 #include "common/read_capture.h"
 #include "common/types.h"
+#include "common/fetch_code_snapshot.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/frontend/copy_shader.h"
 #include "shader_recompiler/frontend/tessellation.h"
@@ -27,6 +29,7 @@ struct Archive;
 }
 
 namespace Shader {
+namespace Gcn { struct FetchShaderData; }
 
 /// PB-1 (shader pre-build): a translation replayed outside the game. What the translator would
 /// read from guest memory comes from a stored shader record instead: the flattened user data
@@ -38,6 +41,8 @@ struct ReplayInputs {
     const void* tess_constants{};           // TessellationDataConstantBuffer
 };
 inline thread_local const ReplayInputs* t_replay = nullptr;
+// Set only while a queued translation owns its auxiliary fetch programs.
+inline thread_local const std::vector<Common::FetchCodeSnapshot>* t_fetch_code_snapshots = nullptr;
 
 enum class Qualifier : u8 {
     None,
@@ -80,6 +85,9 @@ struct InfoPersistent {
 };
 
 struct Info : InfoPersistent {
+    // Parsed while translating; guest fetch code may be reused before async results are harvested.
+    std::shared_ptr<const Gcn::FetchShaderData> translated_fetch_shader;
+
     struct AttributeFlags {
         bool Get(IR::Attribute attrib, u32 comp = 0) const {
             return flags[Index(attrib)] & (1 << comp);

@@ -15,10 +15,35 @@ class Instance;
 
 namespace Vulkan::RytyFrameGen {
 
+// Owned by one presentation Frame. Its ready semaphore orders these copies before
+// FG preparation, and its present fence protects reuse/reallocation.
+struct SceneInputs {
+    vk::Image depth{}, motion{}, hudless{};
+    vk::Extent2D hudless_size{};
+    vk::Format hudless_format{};
+    vk::Extent2D size{};
+    float jitter_x{}, jitter_y{}, motion_scale_x{}, motion_scale_y{};
+    float frame_time_ms{};
+    u64 sequence{};
+    bool valid{};
+};
+struct SceneSnapshot {
+    VideoCore::UniqueImage depth, motion;
+    vk::Extent2D size{};
+    bool initialized{};
+    SceneInputs inputs{};
+    VideoCore::UniqueImage hudless_scene, hudless_output;
+    vk::UniqueImageView hudless_scene_view, hudless_output_view;
+    vk::Extent2D hudless_scene_size{}, hudless_output_size{};
+    vk::Format hudless_output_format{};
+    bool hudless_scene_initialized{}, hudless_output_initialized{};
+    bool hudless_scene_valid{};
+};
+
 /// ryGT: AMD FSR 3.1 frame generation (amd_fidelityfx_vk.dll, GPU.framegen_enabled). FidelityFX
 /// replaces the swapchain with its own, which shows a generated frame between each pair of game
-/// frames from its own present thread. The game picture comes without motion vectors or depth,
-/// so the generated frames come from FSR's optical flow alone.
+/// frames from its own present thread. Captured scene depth/motion are supplied through
+/// per-presentation snapshots; scenes without matching inputs retain optical-flow fallback.
 class FrameGen {
 public:
     ~FrameGen();
@@ -43,7 +68,7 @@ public:
     /// Per presented game frame, before the frame's command buffer is submitted: configures
     /// frame generation and records its preparation.
     void Prepare(vk::CommandBuffer cmdbuf, vk::SwapchainKHR swapchain, vk::Extent2D size,
-                 bool hdr);
+                 bool hdr, const SceneInputs* scene = nullptr, bool fresh_frame = true);
 
 private:
     void CreateAuxImages(vk::CommandBuffer cmdbuf, vk::Extent2D size);
@@ -76,5 +101,14 @@ bool Requested();
 
 /// Frames shown so far (game and generated), for the FPS counter; 0 while generation is off.
 u64 ShownFrames();
+
+/// True only after recent extra presented frames were observed, not merely enabled.
+bool Working();
+void ReportWorking(bool working);
+
+// Optional bounded diagnostics; stage 0 snapshots, stage 1 HUD-reference conversion.
+int BeginGpuTiming(vk::CommandBuffer cmd, u64 sequence, u32 stage);
+void EndGpuTiming(vk::CommandBuffer cmd, int query);
+
 
 } // namespace Vulkan::RytyFrameGen

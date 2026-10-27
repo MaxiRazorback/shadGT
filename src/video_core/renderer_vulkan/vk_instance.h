@@ -33,6 +33,9 @@ public:
     [[nodiscard]] vk::Format GetSupportedFormat(vk::Format format,
                                                 vk::FormatFeatureFlags2 flags) const;
 
+    /// DIAG-206: logs the driver's report of what faulted, once, after the device was lost.
+    void LogDeviceFault() const;
+
     /// Returns the Vulkan instance
     vk::Instance GetInstance() const {
         return *instance;
@@ -93,6 +96,10 @@ public:
     /// Returns true if anisotropic filtering is supported
     bool IsAnisotropicFilteringSupported() const {
         return features.samplerAnisotropy;
+    }
+
+    bool IsImageCubeArraySupported() const {
+        return features.imageCubeArray;
     }
 
     /// Returns true if depth bounds testing is supported
@@ -191,6 +198,11 @@ public:
         return amd_shader_explicit_vertex_parameter;
     }
 
+    /// AMD-311: the vertex order per-vertex reads use with AMD's explicit vertex parameter.
+    u32 GetAmdVertexOrder() const {
+        return amd_vertex_order;
+    }
+
     /// Returns true when VK_EXT_primitive_topology_list_restart is supported for regular lists.
     bool IsListRestartSupported() const {
         return list_restart && list_restart_features.primitiveTopologyListRestart;
@@ -244,6 +256,21 @@ public:
         return vk12_features.shaderSharedInt64Atomics;
     }
 
+    /// Returns true if subgroup size control is supported
+    bool IsSubgroupSizeControlSupported() const {
+        return vk13_features.subgroupSizeControl;
+    }
+
+    /// Returns true if compute full subgroups is supported
+    bool IsComputeFullSubgroupsSupported() const {
+        return vk13_features.computeFullSubgroups;
+    }
+
+    /// Returns the stages supporting required subgroup size
+    vk::ShaderStageFlags RequiredSubgroupSizeStages() const {
+        return vk13_props.requiredSubgroupSizeStages;
+    }
+
     /// Returns true if the subgroup size can be set to match guest subgroup size
     bool IsSubgroupSize64Supported() const {
         return vk13_features.subgroupSizeControl && vk13_props.maxSubgroupSize >= 64;
@@ -285,6 +312,11 @@ public:
     /// Returns the vendor ID of the physical device
     u32 GetVendorID() const {
         return properties.vendorID;
+    }
+
+    /// Returns true if the GPU vendor is Intel (FIX-188: #65's Intel Arc changes apply)
+    bool IsIntel() const {
+        return properties.vendorID == 0x8086;
     }
 
     /// Returns the device ID of the physical device
@@ -537,6 +569,8 @@ private:
     bool custom_border_color{};
     bool fragment_shader_barycentric{};
     bool amd_shader_explicit_vertex_parameter{};
+    u32 amd_vertex_order{}; ///< AMD-311
+    bool device_fault{}; // DIAG-206
     bool depth_clip_control{};
     bool depth_clip_enable{};
     bool dynamic_state_3{};
@@ -566,5 +600,9 @@ private:
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;
 };
+
+/// AMD-312: which shader store version the selected GPU uses (see cache_storage.cpp).
+enum class StoreGpuFamily { Other, AmdRdna3, AmdRdna4 };
+StoreGpuFamily GetStoreGpuFamily();
 
 } // namespace Vulkan

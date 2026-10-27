@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <map>
 #include <algorithm>
 #include <filesystem>
 #include <chrono>
@@ -240,6 +241,20 @@ static constexpr std::array LogicalStageToStageBit = {
 // PERF-021: time of the last pipeline a draw needed that did not exist yet.
 static std::atomic<s64> last_pipeline_miss_ms{};
 
+// SHD-001: pipelines are not linked a second time with link-time optimization. That link is a
+// full driver compile of every new pipeline again (after new content, minutes of compiling in
+// the background on up to four threads, competing with the game for cores), for GPU time the
+// renderer no longer lacks. RYGT_PIPELINE_LTO=1 links them as before (with counts and times).
+static bool LinkTimeOptimization() {
+    static const bool lto = [] {
+        const char* env = std::getenv("RYGT_PIPELINE_LTO");
+        return env && env[0] == '1';
+    }();
+    return lto;
+}
+static std::atomic<u64> lto_links{};
+static std::atomic<u64> lto_us{};
+
 static s64 SteadyMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
@@ -299,28 +314,32 @@ private:
 // PERF-018: shader stage libraries (pre-rasterization and fragment shader) of runtime
 // pipelines, shared by every pipeline whose stages, layout and stage state are the same. Many new
 // pipelines differ from an earlier one only in blending, targets or vertex input, so they reuse
-// both compiled shader libraries and only link. Libraries live until exit.
+// both compiled shader libraries and only link. Pipelines own their shared libraries.
 class StageLibraryCache {
 public:
-    static StageLibraryCache& Instance() {
-        static StageLibraryCache cache;
-        return cache;
+    static StageLibraryCache& Instance() { static StageLibraryCache cache; return cache; }
+    std::shared_ptr<vk::UniquePipeline> Find(vk::Device device, u64 key) {
+        std::scoped_lock lock{mutex};
+        const auto it = libraries.find({device, key});
+        return it != libraries.end() ? it->second.lock() : nullptr;
     }
-
-    vk::Pipeline Find(u64 key) {
-        std::scoped_lock lk{mutex};
-        const auto it = libraries.find(key);
-        return it != libraries.end() ? it->second : vk::Pipeline{};
+    std::shared_ptr<vk::UniquePipeline> Insert(vk::Device device, u64 key, vk::Pipeline library, bool share) {
+        auto owned = std::make_shared<vk::UniquePipeline>(library, device);
+        if (!share) return owned;
+        std::scoped_lock lock{mutex};
+        auto& cached = libraries[{device, key}];
+        if (auto existing = cached.lock()) return existing;
+        cached = owned;
+        // Weak entries own no GPU resources; remove expired keys as scenes change.
+        if (++insertions % 128 == 0) {
+            std::erase_if(libraries, [](const auto& entry) { return entry.second.expired(); });
+        }
+        return owned;
     }
-
-    void Insert(u64 key, vk::Pipeline library) {
-        std::scoped_lock lk{mutex};
-        libraries.emplace(key, library);
-    }
-
 private:
     std::mutex mutex;
-    std::unordered_map<u64, vk::Pipeline> libraries;
+    std::map<std::pair<vk::Device, u64>, std::weak_ptr<vk::UniquePipeline>> libraries;
+    size_t insertions{};
 };
 
 class LibraryKey {
@@ -373,10 +392,14 @@ GraphicsPipeline::GraphicsPipeline(
         .size = sizeof(Shader::PushData),
     };
 
-    const vk::DescriptorSetLayout set_layout = *desc_layout;
+    // SHD-002: one set per stage; with libraries, sets are independent so each shader library
+    // is made with its own stages' sets only.
+    const bool independent_sets = instance.IsGraphicsPipelineLibrarySupported();
     const vk::PipelineLayoutCreateInfo layout_info = {
-        .setLayoutCount = 1U,
-        .pSetLayouts = &set_layout,
+        .flags = independent_sets ? vk::PipelineLayoutCreateFlagBits::eIndependentSetsEXT
+                                  : vk::PipelineLayoutCreateFlags{},
+        .setLayoutCount = num_sets,
+        .pSetLayouts = set_layouts.data(),
         .pushConstantRangeCount = 1,
         .pPushConstantRanges = &push_constants,
     };
@@ -470,6 +493,9 @@ GraphicsPipeline::GraphicsPipeline(
         vk::DynamicState::eLineWidth,          vk::DynamicState::ePrimitiveRestartEnable,
     };
 
+    if (instance.IsAttachmentFeedbackLoopLayoutSupported()) {
+        dynamic_states.push_back(vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);
+    }
     if (instance.IsDepthBoundsSupported()) {
         dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
         dynamic_states.push_back(vk::DynamicState::eDepthBounds);
@@ -564,8 +590,13 @@ GraphicsPipeline::GraphicsPipeline(
     const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
         .requiredSubgroupSize = 64,
     };
+    // AMD-301: only stages the driver lists in requiredSubgroupSizeStages take the requirement
+    // (fragment from RDNA 3 on; compute only on GCN, RDNA 1 and 2, where vertex never did).
+    const vk::ShaderStageFlags sized_stages = instance.RequiredSubgroupSizeStages();
     for (auto& stage : shader_stages) {
-        stage.pNext = instance.IsSubgroupSize64Supported() ? &subgroup_size_ci : nullptr;
+        stage.pNext = instance.IsSubgroupSize64Supported() && (sized_stages & stage.stage)
+                          ? &subgroup_size_ci
+                          : nullptr;
     }
 
     const auto depth_format =
@@ -575,8 +606,11 @@ GraphicsPipeline::GraphicsPipeline(
     for (s32 i = 0; i < key.num_color_attachments; ++i) {
         const auto& col_buf = key.color_buffers[i];
         const auto format = LiverpoolToVK::SurfaceFormat(col_buf.data_format, col_buf.num_format);
-        const auto color_format =
+        auto color_format =
             instance.GetSupportedFormat(format, vk::FormatFeatureFlagBits2::eColorAttachment);
+        if (col_buf.hdr_ui_layer) {
+            color_format = vk::Format::eR16G16B16A16Sfloat; // ryGT HDR-UI: the UI layer
+        }
         if (!instance.IsFormatSupported(color_format,
                                         vk::FormatFeatureFlagBits2::eColorAttachment)) {
             LOG_WARNING(Render_Vulkan,
@@ -674,6 +708,14 @@ GraphicsPipeline::GraphicsPipeline(
                           vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA
                     : key.write_masks[i],
         };
+
+        // ryGT HDR-UI: the UI layer's alpha is its coverage over the scene ("over").
+        if (key.color_buffers[i].hdr_ui_layer) {
+            attachments[i].srcAlphaBlendFactor = vk::BlendFactor::eOne;
+            attachments[i].dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
+            attachments[i].alphaBlendOp = vk::BlendOp::eAdd;
+            attachments[i].colorWriteMask |= vk::ColorComponentFlagBits::eA;
+        }
 
         // The shader squares its color output for this attachment (see PsColorBuffer), so the
         // factors must not scale the operands again.
@@ -791,6 +833,32 @@ GraphicsPipeline::GraphicsPipeline(
                 pre_raster_stages.push_back(stage_info);
             }
         }
+        // SHD-002: the shader libraries' layouts hold their own stages' sets only (the others
+        // are null), so a library doesn't depend on the other stages' resources.
+        const auto library_layout = [&](bool fragment) {
+            std::array<vk::DescriptorSetLayout, Shader::Backend::MaxDescriptorSets> sets{};
+            u32 count = 0;
+            for (u32 set = 0; set < num_sets; ++set) {
+                const bool fragment_set = set == Shader::Backend::StageSet(
+                                                     u32(Shader::SwStage::Fragment));
+                if (fragment_set == fragment && set_layout_hashes[set] != 0) {
+                    sets[set] = set_layouts[set];
+                    count = set + 1;
+                }
+            }
+            auto [result, created] = device.createPipelineLayoutUnique(vk::PipelineLayoutCreateInfo{
+                .flags = vk::PipelineLayoutCreateFlagBits::eIndependentSetsEXT,
+                .setLayoutCount = count,
+                .pSetLayouts = sets.data(),
+                .pushConstantRangeCount = 1,
+                .pPushConstantRanges = &push_constants,
+            });
+            ASSERT_MSG(result == vk::Result::eSuccess, "Failed to create a library layout: {}",
+                       vk::to_string(result));
+            return std::move(created);
+        };
+        const vk::UniquePipelineLayout pre_raster_layout = library_layout(false);
+        const vk::UniquePipelineLayout fragment_layout = library_layout(true);
         const std::array<vk::GraphicsPipelineLibraryFlagsEXT, 4> parts = {
             vk::GraphicsPipelineLibraryFlagBitsEXT::eVertexInputInterface,
             vk::GraphicsPipelineLibraryFlagBitsEXT::ePreRasterizationShaders,
@@ -807,16 +875,20 @@ GraphicsPipeline::GraphicsPipeline(
             auto& part_info = part_infos[i];
             part_info = pipeline_info;
             part_info.pNext = &library_infos[i];
-            part_info.flags = vk::PipelineCreateFlagBits::eLibraryKHR |
-                              vk::PipelineCreateFlagBits::eRetainLinkTimeOptimizationInfoEXT;
+            part_info.flags = vk::PipelineCreateFlagBits::eLibraryKHR;
+            if (LinkTimeOptimization()) { // SHD-001
+                part_info.flags |= vk::PipelineCreateFlagBits::eRetainLinkTimeOptimizationInfoEXT;
+            }
             part_info.stageCount = 0;
             part_info.pStages = nullptr;
             if (i == 1) {
                 part_info.stageCount = static_cast<u32>(pre_raster_stages.size());
                 part_info.pStages = pre_raster_stages.data();
+                part_info.layout = *pre_raster_layout; // SHD-002
             } else if (i == 2) {
                 part_info.stageCount = static_cast<u32>(fragment_stages.size());
                 part_info.pStages = fragment_stages.data();
+                part_info.layout = *fragment_layout; // SHD-002
             }
         }
         const auto create_library = [&](size_t i) {
@@ -834,8 +906,12 @@ GraphicsPipeline::GraphicsPipeline(
         // PERF-018: the shader libraries are keyed by everything their create info reads: the
         // layout's bindings, the stage modules, and the state of their pipeline subset.
         LibraryKey pre_raster_key{1};
-        pre_raster_key.Add(desc_layout_hash);
-        pre_raster_key.Add(uses_push_descriptors);
+        // SHD-002: the sets of the pre-rasterization stages only.
+        for (u32 set = 0; set < num_sets; ++set) {
+            if (set != Shader::Backend::StageSet(u32(Shader::SwStage::Fragment))) {
+                pre_raster_key.Add(set_layout_hashes[set]);
+            }
+        }
         for (const auto& stage_info : pre_raster_stages) {
             pre_raster_key.Add(stage_info.stage);
             pre_raster_key.Add(static_cast<VkShaderModule>(stage_info.module));
@@ -852,22 +928,21 @@ GraphicsPipeline::GraphicsPipeline(
         }
 
         LibraryKey fragment_key{2};
-        fragment_key.Add(desc_layout_hash);
-        fragment_key.Add(uses_push_descriptors);
+        // SHD-002: the fragment stage's set only.
+        fragment_key.Add(set_layout_hashes[Shader::Backend::StageSet(u32(Shader::SwStage::Fragment))]);
         for (const auto& stage_info : fragment_stages) {
             fragment_key.Add(static_cast<VkShaderModule>(stage_info.module));
         }
-        fragment_key.Add(sdata.multisampling.rasterizationSamples);
+        // SHD-004: a fragment shader library doesn't depend on the attachments: of
+        // VkPipelineRenderingCreateInfo only the view mask is part of its state (formats are
+        // ignored), and the multisample state only with sample shading (GPL's fragment shader
+        // subset). One library serves a pixel shader in every pass it draws in.
         fragment_key.Add(sdata.multisampling.sampleShadingEnable);
-        fragment_key.Add(sdata.multisampling.minSampleShading);
-        fragment_key.Add(pipeline_rendering_ci.colorAttachmentCount);
-        for (u32 i = 0; i < pipeline_rendering_ci.colorAttachmentCount; ++i) {
-            fragment_key.Add(color_formats[i]);
-            fragment_key.Add(color_samples[i]);
+        if (sdata.multisampling.sampleShadingEnable) {
+            fragment_key.Add(sdata.multisampling.rasterizationSamples);
+            fragment_key.Add(sdata.multisampling.minSampleShading);
         }
-        fragment_key.Add(pipeline_rendering_ci.depthAttachmentFormat);
-        fragment_key.Add(pipeline_rendering_ci.stencilAttachmentFormat);
-        fragment_key.Add(mixed_samples.depthStencilAttachmentSamples);
+        fragment_key.Add(pipeline_rendering_ci.viewMask);
         for (const auto state : dynamic_states) {
             fragment_key.Add(state);
         }
@@ -877,10 +952,10 @@ GraphicsPipeline::GraphicsPipeline(
         const u64 fragment_hash = fragment_key.Hash();
         // -DisablePerf 18 compiles every library for every pipeline, one after another.
         const bool share_libraries = Common::PerfFeatureEnabled(18);
-        vk::Pipeline pre_raster_library =
-            share_libraries ? library_cache.Find(pre_raster_hash) : vk::Pipeline{};
-        vk::Pipeline fragment_library =
-            share_libraries ? library_cache.Find(fragment_hash) : vk::Pipeline{};
+        auto pre_raster_owner = share_libraries ? library_cache.Find(device, pre_raster_hash) : nullptr;
+        auto fragment_owner = share_libraries ? library_cache.Find(device, fragment_hash) : nullptr;
+        vk::Pipeline pre_raster_library = pre_raster_owner ? **pre_raster_owner : vk::Pipeline{};
+        vk::Pipeline fragment_library = fragment_owner ? **fragment_owner : vk::Pipeline{};
         const bool pre_raster_reused = bool(pre_raster_library);
         const bool fragment_reused = bool(fragment_library);
         // PERF-018: the two shader libraries are compiled at the same time, the fragment one
@@ -893,7 +968,8 @@ GraphicsPipeline::GraphicsPipeline(
         library_handles[0] = create_library(0);
         if (!pre_raster_library) {
             pre_raster_library = create_library(1);
-            library_cache.Insert(pre_raster_hash, pre_raster_library);
+            pre_raster_owner = library_cache.Insert(device, pre_raster_hash, pre_raster_library, share_libraries);
+            pre_raster_library = **pre_raster_owner;
         }
         library_handles[3] = create_library(3);
         if (fragment_future.valid()) {
@@ -902,8 +978,10 @@ GraphicsPipeline::GraphicsPipeline(
             fragment_library = create_library(2);
         }
         if (!fragment_reused) {
-            library_cache.Insert(fragment_hash, fragment_library);
+            fragment_owner = library_cache.Insert(device, fragment_hash, fragment_library, share_libraries);
+            fragment_library = **fragment_owner;
         }
+        library_link->shared_libraries = {pre_raster_owner, fragment_owner};
         library_handles[1] = pre_raster_library;
         library_handles[2] = fragment_library;
         library_link->owned_libraries[0] = vk::UniquePipeline{library_handles[0], device};
@@ -934,6 +1012,9 @@ GraphicsPipeline::GraphicsPipeline(
                                                       libraries_done)
                 .count());
 
+        if (!LinkTimeOptimization()) {
+            return; // SHD-001: the fast-linked pipeline is the one drawn with
+        }
         auto promise = std::make_shared<std::promise<void>>();
         library_link->optimized = promise->get_future();
         const auto layout = *pipeline_layout;
@@ -957,9 +1038,20 @@ GraphicsPipeline::GraphicsPipeline(
             };
             BuildWatch watch{debug_str, "optimized link"};
             HeavyBuildGate gate{tessellated};
+            const auto link_start = std::chrono::steady_clock::now();
             auto [result, optimized] = device.createGraphicsPipeline(cache, optimized_info);
             if (result == vk::Result::eSuccess) {
                 optimized_pipeline.store(optimized, std::memory_order_release);
+            }
+            // SHD-001: how much compiling the optimized links cost.
+            const u64 us = std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now() - link_start)
+                               .count();
+            const u64 total_us = lto_us.fetch_add(us) + us;
+            if (const u64 links = ++lto_links; links % 200 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "SHD-001: {} optimized links done, {:.1f} s of driver compiling",
+                            links, total_us / 1e6);
             }
             promise->set_value();
         });
@@ -999,12 +1091,12 @@ template <typename Attribute, typename Binding>
 void GraphicsPipeline::GetVertexInputs(
     VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
-    VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1) const {
+    VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1,
+    const Shader::Info& vs_info) const {
     using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
     if (fetch_shader.Empty() || fetch_shader.attributes.empty()) {
         return;
     }
-    const auto& vs_info = GetStage(Shader::SwStage::Vertex);
     for (u32 semantic = 0; semantic < fetch_shader.attributes.size(); ++semantic) {
         const auto& attrib = fetch_shader.attributes[semantic];
         const auto step_rate = attrib.GetStepRate();
@@ -1055,20 +1147,39 @@ template void GraphicsPipeline::GetVertexInputs(
     VertexInputs<vk::VertexInputAttributeDescription>& attributes,
     VertexInputs<vk::VertexInputBindingDescription>& bindings,
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
-    VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1) const;
+    VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1,
+    const Shader::Info& vs_info) const;
 template void GraphicsPipeline::GetVertexInputs(
     VertexInputs<vk::VertexInputAttributeDescription2EXT>& attributes,
     VertexInputs<vk::VertexInputBindingDescription2EXT>& bindings,
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
-    VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1) const;
+    VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1,
+    const Shader::Info& vs_info) const;
 
 void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
-    boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;
-    u32 binding{};
+    // SHD-002: one set per stage, its bindings numbered from 0.
+    std::array<boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32>,
+               Shader::Backend::MaxDescriptorSets>
+        set_bindings;
+    std::array<u32, Shader::Backend::MaxDescriptorSets> set_descriptors{};
 
     for (const auto* stage : stages) {
         if (!stage) {
             continue;
+        }
+        const u32 set = Shader::Backend::StageSet(u32(stage->sw_stage));
+        auto& bindings = set_bindings[set];
+        u32 binding{};
+        if (const u32 sw = u32(stage->sw_stage);
+            sw < Shader::Backend::StageBufferOffsetCount.size() &&
+            stage->buffers.size() > Shader::Backend::StageBufferOffsetCount[sw]) {
+            static std::atomic<u32> logged{};
+            if (logged++ < 10) {
+                LOG_ERROR(Render_Vulkan,
+                          "SHD-002: {}_{:#x} has {} buffers, more than its {} push offsets",
+                          stage->hw_stage, stage->pgm_hash, stage->buffers.size(),
+                          Shader::Backend::StageBufferOffsetCount[sw]);
+            }
         }
         const auto stage_bit = LogicalStageToStageBit[u32(stage->sw_stage)];
         for (const auto& buffer : stage->buffers) {
@@ -1101,22 +1212,55 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
                 .stageFlags = stage_bit,
             });
         }
+        set_descriptors[set] = binding;
     }
-    uses_push_descriptors = binding < instance.MaxPushDescriptors();
-    const auto flags = uses_push_descriptors
-                           ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
-                           : vk::DescriptorSetLayoutCreateFlagBits{};
-    const vk::DescriptorSetLayoutCreateInfo desc_layout_ci = {
-        .flags = flags,
-        .bindingCount = static_cast<u32>(bindings.size()),
-        .pBindings = bindings.data(),
-    };
-    desc_layout_hash = XXH3_64bits(bindings.data(), bindings.size() * sizeof(bindings[0]));
-    auto [layout_result, layout] =
-        instance.GetDevice().createDescriptorSetLayoutUnique(desc_layout_ci);
-    ASSERT_MSG(layout_result == vk::Result::eSuccess,
-               "Failed to create graphics descriptor set layout: {}", vk::to_string(layout_result));
-    desc_layout = std::move(layout);
+    // The fragment set is pushed when it fits, else the vertex set; the others are allocated.
+    push_set = NoPushSet;
+    for (const auto sw : {Shader::SwStage::Fragment, Shader::SwStage::Vertex}) {
+        const u32 set = Shader::Backend::StageSet(u32(sw));
+        if (!set_bindings[set].empty() && set_descriptors[set] < instance.MaxPushDescriptors()) {
+            push_set = set;
+            break;
+        }
+    }
+    const vk::Device device = instance.GetDevice();
+    num_sets = 0;
+    set_layout_hashes = {};
+    for (u32 set = 0; set < set_bindings.size(); ++set) {
+        auto& bindings = set_bindings[set];
+        if (bindings.empty()) {
+            continue;
+        }
+        const vk::DescriptorSetLayoutCreateInfo desc_layout_ci = {
+            .flags = set == push_set ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
+                                     : vk::DescriptorSetLayoutCreateFlagBits{},
+            .bindingCount = static_cast<u32>(bindings.size()),
+            .pBindings = bindings.data(),
+        };
+        set_layout_hashes[set] =
+            XXH3_64bits(bindings.data(), bindings.size() * sizeof(bindings[0])) ^
+            (set == push_set ? 0x9E3779B97F4A7C15ULL : 0) ^ (u64(set) << 56) | 1;
+        auto [layout_result, layout] = device.createDescriptorSetLayoutUnique(desc_layout_ci);
+        ASSERT_MSG(layout_result == vk::Result::eSuccess,
+                   "Failed to create graphics descriptor set layout: {}",
+                   vk::to_string(layout_result));
+        desc_layouts[set] = std::move(layout);
+        set_layouts[set] = *desc_layouts[set];
+        num_sets = set + 1;
+    }
+    // Sets between stage sets: an empty layout.
+    for (u32 set = 0; set < num_sets; ++set) {
+        if (!set_layouts[set]) {
+            if (!empty_set_layout) {
+                auto [result, layout] =
+                    device.createDescriptorSetLayoutUnique(vk::DescriptorSetLayoutCreateInfo{});
+                ASSERT_MSG(result == vk::Result::eSuccess, "Failed to create an empty layout: {}",
+                           vk::to_string(result));
+                empty_set_layout = std::move(layout);
+            }
+            set_layouts[set] = *empty_set_layout;
+        }
+    }
 }
 
 } // namespace Vulkan

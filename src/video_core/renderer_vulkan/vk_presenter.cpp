@@ -22,7 +22,11 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/renderer_vulkan/vk_ui_hires.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#ifdef RYTY_GPU
+#include "video_core/renderer_vulkan/vk_rasterizer_native.h"
+#endif
 #include "video_core/texture_cache/image.h"
 
 #include <algorithm>
@@ -48,6 +52,8 @@
 #include <stb_image_write.h>
 #include <vk_mem_alloc.h>
 #include "ryty_gpu/ryty_diag.h"
+#include "ryty_gpu/ryty_fsr3.h"
+#include "ryty_gpu/ryty_upscaler_status.h"
 
 namespace Vulkan {
 
@@ -102,6 +108,21 @@ bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format for
 [[nodiscard]] vk::ImageBlit MakeImageBlitStretch(s32 frame_width, s32 frame_height,
                                                  s32 swapchain_width, s32 swapchain_height) {
     return MakeImageBlit(frame_width, frame_height, swapchain_width, swapchain_height, 0, 0);
+}
+
+#ifdef RYTY_GPU
+float RytyDisplayAspect(); // ryty_game_patch.cpp (GTS-009)
+#endif
+
+// GTS-009: with a widened camera (GPU.aspect_ratio) the game's 16:9 picture is stretched over the
+// whole window instead of being shown between black bars.
+static bool StretchToWindow() {
+#ifdef RYTY_GPU
+    static const bool stretch = RytyDisplayAspect() > 0.0f;
+    return stretch;
+#else
+    return false;
+#endif
 }
 
 static vk::Rect2D FitImage(s32 frame_width, s32 frame_height, s32 swapchain_width,
@@ -838,7 +859,13 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
 
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
-    g_prepared_frames.fetch_add(1, std::memory_order_relaxed); // DIAG-137
+    const u64 guestFrame = g_prepared_frames.fetch_add(1, std::memory_order_relaxed);
+    rasterizer->FrameDumpFlip(); // NAT-116
+#ifdef RYTY_GPU
+    if (auto* native = rasterizer->Native()) {
+        return PrepareNativeFrame(*native, attribute, cpu_address);
+    }
+#endif
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
     const auto image_id = texture_cache.FindImage(desc);
     texture_cache.UpdateImage(image_id);
@@ -878,14 +905,24 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     auto& image = texture_cache.GetImage(image_id);
     auto image_view = *image.FindView(view_info).image_view;
-    const vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
+    vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
+
+#ifdef RYTY_GPU
+    auto& temporalDlss = rasterizer->GetTemporalDlss();
+    temporalDlss.SetOutputSize({frame->width, frame->height}, attribute.attrib.pixel_format ==
+        Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq);
+    const auto temporalView = temporalDlss.PreparePresent(guestFrame, image, view_info.format);
+    if (temporalView) temporalDlss.CopyFrameGenerationInputs(guestFrame, frame->framegen_scene);
+#endif
 
     const u32 capture_game_only_count = VideoCore::ConsumeGameOnlyScreenshotRequests();
     std::optional<ScreenshotReadback> pending_screenshot;
 
-    // Capture the guest output before any host-side scaling (FSR/PP) is applied.
-    if (capture_game_only_count > 0 || FlashWatchEnabled()) {
+    // Capture the guest output before any host-side scaling (FSR/PP) is applied. (Not of an
+    // empty picture: a 0-byte readback buffer stopped the game with "Failed allocating buffer".)
+    if ((capture_game_only_count > 0 || FlashWatchEnabled()) && image_size.width != 0 &&
+        image_size.height != 0) {
         const bool hdr_encoded =
             attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq;
         auto& readback = pending_screenshot.emplace(
@@ -928,14 +965,36 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // PERF-084: the host passes record into the command buffer directly.
     const vk::CommandBuffer pass_cmdbuf = draw_scheduler.DirectCommandBuffer();
     bool scaled = false;
+    bool dlss_scaled = false;
+    vk::ImageView ui_layer_view{}; // HDR-UI
+    std::string upscaler; // FSR-204: for the window title
+    const vk::Extent2D game_size = image_size;
 #ifdef RYTY_GPU
+    const auto shown = UiHires::TakeFrame(instance, pass_cmdbuf, cpu_address, image_size,
+                                          {frame->width, frame->height}, view_info.format);
+    if (temporalView) {
+        image_view = temporalView;
+        image_size = temporalDlss.OutputSize();
+        dlss_scaled = true;
+        scaled = true;
+        upscaler = fmt::format("{} temporal", temporalDlss.BackendName());
+    } else if (shown) {
+        image_view = shown->view;
+        image_size = shown->size;
+        ui_layer_view = shown->ui;
+        dlss_scaled = shown->dlss;
+        scaled = true;
+        upscaler = shown->dlss ? "DLSS" : "high-resolution UI";
+    }
     // ryGT: DLSS (when its plugin is on and can scale to the window size) replaces FSR.
-    if (const auto dlss_view =
+    if (const auto dlss_view = scaled ? image_view :
             dlss_pass.Render(pass_cmdbuf, image.GetImage(), image_view, view_info.format,
                              image_size, {frame->width, frame->height});
         dlss_view != image_view) {
         image_view = dlss_view;
         scaled = true;
+        dlss_scaled = true;
+        upscaler = "DLSS";
     }
     // ryGT: FSR 3.1 replaces FSR 1 when it is on; the RCAS settings carry over (FSR 3.1 turns
     // RCAS attenuation 0..2 into sharpness 1..0).
@@ -950,19 +1009,28 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             fsr3_view != image_view) {
             image_view = fsr3_view;
             scaled = true;
+            upscaler = RytyFsr3::ActiveVersionName();
         }
     }
 #endif
     if (!scaled) {
+        const auto before = image_view;
         image_view = fsr_pass.Render(pass_cmdbuf, image_view, image_size,
                                      {frame->width, frame->height}, fsr_settings, frame->is_hdr);
+        upscaler = image_view != before ? "FSR 1" : "no upscaling";
     }
+#ifdef RYTY_GPU
+    RytyUpscalerStatus::ReportResolution(frame->width, frame->height,
+                                          game_size.width, game_size.height, upscaler,
+                                          RytyFrameGen::Working());
+#endif
 
     // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
     // the post process pass still sRGB encoded and has to be decoded there instead.
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
-    pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, pp_settings);
+    pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, pp_settings, ui_layer_view,
+                   dlss_scaled);
 
     DebugState.game_resolution = {image_size.width, image_size.height};
     DebugState.output_resolution = {frame->width, frame->height};
@@ -983,9 +1051,216 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     return frame;
 }
 
-Frame* Presenter::PrepareBlankFrame(bool present_thread) {
-    // Request a free presentation frame.
+#ifdef RYTY_GPU
+void Presenter::PrepareHudlessReference(Frame& frame, vk::CommandBuffer cmd, vk::Format input_format) {
+    auto& snapshot = frame.framegen_scene;
+    if (!snapshot.inputs.valid || !snapshot.hudless_scene_valid) return;
+    const int timing = RytyFrameGen::BeginGpuTiming(cmd, snapshot.inputs.sequence, 1);
+    const auto output_format = swapchain.GetSurfaceFormat().format;
+    const vk::Extent2D output_size{frame.width, frame.height};
+    if (!snapshot.hudless_scene_view) {
+        snapshot.hudless_scene_view = Check<"create FG HUD-less input view">(
+            instance.GetDevice().createImageViewUnique({.image = snapshot.hudless_scene,
+                .viewType = vk::ImageViewType::e2D, .format = input_format,
+                .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}}));
+    }
+    if (snapshot.hudless_output_size != output_size || snapshot.hudless_output_format != output_format) {
+        snapshot.hudless_output_view.reset();
+        snapshot.hudless_output = VideoCore::UniqueImage{instance.GetDevice(), instance.GetAllocator()};
+        snapshot.hudless_output.Create({.imageType = vk::ImageType::e2D, .format = output_format,
+            .extent = {frame.width, frame.height, 1}, .mipLevels = 1, .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled});
+        snapshot.hudless_output_view = Check<"create FG HUD-less output view">(
+            instance.GetDevice().createImageViewUnique({.image = snapshot.hudless_output,
+                .viewType = vk::ImageViewType::e2D, .format = output_format,
+                .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}}));
+        snapshot.hudless_output_size = output_size;
+        snapshot.hudless_output_format = output_format;
+        snapshot.hudless_output_initialized = false;
+    }
+    const vk::ImageMemoryBarrier2 before{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = snapshot.hudless_output_initialized ? vk::AccessFlagBits2::eShaderRead
+                                                            : vk::AccessFlags2{},
+        .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+        .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+        .oldLayout = snapshot.hudless_output_initialized ? vk::ImageLayout::eShaderReadOnlyOptimal
+                                                        : vk::ImageLayout::eUndefined,
+        .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = snapshot.hudless_output,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}};
+    cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &before});
+    Frame hudless;
+    hudless.width = frame.width; hudless.height = frame.height;
+    hudless.image = snapshot.hudless_output; hudless.image_view = *snapshot.hudless_output_view;
+    hudless.is_hdr = frame.is_hdr;
+    pp_pass.Render(cmd, *snapshot.hudless_scene_view, snapshot.hudless_scene_size,
+                   hudless, pp_settings, {}, false);
+    auto after = before;
+    after.srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
+    after.srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite;
+    after.dstStageMask = vk::PipelineStageFlagBits2::eComputeShader;
+    after.dstAccessMask = vk::AccessFlagBits2::eShaderRead;
+    after.oldLayout = vk::ImageLayout::eGeneral;
+    after.newLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &after});
+    snapshot.hudless_output_initialized = true;
+    snapshot.inputs.hudless = snapshot.hudless_output;
+    snapshot.inputs.hudless_format = output_format;
+    snapshot.inputs.hudless_size = output_size;
+    RytyFrameGen::EndGpuTiming(cmd, timing);
+}
+
+Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
+                                     const Libraries::VideoOut::BufferAttributeGroup& attribute,
+                                     VAddr cpu_address) {
+    // NAT-100: the picture native mode drew at the display buffer, through the same host passes.
+    const VideoCore::TextureCache::ImageDesc desc{attribute, cpu_address};
+    const vk::Format view_format = GetFrameViewFormat(attribute.attrib.pixel_format);
     Frame* frame = GetRenderFrame();
+    rasterizer->GetTemporalDlss().SetOutputSize({frame->width, frame->height},
+        attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq);
+    const auto display = native.FindDisplay(desc.info, view_format, {frame->width, frame->height});
+    const auto scene_sequence = g_prepared_frames.load(std::memory_order_relaxed);
+    if (display && !display->upscaler.empty() && scene_sequence)
+        rasterizer->GetTemporalDlss().CopyFrameGenerationInputs(scene_sequence - 1,
+                                                               frame->framegen_scene, true);
+    if (!display) {
+        return PrepareBlankFrame(false, frame);
+    }
+    const vk::ImageSubresourceRange single{
+        .aspectMask = vk::ImageAspectFlagBits::eColor,
+        .baseMipLevel = 0,
+        .levelCount = 1,
+        .baseArrayLayer = 0,
+        .layerCount = 1,
+    };
+    // The display picture is read in the shader-read layout, then goes back to the general
+    // layout native mode keeps its images in.
+    const std::array<vk::ImageMemoryBarrier2, 2> barriers{{
+        {
+            .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentRead,
+            .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+            .image = frame->image,
+            .subresourceRange{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = VK_REMAINING_ARRAY_LAYERS,
+            },
+        },
+        {
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader |
+                            vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .oldLayout = vk::ImageLayout::eGeneral,
+            .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            .image = display->image,
+            .subresourceRange = single,
+        },
+    }};
+    draw_scheduler.EndRendering();
+    draw_scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
+        .pImageMemoryBarriers = barriers.data(),
+    });
+    vk::Extent2D image_size{display->width, display->height};
+    expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
+    vk::ImageView image_view = display->view;
+    const vk::CommandBuffer pass_cmdbuf = draw_scheduler.DirectCommandBuffer();
+    bool scaled = false;
+    bool dlss_scaled = false;
+    vk::ImageView ui_layer_view{};
+    std::string upscaler = display->upscaler; // actual Native scene reconstruction
+    const vk::Extent2D game_size = image_size;
+    if (display->output_view) {
+        image_view = display->output_view;
+        image_size = display->output_size;
+        ui_layer_view = display->ui_layer;
+        dlss_scaled = display->dlss_scaled;
+        scaled = true;
+        if (display->dlss_scaled) upscaler = "DLSS";
+        else if (upscaler.empty()) upscaler = "high-resolution UI";
+    }
+    if (const auto dlss_view =
+            scaled ? image_view
+                   : dlss_pass.Render(pass_cmdbuf, display->image, image_view, view_format,
+                                      image_size, {frame->width, frame->height});
+        dlss_view != image_view) {
+        image_view = dlss_view;
+        scaled = true;
+        dlss_scaled = true;
+        upscaler = "DLSS";
+    }
+    if (!scaled && fsr_settings.enable) {
+        const float sharpness =
+            fsr_settings.use_rcas ? 1.0f - fsr_settings.rcas_attenuation / 2.0f : -1.0f;
+        if (const auto fsr3_view =
+                fsr3_pass.Render(pass_cmdbuf, display->image, image_view, view_format, image_size,
+                                 {frame->width, frame->height}, sharpness,
+                                 attribute.attrib.pixel_format ==
+                                     Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq);
+            fsr3_view != image_view) {
+            image_view = fsr3_view;
+            scaled = true;
+            upscaler = RytyFsr3::ActiveVersionName();
+        }
+    }
+    if (!scaled) {
+        const auto before = image_view;
+        image_view = fsr_pass.Render(pass_cmdbuf, image_view, image_size,
+                                     {frame->width, frame->height}, fsr_settings, frame->is_hdr);
+        if (image_view != before) upscaler = "FSR 1";
+    }
+    RytyUpscalerStatus::ReportResolution(frame->width, frame->height,
+                                          game_size.width, game_size.height, upscaler,
+                                          RytyFrameGen::Working());
+    pp_settings.srgb_input =
+        attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
+    PrepareHudlessReference(*frame, pass_cmdbuf, view_format);
+    pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, pp_settings, ui_layer_view,
+                   dlss_scaled);
+    const vk::ImageMemoryBarrier2 back{
+        .srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader |
+                        vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .oldLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        .newLayout = vk::ImageLayout::eGeneral,
+        .image = display->image,
+        .subresourceRange = single,
+    };
+    pass_cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &back,
+    });
+    DebugState.game_resolution = {image_size.width, image_size.height};
+    DebugState.output_resolution = {frame->width, frame->height};
+    frame->ready_semaphore = draw_scheduler.GetWorkSemaphore()->Handle();
+    frame->ready_tick = draw_scheduler.CurrentTick();
+    frame->ready_scheduler = &draw_scheduler;
+    SubmitInfo info{};
+    draw_scheduler.Flush(info);
+    return frame;
+}
+#endif
+
+Frame* Presenter::PrepareBlankFrame(bool present_thread, Frame* frame) {
+    // Request a free presentation frame.
+    if (!frame) {
+        frame = GetRenderFrame();
+    }
 
     auto& scheduler = present_thread ? present_scheduler : draw_scheduler;
     scheduler.EndRendering();
@@ -1200,8 +1475,13 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 ImVec2 contentArea = ImGui::GetContentRegionAvail();
                 SetExpectedGameSize((s32)contentArea.x, (s32)contentArea.y);
 
+                const bool stretch =
+                    StretchToWindow() && game_texture == frame->imgui_texture; // not the splash
                 const auto imgRect =
-                    FitImage(game_width, game_height, (s32)contentArea.x, (s32)contentArea.y);
+                    stretch ? vk::Rect2D{{0, 0}, {static_cast<u32>(contentArea.x),
+                                                  static_cast<u32>(contentArea.y)}}
+                            : FitImage(game_width, game_height, (s32)contentArea.x,
+                                       (s32)contentArea.y);
                 ImVec2 offset{
                     static_cast<float>(imgRect.offset.x),
                     static_cast<float>(imgRect.offset.y),
@@ -1224,7 +1504,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         }
         ImGui::Core::Render(cmdbuf, swapchain_image_view, swapchain.GetExtent());
 
-        if (capture_with_overlays_count > 0 || FlashWatchScreen()) {
+        // Not of a minimized window (a 0x0 swapchain: a 0-byte readback buffer stopped the game).
+        if ((capture_with_overlays_count > 0 || FlashWatchScreen()) && extent.width != 0 &&
+            extent.height != 0) {
             auto& readback = pending_screenshot.emplace(
                 instance, ScreenshotKind::WithOverlays,
                 BuildScreenshotPaths(ScreenshotKind::WithOverlays, capture_with_overlays_count),
@@ -1283,7 +1565,17 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
                                vk::PipelineStageFlagBits::eAllCommands,
                                vk::DependencyFlagBits::eByRegion, {}, {}, post_barrier);
-        swapchain.PrepareFrameGeneration(cmdbuf); // ryGT
+#ifdef RYTY_GPU
+        RytyDlssG::SetFreshFrame(is_game_frame && !is_reusing_frame &&
+                                !Libraries::SystemService::IsSplashVisible());
+#endif
+#ifdef RYTY_GPU
+        swapchain.PrepareFrameGeneration(cmdbuf,
+            frame->framegen_scene.inputs.valid ? &frame->framegen_scene.inputs : nullptr,
+            is_game_frame && !is_reusing_frame && !Libraries::SystemService::IsSplashVisible());
+#else
+        swapchain.PrepareFrameGeneration(cmdbuf);
+#endif
 
         if (profiler_ctx) {
             TracyVkCollect(profiler_ctx, cmdbuf);
@@ -1387,6 +1679,10 @@ Frame* Presenter::GetRenderFrame() {
         }
     }
     record_wait();
+#ifdef RYTY_GPU
+    frame->framegen_scene.inputs = {}; // never reuse another scene's metadata on a blank frame
+    frame->framegen_scene.hudless_scene_valid = false;
+#endif
 
     if (frame->width != expected_frame_width || frame->height != expected_frame_height ||
         frame->is_hdr != swapchain.GetHDR()) {
@@ -1401,6 +1697,9 @@ void Presenter::SetExpectedGameSize(s32 width, s32 height) {
 
     expected_frame_height = height;
     expected_frame_width = width;
+    if (StretchToWindow()) {
+        return; // GTS-009: the frame takes the window's shape; the passes scale to it
+    }
     if (ratio > expected_ratio) {
         expected_frame_width = static_cast<s32>(height * expected_ratio);
     } else {

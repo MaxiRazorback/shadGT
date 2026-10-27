@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <functional>
+
 #include <atomic>
 #include <map>
 #include <memory>
@@ -45,6 +47,7 @@ public:
 
     explicit DirectMemory(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler);
     ~DirectMemory();
+    u64 ImportedHostBytes() const { return imported_bytes.load(std::memory_order_relaxed); }
 
     /// Whether the model is on (SHADGT_DIRECT=1 and the driver can import host memory).
     static bool Enabled();
@@ -56,6 +59,12 @@ public:
     /// D6: the imported buffer holding the whole range and the range's offset in it, when one
     /// view holds it (call EnsureImported first).
     std::optional<std::pair<const Buffer*, u64>> FindBuffer(VAddr address, u64 size) const;
+
+    /// NAT-107: the imported views holding [address, address + size) in order:
+    /// fn(view buffer, offset in it, offset in the range, bytes). False (after calling fn for
+    /// the parts before it) when part of the range is not imported.
+    bool ForEachPart(VAddr address, u64 size,
+                     const std::function<void(const Buffer&, u64, u64, u64)>& fn) const;
 
     /// Whether every page of the range is mapped for the GPU (no import attempted).
     bool Covered(VAddr address, u64 size) const;
@@ -102,7 +111,8 @@ private:
     Vulkan::Scheduler& scheduler;
     mutable std::mutex mutex;
     std::map<VAddr, View> views; // by begin
-    std::vector<VAddr> failed;   // view bases that could not be imported (sorted)
+    std::map<VAddr, VAddr> failed; // failed view base -> committed end; invalidated on unmap
+    u64 failed_generation{};
     std::unique_ptr<Buffer> l1;
     std::unique_ptr<Buffer> l2_pool;
     std::unique_ptr<Buffer> zero_page;

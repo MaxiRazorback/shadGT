@@ -244,6 +244,20 @@ Id EmitContext::GetBufferSize(const u32 sharp_idx) {
 }
 
 void EmitContext::DefineBufferProperties() {
+    if (hw_stage == HwStage::Compute && info.uses_direct) {
+        // The per-dispatch table is immutable. Load scalar-pointer entries in the prologue
+        // so their IDs dominate all uses, including dynamic constant reads inside loops.
+        direct_table_words.resize(4 + info.buffers.size() * 4);
+        for (u32 i = 0; i < info.buffers.size(); ++i) {
+            if (!IsDirectBuffer(i) ||
+                info.buffers[i].post_op != SharpFetchPostOp::ReadConstPointer) {
+                continue;
+            }
+            for (u32 word = 4 + i * 4; word < 8 + i * 4; ++word) {
+                direct_table_words[word] = DirectTableWord(word);
+            }
+        }
+    }
     if (!profile.needs_buffer_offsets) {
         return;
     }
@@ -284,10 +298,19 @@ void EmitContext::DefineBufferProperties() {
     }
 }
 
+// AMD-311: VK_AMD_shader_explicit_vertex_parameter leaves to the driver which vertex
+// InterpolateAtVertexAMD(k) returns for the barycentric weights (1 - i - j, i, j) of
+// BaryCoordSmoothAMD. GT Sport blends per-vertex inputs with those weights (FIX-191); the RX 7600
+// numbers them in order 0, while an RX 6600 XT drew its hills and an RX 9060 XT its road as
+// triangles smeared in different directions. Vertex k of the weights reads vertex order[k].
+static constexpr std::array<std::array<u32, 3>, 6> AmdVertexOrders{{
+    {0, 1, 2}, {1, 2, 0}, {2, 0, 1}, {0, 2, 1}, {2, 1, 0}, {1, 0, 2}}};
+
 void EmitContext::DefineAmdPerVertexAttribs() {
     if (!profile.supports_amd_shader_explicit_vertex_parameter) {
         return;
     }
+    const auto& order = AmdVertexOrders[profile.amd_vertex_order % AmdVertexOrders.size()];
     for (s32 i = 0; i < runtime_info.hw.fs.num_inputs; i++) {
         const auto& input = runtime_info.hw.fs.inputs[i];
         if (input.IsDefault() || !info.loads.GetAny(IR::Attribute::Param0 + i) ||
@@ -296,12 +319,10 @@ void EmitContext::DefineAmdPerVertexAttribs() {
         }
         auto& param = input_params[i];
         const Id pointer = param.id;
-        param.id_array[0] =
-            OpInterpolateAtVertexAMD(F32[param.num_components], pointer, ConstU32(0U));
-        param.id_array[1] =
-            OpInterpolateAtVertexAMD(F32[param.num_components], pointer, ConstU32(1U));
-        param.id_array[2] =
-            OpInterpolateAtVertexAMD(F32[param.num_components], pointer, ConstU32(2U));
+        for (u32 k = 0; k < 3; ++k) {
+            param.id_array[k] =
+                OpInterpolateAtVertexAMD(F32[param.num_components], pointer, ConstU32(order[k]));
+        }
         param.is_loaded = true;
     }
 }
@@ -366,7 +387,7 @@ void EmitContext::DefineInputs() {
         break;
     }
     case SwStage::Fragment: {
-        if (info.loads.GetAny(IR::Attribute::FragCoord) ||
+        if (info.loads.GetAny(IR::Attribute::FragCoord) || runtime_info.hw.fs.quad_sample_mask ||
             (info.loads.GetAny(IR::Attribute::BaryCoordPullModel) &&
              !profile.supports_amd_shader_explicit_vertex_parameter)) {
             frag_coord = DefineVariable(F32[4], spv::BuiltIn::FragCoord, spv::StorageClass::Input);
@@ -736,7 +757,7 @@ void EmitContext::DefineOutputs() {
         if (info.stores.Get(IR::Attribute::Depth)) {
             frag_depth = DefineVariable(F32[1], spv::BuiltIn::FragDepth, spv::StorageClass::Output);
         }
-        if (info.stores.Get(IR::Attribute::SampleMask)) {
+        if (info.stores.Get(IR::Attribute::SampleMask) || runtime_info.hw.fs.quad_sample_mask) {
             sample_mask = DefineVariable(TypeArray(U32[1], u32_one_value), spv::BuiltIn::SampleMask,
                                          spv::StorageClass::Output);
         }
@@ -790,7 +811,8 @@ void EmitContext::DefineOutputs() {
 void EmitContext::DefinePushDataBlock() {
     // Create push constants block for instance steps rates
     const Id struct_type{
-        Name(TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2]), "AuxData")};
+        Name(TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[4], U32[4], U32[2]),
+             "AuxData")};
     Decorate(struct_type, spv::Decoration::Block);
     MemberName(struct_type, PushData::XOffsetIndex, "xoffset");
     MemberName(struct_type, PushData::YOffsetIndex, "yoffset");
@@ -799,6 +821,8 @@ void EmitContext::DefinePushDataBlock() {
     MemberName(struct_type, PushData::BufOffsetIndex + 0, "buf_offsets0");
     MemberName(struct_type, PushData::BufOffsetIndex + 1, "buf_offsets1");
     MemberName(struct_type, PushData::BufOffsetIndex + 2, "buf_offsets2");
+    MemberName(struct_type, PushData::BufOffsetIndex + 3, "buf_offsets3"); // SHD-002
+    MemberName(struct_type, PushData::QuadSampleMaskIndex, "quad_sample_mask");
     MemberDecorate(struct_type, PushData::XOffsetIndex, spv::Decoration::Offset, 0U);
     MemberDecorate(struct_type, PushData::YOffsetIndex, spv::Decoration::Offset, 4U);
     MemberDecorate(struct_type, PushData::XScaleIndex, spv::Decoration::Offset, 8U);
@@ -806,6 +830,8 @@ void EmitContext::DefinePushDataBlock() {
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 0, spv::Decoration::Offset, 16U);
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 1, spv::Decoration::Offset, 32U);
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 2, spv::Decoration::Offset, 48U);
+    MemberDecorate(struct_type, PushData::BufOffsetIndex + 3, spv::Decoration::Offset, 64U);
+    MemberDecorate(struct_type, PushData::QuadSampleMaskIndex, spv::Decoration::Offset, 80U);
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
     Name(push_data_block, "push_data");
     interfaces.push_back(push_data_block);
@@ -831,7 +857,7 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_cohere
     const Id pointer_type = TypePointer(storage_class, data_type);
     const Id id{AddGlobalVariable(struct_pointer_type, storage_class)};
     Decorate(id, spv::Decoration::Binding, binding.unified);
-    Decorate(id, spv::Decoration::DescriptorSet, 0U);
+    Decorate(id, spv::Decoration::DescriptorSet, Backend::StageSet(u32(sw_stage))); // SHD-002
     if (!is_written) {
         Decorate(id, spv::Decoration::NonWritable);
     } else if (is_coherent) {
@@ -996,6 +1022,10 @@ Id ImageType(EmitContext& ctx, const ImageResource& desc, Id sampled_type) {
     const auto format = desc.is_atomic ? GetFormat(image) : spv::ImageFormat::Unknown;
     const auto type = image.GetViewType(desc.is_array);
     const u32 sampled = desc.is_written ? 2 : 1;
+    if (desc.post_op == SharpFetchPostOp::NativeCubeSampling) {
+        ctx.AddCapability(spv::Capability::SampledCubeArray);
+        return ctx.TypeImage(sampled_type, spv::Dim::Cube, false, true, false, sampled, format);
+    }
     switch (type) {
     case AmdGpu::ImageType::Color1D:
     case AmdGpu::ImageType::Color2D:
@@ -1035,7 +1065,7 @@ void EmitContext::DefineImagesAndSamplers() {
         const Id id{AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding.unified);
         binding.unified += num_bindings;
-        Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        Decorate(id, spv::Decoration::DescriptorSet, Backend::StageSet(u32(sw_stage))); // SHD-002
         Name(id, fmt::format("{}_{}{}", hw_stage, "img", images.size()));
         images.push_back({
             .data_types = &data_types,
@@ -1045,6 +1075,7 @@ void EmitContext::DefineImagesAndSamplers() {
             .view_type = sharp.GetViewType(image_desc.is_array),
             .is_integer = is_integer,
             .is_storage = is_storage,
+            .native_cube = image_desc.post_op == SharpFetchPostOp::NativeCubeSampling,
             .mip_fallback_mode = mip_fallback_mode,
         });
         interfaces.push_back(id);
@@ -1062,7 +1093,7 @@ void EmitContext::DefineImagesAndSamplers() {
     for (const auto& samp_desc : info.samplers) {
         const Id id{AddGlobalVariable(sampler_pointer_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding.unified++);
-        Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        Decorate(id, spv::Decoration::DescriptorSet, Backend::StageSet(u32(sw_stage))); // SHD-002
         Name(id, fmt::format("{}_{}{}", hw_stage, "samp", samplers.size()));
         samplers.push_back(id);
         interfaces.push_back(id);
@@ -1070,10 +1101,13 @@ void EmitContext::DefineImagesAndSamplers() {
 }
 
 void EmitContext::DefineSharedMemory() {
-    const auto num_types = std::popcount(static_cast<u32>(info.shared_types));
-    if (num_types == 0) {
+    if (std::popcount(static_cast<u32>(info.shared_types)) == 0) {
         return;
     }
+    if (profile.intel_arc_workarounds) {
+        info.shared_types |= IR::Type::U32; // FIX-188: the 64-bit halves are 32-bit accesses
+    }
+    const auto num_types = std::popcount(static_cast<u32>(info.shared_types));
     ASSERT(info.hw_stage == HwStage::Compute);
     const u32 shared_memory_size =
         runtime_info.hw.cs.shared_memory_size + info.shared_memory_scratch_size;
@@ -1213,6 +1247,9 @@ Id EmitContext::DefineUfloatM5ToFloat32(u32 mantissa_bits, const std::string_vie
 }
 
 Id EmitContext::DirectTableWord(u32 index) {
+    if (index < direct_table_words.size() && Sirit::ValidId(direct_table_words[index])) {
+        return direct_table_words[index];
+    }
     const auto& table = buffers[direct_table_index];
     const auto [id, pointer_type] = table.Alias(PointerType::U32);
     return OpLoad(U32[1], OpAccessChain(pointer_type, id, u32_zero_value, ConstU32(index)));
@@ -1265,7 +1302,18 @@ Id EmitContext::EmitDirectLoad(u32 handle, Id byte_offset, u32 bytes, Id result_
     const Id direct_label = OpLabel();
     const Id fallback_label = OpLabel();
     const Id merge_label = OpLabel();
-    const Id valid = OpINotEqual(U1[1], DirectTableWord(entry + 3), u32_zero_value);
+    const Id mode = DirectTableWord(entry + 3);
+    Id valid = OpINotEqual(U1[1], mode, u32_zero_value);
+    if (info.hw_stage == HwStage::Compute &&
+        info.buffers[handle].post_op == SharpFetchPostOp::ReadConstPointer) {
+        // 0: ordinary SSBO, 1: direct guest reads, >1: SSBO prefix length. Reads beyond
+        // the prefix retain the original direct path and its full guest-buffer bounds.
+        const Id end = OpIAdd(U32[1], byte_offset, ConstU32(bytes));
+        const Id cached = OpLogicalAnd(U1[1], OpUGreaterThan(U1[1], mode, ConstU32(1U)),
+            OpLogicalAnd(U1[1], OpULessThanEqual(U1[1], end, mode),
+                          OpUGreaterThanEqual(U1[1], end, byte_offset)));
+        valid = OpLogicalAnd(U1[1], valid, OpLogicalNot(U1[1], cached));
+    }
     OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
     OpBranchConditional(valid, direct_label, fallback_label);
 

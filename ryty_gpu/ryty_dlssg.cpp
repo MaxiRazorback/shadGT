@@ -9,9 +9,15 @@
 #include <string>
 #include <utility>
 
+#include "common/guest_clock.h"
 #include "common/logging/log.h"
+#include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "ryty_gpu/ryty_dlssg.h"
+#include "ryty_gpu/ryty_framegen.h"
+#include "ryty_gpu/ryty_dlssg_options.h"
+#include "ryty_gpu/ryty_dlssg_state.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/texture_cache/image.h"
 
 // Streamline's headers (MIT, ryty_gpu/streamline). Its functions are loaded from
@@ -24,6 +30,10 @@
 
 namespace Vulkan::RytyFrameGen {
 extern std::atomic<u64> g_shown_frames; // ryty_framegen.cpp, read by the FPS counter
+}
+
+namespace Vulkan {
+bool RytyGtsInRace();
 }
 
 namespace Vulkan::RytyDlssG {
@@ -57,9 +67,22 @@ struct Streamline {
     PFN_vkGetInstanceProcAddr get_instance_proc_addr{};
     bool tried{};
     bool features_ready{};
-    bool options_set{};
+    GenerationOptions options{};
+    bool fresh_frame{};
+    bool reset_pending = true;
+    GenerationGate gate{};
+    Suspension suspension = Suspension::None;
+    GameplayState gameplay{};
+    std::mutex telemetry_mutex;
     sl::FrameToken* frame{};
     u32 frame_index{};
+    sl::Result last_inputs_error = sl::Result::eOk;
+    Clock::time_point reclaim_after{};
+    Clock::time_point report_after{};
+    u64 state_samples{};
+    u64 enabled_samples{};
+    u64 presented_frames{};
+    u64 multiple_present_samples{};
     std::mutex mutex;
     // No motion vectors or depth from the game: zero motion and a flat depth image.
     vk::Extent2D aux_size{};
@@ -224,6 +247,56 @@ void Marker(sl::PCLMarker marker) {
     }
 }
 
+bool SetGenerationMode(bool enabled, VmaAllocator allocator) {
+    const auto now = Clock::now();
+    const auto update = g_sl.options.Apply(now, enabled, [&](bool target) {
+        sl::DLSSGOptions options{};
+        options.mode = target ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
+        options.numFramesToGenerate = 1;
+        options.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
+        return g_sl.dlssg_set_options(sl::ViewportHandle{0u}, options);
+    });
+    if (!update.attempted) {
+        return update.applied;
+    }
+    if (update.result == sl::Result::eWarnOutOfVRAM && now >= g_sl.reclaim_after) {
+        g_sl.reclaim_after = now + std::chrono::seconds{30};
+        const auto recycled = VideoCore::ReleaseRecycledImages(allocator);
+        const auto empty_blocks = Vulkan::TrimEmptyVmaBlocks(allocator);
+        LOG_WARNING(Render_Vulkan,
+                    "ryGT DLSS-G: memory-budget warning; keeping requested mode, released {} "
+                    "recycled bytes and {} empty VMA block bytes; not retrying options",
+                    recycled, empty_blocks);
+    }
+    if (!OptionsAccepted(update.result)) {
+        LOG_WARNING(Render_Vulkan,
+                    "ryGT DLSS-G: options failed (result {}); clearing frame inputs, "
+                    "failed enable retries after 2 s",
+                    static_cast<int>(update.result));
+        return false;
+    }
+    LOG_WARNING(Render_Vulkan, "ryGT DLSS-G: frame generation requested {} (options result {})",
+                update.enabled ? "on" : "suspended", static_cast<int>(update.result));
+    return update.applied;
+}
+
+const char* SuspensionName(Suspension reason) {
+    switch (reason) {
+    case Suspension::Gameplay:
+        return "loading, menu, pause or inactive telemetry";
+    case Suspension::RepeatedFrame:
+        return "repeated frame or presentation gap";
+    case Suspension::Compilation:
+        return "shader compilation";
+    case Suspension::Resize:
+        return "output size changed";
+    case Suspension::Settling:
+        return "waiting for stable gameplay";
+    default:
+        return "active gameplay";
+    }
+}
+
 } // namespace
 
 bool Requested() {
@@ -232,6 +305,19 @@ bool Requested() {
 
 bool Active() {
     return g_sl.get_instance_proc_addr != nullptr;
+}
+
+void PublishTelemetry(const u8* packet) {
+    std::scoped_lock lock{g_sl.telemetry_mutex};
+    g_sl.gameplay.Publish(packet, Clock::now());
+}
+
+void SetFreshFrame(bool fresh) {
+    if (!Active()) {
+        return;
+    }
+    std::scoped_lock lock{g_sl.mutex};
+    g_sl.fresh_frame = fresh;
 }
 
 PFN_vkGetInstanceProcAddr LoadInterposer() {
@@ -316,12 +402,35 @@ void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     if (!LoadFeatureFunctions()) {
         return;
     }
-    if (size != g_sl.aux_size || !g_sl.motion_vectors_view || !g_sl.depth_view) {
+    const auto now = Clock::now();
+    bool gameplay_ready;
+    {
+        std::scoped_lock telemetry_lock{g_sl.telemetry_mutex};
+        gameplay_ready = g_sl.gameplay.Ready(now);
+    }
+    gameplay_ready = gameplay_ready && RytyGtsInRace() &&
+                     !Common::GuestClock::IsPaused() && !DebugState.IsGuestThreadsPaused();
+    const bool resized = size != g_sl.aux_size;
+    const auto reason =
+        g_sl.gate.Update(now, gameplay_ready, std::exchange(g_sl.fresh_frame, false),
+                         CompilationInProgress() || CompileSlowMotion(), resized);
+    const bool enabled = reason == Suspension::None;
+    if (reason != g_sl.suspension) {
+        g_sl.suspension = reason;
+        LOG_WARNING(Render_Vulkan, "ryGT DLSS-G: {}", SuspensionName(reason));
+    }
+    if (!enabled) {
+        g_sl.reset_pending = true;
+    }
+    if (resized || !g_sl.motion_vectors_view || !g_sl.depth_view) {
+        g_sl.reset_pending = true;
         CreateAuxImages(device, allocator, cmdbuf, size);
     }
     ++g_sl.frame_index;
     if (g_sl.new_frame_token(g_sl.frame, &g_sl.frame_index) != sl::Result::eOk || !g_sl.frame) {
         g_sl.frame = nullptr;
+        g_sl.reset_pending = true;
+        SetGenerationMode(false, allocator);
         return;
     }
     Marker(sl::PCLMarker::eSimulationStart);
@@ -349,8 +458,9 @@ void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     constants.depthInverted = sl::Boolean::eFalse;
     constants.cameraMotionIncluded = sl::Boolean::eTrue;
     constants.motionVectors3D = sl::Boolean::eFalse;
-    constants.reset = sl::Boolean::eFalse;
-    g_sl.set_constants(constants, *g_sl.frame, viewport);
+    constants.reset = g_sl.reset_pending ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+    const auto constants_result = g_sl.set_constants(constants, *g_sl.frame, viewport);
+    const bool valid_inputs = enabled && constants_result == sl::Result::eOk;
 
     const sl::Extent extent{0, 0, size.width, size.height};
     sl::Resource mvec{sl::ResourceType::eTex2d,
@@ -377,38 +487,66 @@ void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     // The backbuffer tag only carries the extent (Streamline knows the swapchain image).
     sl::Resource backbuffer{sl::ResourceType::eTex2d, nullptr, nullptr, nullptr};
     const sl::ResourceTag tags[] = {
-        sl::ResourceTag{&backbuffer, sl::kBufferTypeBackbuffer,
+        sl::ResourceTag{valid_inputs ? &backbuffer : nullptr, sl::kBufferTypeBackbuffer,
                         sl::ResourceLifecycle::eValidUntilPresent, &extent},
-        sl::ResourceTag{&mvec, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent,
-                        &extent},
-        sl::ResourceTag{&dep, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent,
-                        &extent},
+        sl::ResourceTag{valid_inputs ? &mvec : nullptr, sl::kBufferTypeMotionVectors,
+                        sl::ResourceLifecycle::eValidUntilPresent, &extent},
+        sl::ResourceTag{valid_inputs ? &dep : nullptr, sl::kBufferTypeDepth,
+                        sl::ResourceLifecycle::eValidUntilPresent, &extent},
     };
     auto* command_buffer =
         reinterpret_cast<sl::CommandBuffer*>(static_cast<VkCommandBuffer>(cmdbuf));
-    g_sl.set_tag(*g_sl.frame, viewport, tags, static_cast<u32>(std::size(tags)), command_buffer);
-
-    if (!g_sl.options_set) {
-        sl::DLSSGOptions options{};
-        options.mode = sl::DLSSGMode::eOn;
-        options.numFramesToGenerate = 1;
-        const sl::Result set = g_sl.dlssg_set_options(viewport, options);
-        g_sl.options_set = set == sl::Result::eOk;
-        LOG_WARNING(Render_Vulkan, "ryGT DLSS-G: frame generation {} (result {})",
-                    g_sl.options_set ? "on" : "could not be turned on", static_cast<int>(set));
+    const auto tags_result = g_sl.set_tag(*g_sl.frame, viewport, tags,
+                                        static_cast<u32>(std::size(tags)), command_buffer);
+    const auto inputs_error =
+        constants_result != sl::Result::eOk ? constants_result : tags_result;
+    if (inputs_error != sl::Result::eOk && inputs_error != g_sl.last_inputs_error) {
+        LOG_ERROR(Render_Vulkan, "ryGT DLSS-G: frame inputs rejected (result {}); generation off",
+                  static_cast<int>(inputs_error));
     }
+    g_sl.last_inputs_error = inputs_error;
+    const bool ready = valid_inputs && tags_result == sl::Result::eOk;
+    const bool mode_set = SetGenerationMode(ready, allocator);
+    if (valid_inputs && !(ready && mode_set)) {
+        auto cleared_tags = std::to_array(tags);
+        for (auto& tag : cleared_tags) {
+            tag.resource = nullptr;
+        }
+        g_sl.set_tag(*g_sl.frame, viewport, cleared_tags.data(),
+                     static_cast<u32>(cleared_tags.size()), command_buffer);
+    }
+    g_sl.reset_pending = !(ready && mode_set);
+    if (!(ready && mode_set)) RytyFrameGen::ReportWorking(false);
     Marker(sl::PCLMarker::eRenderSubmitEnd);
 
     // Frames shown (game and generated) for the FPS counter, and DLSS-G's status when it changes.
     if (g_sl.dlssg_get_state) {
         sl::DLSSGState state{};
         if (g_sl.dlssg_get_state(viewport, state, nullptr) == sl::Result::eOk) {
+            if (ready && mode_set && state.numFramesActuallyPresented > 1)
+                RytyFrameGen::ReportWorking(true);
             RytyFrameGen::g_shown_frames.fetch_add(state.numFramesActuallyPresented,
                                                    std::memory_order_relaxed);
             if (static_cast<int>(state.status) != g_sl.last_status) {
                 g_sl.last_status = static_cast<int>(state.status);
-                LOG_WARNING(Render_Vulkan, "ryGT DLSS-G: status {:#x} (0 = generating)",
+                LOG_WARNING(Render_Vulkan, "ryGT DLSS-G: status {:#x} (0 = no reported error)",
                             g_sl.last_status);
+            }
+            ++g_sl.state_samples;
+            g_sl.enabled_samples += ready && mode_set;
+            g_sl.presented_frames += state.numFramesActuallyPresented;
+            g_sl.multiple_present_samples += state.numFramesActuallyPresented > 1;
+            if (now >= g_sl.report_after) {
+                LOG_INFO(Render_Vulkan,
+                         "ryGT DLSS-G: presentation sample: {} queries, {} enabled queries, "
+                         "{} reported presented frames, {} queries with multiple presents",
+                         g_sl.state_samples, g_sl.enabled_samples, g_sl.presented_frames,
+                         g_sl.multiple_present_samples);
+                g_sl.report_after = now + std::chrono::seconds{5};
+                g_sl.state_samples = 0;
+                g_sl.enabled_samples = 0;
+                g_sl.presented_frames = 0;
+                g_sl.multiple_present_samples = 0;
             }
         }
     }
@@ -430,11 +568,22 @@ void PresentEnd() {
 
 void Shutdown() {
     std::scoped_lock lock{g_sl.mutex};
+    RytyFrameGen::ReportWorking(false);
     g_sl.motion_vectors_view.reset();
     g_sl.depth_view.reset();
     g_sl.motion_vectors.Destroy();
     g_sl.depth.Destroy();
     g_sl.aux_size = {};
+    g_sl.options = {};
+    g_sl.fresh_frame = false;
+    g_sl.reset_pending = true;
+    g_sl.gate = {};
+    g_sl.reclaim_after = {};
+    g_sl.report_after = {};
+    g_sl.state_samples = 0;
+    g_sl.enabled_samples = 0;
+    g_sl.presented_frames = 0;
+    g_sl.multiple_present_samples = 0;
 }
 
 } // namespace Vulkan::RytyDlssG

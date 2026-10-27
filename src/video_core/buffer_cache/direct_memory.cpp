@@ -14,6 +14,7 @@
 #endif
 
 #include "common/logging/log.h"
+#include "core/memory.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/direct_memory.h"
 #include "video_core/buffer_cache/proto_import.h"
@@ -220,12 +221,17 @@ bool DirectMemory::ImportView(VAddr address) {
     if (base == 0) {
         return false;
     }
-    if (std::ranges::binary_search(failed, base)) {
+    if (failed.contains(base)) {
         return false;
     }
     const VAddr end = GuestViewEnd(base, 1ULL << 32);
     const auto fail = [&](const char* why) {
-        failed.insert(std::ranges::upper_bound(failed, base), base);
+        // An unmap/remap can leave the allocation temporarily uncommitted or split
+        // before the requested page. That is not a permanent import failure.
+        if (end > address && (base & (PageSize - 1)) == 0 &&
+            ((end - base) & (PageSize - 1)) == 0) {
+            failed.emplace(base, end);
+        }
         if (++failed_count <= 40) {
             LOG_WARNING(Render_Vulkan, "D1: view {:#x}+{:#x} not imported: {}", base, end - base,
                         why);
@@ -260,8 +266,18 @@ bool DirectMemory::ImportView(VAddr address) {
                                             &flags_info,
                                             VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
                                             alias};
+    u32 memory_type_index = static_cast<u32>(std::countr_zero(ptr_props.memoryTypeBits));
+    // FIX-188: Intel Arc (#65) imports into cached host memory (uncached stalls the CPU).
+    const auto& mem_props = instance.GetMemoryProperties();
+    for (u32 i = 0; instance.IsIntel() && i < mem_props.memoryTypeCount; ++i) {
+        if ((ptr_props.memoryTypeBits & (1u << i)) &&
+            (mem_props.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eHostCached)) {
+            memory_type_index = i;
+            break;
+        }
+    }
     VkMemoryAllocateInfo info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &import, end - base,
-                              static_cast<u32>(std::countr_zero(ptr_props.memoryTypeBits))};
+                              memory_type_index};
     VkDeviceMemory memory{};
     if (const VkResult r = d.vkAllocateMemory(device, &info, nullptr, &memory); r != VK_SUCCESS) {
         UnmapAlias()(alias);
@@ -275,7 +291,8 @@ bool DirectMemory::ImportView(VAddr address) {
     buffer_info.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                        VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT; // NAT-100: dispatch arguments
     VkBuffer buffer{};
     if (d.vkCreateBuffer(device, &buffer_info, nullptr, &buffer) != VK_SUCCESS ||
         d.vkBindBufferMemory(device, buffer, memory, 0) != VK_SUCCESS) {
@@ -298,6 +315,26 @@ bool DirectMemory::ImportView(VAddr address) {
 #else
     return false;
 #endif
+}
+
+bool DirectMemory::ForEachPart(VAddr address, u64 size,
+                               const std::function<void(const Buffer&, u64, u64, u64)>& fn) const {
+    std::scoped_lock lk{mutex};
+    const VAddr end = address + size;
+    for (VAddr cursor = address; cursor < end;) {
+        auto it = views.upper_bound(cursor);
+        if (it == views.begin()) {
+            return false;
+        }
+        const View& view = std::prev(it)->second;
+        if (cursor < view.begin || cursor >= view.end || !view.wrapper) {
+            return false;
+        }
+        const u64 bytes = std::min(end, view.end) - cursor;
+        fn(*view.wrapper, cursor - view.begin, cursor - address, bytes);
+        cursor += bytes;
+    }
+    return true;
 }
 
 bool DirectMemory::EnsureImported(VAddr address, u64 size) {
@@ -324,7 +361,22 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
         }
     }
     std::scoped_lock lk{mutex};
+#ifdef RYTY_GPU
+    // OnUnmap is reported before the host remap. A lookup during that window can
+    // fail, so discard negative results after the completed mapping is reported too.
+    const u64 mapping_generation = Core::RytyMemory::MappingGeneration();
+    if (failed_generation != mapping_generation) {
+        failed.clear();
+        failed_generation = mapping_generation;
+    }
+#endif
     for (VAddr page = address & ~(PageSize - 1); page < end;) {
+        // A failed view is retried by many draws (and again by the gather fallback).
+        // Its bounds are already known: avoid querying Windows for its base each time.
+        const auto failure = failed.upper_bound(page);
+        if (failure != failed.begin() && page < std::prev(failure)->second) {
+            return false;
+        }
         auto it = views.upper_bound(page);
         if (it != views.begin()) {
             const auto& view = std::prev(it)->second;
@@ -377,8 +429,10 @@ void DirectMemory::OnUnmap(VAddr address, u64 size) {
         }
         it = views.erase(it);
     }
-    // A view base unmapped may be mapped again with other memory.
-    std::erase_if(failed, [&](VAddr base) { return base >= address && base < end; });
+    // Even a partial unmap can replace part of a failed view with importable memory.
+    std::erase_if(failed, [&](const auto& view) {
+        return view.first < end && (view.second > address || view.first >= address);
+    });
 }
 
 DirectMemory::Stats DirectMemory::GetStats() const {

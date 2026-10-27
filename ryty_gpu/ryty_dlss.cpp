@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <string>
 
 #include "common/logging/log.h"
@@ -26,6 +27,9 @@ struct Plugin {
     PFN_RygtDlss_Evaluate evaluate{};
     PFN_RygtDlss_Shutdown shutdown{};
     PFN_RygtDlss_LastError last_error{};
+    PFN_RygtDlss_TemporalApiVersion temporal_version{};
+    PFN_RygtDlss_GetOptimalSettings optimal_settings{};
+    PFN_RygtDlss_EvaluateTemporal evaluate_temporal{};
     bool tried{};
     bool ready{}; // Init succeeded
 };
@@ -36,6 +40,26 @@ std::string LastError() {
 }
 
 } // namespace
+
+bool TemporalRequested() {
+    static const bool requested = [] {
+        const char* value = std::getenv("SHADGT_DLSS_TEMPORAL");
+        return value ? std::strcmp(value, "1") == 0 : EmulatorSettings.IsDlssEnabled();
+    }();
+    return requested;
+}
+
+RygtDlssQuality Quality() {
+    const char* overrideMode = std::getenv("SHADGT_DLSS_QUALITY");
+    const auto mode = overrideMode ? std::string{overrideMode} : EmulatorSettings.GetDlssQuality();
+    if (mode == "ultra_performance") return RYGT_DLSS_QUALITY_ULTRA_PERFORMANCE;
+    if (mode == "performance") return RYGT_DLSS_QUALITY_PERFORMANCE;
+    if (mode == "balanced") return RYGT_DLSS_QUALITY_BALANCED;
+    if (mode == "quality") return RYGT_DLSS_QUALITY_QUALITY;
+    if (mode == "dlaa") return RYGT_DLSS_QUALITY_DLAA;
+    LOG_WARNING(Render_Vulkan, "Temporal DLSS: unknown mode '{}'; using Performance", mode);
+    return RYGT_DLSS_QUALITY_PERFORMANCE;
+}
 
 bool Load() {
     if (g_plugin.tried) {
@@ -75,6 +99,9 @@ bool Load() {
     LOAD(evaluate, "RygtDlss_Evaluate");
     LOAD(shutdown, "RygtDlss_Shutdown");
     LOAD(last_error, "RygtDlss_LastError");
+    LOAD(temporal_version, "RygtDlss_TemporalApiVersion");
+    LOAD(optimal_settings, "RygtDlss_GetOptimalSettings");
+    LOAD(evaluate_temporal, "RygtDlss_EvaluateTemporal");
 #undef LOAD
     if (!g_plugin.get_instance_extensions || !g_plugin.get_device_extensions || !g_plugin.init ||
         !g_plugin.supports || !g_plugin.evaluate || !g_plugin.shutdown || !g_plugin.last_error) {
@@ -84,6 +111,9 @@ bool Load() {
         return false;
     }
     g_plugin.module = module;
+    // RivaTuner's (RTSS) Vulkan layer crashes inside vkCreateDevice once the DLSS device
+    // extensions are enabled. The loader reads this switch when the instance is created.
+    SetEnvironmentVariableA("DISABLE_RTSS_LAYER", "1");
     LOG_INFO(Render_Vulkan, "ryGT DLSS: plugin loaded");
     return true;
 }
@@ -146,6 +176,10 @@ bool Init(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Device 
     }
     g_plugin.ready = true;
     LOG_INFO(Render_Vulkan, "ryGT DLSS: ready");
+    if (TemporalRequested()) {
+        LOG_INFO(Render_Vulkan, "ryGT DLSS: temporal interface v2 {}",
+                 TemporalEnabled() ? "armed; waiting for a matching scene" : "unavailable; keeping spatial fallback");
+    }
     return true;
 }
 
@@ -154,6 +188,92 @@ void Shutdown() {
         g_plugin.shutdown();
         g_plugin.ready = false;
     }
+}
+
+bool TemporalEnabled() {
+    return TemporalRequested() && g_plugin.ready && g_plugin.temporal_version &&
+           g_plugin.temporal_version() == RYGT_DLSS_TEMPORAL_API_VERSION &&
+           g_plugin.optimal_settings && g_plugin.evaluate_temporal;
+}
+
+bool GetOptimalSettings(u32 width, u32 height, RygtDlssQuality quality,
+                        RygtDlssOptimalSettings& settings) {
+    settings = {.struct_size = sizeof(settings)};
+    return TemporalEnabled() &&
+           g_plugin.optimal_settings(width, height, quality, &settings) == 0;
+}
+
+bool EvaluateTemporal(vk::CommandBuffer cmdbuf, const RygtDlssFrame& frame) {
+    if (!TemporalEnabled()) {
+        return false;
+    }
+    if (g_plugin.evaluate_temporal(cmdbuf, &frame) != 0) {
+        LOG_ERROR(Render_Vulkan, "ryGT temporal DLSS: {}", LastError());
+        return false;
+    }
+    return true;
+}
+
+bool CanScale(vk::Extent2D input_size, vk::Extent2D output_size) {
+    return g_plugin.ready && g_plugin.supports(input_size.width, input_size.height,
+                                               output_size.width, output_size.height);
+}
+
+bool ScaleInto(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::ImageView input,
+               vk::Format input_format, vk::Extent2D input_size, vk::Image output_image,
+               vk::ImageView output, vk::Extent2D output_size) {
+    if (!CanScale(input_size, output_size)) {
+        return false;
+    }
+    const vk::MemoryBarrier2 input_barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+    };
+    const vk::ImageMemoryBarrier2 output_barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+        .oldLayout = vk::ImageLayout::eUndefined,
+        .newLayout = vk::ImageLayout::eGeneral,
+        .image = output_image,
+        .subresourceRange{.aspectMask = vk::ImageAspectFlagBits::eColor, .levelCount = 1,
+                          .layerCount = 1},
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &input_barrier,
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &output_barrier,
+    });
+    const RygtDlssImage in{
+        .image = static_cast<VkImage>(input_image),
+        .view = static_cast<VkImageView>(input),
+        .format = static_cast<VkFormat>(input_format),
+        .width = input_size.width,
+        .height = input_size.height,
+    };
+    const RygtDlssImage out{
+        .image = static_cast<VkImage>(output_image),
+        .view = static_cast<VkImageView>(output),
+        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+        .width = output_size.width,
+        .height = output_size.height,
+    };
+    if (g_plugin.evaluate(static_cast<VkCommandBuffer>(cmdbuf), &in, &out, 0.0f) != 0) {
+        LOG_ERROR(Render_Vulkan, "ryGT DLSS (UI-HIRES): {}", LastError());
+        return false;
+    }
+    static vk::Extent2D logged_in{}, logged_out{};
+    if (input_size != logged_in || output_size != logged_out) {
+        logged_in = input_size;
+        logged_out = output_size;
+        LOG_INFO(Render_Vulkan, "ryGT DLSS: UI-HIRES scene {}x{} to {}x{}", input_size.width,
+                 input_size.height, output_size.width, output_size.height);
+    }
+    return true;
 }
 
 void Pass::Create(vk::Device device_, VmaAllocator allocator, u32 num_images) {
@@ -168,7 +288,7 @@ void Pass::Create(vk::Device device_, VmaAllocator allocator, u32 num_images) {
 vk::ImageView Pass::Render(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::ImageView input,
                            vk::Format input_format, vk::Extent2D input_size,
                            vk::Extent2D output_size) {
-    if (!g_plugin.ready || failed) {
+    if (!g_plugin.ready || failed || TemporalRequested()) {
         return input;
     }
     if (!g_plugin.supports(input_size.width, input_size.height, output_size.width,

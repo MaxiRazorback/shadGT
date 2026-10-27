@@ -247,6 +247,20 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
 
     auto image = image_res.GetSharp(info);
     ASSERT(image.GetType() != AmdGpu::ImageType::Invalid);
+    // Keep integer accesses, comparison/gather operations, and face-space offsets or
+    // gradients on their existing array path. Ordinary cube samples can use the host
+    // cube sampler; the post-op separates their descriptor from any array access.
+    if (profile.native_cube_sampling && info.hw_stage == HwStage::Fragment &&
+        image.GetType() == AmdGpu::ImageType::Cube &&
+        inst.GetOpcode() == IR::Opcode::ImageSampleRaw && !inst_info.is_depth &&
+        !inst_info.is_gather && !inst_info.has_offset && !inst_info.has_derivatives &&
+        !inst_info.is_unnormalized) {
+        AmdGpu::Sampler sampler{};
+        const auto fetch = ConstructSharpFetch<AmdGpu::Sampler>(resource.sharps[1]);
+        if (fetch.Fetch(info.flattened_ud_buf.data(), &sampler) && !sampler.force_unnormalized) {
+            image_res.post_op = SharpFetchPostOp::NativeCubeSampling;
+        }
+    }
 
     if (needs_mip_storage_fallback) {
         // If the mip level to IMAGE_(LOAD/STORE)_MIP is a constant, set up ImageResource
@@ -868,6 +882,11 @@ void PatchImageArgs(IR::Inst& inst, Info& info) {
     IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
     auto inst_info = inst.Flags<IR::TextureInstInfo>();
     const auto view_type = image.GetViewType(image_res.is_array);
+    const auto has_ms = view_type == AmdGpu::ImageType::Color2DMsaa ||
+                        view_type == AmdGpu::ImageType::Color2DMsaaArray;
+    if (has_ms && inst.GetOpcode() == IR::Opcode::ImageRead) {
+        inst_info.has_lod.Assign(false);
+    }
 
     // Now that we know the image type, adjust texture coordinate vector.
     IR::Inst* body = inst.Arg(1).Inst();
@@ -908,8 +927,6 @@ void PatchImageArgs(IR::Inst& inst, Info& info) {
         }
     }();
 
-    const auto has_ms = view_type == AmdGpu::ImageType::Color2DMsaa ||
-                        view_type == AmdGpu::ImageType::Color2DMsaaArray;
     ASSERT(!inst_info.has_lod || !has_ms);
     // If we are binding a single mip level as fallback, drop the argument
     const auto lod =

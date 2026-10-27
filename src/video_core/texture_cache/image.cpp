@@ -21,6 +21,8 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
+#include "video_core/renderer_vulkan/image_allocation.h"
+#include <chrono>
 
 #include <vk_mem_alloc.h>
 
@@ -214,6 +216,7 @@ struct RecycledImage {
     vk::Image image;
     vk::DeviceSize size_bytes;
     u64 seq;
+    std::chrono::steady_clock::time_point unused_since;
 };
 std::deque<std::pair<RecycleKey, u64>> g_recycle_order; // oldest first, for eviction
 u64 g_recycle_seq = 0;
@@ -284,7 +287,7 @@ bool Recycle(VmaAllocator allocator, const vk::ImageCreateInfo& ci, VmaAllocatio
         });
     }
     const u64 seq = ++g_recycle_seq;
-    g_recycled[key].push_back({allocation, image, size_bytes, seq});
+    g_recycled[key].push_back({allocation, image, size_bytes, seq, std::chrono::steady_clock::now()});
     g_recycle_order.emplace_back(key, seq);
     g_recycled_bytes += size_bytes;
     return true;
@@ -313,6 +316,61 @@ std::optional<RecycledImage> TakeRecycled(const vk::ImageCreateInfo& ci) {
 }
 } // namespace
 
+u64 RecycledImageBytes() {
+    std::scoped_lock lk{g_recycle_mutex};
+    return g_recycled_bytes;
+}
+
+void ClearRecycledImages(VmaAllocator allocator) {
+    std::scoped_lock lk{g_recycle_mutex};
+    for (auto& [key, images] : g_recycled) {
+        for (const auto& image : images) vmaDestroyImage(allocator, image.image, image.allocation);
+    }
+    g_recycled.clear();
+    g_recycle_order.clear();
+    g_recycled_bytes = 0;
+}
+
+void TrimUnusedRecycledImages(VmaAllocator allocator) {
+    const auto cutoff = std::chrono::steady_clock::now() - std::chrono::seconds{30};
+    std::scoped_lock lk{g_recycle_mutex};
+    while (!g_recycle_order.empty()) {
+        const auto& [key, seq] = g_recycle_order.front();
+        auto bucket = g_recycled.find(key);
+        if (bucket == g_recycled.end()) {
+            g_recycle_order.pop_front();
+            continue;
+        }
+        auto& images = bucket->second;
+        const auto it = std::ranges::find(images, seq, &RecycledImage::seq);
+        if (it != images.end()) {
+            if (it->unused_since > cutoff) break;
+            // Images enter this pool only after their GPU completion callback.
+            vmaDestroyImage(allocator, it->image, it->allocation);
+            g_recycled_bytes -= it->size_bytes;
+            images.erase(it);
+            ++g_recycle_dropped;
+        }
+        if (images.empty()) g_recycled.erase(bucket);
+        g_recycle_order.pop_front();
+    }
+}
+
+u64 ReleaseRecycledImages(VmaAllocator allocator) {
+    std::scoped_lock lock{g_recycle_mutex};
+    const u64 released = g_recycled_bytes;
+    for (const auto& [key, images] : g_recycled) {
+        for (const auto& image : images) {
+            vmaDestroyImage(allocator, image.image, image.allocation);
+            ++g_recycle_dropped;
+        }
+    }
+    g_recycled.clear();
+    g_recycle_order.clear();
+    g_recycled_bytes = 0;
+    return released;
+}
+
 UniqueImage::~UniqueImage() {
     Destroy();
 }
@@ -336,7 +394,7 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
         size_bytes = recycled->size_bytes;
         return;
     }
-    const VmaAllocationCreateInfo alloc_ci = {
+    VmaAllocationCreateInfo alloc_ci = {
         .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         .requiredFlags = 0,
@@ -346,10 +404,16 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     };
 
     const VkImageCreateInfo image_ci_unsafe = static_cast<VkImageCreateInfo>(image_ci);
+    alloc_ci.pool = Vulkan::SmallImageAllocationPool(allocator, image_ci_unsafe, alloc_ci);
     VkImage unsafe_image{};
     VmaAllocationInfo alloc_info{};
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
                                      &allocation, &alloc_info);
+    if (result != VK_SUCCESS && alloc_ci.pool) {
+        alloc_ci.pool = VK_NULL_HANDLE;
+        result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
+                               &allocation, &alloc_info);
+    }
     ASSERT_MSG(result == VK_SUCCESS,
                "Failed allocating image: error={} format={} type={} extent={}x{}x{} "
                "mips={} layers={} samples={} flags={} usage={} tiling={}",
@@ -384,6 +448,47 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
 
     usage_flags = ImageUsageFlags(instance, info);
     format_features = FormatFeatureFlags(usage_flags);
+    // FIX-211: AMD's driver refuses storage use for some block-compressed formats even with
+    // extended usage (BC5 and BC6H on an RX 7600), where NVIDIA's accepts it. The image was made
+    // anyway, outside what the driver supports, and textures came out garbled (broken colours
+    // on car dashboards). Shaders only sample these, so storage use is dropped.
+    if (info.props.is_block && (usage_flags & vk::ImageUsageFlagBits::eStorage)) {
+        static std::mutex refused_mutex;
+        static std::unordered_map<u64, bool> refused_cache;
+        const u64 refused_key = (u64(info.pixel_format) << 40) ^
+                                (u64(ConvertImageType(info.type)) << 36) ^
+                                (u64(VkImageUsageFlags(usage_flags)) << 16) ^
+                                u64(VkImageCreateFlags(flags));
+        std::optional<bool> refused;
+        {
+            std::scoped_lock lk{refused_mutex};
+            if (const auto it = refused_cache.find(refused_key); it != refused_cache.end()) {
+                refused = it->second;
+            }
+        }
+        if (!refused) {
+            const auto result = instance.GetPhysicalDevice()
+                                    .getImageFormatProperties2(vk::PhysicalDeviceImageFormatInfo2{
+                                        .format = info.pixel_format,
+                                        .type = ConvertImageType(info.type),
+                                        .tiling = vk::ImageTiling::eOptimal,
+                                        .usage = usage_flags,
+                                        .flags = flags,
+                                    })
+                                    .result;
+            refused = result == vk::Result::eErrorFormatNotSupported;
+            if (*refused) {
+                LOG_INFO(Render_Vulkan, "FIX-211: format {} made without storage use",
+                         vk::to_string(info.pixel_format));
+            }
+            std::scoped_lock lk{refused_mutex};
+            refused_cache.emplace(refused_key, *refused);
+        }
+        if (*refused) {
+            usage_flags &= ~vk::ImageUsageFlagBits::eStorage;
+            format_features = FormatFeatureFlags(usage_flags);
+        }
+    }
     if (info.props.is_depth) {
         aspect_mask = vk::ImageAspectFlagBits::eDepth;
         if (info.props.has_stencil) {

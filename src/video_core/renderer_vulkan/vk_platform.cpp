@@ -24,6 +24,7 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 #ifdef RYTY_GPU
 #include "ryty_gpu/ryty_dlss.h"
+#include "ryty_gpu/ryty_xess.h"
 #include "ryty_gpu/ryty_dlssg.h"
 #endif
 
@@ -210,6 +211,8 @@ std::vector<const char*> GetInstanceExtensions(Frontend::WindowSystemType window
 #ifdef RYTY_GPU
     // ryGT: the instance extensions NVIDIA DLSS needs, when the DLSS plugin is used.
     RytyDlss::AddInstanceExtensions(extensions, properties);
+    // XESS-200: and Intel XeSS's, when it is the temporal upscaler.
+    RytyXess::AddInstanceExtensions(extensions, properties);
 #endif
 
     // Sanitize extension list
@@ -231,11 +234,12 @@ std::vector<const char*> GetInstanceExtensions(Frontend::WindowSystemType window
 
 std::vector<const char*> GetInstanceLayers(bool enable_validation, bool enable_crash_diagnostic) {
     const auto [properties_result, properties] = vk::enumerateInstanceLayerProperties();
-    if (properties_result != vk::Result::eSuccess || properties.empty()) {
+    if (properties_result != vk::Result::eSuccess) {
         LOG_ERROR(Render_Vulkan, "Failed to query layer properties: {}",
                   vk::to_string(properties_result));
         return {};
     }
+    if (properties.empty()) return {};
 
     std::vector<const char*> layers;
     layers.reserve(2);

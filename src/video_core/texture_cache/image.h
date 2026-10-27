@@ -31,6 +31,11 @@ VK_DEFINE_HANDLE(VmaAllocator)
 
 namespace VideoCore {
 
+/// Release GPU-completed recycled images unused for at least 30 seconds.
+void TrimUnusedRecycledImages(VmaAllocator allocator);
+u64 ReleaseRecycledImages(VmaAllocator allocator);
+u64 RecycledImageBytes();
+
 enum ImageFlagBits : u32 {
     Empty = 0,
     MaybeCpuDirty = 1 << 0, ///< The page this image is in was touched before the image address

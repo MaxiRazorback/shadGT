@@ -512,11 +512,17 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     }
 #endif
 
+    if (instance.IsIntel()) {
+        EndSession(); // FIX-188: Intel Arc (#65)
+    }
+
     if (on_submit) {
         on_submit(info);
     }
 
-    EndSession();
+    if (!instance.IsIntel()) {
+        EndSession();
+    }
 
     info.AddSignal(work_semaphore.Handle(), signal_value);
     if (ring) {
@@ -571,6 +577,9 @@ void Scheduler::SubmitSessions(SubmitInfo& info, u64 signal_value) {
         std::scoped_lock lk{submit_mutex};
         ImGui::Core::TextureManager::Submit();
         auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+        if (submit_result == vk::Result::eErrorDeviceLost) {
+            instance.LogDeviceFault(); // DIAG-206
+        }
         ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
     }
 

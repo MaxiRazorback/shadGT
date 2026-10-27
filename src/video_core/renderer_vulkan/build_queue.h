@@ -27,8 +27,9 @@ public:
     using Clock = std::chrono::steady_clock;
     enum class Kind { Urgent, Normal, Background };
 
-    explicit BuildQueue(u32 max_background_, u32 max_boost_ = 0)
-        : max_background{max_background_}, max_boost{std::max(max_background_, max_boost_)} {}
+    explicit BuildQueue(u32 max_foreground_, u32 max_background_, u32 max_boost_ = 0)
+        : max_foreground{max_foreground_}, max_background{max_background_},
+          max_boost{std::max(max_background_, max_boost_)} {}
 
     /// PERF-098: while the splash screen shows, background jobs run on every worker and are
     /// never paused (no game draw waits for a pipeline yet).
@@ -42,35 +43,38 @@ public:
         }
     }
 
-    void Push(Job&& job, Kind kind) {
+    void Push(Job&& job, Kind kind, bool heavy = false) {
         {
             std::scoped_lock lk{mutex};
             switch (kind) {
             case Kind::Urgent:
-                jobs.push_front(std::move(job));
+                jobs.push_front({std::move(job), heavy});
                 break;
             case Kind::Normal:
-                jobs.push_back(std::move(job));
+                jobs.push_back({std::move(job), heavy});
                 break;
             case Kind::Background:
-                background.push_back(std::move(job));
+                background.push_back({std::move(job), heavy});
                 break;
             }
         }
-        cv.notify_one();
+        cv.notify_all();
     }
 
     /// Waits for the next job. False once stopped. `is_background` tells which queue it came
     /// from; a background job must be followed by FinishedBackground.
-    bool Pop(Job& job, bool& is_background, std::stop_token stop) {
+    bool Pop(Job& job, bool& is_background, std::stop_token stop, bool* is_heavy = nullptr) {
         std::unique_lock lk{mutex};
         while (true) {
             if (stop.stop_requested()) {
                 return false;
             }
-            if (!jobs.empty()) {
-                job = std::move(jobs.front());
-                jobs.pop_front();
+            if (auto next = Runnable(jobs); next != jobs.end() && running_foreground < max_foreground) {
+                const bool heavy = next->heavy;
+                job = std::move(next->job);
+                jobs.erase(next);
+                running_heavy += heavy;
+                if (is_heavy) *is_heavy = heavy;
                 is_background = false;
                 ++running_foreground;
                 return true;
@@ -79,30 +83,39 @@ public:
             const bool boosted = boost.load(std::memory_order_relaxed);
             const bool paused = !boosted && now < pause_until;
             const u32 limit = boosted ? max_boost : max_background;
-            if (!background.empty() && !paused && running_background < limit) {
-                job = std::move(background.front());
-                background.pop_front();
+            if (auto next = Runnable(background); next != background.end() && !paused && running_background < limit) {
+                const bool heavy = next->heavy;
+                job = std::move(next->job);
+                background.erase(next);
+                running_heavy += heavy;
+                if (is_heavy) *is_heavy = heavy;
                 ++running_background;
                 is_background = true;
                 return true;
             }
             if (!background.empty() && paused) {
                 cv.wait_until(lk, stop, pause_until, [&] {
-                    return !jobs.empty() || Clock::now() >= pause_until;
+                    return (Runnable(jobs) != jobs.end() && running_foreground < max_foreground) ||
+                           Clock::now() >= pause_until;
                 });
             } else {
                 cv.wait(lk, stop, [&] {
                     const u32 limit = boost.load(std::memory_order_relaxed) ? max_boost
                                                                             : max_background;
-                    return !jobs.empty() || (!background.empty() && running_background < limit);
+                    return (Runnable(jobs) != jobs.end() && running_foreground < max_foreground) ||
+                           (Runnable(background) != background.end() && running_background < limit);
                 });
             }
         }
     }
 
-    void FinishedForeground() {
-        std::scoped_lock lk{mutex};
-        --running_foreground;
+    void FinishedForeground(bool heavy = false) {
+        {
+            std::scoped_lock lk{mutex};
+            --running_foreground;
+            running_heavy -= heavy;
+        }
+        cv.notify_all();
     }
 
     /// PERF-101: no draw or read-ahead build is queued or running.
@@ -111,12 +124,13 @@ public:
         return jobs.empty() && running_foreground == 0;
     }
 
-    void FinishedBackground() {
+    void FinishedBackground(bool heavy = false) {
         {
             std::scoped_lock lk{mutex};
             --running_background;
+            running_heavy -= heavy;
         }
-        cv.notify_one();
+        cv.notify_all();
     }
 
     /// No background job starts before `until` (jobs already running finish).
@@ -130,19 +144,34 @@ public:
         return background.size();
     }
 
+    /// PERF-160: jobs waiting for a worker, foreground and background.
+    size_t Pending() {
+        std::scoped_lock lk{mutex};
+        return jobs.size() + background.size();
+    }
+
     /// Wakes the workers waiting for jobs or a pause, so they can see a stop request.
     void NotifyAll() {
         cv.notify_all();
     }
 
 private:
+    const u32 max_foreground;
     const u32 max_background;
     const u32 max_boost;
     std::atomic<bool> boost{false};
     std::mutex mutex;
     std::condition_variable_any cv;
-    std::deque<Job> jobs;
-    std::deque<Job> background;
+    struct Entry { Job job; bool heavy; };
+    std::deque<Entry> jobs;
+    std::deque<Entry> background;
+    // Keep queued heavy jobs out of worker threads until memory capacity is available.
+    std::deque<Entry>::iterator Runnable(std::deque<Entry>& entries) {
+        return std::find_if(entries.begin(), entries.end(), [this](const Entry& entry) {
+            return !entry.heavy || running_heavy < 2;
+        });
+    }
+    u32 running_heavy{};
     u32 running_background{};
     u32 running_foreground{};
     Clock::time_point pause_until{};

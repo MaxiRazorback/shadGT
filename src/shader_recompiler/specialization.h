@@ -97,9 +97,19 @@ struct StageSpecialization {
 
     StageSpecialization() = default;
     StageSpecialization(const Info& info_, RuntimeInfo runtime_info_, const Profile& profile_,
-                        Backend::Bindings start_)
+                        Backend::Bindings start_,
+                        const Gcn::FetchShaderData* translated_fetch = nullptr)
         : info{&info_}, runtime_info{runtime_info_}, start{start_} {
-        if (info_.sw_stage == SwStage::Vertex && Gcn::ParseFetchShader(info_, fetch_shader_data)) {
+        bool parsed_fetch = false;
+        if (info_.sw_stage == SwStage::Vertex) {
+            if (translated_fetch) {
+                fetch_shader_data = *translated_fetch;
+                parsed_fetch = true;
+            } else {
+                parsed_fetch = Gcn::ParseFetchShader(info_, fetch_shader_data);
+            }
+        }
+        if (parsed_fetch) {
             // Specialize shader on VS input number types to follow spec.
             ForEachSharp(vs_attribs, fetch_shader_data.attributes,
                          [this](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
@@ -177,7 +187,11 @@ struct StageSpecialization {
                 }
                 spec.num_conversion = sharp.GetNumberConversion();
                 spec.num_bindings = desc.NumBindings(*info);
-            });
+            },
+            // SHD-003: an empty slot records the null image translation saw (a 2D float image),
+            // so a texture bound there later that translates the same way matches instead of
+            // getting a new translation (one in 16 pixel shader translations was such a copy).
+            true);
         ForEachSharp(binding, fmasks, info->fmasks,
                      [](auto& spec, const auto& desc, AmdGpu::Image sharp) {
                          spec.width = sharp.width;

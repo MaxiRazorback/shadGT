@@ -31,9 +31,14 @@
 #include "ryty_gpu/ryty_framegen.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "ryty_gpu/ryty_input_bridge.h"
+#include "ryty_gpu/ryty_camera.h"
 #include "ryty_gpu/ryty_library.h"
+#include "ryty_gpu/ryty_upscaler_status.h"
+#include "ryty_gpu/native/gts_hooks.h"
+#include "ryty_gpu/native/image_registry.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_rasterizer_native.h"
 #include "core/debug_state.h"
 #include "imgui.h"
 #ifdef ENABLE_DISCORD_RPC
@@ -62,7 +67,9 @@ void RunWindowThread() {
     auto* controllers = Common::Singleton<Input::GameControllers>::Instance();
     static Frontend::WindowSDL window(EmulatorSettings.GetWindowWidth(),
                                       EmulatorSettings.GetWindowHeight(), controllers,
-                                      "ryGT - Gran Turismo Sport");
+                                      Vulkan::NativeModeRequested()
+                                          ? "ryGT - Gran Turismo Sport (Native renderer)"
+                                          : "ryGT - Gran Turismo Sport (ShadGT renderer)");
     window.SetIcon({}); // shadGT's Gran Turismo Sport icon
     {
         std::scoped_lock lock{g_window_mutex};
@@ -78,8 +85,19 @@ void RunWindowThread() {
     window.InitTimers();
     while (window.IsOpen()) {
         window.WaitEvent();
+        if (const auto status = Vulkan::RytyUpscalerStatus::Take()) { // FSR-204
+            const std::string title = "ryGT - Gran Turismo Sport | " + *status;
+            SDL_SetWindowTitle(window.GetSDLWindow(), title.c_str());
+        }
     }
     // The window was closed: end the game without DLL teardown (see Emulator::Shutdown).
+    // Stop trigger effects before the deliberate TerminateProcess skips SDL cleanup.
+    Input::TriggerFeedback::stopping = true;
+    const auto released = Input::TriggerFeedback::Vibration(0);
+    for (int slot = 0; slot < 4; ++slot) {
+        (*controllers)[slot]->SetTriggerFeedback(released, released, 0, 0);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50)); // Flush queued HID releases.
     TerminateProcess(GetCurrentProcess(), 0);
 }
 
@@ -183,7 +201,8 @@ void DrawCompileNotice() {
     static Clock::time_point paused_since{};
     static Clock::time_point last_paused{};
     const auto now = Clock::now();
-    if (Common::GuestClock::IsPaused() || Vulkan::CompileSlowMotion()) {
+    if (Common::GuestClock::IsPaused() || Vulkan::CompileSlowMotion() ||
+        Vulkan::CompilationInProgress()) {
         if (paused_since == Clock::time_point{} || now - last_paused > std::chrono::milliseconds{300}) {
             paused_since = now;
         }
@@ -221,6 +240,8 @@ void DrawCompileNotice() {
 }
 
 void DrawFpsCounter() {
+    Ryty::DrawControllerOverlay();
+    Ryty::Camera::DrawOverlay();
     DrawPrecompileProgress();
     if (!Vulkan::GetPrecompileProgress().active) {
         DrawCompileNotice();
@@ -366,6 +387,9 @@ void StartHeapReport() {
 
 void Ryty::RytyLibraryInitialize() {
     InitializeCommon("shadgt_ryty.log");
+    // Camera file I/O, executable validation and hook setup belong to library startup,
+    // before the game runs camera callbacks, never to the per-frame overlay draw.
+    Camera::InitializeRuntime();
     LOG_INFO(Lib_GnmDriver, "Ryty: starting shadGT renderer");
     // shadGT's main() loads the player list (user/users.json, created with defaults when
     // missing); a gamepad is only assigned to a player that exists ("User 1 not found").
@@ -475,10 +499,12 @@ void Ryty::RytyLibraryInitialize() {
                 if (c1 == std::string::npos || c2 == std::string::npos) {
                     continue;
                 }
-                // "x<offset>": an instruction breakpoint at that offset in GTSport.exe.
+                // "x<offset>": an instruction breakpoint at that offset in GTSport.exe;
+                // "r<address>": reads of the address trap too (FIX-153 diagnosis).
                 const bool execute = item[0] == 'x';
-                u64 address = std::stoull(item.substr(execute ? 1 : 0, c1 - (execute ? 1 : 0)),
-                                          nullptr, 16);
+                const bool reads = item[0] == 'r';
+                const size_t skip = execute || reads ? 1 : 0;
+                u64 address = std::stoull(item.substr(skip, c1 - skip), nullptr, 16);
                 if (execute) {
                     address += reinterpret_cast<u64>(GetModuleHandleA(nullptr));
                 }
@@ -487,7 +513,9 @@ void Ryty::RytyLibraryInitialize() {
                 std::this_thread::sleep_until(start + std::chrono::milliseconds(
                                                           static_cast<long long>(at * 1000)));
                 Vulkan::RytyWatchWrites(address, ms,
-                                        fmt::format("{} {:#x}", execute ? "exec" : "watch", address));
+                                        fmt::format("{} {:#x}",
+                                                    execute ? "exec" : reads ? "rw" : "watch",
+                                                    address));
                 std::this_thread::sleep_for(std::chrono::milliseconds(ms + 200));
             }
         }).detach();
@@ -511,6 +539,9 @@ void Ryty::RytyLibraryInitialize() {
 // memory manager would otherwise do this. Without them the renderer keeps cached GPU copies and
 // page tracking for memory the game has freed and reused, and its watcher counts go wrong.
 extern "C" __declspec(dllexport) void RytyGpuUnmapMemory(u64 address, u64 size) {
+    if (Native::WatchedTexture(address, address + size)) {
+        LOG_WARNING(Render_Vulkan, "FIX-153 watch: Ryty unmaps {:#x}+{:#x}", address, size);
+    }
     Core::RytyMemory::NoteMappingChange(address, size);
     if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
         rasterizer->UnmapMemory(address, size);
@@ -526,6 +557,10 @@ extern "C" __declspec(dllexport) void RytyGpuMappingChanged(u64 address, u64 siz
 // Ryty calls this after the game changed the protection of guest memory (sceKernelMprotect),
 // which replaced the protections the renderer's page tracking had set there.
 extern "C" __declspec(dllexport) void RytyGpuProtectionChanged(u64 address, u64 size) {
+    if (Native::WatchedTexture(address, address + size)) {
+        LOG_WARNING(Render_Vulkan, "FIX-153 watch: game protection change {:#x}+{:#x}", address,
+                    size);
+    }
     Core::RytyMemory::NoteMappingChange(address, size);
     if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
         rasterizer->GetPageManager().ReapplyProtection(address, size);
@@ -533,15 +568,37 @@ extern "C" __declspec(dllexport) void RytyGpuProtectionChanged(u64 address, u64 
 }
 
 extern "C" __declspec(dllexport) void RytyGpuMapMemory(u64 address, u64 size) {
+    if (Native::WatchedTexture(address, address + size)) {
+        LOG_WARNING(Render_Vulkan, "FIX-153 watch: map {:#x}+{:#x}", address, size);
+    }
     Core::RytyMemory::NoteMappingChange(address, size);
     if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
         rasterizer->MapMemory(address, size);
         rasterizer->RegisterMemory(address, size);
+        // FIX-153: new memory comes writable. Pages the renderer still tracks there (tracked
+        // between Ryty's unmap report and this map, or never released at the unmap) get their
+        // protection back, or writes to them would go unseen while they count as tracked.
+        rasterizer->GetPageManager().ReapplyProtection(address, size);
     }
 }
 
 void RytyProtectGuestRedZones(); // ryty_red_zone.cpp
 void RytyApplyGamePatches();     // ryty_game_patch.cpp (GTS-001)
+
+// Whether the process is a game converted by Ryty (its code has Ryty's guest-TLS section), and
+// not a tool or test harness that loaded this library (NAT-012).
+static bool HostIsConvertedGame() {
+    const auto* base = reinterpret_cast<const u8*>(GetModuleHandleA(nullptr));
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    const auto* sections = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        if (std::memcmp(sections[i].Name, ".gtcode", 8) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 // Ryty loads this library before the game's code starts, so the game code can still be patched
 // safely here (FIX-074).
@@ -552,8 +609,12 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
         if (GetEnvironmentVariableW(L"VK_LOADER_LAYERS_DISABLE", nullptr, 0) == 0) {
             SetEnvironmentVariableW(L"VK_LOADER_LAYERS_DISABLE", L"~implicit~");
         }
-        RytyProtectGuestRedZones();
-        RytyApplyGamePatches();
+        if (HostIsConvertedGame()) {
+            RytyProtectGuestRedZones();
+            RytyApplyGamePatches();
+            // NAT-002: hook points for the native renderer (RYGT_NATIVE_HOOKS=1).
+            Native::InstallGtsHooks(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+        }
     }
     return TRUE;
 }
@@ -621,6 +682,10 @@ extern "C" __declspec(dllexport) u64 RytyGpuGuestTsc() {
 // Ryty calls this before the kernel writes guest memory directly (a file read into a guest
 // buffer), which would fail on a write-protected page instead of faulting.
 extern "C" __declspec(dllexport) void RytyGpuInvalidateMemory(u64 address, u64 size) {
+    if (Native::WatchedTexture(address, address + size)) {
+        LOG_WARNING(Render_Vulkan, "FIX-153 watch: Ryty invalidates {:#x}+{:#x} (a file read)",
+                    address, size);
+    }
     if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
         rasterizer->InvalidateMemory(address, size);
     }

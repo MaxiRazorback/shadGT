@@ -108,7 +108,16 @@ public:
     void GetVertexInputs(VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
                          VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
                          VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0,
-                         u32 step_rate_1) const;
+                         u32 step_rate_1) const {
+        GetVertexInputs(attributes, bindings, divisors, guest_buffers, step_rate_0, step_rate_1,
+                        GetStage(Shader::SwStage::Vertex));
+    }
+    /// OPT-011: the same with the vertex stage's info given (a game job thread's copy).
+    template <typename Attribute, typename Binding>
+    void GetVertexInputs(VertexInputs<Attribute>& attributes, VertexInputs<Binding>& bindings,
+                         VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
+                         VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0,
+                         u32 step_rate_1, const Shader::Info& vs_info) const;
 
 private:
     void BuildDescSetLayout(bool preloading);
@@ -117,6 +126,10 @@ public:
     /// PERF-021: optimized relinks wait until no new pipeline has been needed for a while, so
     /// they never take cores from pipelines a draw is waiting for.
     static void NotePipelineMiss();
+    bool CanRetire() const {
+        return !library_link || !library_link->optimized.valid() ||
+               library_link->optimized.wait_for(std::chrono::seconds{0}) == std::future_status::ready;
+    }
 
     /// PERF-019: a pipeline built on a worker from copies of the shader infos points at the
     /// cached infos once it is used.
@@ -130,11 +143,15 @@ private:
     struct LibraryLink {
         /// Vertex input and fragment output libraries; the shader libraries are shared (PERF-018).
         std::array<vk::UniquePipeline, 2> owned_libraries;
+        std::array<std::shared_ptr<vk::UniquePipeline>, 2> shared_libraries;
         std::future<void> optimized;
     };
-    /// PERF-018: hash of the descriptor set layout's bindings, so shader libraries are shared
-    /// only between pipelines with identically defined layouts.
-    u64 desc_layout_hash{};
+    /// PERF-018 / SHD-002: hashes of the stage set layouts' bindings, so a shader library is
+    /// shared between pipelines whose sets for its stages are identically defined.
+    std::array<u64, Shader::Backend::MaxDescriptorSets> set_layout_hashes{};
+    /// SHD-002: the layout of sets between stage sets (no bindings).
+    vk::UniqueDescriptorSetLayout empty_set_layout;
+    u32 num_sets = 0;
     std::unique_ptr<LibraryLink> library_link;
 
     GraphicsPipelineKey key;

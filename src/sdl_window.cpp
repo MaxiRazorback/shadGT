@@ -28,6 +28,10 @@
 #include "input/input_handler.h"
 #include "input/input_mouse.h"
 #include "sdl_window.h"
+#ifdef RYTY_GPU
+#include "ryty_gpu/ryty_camera.h"
+#include "ryty_gpu/ryty_camera_input.h"
+#endif
 #include "video_core/renderdoc.h"
 
 #ifdef __APPLE__
@@ -230,6 +234,43 @@ void WindowSDL::WaitEvent() {
         return;
     }
 
+#ifdef RYTY_GPU
+    if ((event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) &&
+        event.key.scancode == SDL_SCANCODE_F4) {
+        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
+            const bool was_open = Ryty::Camera::OverlayOpen();
+            if (event.key.mod & SDL_KMOD_CTRL) Ryty::Camera::ResetOverlayLayout();
+            else Ryty::Camera::ToggleOverlay();
+            if (!was_open && Ryty::Camera::OverlayOpen()) {
+                // Release keyboard/mouse bindings held before opening, preserving
+                // all physical controller inputs in the binding system.
+                int count{};
+                const auto* keys = SDL_GetKeyboardState(&count);
+                for (int key = 0; key < count; ++key) if (keys[key]) {
+                    SDL_Event up{}; up.type = SDL_EVENT_KEY_UP;
+                    up.key.scancode = static_cast<SDL_Scancode>(key);
+                    up.key.key = SDL_GetKeyFromScancode(up.key.scancode, SDL_GetModState(), true);
+                    OnKeyboardMouseInput(&up);
+                }
+                const auto buttons = SDL_GetMouseState(nullptr, nullptr);
+                for (int button = 1; button <= 5; ++button) if (buttons & SDL_BUTTON_MASK(button)) {
+                    SDL_Event up{}; up.type = SDL_EVENT_MOUSE_BUTTON_UP;
+                    up.button.button = static_cast<Uint8>(button);
+                    OnKeyboardMouseInput(&up);
+                }
+            }
+        }
+        return;
+    }
+    if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST) Ryty::Camera::CloseOverlay();
+    const auto route = Ryty::Camera::RouteInput(Ryty::Camera::OverlayOpen(), event.type);
+    if (route != Ryty::Camera::InputRoute::Normal) {
+        ImGui::Core::ProcessEvent(&event);
+        if (route == Ryty::Camera::InputRoute::ReleaseBinding) OnKeyboardMouseInput(&event);
+        else if (route == Ryty::Camera::InputRoute::Gamepad) OnGamepadEvent(&event);
+        return;
+    }
+#endif
     if (Libraries::Mouse::PushSDLEvent(event) || Libraries::Keyboard::PushSDLEvent(event)) {
         return;
     }
@@ -296,7 +337,8 @@ void WindowSDL::WaitEvent() {
         }
         break;
     case SDL_EVENT_CHANGE_CONTROLLER:
-        UNREACHABLE_MSG("todo");
+        // ryGT: the player ports changed in the in-game Controllers window.
+        controllers.ReassignAll();
         break;
     case SDL_EVENT_TOGGLE_SIMPLE_FPS:
         Overlay::ToggleSimpleFps();
@@ -424,6 +466,13 @@ void WindowSDL::OnKeyboardMouseInput(const SDL_Event* event) {
 }
 
 void WindowSDL::OnGamepadEvent(const SDL_Event* event) {
+#ifdef RYTY_GPU
+    // ryGT: a gamepad without a player port (more than 2 connected, opened only by the overlay's
+    // navigation) plays no part (its port index would be out of range).
+    if (controllers.GetGamepadIndexFromJoystickId(event->gbutton.which) >= 5) {
+        return;
+    }
+#endif
     bool input_down = event->type == SDL_EVENT_GAMEPAD_AXIS_MOTION ||
                       event->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
     Input::InputEvent input_event = Input::InputBinding::GetInputEventFromSDLEvent(*event);

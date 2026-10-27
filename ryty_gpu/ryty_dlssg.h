@@ -28,6 +28,9 @@ PFN_vkGetInstanceProcAddr LoadInterposer();
 /// Whether Streamline is in use (LoadInterposer succeeded).
 bool Active();
 
+void PublishTelemetry(const u8* packet);
+void SetFreshFrame(bool fresh);
+
 /// Per presented game frame, before the frame's command buffer is submitted: starts a Streamline
 /// frame, records the tags (motion vectors, depth) and sets the constants and options.
 void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf,

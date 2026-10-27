@@ -100,13 +100,20 @@ ryty_add_library(ryty_gpu libSceVideoOut
         src/core/debug_state.cpp
         ryty_gpu/ryty_entry.cpp
         ryty_gpu/ryty_input_bridge.cpp
+        ryty_gpu/ryty_controller_overlay.cpp
+        ryty_gpu/ryty_camera_overlay.cpp
+        ryty_gpu/ryty_camera_settings.cpp
+        ryty_gpu/ryty_camera_runtime.cpp
         ryty_gpu/ryty_write_watch.cpp
         # Stutter diagnostics (RYGT_DIAG=1), ryty_diag.h.
         ryty_gpu/ryty_diag.cpp
         # NVIDIA DLSS through the optional plugin dlss\ryGT_dlss.dll (ryty_dlss.h).
         ryty_gpu/ryty_dlss.cpp
+        ryty_gpu/ryty_gts_dlss.cpp
         # AMD FSR 3.1 through amd_fidelityfx_vk.dll (ryty_fsr3.h).
         ryty_gpu/ryty_fsr3.cpp
+        # Intel XeSS-SR through libxess.dll (ryty_xess.h).
+        ryty_gpu/ryty_xess.cpp
         # AMD FSR 3.1 frame generation (ryty_framegen.h).
         ryty_gpu/ryty_framegen.cpp
         # NVIDIA DLSS frame generation through Streamline (ryty_dlssg.h).
@@ -114,6 +121,19 @@ ryty_add_library(ryty_gpu libSceVideoOut
         # FIX-074: shadGT's static red-zone patching, applied to the converted game code.
         ryty_gpu/ryty_red_zone.cpp
         ryty_gpu/ryty_game_patch.cpp
+        # NAT-001/002: hook points in GT Sport's code for the native renderer (experimental).
+        ryty_gpu/native/entry_hook.cpp
+        ryty_gpu/native/gts_hooks.cpp
+        ryty_gpu/native/job_walker.cpp
+        ryty_gpu/native/shadow.cpp
+        # NAT-010/011: the native renderer's backend interface and its Vulkan backend.
+        ryty_gpu/native/rhi/rhi_vulkan.cpp
+        ryty_gpu/native/rhi/rhi_selftest.cpp
+        # NAT-020/021: the native image registry and its self test.
+        ryty_gpu/native/image_registry.cpp
+        ryty_gpu/native/native_selftest.cpp
+        # NAT-100: native mode (RYGT_NATIVE=1): draws recorded with native images.
+        src/video_core/renderer_vulkan/vk_rasterizer_native.cpp
         src/core/cpu_patches.cpp
         src/core/loader/dwarf.cpp
 )
@@ -220,3 +240,5 @@ target_include_directories(ryty_np PRIVATE "${SHADNET_PROTO_OUT}")
 foreach(target IN ITEMS ryty_ngs2 ryty_ajm ryty_audio3d ryty_zlib ryty_discmap ryty_screenshot ryty_np)
     target_sources(${target} PRIVATE ryty_gpu/ryty_hle_precompile.cpp)
 endforeach()
+
+target_link_libraries(ryty_gpu PRIVATE bcrypt)

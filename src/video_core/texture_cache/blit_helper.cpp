@@ -191,12 +191,23 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
         device.destroyImageView(dst_view);
     });
 
+    copyViews(width, height, {num_samples, pixel_format, src_msaa}, src_view, dst_view);
+}
+
+void BlitHelper::CopyColorViews(vk::Extent2D size, vk::Format destFormat,
+                               vk::ImageView source, vk::ImageView dest) {
+    copyViews(size.width, size.height, {1, destFormat, false}, source, dest);
+}
+
+void BlitHelper::copyViews(u32 width, u32 height, const MsPipelineKey& key,
+                          vk::ImageView sourceView, vk::ImageView destView) {
+
     Vulkan::RenderState state{};
     state.width = width;
     state.height = height;
     state.num_layers = 1;
     state.num_color_attachments = 1;
-    state.color_attachments[0].image_view = dst_view;
+    state.color_attachments[0].image_view = destView;
     state.color_attachments[0].image_layout = vk::ImageLayout::eColorAttachmentOptimal;
     state.color_attachments[0].is_clear = true;
     scheduler.BeginRendering(state);
@@ -204,7 +215,7 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
     const auto cmdbuf = scheduler.CommandBuffer();
     const vk::DescriptorImageInfo image_info = {
         .sampler = VK_NULL_HANDLE,
-        .imageView = src_view,
+        .imageView = sourceView,
         .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
     };
     const vk::WriteDescriptorSet texture_write = {
@@ -218,7 +229,6 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *single_texture_pl_layout, 0U,
                                 texture_write);
 
-    const MsPipelineKey key{num_samples, pixel_format, src_msaa};
     auto it = std::ranges::find(ms_image_copy_pl, key, &MsPipeline::first);
     if (it == ms_image_copy_pl.end()) {
         CreateMsCopyPipeline(key);

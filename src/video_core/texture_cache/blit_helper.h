@@ -31,6 +31,9 @@ public:
     void CopyBetweenMsImages(u32 width, u32 height, u32 num_samples, vk::Format pixel_format,
                              bool src_msaa, vk::Image source, vk::Image dest);
 
+    void CopyColorViews(vk::Extent2D size, vk::Format destFormat,
+                        vk::ImageView source, vk::ImageView dest);
+
 private:
     void CreateShaders();
     void CreatePipelineLayouts();
@@ -44,6 +47,8 @@ private:
     };
     void CreateColorToMSDepthPipeline(const MsPipelineKey& key);
     void CreateMsCopyPipeline(const MsPipelineKey& key);
+    void copyViews(u32 width, u32 height, const MsPipelineKey& key,
+                   vk::ImageView source, vk::ImageView dest);
 
 private:
     const Vulkan::Instance& instance;
