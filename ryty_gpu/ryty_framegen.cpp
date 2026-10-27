@@ -281,13 +281,13 @@ vk::Result FrameGen::Present(vk::Queue queue, const vk::PresentInfoKHR& info) co
 }
 
 void FrameGen::Prepare(vk::CommandBuffer cmdbuf, vk::SwapchainKHR swapchain, vk::Extent2D size,
-                       bool hdr) {
+                       bool hdr, const SceneInputs* scene, bool fresh_frame) {
     if (!framegen_context) {
         return;
     }
-    if (size != aux_size) {
-        CreateAuxImages(cmdbuf, size);
-    }
+    const bool scene_valid = scene && scene->valid && scene->depth && scene->motion &&
+        scene->size.width && scene->size.height && scene->size.width <= display_size.width &&
+        scene->size.height <= display_size.height;
     const auto now = std::chrono::steady_clock::now();
     const float delta_ms =
         last_prepare.time_since_epoch().count() == 0
@@ -365,7 +365,11 @@ void FrameGen::Prepare(vk::CommandBuffer cmdbuf, vk::SwapchainKHR swapchain, vk:
             enabled = false;
         }
     }
-    config.frameGenerationEnabled = enabled;
+    // With temporal FSR, use only frames carrying matching scene inputs. Intro/UI
+    // frames have no such inputs and should retain normal presentation pacing.
+    // Standalone optical-flow FG keeps its existing fallback when temporal FSR is off.
+    const bool scene_ready = !RytyFsr3::TemporalRequested() || scene_valid;
+    config.frameGenerationEnabled = enabled && fresh_frame && scene_ready;
     config.allowAsyncWorkloads = false;
     config.HUDLessColor = FfxApiResource{};
     config.flags = 0;
@@ -383,6 +387,15 @@ void FrameGen::Prepare(vk::CommandBuffer cmdbuf, vk::SwapchainKHR swapchain, vk:
         return;
     }
 
+    if (!config.frameGenerationEnabled) {
+        static u32 bypass_logged{};
+        if (bypass_logged++ < 12)
+            LOG_INFO(Render_Vulkan, "Frame generation: bypass prepare (scene ready {}, fresh {}, compile/pause ready {})",
+                scene_ready, fresh_frame, enabled);
+        return; // no auxiliary allocations or FG compute work for disabled frames
+    }
+    if (!scene_valid && size != aux_size) CreateAuxImages(cmdbuf, size);
+
     ffxDispatchDescFrameGenerationPrepareCameraInfo camera{};
     camera.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_CAMERAINFO;
     camera.cameraUp[1] = 1.0f;
@@ -395,18 +408,21 @@ void FrameGen::Prepare(vk::CommandBuffer cmdbuf, vk::SwapchainKHR swapchain, vk:
     prepare.frameID = frame_id;
     prepare.flags = 0;
     prepare.commandList = static_cast<VkCommandBuffer>(cmdbuf);
-    prepare.renderSize = {size.width, size.height};
-    prepare.jitterOffset = {0.0f, 0.0f};
-    prepare.motionVectorScale = {1.0f, 1.0f};
-    prepare.frameTimeDelta = delta_ms;
+    const vk::Extent2D input_size = scene_valid ? scene->size : size;
+    prepare.renderSize = {input_size.width, input_size.height};
+    prepare.jitterOffset = {scene_valid ? scene->jitter_x : 0.f,
+                            scene_valid ? scene->jitter_y : 0.f};
+    prepare.motionVectorScale = {scene_valid ? scene->motion_scale_x : 1.f,
+                                 scene_valid ? scene->motion_scale_y : 1.f};
+    prepare.frameTimeDelta = scene_valid ? scene->frame_time_ms : delta_ms;
     prepare.unused_reset = false;
     prepare.cameraNear = 0.1f;
     prepare.cameraFar = 1000.0f;
     prepare.cameraFovAngleVertical = 1.0f;
     prepare.viewSpaceToMetersFactor = 1.0f;
-    prepare.depth = Resource(depth, vk::Format::eR32Sfloat, size, FFX_API_RESOURCE_USAGE_READ_ONLY,
+    prepare.depth = Resource(scene_valid ? scene->depth : vk::Image{depth}, vk::Format::eR32Sfloat, input_size, FFX_API_RESOURCE_USAGE_READ_ONLY,
                              FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
-    prepare.motionVectors = Resource(motion_vectors, vk::Format::eR16G16Sfloat, size,
+    prepare.motionVectors = Resource(scene_valid ? scene->motion : vk::Image{motion_vectors}, vk::Format::eR16G16Sfloat, input_size,
                                      FFX_API_RESOURCE_USAGE_READ_ONLY,
                                      FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
     result = g_api.dispatch(reinterpret_cast<ffxContext*>(&framegen_context), &prepare.header);
@@ -416,6 +432,13 @@ void FrameGen::Prepare(vk::CommandBuffer cmdbuf, vk::SwapchainKHR swapchain, vk:
             logged = true;
             LOG_ERROR(Render_Vulkan, "Frame generation: preparing failed (code {})", result);
         }
+    }
+    if (result == FFX_API_RETURN_OK && scene_valid) {
+        static u32 scene_logged{};
+        if (scene_logged++ < 12)
+            LOG_INFO(Render_Vulkan, "Frame generation: real scene {}x{} R32 depth + motion, scene {} FG {}, jitter ({}, {}), enabled {}",
+                input_size.width, input_size.height, scene->sequence, frame_id,
+                scene->jitter_x, scene->jitter_y, config.frameGenerationEnabled);
     }
     (void)hdr;
 }

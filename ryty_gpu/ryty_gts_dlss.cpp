@@ -282,6 +282,74 @@ void GtsDlssPass::copyDepthForFsr() {
     transit(depth, vk::ImageLayout::eShaderReadOnlyOptimal);
 }
 
+bool GtsDlssPass::CopyFrameGenerationInputs(u64 frame, RytyFrameGen::SceneSnapshot& snapshot) {
+    snapshot.inputs = {};
+    if (!RytyFrameGen::Requested() || failed || (!useFsr && !useXess) ||
+        sceneFrame != frame || !renderSize.width || !renderSize.height ||
+        fsrDepth.format != vk::Format::eR32Sfloat || motion.format != vk::Format::eR16G16Sfloat)
+        return false;
+    if (snapshot.size != renderSize) {
+        // GetRenderFrame has waited for this Frame's presentation fence.
+        snapshot.depth = VideoCore::UniqueImage{instance.GetDevice(), instance.GetAllocator()};
+        snapshot.motion = VideoCore::UniqueImage{instance.GetDevice(), instance.GetAllocator()};
+        const auto make = [&](VideoCore::UniqueImage& image, vk::Format format) {
+            image.Create({.imageType = vk::ImageType::e2D, .format = format,
+                .extent = {renderSize.width, renderSize.height, 1}, .mipLevels = 1,
+                .arrayLayers = 1, .samples = vk::SampleCountFlagBits::e1,
+                .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst});
+        };
+        make(snapshot.depth, vk::Format::eR32Sfloat);
+        make(snapshot.motion, vk::Format::eR16G16Sfloat);
+        snapshot.size = renderSize;
+        snapshot.initialized = false;
+    }
+    scheduler.EndRendering();
+    const auto copy = [&](Texture& source, VideoCore::UniqueImage& target) {
+        transit(source, vk::ImageLayout::eTransferSrcOptimal);
+        const vk::ImageMemoryBarrier2 before{
+            .srcStageMask = snapshot.initialized ? vk::PipelineStageFlagBits2::eAllCommands
+                                                 : vk::PipelineStageFlagBits2::eTopOfPipe,
+            .srcAccessMask = snapshot.initialized ? vk::AccessFlagBits2::eShaderRead
+                                                  : vk::AccessFlags2{},
+            .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .oldLayout = snapshot.initialized ? vk::ImageLayout::eShaderReadOnlyOptimal
+                                              : vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eTransferDstOptimal,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = target,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}};
+        const auto cmd = scheduler.DirectCommandBuffer();
+        cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                               .pImageMemoryBarriers = &before});
+        const vk::ImageCopy region{.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .extent = {renderSize.width, renderSize.height, 1}};
+        cmd.copyImage(source.image, vk::ImageLayout::eTransferSrcOptimal, target,
+                      vk::ImageLayout::eTransferDstOptimal, region);
+        auto after = before;
+        after.srcStageMask = vk::PipelineStageFlagBits2::eCopy;
+        after.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+        after.dstStageMask = vk::PipelineStageFlagBits2::eComputeShader;
+        after.dstAccessMask = vk::AccessFlagBits2::eShaderRead;
+        after.oldLayout = vk::ImageLayout::eTransferDstOptimal;
+        after.newLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+        cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                               .pImageMemoryBarriers = &after});
+        transit(source, vk::ImageLayout::eShaderReadOnlyOptimal);
+    };
+    copy(fsrDepth, snapshot.depth);
+    copy(motion, snapshot.motion);
+    snapshot.initialized = true;
+    snapshot.inputs = {.depth = snapshot.depth, .motion = snapshot.motion, .size = renderSize,
+        .jitter_x = jitterX, .jitter_y = jitterY,
+        .motion_scale_x = -float(renderSize.width) * .5f,
+        .motion_scale_y = float(renderSize.height) * .5f,
+        .frame_time_ms = frameTimeMs, .sequence = frame, .valid = true};
+    return true;
+}
+
 bool GtsDlssPass::HasScene(u64 frame, u64 uid) const {
     return !failed && sceneFrame == frame && sceneUid == uid && outputFrame != frame;
 }

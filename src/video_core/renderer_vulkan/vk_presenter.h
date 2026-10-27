@@ -42,6 +42,9 @@ struct Frame {
     bool is_hdr{false};
     u8 id{};
 
+#ifdef RYTY_GPU
+    RytyFrameGen::SceneSnapshot framegen_scene;
+#endif
     ImTextureID imgui_texture;
 };
 

@@ -913,6 +913,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     temporalDlss.SetOutputSize({frame->width, frame->height}, attribute.attrib.pixel_format ==
         Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq);
     const auto temporalView = temporalDlss.PreparePresent(guestFrame, image, view_info.format);
+    if (temporalView) temporalDlss.CopyFrameGenerationInputs(guestFrame, frame->framegen_scene);
 #endif
 
     const u32 capture_game_only_count = VideoCore::ConsumeGameOnlyScreenshotRequests();
@@ -1060,6 +1061,10 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     rasterizer->GetTemporalDlss().SetOutputSize({frame->width, frame->height},
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq);
     const auto display = native.FindDisplay(desc.info, view_format, {frame->width, frame->height});
+    const auto scene_sequence = g_prepared_frames.load(std::memory_order_relaxed);
+    if (display && !display->upscaler.empty() && scene_sequence)
+        rasterizer->GetTemporalDlss().CopyFrameGenerationInputs(scene_sequence - 1,
+                                                               frame->framegen_scene);
     if (!display) {
         return PrepareBlankFrame(false, frame);
     }
@@ -1499,7 +1504,13 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         RytyDlssG::SetFreshFrame(is_game_frame && !is_reusing_frame &&
                                 !Libraries::SystemService::IsSplashVisible());
 #endif
-        swapchain.PrepareFrameGeneration(cmdbuf); // ryGT
+#ifdef RYTY_GPU
+        swapchain.PrepareFrameGeneration(cmdbuf,
+            frame->framegen_scene.inputs.valid ? &frame->framegen_scene.inputs : nullptr,
+            is_game_frame && !is_reusing_frame && !Libraries::SystemService::IsSplashVisible());
+#else
+        swapchain.PrepareFrameGeneration(cmdbuf);
+#endif
 
         if (profiler_ctx) {
             TracyVkCollect(profiler_ctx, cmdbuf);
@@ -1603,6 +1614,9 @@ Frame* Presenter::GetRenderFrame() {
         }
     }
     record_wait();
+#ifdef RYTY_GPU
+    frame->framegen_scene.inputs = {}; // never reuse another scene's metadata on a blank frame
+#endif
 
     if (frame->width != expected_frame_width || frame->height != expected_frame_height ||
         frame->is_hdr != swapchain.GetHDR()) {

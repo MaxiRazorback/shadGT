@@ -7,6 +7,7 @@
 #include <functional>
 #include "ryty_gpu/ryty_dlss.h"
 #include "ryty_gpu/ryty_fsr3.h"
+#include "ryty_gpu/ryty_framegen.h"
 #include "ryty_gpu/ryty_xess.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -51,6 +52,7 @@ public:
                  GtsSceneImage motion, GtsSceneImage resolved,
                  const std::array<float, 28>& constants);
     bool HasScene(u64 frame, u64 resolvedUid) const;
+    bool CopyFrameGenerationInputs(u64 frame, RytyFrameGen::SceneSnapshot& snapshot);
     void PrepareScene(u64 frame, GtsSceneImage resolved);
     void Resolve(u64 frame, GtsSceneImage display);
     bool ResolveNativeComposition(u64 frame, GtsSceneImage scene, GtsSceneImage display);

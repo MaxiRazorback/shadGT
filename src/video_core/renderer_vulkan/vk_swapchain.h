@@ -102,9 +102,13 @@ public:
     }
 
     /// ryGT: frame generation's per-frame preparation, recorded before the present submit.
-    void PrepareFrameGeneration(vk::CommandBuffer cmdbuf) {
+    void PrepareFrameGeneration(vk::CommandBuffer cmdbuf
 #ifdef RYTY_GPU
-        framegen.Prepare(cmdbuf, swapchain, extent, needs_hdr);
+        , const RytyFrameGen::SceneInputs* scene = nullptr, bool fresh_frame = true
+#endif
+    ) {
+#ifdef RYTY_GPU
+        framegen.Prepare(cmdbuf, swapchain, extent, needs_hdr, scene, fresh_frame);
         RytyDlssG::Prepare(instance.GetDevice(), instance.GetAllocator(), cmdbuf, extent);
 #endif
     }
