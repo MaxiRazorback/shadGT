@@ -1225,6 +1225,22 @@ std::tuple<vk::Buffer, u64, u8*> NativeRenderer::Allocate(u64 size, u64 align) {
     return {vk::Buffer{Handle<VkBuffer_T>(buffer.NativeHandle())}, offset, buffer.Mapped() + offset};
 }
 
+vk::DescriptorBufferInfo NativeRenderer::UploadFlatData(u32 stage, const u8* source, u32 size) {
+    auto& previous = stream.flat_uploads[stage];
+    if (previous.data && previous.binding.range == size &&
+        std::memcmp(previous.data, source, size) == 0) {
+        ++stats.flat_upload_hits;
+        stats.flat_upload_bytes_saved += size;
+        return previous.binding;
+    }
+    ++stats.flat_upload_misses;
+    const auto [buffer, offset, data] = Allocate(size, r.instance.StorageMinAlignment());
+    std::memcpy(data, source, size);
+    const vk::DescriptorBufferInfo binding{buffer, offset, size};
+    previous = {data, binding};
+    return binding;
+}
+
 vk::DescriptorPool NativeRenderer::TakeDescriptorPool() {
     const vk::Device vk_device = r.instance.GetDevice();
     {
@@ -2544,9 +2560,9 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
             case Shader::BufferType::Flatbuf: {
                 const u32 size = static_cast<u32>(stage.flattened_ud_buf.size() * sizeof(u32));
                 if (size != 0) {
-                    const auto [buffer, offset, data] = Allocate(size, alignment);
-                    std::memcpy(data, stage.flattened_ud_buf.data(), size);
-                    info = {buffer, offset, size};
+                    info = UploadFlatData(static_cast<u32>(stage.sw_stage),
+                                          reinterpret_cast<const u8*>(stage.flattened_ud_buf.data()),
+                                          size);
                 }
                 break;
             }
@@ -5030,9 +5046,14 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
         if (upload.flat_stage >= 0) {
             source = reinterpret_cast<const u8*>(stages[upload.flat_stage]->flattened_ud_buf.data());
         }
-        const auto [buffer, offset, data] = Allocate(size, alignment);
-        std::memcpy(data, source, size);
-        p.bindings.buffers[upload.info] = vk::DescriptorBufferInfo{buffer, offset, size};
+        if (upload.flat_stage >= 0) {
+            p.bindings.buffers[upload.info] =
+                UploadFlatData(static_cast<u32>(upload.flat_stage), source, size);
+        } else {
+            const auto [buffer, offset, data] = Allocate(size, alignment);
+            std::memcpy(data, source, size);
+            p.bindings.buffers[upload.info] = vk::DescriptorBufferInfo{buffer, offset, size};
+        }
     }
     for (const auto* stored : p.bindings.stored) {
         auto& entry = *const_cast<Native::ImageEntry*>(stored);
@@ -6329,6 +6350,7 @@ void NativeRenderer::Splice() {
             retiring_pools.emplace_back(tick, pool);
         }
     }
+    s.flat_uploads = {}; // no upload pointers survive command-list retirement
     s.chunks.clear();
     s.chunk_used = 0;
     s.descriptor_reserve.Clear(); // unused handles retire with the same pools
@@ -6950,6 +6972,9 @@ void NativeRenderer::Report() {
              "OPT-DESCRIPTOR-CALLS: {} sets in {} bind calls, {} allocation calls, {} update calls, {} unused reserve sets issued in 10 s",
              stats.descriptor_bound_sets, stats.descriptor_bind_calls,
              stats.descriptor_allocate_calls, stats.descriptor_update_calls, stats.descriptor_reserve_hits);
+    LOG_INFO(Render_Vulkan, "NAT: flat uploads reused={} uploaded={} bytes_saved={}",
+             stats.flat_upload_hits, stats.flat_upload_misses, stats.flat_upload_bytes_saved);
+    stats.flat_upload_hits = stats.flat_upload_misses = stats.flat_upload_bytes_saved = 0;
     stats.descriptor_reserve_hits = 0;
     stats.descriptor_allocate_calls = stats.descriptor_update_calls = 0;
     stats.descriptor_bind_calls = stats.descriptor_bound_sets = 0;

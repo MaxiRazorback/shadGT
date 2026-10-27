@@ -196,6 +196,13 @@ private:
         std::vector<const Native::ImageEntry*> read;
         std::vector<Chunk> chunks;
         u64 chunk_used = 0;
+        // Flattened user data is read-only. Keep the last immutable upload for each
+        // stage until this command list retires; compare bytes, never just addresses.
+        struct FlatUpload {
+            const u8* data = nullptr;
+            vk::DescriptorBufferInfo binding{};
+        };
+        std::array<FlatUpload, Shader::MaxStageTypes> flat_uploads{};
         DescriptorSetMemo<vk::DescriptorSet> descriptor_sets;
         DescriptorSetReserve<u64, vk::DescriptorSet> descriptor_reserve;
         std::vector<vk::DescriptorPool> pools; ///< for pipelines without push descriptors
@@ -230,6 +237,7 @@ private:
 
     /// Upload memory of the stream's list: (buffer, offset, CPU pointer).
     std::tuple<vk::Buffer, u64, u8*> Allocate(u64 size, u64 align);
+    vk::DescriptorBufferInfo UploadFlatData(u32 stage, const u8* source, u32 size);
     Chunk TakeChunk(u64 size);
     vk::DescriptorPool TakeDescriptorPool();
 
@@ -719,6 +727,7 @@ private:
         u64 descriptor_reuses = 0, descriptor_allocations = 0;
         u64 descriptor_allocate_calls = 0, descriptor_update_calls = 0;
         u64 descriptor_reserve_hits = 0;
+        u64 flat_upload_hits = 0, flat_upload_bytes_saved = 0, flat_upload_misses = 0;
         u64 descriptor_bind_calls = 0, descriptor_bound_sets = 0;
         u64 texture_memo_hits = 0, texture_lookups = 0; ///< OPT-002
         u64 buffer_memo_hits = 0;                        ///< OPT-003
