@@ -2212,7 +2212,23 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
         LOG_WARNING(Render_Vulkan, "DIAG-150: native shader {:#x} use {} sources:{}",
                     stage.pgm_hash, watched_bind, sources);
     }
-    auto* direct = stage.uses_direct ? r.buffer_cache.GetDirectMemory() : nullptr;
+    // Opt-in composition comparison: use the existing descriptor-backed buffer path
+    // rather than repeating guest page-table walks for each scalar constant load.
+    static const bool composition_descriptors = [] {
+        const char* env = std::getenv("RYGT_COMPOSITION_BUFFER_DESCRIPTORS");
+        return env && env[0] == '1';
+    }();
+    const bool descriptor_composition = composition_descriptors &&
+        stage.sw_stage == Shader::SwStage::Fragment && stage.pgm_hash == 0xb33ec4df;
+    static const bool postprocess_descriptors = [] {
+        const char* env = std::getenv("RYGT_POSTPROCESS_BUFFER_DESCRIPTORS");
+        return env && env[0] == '1';
+    }();
+    const bool descriptor_postprocess = postprocess_descriptors &&
+        stage.sw_stage == Shader::SwStage::Fragment &&
+        (stage.pgm_hash == 0x184b619c || stage.pgm_hash == 0x7cd92fb8);
+    auto* direct = stage.uses_direct && !descriptor_composition
+        ? r.buffer_cache.GetDirectMemory() : nullptr;
     // D3's table: page table L1 and zero page, then base, size and valid of each buffer read
     // through it.
     static thread_local std::vector<std::array<u32, 4>> direct_entries;
@@ -2363,7 +2379,9 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                     (size == 12 || size == 16 ||
                      desc.post_op == Shader::SharpFetchPostOp::ReadConstPointer) &&
                     !RegionOver(base, 12);
-                if (!freeze_fill_args && direct && desc.IsDirectEligible() && size < (u64{1} << 32) &&
+                if (!freeze_fill_args && direct &&
+                    !(descriptor_postprocess && !desc.is_written) &&
+                    desc.IsDirectEligible() && size < (u64{1} << 32) &&
                     (desc.is_written || size > SnapshotBelow()) && // FIX-170
                     !RegionOver(base, size) && direct->EnsureImported(base, size)) {
                     // D3: read in place through the page table; nothing bound.
@@ -3956,7 +3974,22 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
     // As BindBuffers, without its side effects.
     DrawBindings& b = p.bindings;
     const u64 alignment = r.instance.StorageMinAlignment();
-    auto* direct = stage.uses_direct ? r.buffer_cache.GetDirectMemory() : nullptr;
+    // Match BindBuffers: prepared and recorder-side draws must choose the same path.
+    static const bool composition_descriptors = [] {
+        const char* env = std::getenv("RYGT_COMPOSITION_BUFFER_DESCRIPTORS");
+        return env && env[0] == '1';
+    }();
+    const bool descriptor_composition = composition_descriptors &&
+        stage.sw_stage == Shader::SwStage::Fragment && stage.pgm_hash == 0xb33ec4df;
+    static const bool postprocess_descriptors = [] {
+        const char* env = std::getenv("RYGT_POSTPROCESS_BUFFER_DESCRIPTORS");
+        return env && env[0] == '1';
+    }();
+    const bool descriptor_postprocess = postprocess_descriptors &&
+        stage.sw_stage == Shader::SwStage::Fragment &&
+        (stage.pgm_hash == 0x184b619c || stage.pgm_hash == 0x7cd92fb8);
+    auto* direct = stage.uses_direct && !descriptor_composition
+        ? r.buffer_cache.GetDirectMemory() : nullptr;
     static thread_local std::vector<std::array<u32, 4>> direct_entries;
     direct_entries.assign(stage.buffers.size(), {});
     constexpr u64 GpuAddressLimit = 1ULL << 40;
@@ -4039,7 +4072,8 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
                     region_over = RegionOver(base, size) != nullptr;
                 }
                 p.buffer_ranges.emplace_back(base, base + size);
-                if (direct && desc.IsDirectEligible() && size < (u64{1} << 32) && !region_over &&
+                if (direct && !(descriptor_postprocess && !desc.is_written) &&
+                    desc.IsDirectEligible() && size < (u64{1} << 32) && !region_over &&
                     direct->EnsureImported(base, size)) {
                     direct_entries[buffer_index] = {u32(base), u32(base >> 32), u32(size), 1u};
                 } else if (const auto found = JobGuestBuffer(base, size, desc.is_written, p)) {
