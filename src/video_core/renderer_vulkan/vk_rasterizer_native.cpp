@@ -2983,6 +2983,34 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
     for (size_t i = 0; i < b.writes.size(); ++i) {
         by_set[i < b.write_sets.size() ? b.write_sets[i] : 0].push_back(b.writes[i]);
     }
+    std::array<vk::DescriptorSet, Shader::Backend::MaxDescriptorSets> sets{};
+    // Preserve ascending set order: a lower incompatible bind can disturb
+    // a higher push set. Flush lower ordinary sets before every push.
+    u32 first_unbound = 0;
+    const auto bind_before = [&](u32 limit) {
+        for (u32 first = first_unbound; first < limit;) {
+            if (!sets[first]) {
+                ++first;
+                continue;
+            }
+            u32 end = first + 1;
+            while (end < limit && sets[end]) {
+                ++end;
+            }
+            cmdbuf.bindDescriptorSets(bind_point, pipeline.GetLayout(), first,
+                                     std::span<const vk::DescriptorSet>{sets.data() + first, end - first}, {});
+            ++stats.descriptor_bind_calls;
+            stats.descriptor_bound_sets += end - first;
+            first = end;
+        }
+        first_unbound = limit;
+    };
+    std::array<boost::container::small_vector<u64, 128>, Shader::Backend::MaxDescriptorSets> keys;
+    std::array<u64, Shader::Backend::MaxDescriptorSets> hashes{};
+    std::array<bool, Shader::Backend::MaxDescriptorSets> cacheable_sets{};
+    std::array<vk::DescriptorSetLayout, Shader::Backend::MaxDescriptorSets> missing_layouts{};
+    std::array<u32, Shader::Backend::MaxDescriptorSets> missing_indices{};
+    u32 missing_count = 0;
     const vk::Device vk_device = r.instance.GetDevice();
     for (u32 index = 0; index < by_set.size(); ++index) {
         auto& writes = by_set[index];
@@ -2990,13 +3018,12 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
             continue;
         }
         if (index == pipeline.PushSet()) {
-            cmdbuf.pushDescriptorSetKHR(bind_point, pipeline.GetLayout(), index, writes);
-            continue;
+            continue; // Recorded in set order after ordinary sets are ready.
         }
         const vk::DescriptorSetLayout layout = pipeline.SetLayout(index);
         // Cache values, never pointers into per-draw binding storage. Rebind even
         // on a hit so pipeline-layout switches and intervening passes remain safe.
-        boost::container::small_vector<u64, 128> key;
+        auto& key = keys[index];
         key.push_back(u64(VkDescriptorSetLayout(layout)));
         bool cacheable = true;
         for (const auto& write : writes) {
@@ -3020,43 +3047,108 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         const u64 key_hash = cacheable ? XXH3_64bits(key.data(), key.size() * sizeof(u64)) : 0;
         if (cacheable) {
             if (const auto reused = s.descriptor_sets.Find(key_hash, descriptor_key)) {
-                cmdbuf.bindDescriptorSets(bind_point, pipeline.GetLayout(), index, reused, {});
+                sets[index] = reused;
                 ++stats.descriptor_reuses;
                 continue;
             }
         }
-        vk::DescriptorSet set{};
-        for (u32 attempt = 0; attempt < 2 && !set; ++attempt) {
-            if (s.pools.empty() || attempt == 1) {
-                s.pools.push_back(TakeDescriptorPool());
+        hashes[index] = key_hash;
+        cacheable_sets[index] = cacheable;
+        missing_layouts[missing_count] = layout;
+        missing_indices[missing_count++] = index;
+    }
+    if (missing_count) {
+        constexpr u32 MaxReserved = Shader::Backend::MaxDescriptorSets * 8;
+        std::array<vk::DescriptorSet, MaxReserved> allocated{};
+        std::array<vk::DescriptorSetLayout, MaxReserved> layouts{};
+        std::array<u32, Shader::Backend::MaxDescriptorSets> starts{}, counts{};
+        u32 allocate_count = 0;
+        u32 pending_extra = 0;
+        for (u32 i = 0; i < missing_count; ++i) {
+            const u64 layout_key = u64(VkDescriptorSetLayout(missing_layouts[i]));
+            const u32 index = missing_indices[i];
+            if (const auto spare = s.descriptor_reserve.Take(layout_key)) {
+                sets[index] = spare;
+                ++stats.descriptor_reserve_hits;
+                continue;
             }
-            vk::DescriptorSetAllocateInfo alloc{
+            const u32 count = u32(s.descriptor_reserve.BatchSize(layout_key, pending_extra));
+            starts[i] = allocate_count;
+            counts[i] = count;
+            pending_extra += count - 1;
+            for (u32 j = 0; j < count; ++j) layouts[allocate_count++] = missing_layouts[i];
+        }
+        const auto allocate = [&] {
+            if (!allocate_count) return true;
+            if (s.pools.empty()) s.pools.push_back(TakeDescriptorPool());
+            const vk::DescriptorSetAllocateInfo alloc{
                 .descriptorPool = s.pools.back(),
-                .descriptorSetCount = 1,
-                .pSetLayouts = &layout,
+                .descriptorSetCount = allocate_count,
+                .pSetLayouts = layouts.data(),
             };
-            VkDescriptorSet raw{};
-            if (vk_device.allocateDescriptorSets(&alloc,
-                                                 reinterpret_cast<vk::DescriptorSet*>(&raw)) ==
-                vk::Result::eSuccess) {
-                set = raw;
+            ++stats.descriptor_allocate_calls;
+            if (vk_device.allocateDescriptorSets(&alloc, allocated.data()) != vk::Result::eSuccess)
+                return false;
+            stats.descriptor_allocations += allocate_count;
+            return true;
+        };
+        bool success = allocate();
+        if (!success) {
+            // If a reserve block will not fit, try only the required sets in
+            // the current pool, then a fresh pool. Failed outputs are unused.
+            allocate_count = 0;
+            for (u32 i = 0; i < missing_count; ++i) {
+                if (!counts[i]) continue;
+                starts[i] = allocate_count;
+                counts[i] = 1;
+                layouts[allocate_count++] = missing_layouts[i];
+            }
+            success = allocate();
+            if (!success) {
+                s.pools.push_back(TakeDescriptorPool());
+                success = allocate();
             }
         }
-        if (!set) {
+        if (success) {
+            boost::container::small_vector<vk::WriteDescriptorSet, 64> updates;
+            for (u32 i = 0; i < missing_count; ++i) {
+                const u32 index = missing_indices[i];
+                if (counts[i]) {
+                    sets[index] = allocated[starts[i]];
+                    if (counts[i] > 1) {
+                        s.descriptor_reserve.Store(u64(VkDescriptorSetLayout(missing_layouts[i])),
+                            std::span<const vk::DescriptorSet>{allocated.data() + starts[i] + 1, counts[i] - 1});
+                    }
+                }
+                for (auto write : by_set[index]) {
+                    write.dstSet = sets[index];
+                    updates.push_back(write);
+                }
+            }
+            // Each set remains immutable and list-scoped, as before. Only the
+            // host allocation/update calls are combined; descriptor values are unchanged.
+            vk_device.updateDescriptorSets(updates, {});
+            ++stats.descriptor_update_calls;
+            for (u32 i = 0; i < missing_count; ++i) {
+                const u32 index = missing_indices[i];
+                if (cacheable_sets[index]) {
+                    s.descriptor_sets.Store(hashes[index], keys[index], sets[index]);
+                }
+            }
+        } else {
             static std::atomic<u32> logged{};
             if (Sample(logged)) {
-                LOG_ERROR(Render_Vulkan, "NAT-100: no descriptor set for a draw");
+                LOG_ERROR(Render_Vulkan, "NAT-100: no descriptor sets for a draw");
             }
-            continue;
         }
-        for (auto& write : writes) {
-            write.dstSet = set;
-        }
-        vk_device.updateDescriptorSets(writes, {});
-        ++stats.descriptor_allocations;
-        if (cacheable) s.descriptor_sets.Store(key_hash, descriptor_key, set);
-        cmdbuf.bindDescriptorSets(bind_point, pipeline.GetLayout(), index, set, {});
     }
+    for (u32 index = 0; index < by_set.size(); ++index) {
+        if (index == pipeline.PushSet() && !by_set[index].empty()) {
+            bind_before(index);
+            cmdbuf.pushDescriptorSetKHR(bind_point, pipeline.GetLayout(), index, by_set[index]);
+        }
+    }
+    bind_before(u32(sets.size()));
 }
 
 bool NativeRenderer::MirrorKind(char kind) {
@@ -6239,6 +6331,7 @@ void NativeRenderer::Splice() {
     }
     s.chunks.clear();
     s.chunk_used = 0;
+    s.descriptor_reserve.Clear(); // unused handles retire with the same pools
     s.descriptor_sets.Clear(); // descriptor pools retire with this list
     s.pools.clear();
     s.keep.clear(); // freed by the device once the GPU ran this list (NAT-107)
@@ -6853,6 +6946,13 @@ void NativeRenderer::Report() {
     }
     LOG_INFO(Render_Vulkan, "OPT-DESCRIPTORS: {} identical sets reused, {} sets allocated in 10 s",
              stats.descriptor_reuses, stats.descriptor_allocations);
+    LOG_INFO(Render_Vulkan,
+             "OPT-DESCRIPTOR-CALLS: {} sets in {} bind calls, {} allocation calls, {} update calls, {} unused reserve sets issued in 10 s",
+             stats.descriptor_bound_sets, stats.descriptor_bind_calls,
+             stats.descriptor_allocate_calls, stats.descriptor_update_calls, stats.descriptor_reserve_hits);
+    stats.descriptor_reserve_hits = 0;
+    stats.descriptor_allocate_calls = stats.descriptor_update_calls = 0;
+    stats.descriptor_bind_calls = stats.descriptor_bound_sets = 0;
     stats.descriptor_reuses = stats.descriptor_allocations = 0;
     const u64 cpu_writes = stats.cpu_writes.load();
     stats.draws = stats.dispatches = stats.skipped = stats.no_pipeline = stats.passes = 0;

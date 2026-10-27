@@ -25,6 +25,7 @@
 
 #include "common/types.h"
 #include "video_core/renderer_vulkan/descriptor_set_memo.h"
+#include "video_core/renderer_vulkan/descriptor_set_reserve.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/amdgpu/regs_texture.h"
@@ -196,6 +197,7 @@ private:
         std::vector<Chunk> chunks;
         u64 chunk_used = 0;
         DescriptorSetMemo<vk::DescriptorSet> descriptor_sets;
+        DescriptorSetReserve<u64, vk::DescriptorSet> descriptor_reserve;
         std::vector<vk::DescriptorPool> pools; ///< for pipelines without push descriptors
         std::vector<std::unique_ptr<Native::Rhi::Buffer>> keep; ///< alive until the list ran
         u32 commands = 0;
@@ -715,6 +717,9 @@ private:
         /// and index binds, pipeline bind, descriptors and push constants, the draw, write notes.
         std::array<u64, 8> record_ns{};
         u64 descriptor_reuses = 0, descriptor_allocations = 0;
+        u64 descriptor_allocate_calls = 0, descriptor_update_calls = 0;
+        u64 descriptor_reserve_hits = 0;
+        u64 descriptor_bind_calls = 0, descriptor_bound_sets = 0;
         u64 texture_memo_hits = 0, texture_lookups = 0; ///< OPT-002
         u64 buffer_memo_hits = 0;                        ///< OPT-003
         u64 mirror_binds = 0, mirrors_made = 0, mirror_made_bytes = 0, mirrors_dropped = 0,
