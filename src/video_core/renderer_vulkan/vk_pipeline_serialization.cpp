@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <mutex>
 
@@ -36,6 +37,8 @@ static constexpr u32 ShaderBinaryVersionVertexFetch = 277u;
 // Shader semantic revision 0x100 invalidates binaries emitted before the MED3 quiet-NaN fix.
 // Fragment reflections use cube views; other stages keep their existing array path.
 static constexpr u32 ShaderBinaryVersionNativeCube = 279u;
+// AMD single-sample KHR barycentrics change the fragment interface and interpolation.
+static constexpr u32 ShaderBinaryVersionSingleSampleBarycentric = 281u;
 
 static bool UsesScalarPrefix(const Shader::Info& info) {
     return info.hw_stage == Shader::HwStage::Compute &&
@@ -67,6 +70,11 @@ static constexpr u32 PipelineKeyVersionOldQuadHelpers = 9u;
 
 namespace Vulkan {
 
+static std::atomic<bool> single_sample_barycentric_cache_enabled{false};
+void SetSingleSampleBarycentricCacheEnabled(bool enabled) {
+    single_sample_barycentric_cache_enabled.store(enabled, std::memory_order_relaxed);
+}
+
 static bool HasMsaaImage(const Shader::StageSpecialization& spec) {
     return std::ranges::any_of(spec.images, [](const auto& image) {
         return image.type == AmdGpu::ImageType::Color2DMsaa ||
@@ -76,6 +84,10 @@ static bool HasMsaaImage(const Shader::StageSpecialization& spec) {
 
 static u32 ShaderBinaryVersionFor(const Shader::StageSpecialization& spec,
                                   bool scalar_prefix = false) {
+    if (spec.runtime_info.hw_stage == Shader::HwStage::Fragment &&
+        spec.runtime_info.hw.fs.single_sample_barycentric) {
+        return Serialization::ShaderBinaryVersionSingleSampleBarycentric;
+    }
 #ifdef RYTY_GPU
     if (NativeModeRequested() && spec.runtime_info.hw_stage == Shader::HwStage::Fragment &&
         std::ranges::any_of(spec.images, [](const auto& image) {
@@ -105,6 +117,9 @@ static bool IsKnownShaderBinaryVersion(u32 version) {
     // Recognize old metadata for prewarm discovery, but LoadShaderMeta below rejects its
     // binary revision and retranslates it. Never relabel an old binary as corrected.
     version |= 0x100u;
+    if (version == Serialization::ShaderBinaryVersionSingleSampleBarycentric) {
+        return single_sample_barycentric_cache_enabled.load(std::memory_order_relaxed);
+    }
     return version == Serialization::ShaderBinaryVersion ||
            version == Serialization::ShaderBinaryVersionQuadSampleMask ||
            version == Serialization::ShaderBinaryVersionMsaaRead ||
@@ -373,6 +388,11 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     meta.Read(perm_idx);
 
     spec.Deserialize(ar);
+    if (spec.runtime_info.hw_stage == Shader::HwStage::Fragment &&
+        binary_version != Serialization::ShaderBinaryVersionSingleSampleBarycentric) {
+        // This byte was padding in every older metadata revision.
+        spec.runtime_info.hw.fs.single_sample_barycentric = false;
+    }
     if ((binary_version | 0x100u) == Serialization::ShaderBinaryVersion &&
         spec.runtime_info.hw_stage == Shader::HwStage::Fragment) {
         // This byte was padding before quad-mask emulation, and need not have been zero.

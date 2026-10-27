@@ -10,6 +10,9 @@
 
 namespace Vulkan {
 
+// Set before cache readers/workers start; candidate blobs are ignored on other profiles.
+void SetSingleSampleBarycentricCacheEnabled(bool enabled);
+
 void RegisterPipelineData(const ComputePipelineKey& key,
                           ComputePipeline::SerializationSupport& sdata);
 void RegisterPipelineData(const GraphicsPipelineKey& key, u64 hash,
