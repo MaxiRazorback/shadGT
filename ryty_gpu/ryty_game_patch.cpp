@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <atomic>
 #include <chrono>
@@ -30,6 +31,7 @@
 #include "common/types.h"
 #include "core/debug_state.h"
 #include "core/memory.h"
+#include "ryty_gpu/native/entry_hook.h"
 #include "input/trigger_feedback.h"
 #include "ryty_gpu/ryty_dlssg.h"
 
@@ -1270,7 +1272,31 @@ void InstallUi4kImages(u8* base) {
     Apply(base, Patch{0xf387b2, {0x20, 0xd1}, {0xb1, 0x01}, "GTS-009 4K UI images (2/2)"});
 }
 
+// The page handoff closes the keyboard even when no dialog was opened.
+// Calling the original close in state zero waits 300 yields before cleanup.
+using OskCloseFn = void(PS4_SYSV_ABI*)(u64);
+OskCloseFn g_osk_close{};
+
+void PS4_SYSV_ABI CloseOskIfActive(u64 keyboard) {
+    u32 state{};
+    if (Core::RytyMemory::GuardedCopy(&state,
+            reinterpret_cast<const void*>(keyboard + 0xf4), sizeof(state)) && state == 0) {
+        return;
+    }
+    // Preserve active, pending and error-state shutdown, including unreadable state.
+    g_osk_close(keyboard);
+}
+
+void InstallIdleKeyboardClose(u8* base) {
+    Native::NearCode code{base};
+    constexpr std::array<u8, 6> prologue{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
+    g_osk_close = reinterpret_cast<OskCloseFn>(Native::HookEntry(
+        code, base, 0xf345a0, prologue, reinterpret_cast<void*>(&CloseOskIfActive),
+        "idle keyboard close"));
+}
+
 void RytyApplyGamePatches() {
+    InstallIdleKeyboardClose(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallWideCamera(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallTriggerTelemetry(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallUi4kImages(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
