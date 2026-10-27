@@ -298,10 +298,19 @@ void EmitContext::DefineBufferProperties() {
     }
 }
 
+// AMD-311: VK_AMD_shader_explicit_vertex_parameter leaves to the driver which vertex
+// InterpolateAtVertexAMD(k) returns for the barycentric weights (1 - i - j, i, j) of
+// BaryCoordSmoothAMD. GT Sport blends per-vertex inputs with those weights (FIX-191); the RX 7600
+// numbers them in order 0, while an RX 6600 XT drew its hills and an RX 9060 XT its road as
+// triangles smeared in different directions. Vertex k of the weights reads vertex order[k].
+static constexpr std::array<std::array<u32, 3>, 6> AmdVertexOrders{{
+    {0, 1, 2}, {1, 2, 0}, {2, 0, 1}, {0, 2, 1}, {2, 1, 0}, {1, 0, 2}}};
+
 void EmitContext::DefineAmdPerVertexAttribs() {
     if (!profile.supports_amd_shader_explicit_vertex_parameter) {
         return;
     }
+    const auto& order = AmdVertexOrders[profile.amd_vertex_order % AmdVertexOrders.size()];
     for (s32 i = 0; i < runtime_info.hw.fs.num_inputs; i++) {
         const auto& input = runtime_info.hw.fs.inputs[i];
         if (input.IsDefault() || !info.loads.GetAny(IR::Attribute::Param0 + i) ||
@@ -310,12 +319,10 @@ void EmitContext::DefineAmdPerVertexAttribs() {
         }
         auto& param = input_params[i];
         const Id pointer = param.id;
-        param.id_array[0] =
-            OpInterpolateAtVertexAMD(F32[param.num_components], pointer, ConstU32(0U));
-        param.id_array[1] =
-            OpInterpolateAtVertexAMD(F32[param.num_components], pointer, ConstU32(1U));
-        param.id_array[2] =
-            OpInterpolateAtVertexAMD(F32[param.num_components], pointer, ConstU32(2U));
+        for (u32 k = 0; k < 3; ++k) {
+            param.id_array[k] =
+                OpInterpolateAtVertexAMD(F32[param.num_components], pointer, ConstU32(order[k]));
+        }
         param.is_loaded = true;
     }
 }

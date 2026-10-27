@@ -126,7 +126,12 @@ void DataBase::Open() {
         // set aside as <store>.outdated and starts again, and the launcher's shader pack stamp
         // goes with it, so the next Play prepares the pack into the new store. Raise the
         // version whenever a change makes stored translations wrong.
-        static constexpr std::string_view StoreVersion = "RyGT shader store 3 (FIX-215/216 MED3, MIN3, MAX3 NaN on AMD)";
+        // AMD-311: each vertex order of AMD's per-vertex reads has a store of its own version.
+        const char* order_env = std::getenv("SHADGT_AMD_VERTEX_ORDER");
+        const std::string StoreVersion =
+            std::string{"RyGT shader store 4 (FIX-215/216 NaN on AMD, AMD-311 vertex order)"} +
+            (order_env && *order_env ? fmt::format(", SHADGT_AMD_VERTEX_ORDER={}", order_env[0])
+                                     : std::string{});
         const auto version_path = cache_path / "store-version.txt";
         std::error_code ec;
         if (std::filesystem::exists(cache_path, ec)) {

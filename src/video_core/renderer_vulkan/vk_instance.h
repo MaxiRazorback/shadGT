@@ -198,6 +198,11 @@ public:
         return amd_shader_explicit_vertex_parameter;
     }
 
+    /// AMD-311: the vertex order per-vertex reads use with AMD's explicit vertex parameter.
+    u32 GetAmdVertexOrder() const {
+        return amd_vertex_order;
+    }
+
     /// Returns true when VK_EXT_primitive_topology_list_restart is supported for regular lists.
     bool IsListRestartSupported() const {
         return list_restart && list_restart_features.primitiveTopologyListRestart;
@@ -564,6 +569,7 @@ private:
     bool custom_border_color{};
     bool fragment_shader_barycentric{};
     bool amd_shader_explicit_vertex_parameter{};
+    u32 amd_vertex_order{}; ///< AMD-311
     bool device_fault{}; // DIAG-206
     bool depth_clip_control{};
     bool depth_clip_enable{};

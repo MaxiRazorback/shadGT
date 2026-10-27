@@ -47,6 +47,9 @@ struct Profile {
     bool supports_amd_shader_explicit_vertex_parameter{};
     bool supports_fragment_shader_barycentric{};
     bool supports_shader_subgroup_clock{};
+    /// AMD-311: which of the six vertex orders per-vertex reads use with AMD's explicit vertex
+    /// parameter extension (index into AmdVertexOrders in spirv_emit_context.cpp; 0 as before).
+    u32 amd_vertex_order{};
     bool has_broken_spirv_clamp{};
     bool lower_left_origin_mode{};
     bool needs_manual_interpolation{};

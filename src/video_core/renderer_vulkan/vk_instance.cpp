@@ -434,6 +434,14 @@ bool Instance::CreateDevice() {
         LOG_INFO(Render_Vulkan, "- primitiveTopologyPatchListRestart: {}",
                  list_restart_features.primitiveTopologyPatchListRestart);
     }
+    // AMD-311: SHADGT_AMD_VERTEX_ORDER=0..5 picks the vertex order of AMD's per-vertex reads
+    // (see spirv_emit_context.cpp); 0, the order an RX 7600 uses, unless set.
+    if (const char* order_env = std::getenv("SHADGT_AMD_VERTEX_ORDER");
+        order_env && order_env[0] >= '0' && order_env[0] <= '5') {
+        amd_vertex_order = u32(order_env[0] - '0');
+    }
+    LOG_INFO(Render_Vulkan, "AMD-311: vertex order of AMD per-vertex reads: {}",
+             amd_vertex_order);
     amd_shader_explicit_vertex_parameter =
         add_extension(VK_AMD_SHADER_EXPLICIT_VERTEX_PARAMETER_EXTENSION_NAME);
     if (!amd_shader_explicit_vertex_parameter) {
