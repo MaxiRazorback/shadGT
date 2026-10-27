@@ -63,6 +63,44 @@ bool RytyGtsInRace();
 bool RytyGtsMenuSnapshotsAllowed();
 namespace {
 
+// The experimental 540p scene leaves GT Sport's final composition T# at output size.
+// Resolve that one sampled view against a matching, already-rendered physical target.
+// False means a preparing worker must defer to the ordered recorder, where earlier
+// draws have registered their targets. No descriptor or registry entry is mutated.
+bool MatchExperimentalCompositionTexture(AmdGpu::Image& sharp, const Shader::Info& stage,
+                                         const Shader::ImageResource& resource,
+                                         Native::ImageRegistry& registry) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_EXPERIMENTAL_SCENE_VIEWPORT");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    if (!enabled || stage.pgm_hash != 0xb33ec4df || resource.is_written || resource.is_depth ||
+        sharp.GetType() != AmdGpu::ImageType::Color2D || sharp.width != 1919 ||
+        sharp.height != 1079 || sharp.Pitch() != 1024 || sharp.NumLevels() != 1 ||
+        sharp.NumLayers() != 1 || sharp.base_level != 0) {
+        return true;
+    }
+    const auto format = LiverpoolToVK::TrySurfaceFormat(sharp.GetDataFmt(), sharp.GetNumberFmt());
+    const auto tile_mode = sharp.GetTileMode();
+    const auto* target = registry.FindExisting(sharp.Address(), [&](const Native::ImageEntry& entry) {
+        const auto& info = entry.info;
+        return !entry.from_cpu && !info.props.is_depth && info.pixel_format == format &&
+               info.size.width == 960 && info.size.height == 540 && info.size.depth == 1 &&
+               info.pitch == 1024 && info.tile_mode == tile_mode && info.num_samples == 1 &&
+               info.resources.levels == 1 && info.resources.layers == 1;
+    }, true);
+    if (!target) return false;
+    sharp.width = target->info.size.width - 1;
+    sharp.height = target->info.size.height - 1;
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+        LOG_WARNING(Render_Vulkan,
+            "RES-COMP: sampled view {:#x} matched rendered target 960x540 (output 1920x1080)",
+            sharp.Address());
+    }
+    return true;
+}
+
 /// Logs the first few times and then every 1000th.
 bool Sample(std::atomic<u32>& counter) {
     const u32 n = ++counter;
@@ -2489,7 +2527,8 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
 void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs& regs,
                                   Shader::Backend::Bindings& binding, DrawBindings& b) {
     for (const auto& image_desc : stage.images) {
-        const auto tsharp = image_desc.GetSharp(stage);
+        auto tsharp = image_desc.GetSharp(stage);
+        MatchExperimentalCompositionTexture(tsharp, stage, image_desc, *registry);
         const bool cube_sampling = image_desc.post_op == Shader::SharpFetchPostOp::NativeCubeSampling;
         const u32 num_bindings = image_desc.NumBindings(stage);
         const u32 first = static_cast<u32>(b.images.size());
@@ -4133,7 +4172,10 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
     const u64 now_frame = shared_frame.load(std::memory_order_relaxed);
     static thread_local std::array<TextureMemo, 4096> memos{};
     for (const auto& image_desc : stage.images) {
-        const auto tsharp = image_desc.GetSharp(stage);
+        auto tsharp = image_desc.GetSharp(stage);
+        if (!MatchExperimentalCompositionTexture(tsharp, stage, image_desc, *registry)) {
+            return false; // Wait for preceding target registrations on the recorder.
+        }
         const bool cube_sampling = image_desc.post_op == Shader::SharpFetchPostOp::NativeCubeSampling;
         const u32 num_bindings = image_desc.NumBindings(stage);
         const u32 first = static_cast<u32>(b.images.size());

@@ -1352,7 +1352,45 @@ void InstallMenuSnapshotSessionGuard(u8* base) {
     g_snapshot_session_ready = g_snapshot_start && g_snapshot_end;
 }
 
+// Diagnostic comparison: keep output/UI at 1080p while the allocator experiment
+// supplies 540p scene targets. This scoped helper already supports separate scene
+// scale inputs; its default 1:1 scale otherwise expands scene logical viewports.
+using SceneViewportFn = void(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64,
+                                         float, float, float, float, float, float, u64, u64);
+SceneViewportFn g_scene_viewport{};
+void PS4_SYSV_ABI MatchExperimentalSceneViewport(
+    u64 self, u64 output, u64 auxiliary, u64 scene, u64 depth, u64 motion,
+    float x, float y, float width, float height, float scene_x, float scene_y,
+    u64 extra_a, u64 extra_b) {
+    u32 output_extent{}, scene_extent{};
+    // These are verified color-target hint fields, not guessed ImageInfo offsets.
+    if (output && scene && scene_x == 1.0f && scene_y == 1.0f &&
+        Core::RytyMemory::GuardedCopy(&output_extent,
+            reinterpret_cast<const void*>(output + 0x44), sizeof(output_extent)) &&
+        Core::RytyMemory::GuardedCopy(&scene_extent,
+            reinterpret_cast<const void*>(scene + 0x44), sizeof(scene_extent)) &&
+        output_extent == 0x04380780 && scene_extent == 0x021c03c0) {
+        scene_x = scene_y = 0.5f;
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+            std::fprintf(stderr, "[resolution] scene viewport 960x540; output 1920x1080\n");
+        }
+    }
+    g_scene_viewport(self, output, auxiliary, scene, depth, motion,
+                     x, y, width, height, scene_x, scene_y, extra_a, extra_b);
+}
+void InstallExperimentalSceneViewport(u8* base) {
+    const char* enabled = std::getenv("RYGT_EXPERIMENTAL_SCENE_VIEWPORT");
+    if (!enabled || std::strcmp(enabled, "1") != 0) return;
+    Native::NearCode code{base};
+    constexpr std::array<u8, 6> original{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
+    g_scene_viewport = reinterpret_cast<SceneViewportFn>(Native::HookEntry(
+        code, base, 0x18d2cb0, original,
+        reinterpret_cast<void*>(&MatchExperimentalSceneViewport), "experimental scene viewport scale"));
+}
+
 void RytyApplyGamePatches() {
+    InstallExperimentalSceneViewport(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallMenuSnapshotSessionGuard(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallIdleKeyboardClose(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallWideCamera(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
