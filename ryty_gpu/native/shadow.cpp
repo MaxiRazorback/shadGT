@@ -46,12 +46,12 @@ const bool g_compare = [] {
     return env && env[0] == '1';
 }();
 // OPT-010: native mode prepares each draw's bindings on the job's thread (no comparisons).
-const bool g_prepare = [] {
-    const char* env = std::getenv("RYGT_NATIVE_PREPARE");
-    const char* native = std::getenv("RYGT_NATIVE");
-    return env && env[0] == '1' && native && native[0] == '1';
-}();
-const bool g_enabled = g_compare || g_prepare;
+// PERF-316: on whenever the native renderer is (launcher or RYGT_NATIVE); RYGT_NATIVE_PREPARE=0
+// turns it off. Decided at first use: the game's settings are not readable at load time.
+bool PrepareOn() {
+    static const bool on = Vulkan::NativeRenderer::PrepareEnabled();
+    return on;
+}
 
 // The state compared at each draw (dword indices into Regs::reg_array): the graphics stages' SH
 // registers (programs, user data; compute registers from 0x2E00 are kept apart by the command
@@ -570,7 +570,7 @@ public:
         std::shared_ptr<const void> pipeline_keepalive;
         const char* miss = nullptr;
         bool looked_up = false;
-        if ((g_lookups || g_prepare) && state != nullptr && liverpool &&
+        if ((g_lookups || PrepareOn()) && state != nullptr && liverpool &&
             liverpool->GetRasterizer()) {
             // The walk's registers are the thread's draw state while the lookup runs.
             state->cb_extent = extents.cb;
@@ -581,7 +581,7 @@ public:
             const Vulkan::GraphicsPipeline* found =
                 rasterizer->LookupJobPipeline(pipeline_keepalive, &miss);
             pipeline = found;
-            if (found && g_prepare) {
+            if (found && PrepareOn()) {
                 // OPT-010: the draw's bindings, worked out here for the recorder.
                 if (auto* native = rasterizer->Native()) {
                     const auto& infos = Vulkan::PipelineCache::JobInfos();
@@ -859,7 +859,7 @@ std::atomic<bool> g_reporter_started{false};
 } // namespace
 
 bool ShadowEnabled() {
-    return g_enabled;
+    return g_compare || PrepareOn();
 }
 
 bool ShadowComparing() {
@@ -1053,7 +1053,7 @@ void ShadowJobDecode() {
 }
 
 void ShadowSubmitBase(const Regs& regs) {
-    if (g_prepare && !g_reporter_started.exchange(true)) {
+    if (PrepareOn() && !g_reporter_started.exchange(true)) {
         std::thread{ReporterLoop}.detach(); // OPT-010: the job walks' costs
     }
     ++g_epoch;
