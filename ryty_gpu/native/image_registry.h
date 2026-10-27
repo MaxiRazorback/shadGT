@@ -73,6 +73,11 @@ class ImageEntry {
 public:
     VideoCore::ImageInfo info;
     std::unique_ptr<Rhi::Image> image;
+    /// PERF-314: a write-back's re-tiling buffers (linear and tiled scratch, tiling parameters),
+    /// kept for the next write-back of this picture instead of made each time (recorder only).
+    std::unique_ptr<Rhi::Buffer> download_linear;
+    std::unique_ptr<Rhi::Buffer> download_tiled;
+    std::unique_ptr<Rhi::Buffer> download_params;
     u32 backend_usage = 0;    ///< from the image factory
     u64 backend_features = 0; ///< from the image factory
     /// NAT-104: when the renderer last wrote the picture (its own clock; 0: never).

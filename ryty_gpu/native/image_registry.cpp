@@ -1219,34 +1219,49 @@ bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, co
         return true;
     }
     const Rhi::Pipeline* tile = TilingPipeline(info, true);
-    auto params_buffer = TilingParamsBuffer(info);
-    auto linear = device.CreateBuffer({.size = size,
-                                       .usage = Rhi::BufferUsageStorage |
-                                                Rhi::BufferUsageTransferDst,
-                                       .memory = Rhi::MemoryKind::DeviceLocal});
-    auto tiled = device.CreateBuffer({.size = size,
-                                      .usage = Rhi::BufferUsageStorage |
-                                               Rhi::BufferUsageTransferSrc,
-                                      .memory = Rhi::MemoryKind::DeviceLocal});
+    // PERF-314: GT Sport writes the same small pictures back thousands of times a second; making
+    // three buffers for each write-back was most of the recorder's time in write-backs. The
+    // picture's buffers are reused: its size and tiling never change, and every write-back is
+    // recorded on the one queue, ordered after the last by the barriers below. Freed with the
+    // entry (after the GPU is done with them, as before).
+    if (!entry.download_params) {
+        entry.download_params = TilingParamsBuffer(info);
+    }
+    if (!entry.download_linear || entry.download_linear->Size() < size) {
+        entry.download_linear = device.CreateBuffer({.size = size,
+                                                     .usage = Rhi::BufferUsageStorage |
+                                                              Rhi::BufferUsageTransferDst,
+                                                     .memory = Rhi::MemoryKind::DeviceLocal});
+    }
+    if (!entry.download_tiled || entry.download_tiled->Size() < size) {
+        entry.download_tiled = device.CreateBuffer({.size = size,
+                                                    .usage = Rhi::BufferUsageStorage |
+                                                             Rhi::BufferUsageTransferSrc,
+                                                    .memory = Rhi::MemoryKind::DeviceLocal});
+    }
+    Rhi::Buffer* params_buffer = entry.download_params.get();
+    Rhi::Buffer* linear = entry.download_linear.get();
+    Rhi::Buffer* tiled = entry.download_tiled.get();
     if (!tile || !params_buffer || !linear || !tiled) {
         return false;
     }
-    list.CopyImageToBuffer(entry.image.get(), linear.get(), MipCopies(info));
+    list.CopyImageToBuffer(entry.image.get(), linear, MipCopies(info));
     list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeCompute);
     list.BindPipeline(tile);
     const std::array<Rhi::Binding, 3> bindings{{
-        {.slot = 0, .type = Rhi::BindingType::StorageBuffer, .buffer = tiled.get(), .offset = 0,
+        {.slot = 0, .type = Rhi::BindingType::StorageBuffer, .buffer = tiled, .offset = 0,
          .size = size},
-        {.slot = 1, .type = Rhi::BindingType::StorageBuffer, .buffer = linear.get(), .size = size},
-        {.slot = 2, .type = Rhi::BindingType::UniformBuffer, .buffer = params_buffer.get(),
+        {.slot = 1, .type = Rhi::BindingType::StorageBuffer, .buffer = linear, .size = size},
+        {.slot = 2, .type = Rhi::BindingType::UniformBuffer, .buffer = params_buffer,
          .size = sizeof(TilingParams)},
     }};
     list.PushBindings(bindings);
     list.Dispatch(static_cast<u32>((size / (info.num_bits / 8)) / 64), 1, 1);
     list.Barrier(Rhi::ScopeCompute, Rhi::ScopeTransfer);
-    list.CopyBuffer(tiled.get(), 0, &out, out_offset, size);
-    list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeCompute | Rhi::ScopeHost);
-    return true; // the device frees the temporary buffers after the GPU used them
+    list.CopyBuffer(tiled, 0, &out, out_offset, size);
+    // Also orders this write-back's reads of the scratch buffers before the next one's writes.
+    list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeCompute | Rhi::ScopeHost | Rhi::ScopeTransfer);
+    return true;
 }
 
 } // namespace Native
