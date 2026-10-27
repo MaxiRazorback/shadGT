@@ -1004,6 +1004,37 @@ bool ConfigFlag(const char* key, bool fallback) {
     return text.compare(value, 4, "true") == 0;
 }
 
+// Disable the two motion-blur inputs while retaining the game's normal effect graph.
+// CUSA03220 v1.69: EffectParameter.motionblur.enable (+0x264) and
+// fixmotionblur.enable (+0x288) are read when scheduling the post-process jobs.
+// The combined scene-motion-blur/depth-of-field job must still run for defocus.
+void InstallMotionBlurOption(u8* base) {
+    if (!ConfigFlag("disable_motion_blur", false)) return;
+    const Patch patches[] = {
+        {0x1146c00, {0x80, 0xb8, 0x64, 0x02, 0x00, 0x00, 0x00, 0x0f, 0x95, 0xc1},
+         {0xb9, 0x00, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90, 0x90, 0x90},
+         "motion blur: scene effect disabled"},
+        {0x1146c1b, {0x8a, 0x90, 0x88, 0x02, 0x00, 0x00},
+         {0xb2, 0x00, 0x90, 0x90, 0x90, 0x90}, "motion blur: fixed effect disabled"},
+    };
+    // Check both sites before changing either; other executable versions stay untouched.
+    for (const auto& patch : patches) {
+        MEMORY_BASIC_INFORMATION info{};
+        const auto* target = base + patch.rva;
+        if (!VirtualQuery(target, &info, sizeof(info)) || info.State != MEM_COMMIT ||
+            reinterpret_cast<uintptr_t>(target) + patch.original.size() >
+                reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize ||
+            (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
+            std::memcmp(target, patch.original.data(), patch.original.size()) != 0) {
+            std::fprintf(stderr, "[patch] motion blur: unsupported executable; option not applied\n");
+            return;
+        }
+    }
+    for (const auto& patch : patches) {
+        if (!Apply(base, patch)) return;
+    }
+}
+
 // A setting of the GT Sport config as written (a string without its quotes, a number), or "".
 static std::string ConfigValue(const char* key) {
     char path[MAX_PATH];
@@ -1301,6 +1332,7 @@ void RytyApplyGamePatches() {
     InstallTriggerTelemetry(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallUi4kImages(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallMirrorHalfRate(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    InstallMotionBlurOption(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     if (!WetReflectionsWanted()) {
         // jne (reflect when wet) -> two nops
         Apply(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)),
