@@ -27,6 +27,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/compiler_worker_budget.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -189,7 +190,8 @@ private:
 // FIX-057: the driver compiles a tessellated pipeline with a lot of memory, and GT Sport's race
 // summary (the driver figure) needs hundreds of new ones at once. With every build worker on one,
 // the process went from 11 GB to 100 GB in seconds and the driver's compiler ran out of memory.
-// At most two of them are created at the same time; -DisablePerf 79 lets them all run.
+// Admit one heavy compile at a time: two simultaneous builds exhausted system
+// commit inside NVIDIA LLVM. -DisablePerf 79 disables this final driver-call gate.
 class HeavyBuildGate {
 public:
     explicit HeavyBuildGate(bool heavy) {
@@ -219,7 +221,7 @@ public:
 
 private:
     static std::counting_semaphore<64>& Semaphore() {
-        static std::counting_semaphore<64> semaphore{2};
+        static std::counting_semaphore<64> semaphore{CompilerWorkerBudget::HeavyPipelineLimit};
         return semaphore;
     }
     bool held = false;

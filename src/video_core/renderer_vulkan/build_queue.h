@@ -13,6 +13,7 @@
 #include <stop_token>
 
 #include "common/types.h"
+#include "video_core/renderer_vulkan/compiler_worker_budget.h"
 
 namespace Vulkan {
 
@@ -168,7 +169,7 @@ private:
     // Keep queued heavy jobs out of worker threads until memory capacity is available.
     std::deque<Entry>::iterator Runnable(std::deque<Entry>& entries) {
         return std::find_if(entries.begin(), entries.end(), [this](const Entry& entry) {
-            return !entry.heavy || running_heavy < 2;
+            return !entry.heavy || running_heavy < CompilerWorkerBudget::HeavyPipelineLimit;
         });
     }
     u32 running_heavy{};

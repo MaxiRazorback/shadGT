@@ -3,6 +3,9 @@
 #include <algorithm>
 namespace Vulkan {
 struct CompilerWorkerBudget {
+    // Concurrent tessellation compiles exhausted system commit in NVIDIA LLVM.
+    // Share one admission limit between dispatch and direct driver calls.
+    static constexpr unsigned HeavyPipelineLimit = 1;
     unsigned translation;
     unsigned pipeline;
     static constexpr CompilerWorkerBudget ForLogicalThreads(unsigned logical) {
