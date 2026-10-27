@@ -2966,6 +2966,37 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
             continue;
         }
         const vk::DescriptorSetLayout layout = pipeline.SetLayout(index);
+        // Cache values, never pointers into per-draw binding storage. Rebind even
+        // on a hit so pipeline-layout switches and intervening passes remain safe.
+        boost::container::small_vector<u64, 128> key;
+        key.push_back(u64(VkDescriptorSetLayout(layout)));
+        bool cacheable = true;
+        for (const auto& write : writes) {
+            key.insert(key.end(), {u64(write.dstBinding), u64(write.dstArrayElement),
+                                   u64(write.descriptorCount), u64(write.descriptorType)});
+            if (write.pNext || write.pTexelBufferView) { cacheable = false; break; }
+            if (write.pBufferInfo) {
+                for (u32 i = 0; i < write.descriptorCount; ++i) {
+                    const auto& info = write.pBufferInfo[i];
+                    key.insert(key.end(), {u64(VkBuffer(info.buffer)), info.offset, info.range});
+                }
+            } else if (write.pImageInfo) {
+                for (u32 i = 0; i < write.descriptorCount; ++i) {
+                    const auto& info = write.pImageInfo[i];
+                    key.insert(key.end(), {u64(VkSampler(info.sampler)),
+                        u64(VkImageView(info.imageView)), u64(info.imageLayout)});
+                }
+            } else { cacheable = false; break; }
+        }
+        const std::span<const u64> descriptor_key{key.data(), key.size()};
+        const u64 key_hash = cacheable ? XXH3_64bits(key.data(), key.size() * sizeof(u64)) : 0;
+        if (cacheable) {
+            if (const auto reused = s.descriptor_sets.Find(key_hash, descriptor_key)) {
+                cmdbuf.bindDescriptorSets(bind_point, pipeline.GetLayout(), index, reused, {});
+                ++stats.descriptor_reuses;
+                continue;
+            }
+        }
         vk::DescriptorSet set{};
         for (u32 attempt = 0; attempt < 2 && !set; ++attempt) {
             if (s.pools.empty() || attempt == 1) {
@@ -2994,6 +3025,8 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
             write.dstSet = set;
         }
         vk_device.updateDescriptorSets(writes, {});
+        ++stats.descriptor_allocations;
+        if (cacheable) s.descriptor_sets.Store(key_hash, descriptor_key, set);
         cmdbuf.bindDescriptorSets(bind_point, pipeline.GetLayout(), index, set, {});
     }
 }
@@ -6178,6 +6211,7 @@ void NativeRenderer::Splice() {
     }
     s.chunks.clear();
     s.chunk_used = 0;
+    s.descriptor_sets.Clear(); // descriptor pools retire with this list
     s.pools.clear();
     s.keep.clear(); // freed by the device once the GPU ran this list (NAT-107)
     device->Collect(); // objects the GPU finished with (staging buffers of uploads)
@@ -6789,6 +6823,9 @@ void NativeRenderer::Report() {
         in_place.total = {};
         in_place.frames = 0;
     }
+    LOG_INFO(Render_Vulkan, "OPT-DESCRIPTORS: {} identical sets reused, {} sets allocated in 10 s",
+             stats.descriptor_reuses, stats.descriptor_allocations);
+    stats.descriptor_reuses = stats.descriptor_allocations = 0;
     const u64 cpu_writes = stats.cpu_writes.load();
     stats.draws = stats.dispatches = stats.skipped = stats.no_pipeline = stats.passes = 0;
     stats.barriers = stats.splices = stats.copied_reads = stats.copied_bytes = stats.unbound = 0;
