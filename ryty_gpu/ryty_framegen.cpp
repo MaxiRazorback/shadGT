@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <windows.h>
+#include <bcrypt.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <string>
 
 #include "common/logging/log.h"
@@ -172,6 +175,66 @@ struct TimingTrace {
     }
 } g_timing;
 
+// Diagnostic workaround for the bundled SDK's 100 ms pacing-history timeout.
+// This constant has one code reference: the interpolation-thread reset threshold.
+// Check the entire DLL on disk and the loaded instructions before touching its data.
+bool ApplyLowFpsPacing(HMODULE module, const std::wstring& path) {
+    const char* option = std::getenv("RYGT_FG_LOW_FPS_PACING");
+    if (!option || std::string{option} != "1") return false;
+    constexpr std::array<u8, 32> expected_hash{
+        0xa1,0x62,0x4c,0xc4,0x23,0x8f,0xef,0x04,0x6f,0x30,0xc4,0xd8,0x0c,0xe3,0xf4,0x7b,
+        0xe6,0x3f,0xc5,0xf5,0x37,0x3f,0x49,0xe3,0xee,0x9e,0xdb,0x99,0x60,0xf5,0x4c,0x78};
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file || file.tellg() != std::streampos{9332432}) {
+        LOG_WARNING(Render_Vulkan, "FG pacing workaround: DLL size differs; skipped");
+        return false;
+    }
+    std::vector<u8> bytes(9332432);
+    file.seekg(0);
+    if (!file.read(reinterpret_cast<char*>(bytes.data()), bytes.size())) return false;
+    const HMODULE crypto = LoadLibraryExW(L"bcrypt.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!crypto) return false;
+    const auto open = reinterpret_cast<decltype(&BCryptOpenAlgorithmProvider)>(GetProcAddress(crypto, "BCryptOpenAlgorithmProvider"));
+    const auto hash = reinterpret_cast<decltype(&BCryptHash)>(GetProcAddress(crypto, "BCryptHash"));
+    const auto close = reinterpret_cast<decltype(&BCryptCloseAlgorithmProvider)>(GetProcAddress(crypto, "BCryptCloseAlgorithmProvider"));
+    BCRYPT_ALG_HANDLE algorithm{};
+    std::array<u8, 32> actual{};
+    bool matches = false;
+    if (open && hash && close && open(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) >= 0) {
+        matches = hash(algorithm, nullptr, 0, bytes.data(), static_cast<ULONG>(bytes.size()),
+                       actual.data(), static_cast<ULONG>(actual.size())) >= 0 && actual == expected_hash;
+        close(algorithm, 0);
+    }
+    FreeLibrary(crypto);
+    if (!matches) {
+        LOG_WARNING(Render_Vulkan, "FG pacing workaround: DLL hash differs; skipped");
+        return false;
+    }
+    auto* base = reinterpret_cast<u8*>(module);
+    constexpr std::array<u8, 9> load{0xf3,0x44,0x0f,0x10,0x0d,0x45,0x34,0x02,0x00};
+    constexpr std::array<u8, 12> compare{0xf3,0x41,0x0f,0x59,0xc1,0x0f,0x5a,0xc0,0x66,0x0f,0x2f,0xf0};
+    u32 value{};
+    std::memcpy(&value, base + 0x4c650, sizeof(value));
+    if (std::memcmp(base + 0x29202, load.data(), load.size()) ||
+        std::memcmp(base + 0x29387, compare.data(), compare.size()) || value != 0x3dcccccd) {
+        LOG_WARNING(Render_Vulkan, "FG pacing workaround: loaded signature differs; skipped");
+        return false;
+    }
+    DWORD old{};
+    if (!VirtualProtect(base + 0x4c650, sizeof(value), PAGE_READWRITE, &old)) return false;
+    const u32 replacement = 0x3f000000; // 0.5 seconds, still reset after a genuine long gap.
+    std::memcpy(base + 0x4c650, &replacement, sizeof(replacement));
+    DWORD ignored{};
+    if (!VirtualProtect(base + 0x4c650, sizeof(value), old, &ignored)) {
+        std::memcpy(base + 0x4c650, &value, sizeof(value));
+        VirtualProtect(base + 0x4c650, sizeof(value), old, &ignored);
+        LOG_ERROR(Render_Vulkan, "FG pacing workaround: protection restore failed; rolled back");
+        return false;
+    }
+    LOG_INFO(Render_Vulkan, "FG pacing workaround: verified DLL, history timeout 100 -> 500 ms");
+    return true;
+}
+
 bool Load() {
     if (g_api.tried) {
         return g_api.module != nullptr;
@@ -206,6 +269,7 @@ bool Load() {
         return false;
     }
     g_api.module = module;
+    ApplyLowFpsPacing(module, path);
     return true;
 }
 
