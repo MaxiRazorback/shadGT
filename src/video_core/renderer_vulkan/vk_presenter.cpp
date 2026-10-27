@@ -22,6 +22,7 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/renderer_vulkan/vk_ui_hires.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #ifdef RYTY_GPU
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
@@ -961,19 +962,31 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // PERF-084: the host passes record into the command buffer directly.
     const vk::CommandBuffer pass_cmdbuf = draw_scheduler.DirectCommandBuffer();
     bool scaled = false;
+    bool dlss_scaled = false;
+    vk::ImageView ui_layer_view{}; // HDR-UI
 #ifdef RYTY_GPU
+    const auto shown = UiHires::TakeFrame(instance, pass_cmdbuf, cpu_address, image_size,
+                                          {frame->width, frame->height}, view_info.format);
     if (temporalView) {
         image_view = temporalView;
         image_size = temporalDlss.OutputSize();
+        dlss_scaled = true;
+        scaled = true;
+    } else if (shown) {
+        image_view = shown->view;
+        image_size = shown->size;
+        ui_layer_view = shown->ui;
+        dlss_scaled = shown->dlss;
         scaled = true;
     }
     // ryGT: DLSS (when its plugin is on and can scale to the window size) replaces FSR.
-    if (const auto dlss_view =
+    if (const auto dlss_view = scaled ? image_view :
             dlss_pass.Render(pass_cmdbuf, image.GetImage(), image_view, view_info.format,
                              image_size, {frame->width, frame->height});
         dlss_view != image_view) {
         image_view = dlss_view;
         scaled = true;
+        dlss_scaled = true;
     }
     // ryGT: FSR 3.1 replaces FSR 1 when it is on; the RCAS settings carry over (FSR 3.1 turns
     // RCAS attenuation 0..2 into sharpness 1..0).
@@ -1000,7 +1013,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // the post process pass still sRGB encoded and has to be decoded there instead.
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
-    pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, pp_settings);
+    pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, pp_settings, ui_layer_view,
+                   dlss_scaled);
 
     DebugState.game_resolution = {image_size.width, image_size.height};
     DebugState.output_resolution = {frame->width, frame->height};
@@ -1028,11 +1042,11 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     // NAT-100: the picture native mode drew at the display buffer, through the same host passes.
     const VideoCore::TextureCache::ImageDesc desc{attribute, cpu_address};
     const vk::Format view_format = GetFrameViewFormat(attribute.attrib.pixel_format);
-    const auto display = native.FindDisplay(desc.info, view_format);
-    if (!display) {
-        return PrepareBlankFrame(false);
-    }
     Frame* frame = GetRenderFrame();
+    const auto display = native.FindDisplay(desc.info, view_format, {frame->width, frame->height});
+    if (!display) {
+        return PrepareBlankFrame(false, frame);
+    }
     const vk::ImageSubresourceRange single{
         .aspectMask = vk::ImageAspectFlagBits::eColor,
         .baseMipLevel = 0,
@@ -1076,17 +1090,28 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
         .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
         .pImageMemoryBarriers = barriers.data(),
     });
-    const vk::Extent2D image_size{display->width, display->height};
+    vk::Extent2D image_size{display->width, display->height};
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
     vk::ImageView image_view = display->view;
     const vk::CommandBuffer pass_cmdbuf = draw_scheduler.DirectCommandBuffer();
     bool scaled = false;
-    if (const auto dlss_view = dlss_pass.Render(pass_cmdbuf, display->image, image_view,
-                                                view_format, image_size,
-                                                {frame->width, frame->height});
+    bool dlss_scaled = false;
+    vk::ImageView ui_layer_view{};
+    if (display->output_view) {
+        image_view = display->output_view;
+        image_size = display->output_size;
+        ui_layer_view = display->ui_layer;
+        dlss_scaled = display->dlss_scaled;
+        scaled = true;
+    }
+    if (const auto dlss_view =
+            scaled ? image_view
+                   : dlss_pass.Render(pass_cmdbuf, display->image, image_view, view_format,
+                                      image_size, {frame->width, frame->height});
         dlss_view != image_view) {
         image_view = dlss_view;
         scaled = true;
+        dlss_scaled = true;
     }
     if (!scaled && fsr_settings.enable) {
         const float sharpness =
@@ -1107,7 +1132,8 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     }
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
-    pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, pp_settings);
+    pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, pp_settings, ui_layer_view,
+                   dlss_scaled);
     const vk::ImageMemoryBarrier2 back{
         .srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader |
                         vk::PipelineStageFlagBits2::eComputeShader,
@@ -1134,9 +1160,11 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
 }
 #endif
 
-Frame* Presenter::PrepareBlankFrame(bool present_thread) {
+Frame* Presenter::PrepareBlankFrame(bool present_thread, Frame* frame) {
     // Request a free presentation frame.
-    Frame* frame = GetRenderFrame();
+    if (!frame) {
+        frame = GetRenderFrame();
+    }
 
     auto& scheduler = present_thread ? present_scheduler : draw_scheduler;
     scheduler.EndRendering();
@@ -1441,6 +1469,10 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
                                vk::PipelineStageFlagBits::eAllCommands,
                                vk::DependencyFlagBits::eByRegion, {}, {}, post_barrier);
+#ifdef RYTY_GPU
+        RytyDlssG::SetFreshFrame(is_game_frame && !is_reusing_frame &&
+                                !Libraries::SystemService::IsSplashVisible());
+#endif
         swapchain.PrepareFrameGeneration(cmdbuf); // ryGT
 
         if (profiler_ctx) {

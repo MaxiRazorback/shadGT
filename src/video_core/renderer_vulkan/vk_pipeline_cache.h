@@ -180,6 +180,8 @@ public:
 
 private:
     bool RefreshGraphicsKey();
+    Result GetProgramImpl(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
+                          const Shader::ShaderParams& params, Shader::Backend::Bindings& binding);
     /// Registers the pipeline keys are built from: the current ones, or during read-ahead the
     /// registers at an upcoming draw (PERF-019).
     const AmdGpu::Regs& Regs() const;
@@ -469,6 +471,7 @@ private:
         std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data;
         std::span<const u32> code; // FIX-160: over code_copy, not guest memory
         std::vector<u32> code_copy;
+        VAddr code_base{};
         Shader::RuntimeInfo runtime_info;
         Shader::Backend::Bindings start;
         std::unique_ptr<Shader::Info> info;

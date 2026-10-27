@@ -50,9 +50,10 @@ ImageInfo::ImageInfo(const Libraries::VideoOut::BufferAttributeGroup& group,
     size.width = attrib.width;
     size.height = attrib.height;
     size.depth = 1;
-    pitch = attrib.tiling_mode == TilingMode::Linear ? size.width : (size.width + 127) & (~127);
+    pitch = attrib.pitch_in_pixel;
     num_bits = attrib.pixel_format != VideoOutFormat::A16R16G16B16Float ? 32 : 64;
     ASSERT(num_bits == 32);
+    alt_tile = Libraries::Kernel::sceKernelIsNeoMode() && props.is_tiled;
 
     guest_address = cpu_address;
     UpdateSize();

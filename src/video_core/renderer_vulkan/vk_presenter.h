@@ -84,7 +84,10 @@ public:
         if (!IsHDRSupported()) {
             return;
         }
+#ifndef RYTY_GPU
         swapchain.SetHDR(enable);
+#endif
+        // ryGT: whether the game's frames are HDR10; the swapchain is HDR10 throughout.
         pp_settings.hdr = enable ? 1 : 0;
     }
 
@@ -103,7 +106,7 @@ public:
     Frame* PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                         VAddr cpu_address);
 
-    Frame* PrepareBlankFrame(bool present_thread);
+    Frame* PrepareBlankFrame(bool present_thread, Frame* frame = nullptr);
 #ifdef RYTY_GPU
     /// NAT-100: PrepareFrame for native mode (the picture native mode drew there).
     Frame* PrepareNativeFrame(NativeRenderer& native,

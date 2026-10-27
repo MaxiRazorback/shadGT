@@ -10,15 +10,37 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#ifdef RYTY_GPU
+#include "ryty_gpu/ryty_pro_mode.h"
+#endif
 
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
 #include <boost/container/static_vector.hpp>
 
 namespace Vulkan::HostPasses {
+
+namespace {
+struct PostProcessingConstants {
+    PostProcessingPass::Settings settings;
+    float dlss_sharpening = 0.0f;
+};
+static_assert(offsetof(PostProcessingConstants, dlss_sharpening) == 44);
+static_assert(sizeof(PostProcessingConstants) == 48);
+} // namespace
 
 void PostProcessingPass::Create(vk::Device device, const vk::Format surface_format) {
     boost::container::static_vector<vk::DescriptorSetLayoutBinding, 2> bindings{
         {
             .binding = 0,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eFragment,
+        },
+        {
+            .binding = 1, // ryGT HDR-UI: the UI layer
             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
             .descriptorCount = 1,
             .stageFlags = vk::ShaderStageFlagBits::eFragment,
@@ -37,7 +59,7 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
     const vk::PushConstantRange push_constants{
         .stageFlags = vk::ShaderStageFlagBits::eFragment,
         .offset = 0,
-        .size = sizeof(Settings),
+        .size = sizeof(PostProcessingConstants),
     };
 
     const auto& vs_module = CompileSPV(FS_TRI_VERT, device);
@@ -182,7 +204,8 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
 }
 
 void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
-                                vk::Extent2D input_size, Frame& frame, Settings settings) {
+                                vk::Extent2D input_size, Frame& frame, Settings settings,
+                                vk::ImageView ui_layer, bool dlss_scaled) {
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
             .pLabelName = "Host/Post processing",
@@ -220,6 +243,12 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
     };
 
+    vk::DescriptorImageInfo ui_info{
+        .sampler = *sampler,
+        .imageView = ui_layer ? ui_layer : input,
+        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+    };
+    settings.ui_layer = ui_layer ? 1 : 0;
     const std::array set_writes{
         vk::WriteDescriptorSet{
             .dstSet = VK_NULL_HANDLE,
@@ -228,6 +257,14 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
             .descriptorCount = 1,
             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
             .pImageInfo = &image_info,
+        },
+        vk::WriteDescriptorSet{
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 1,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .pImageInfo = &ui_info,
         },
     };
 
@@ -251,8 +288,45 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                          });
 
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, set_writes);
-    cmdbuf.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(Settings),
-                         &settings);
+    float dlss_sharpening = 0.0f;
+#ifdef RYTY_GPU
+    {
+        // The HDR settings are read again every 2 seconds, so they can be tuned while playing.
+        static float peak_nits = 1000.0f, gain = 1.0f, sdr_white = 200.0f;
+        static bool input_709 = false;
+        static float ui_white = 250.0f;
+        static float saturation = 1.0f;
+        static float sharpening = 0.0f;
+        static auto next_read = std::chrono::steady_clock::time_point{};
+        if (const auto now = std::chrono::steady_clock::now(); now >= next_read) {
+            next_read = now + std::chrono::seconds(2);
+            peak_nits = static_cast<float>(Ryty::ConfigNumber("hdr_peak_nits", 1000.0));
+            gain = static_cast<float>(Ryty::ConfigNumber("hdr_brightness", 100.0) / 100.0);
+            sdr_white = static_cast<float>(Ryty::ConfigNumber("hdr_sdr_white_nits", 200.0));
+            input_709 = Ryty::ConfigTrue("hdr_input_709");
+            ui_white = static_cast<float>(Ryty::ConfigNumber("hdr_ui_white_nits", 250.0));
+            saturation = static_cast<float>(Ryty::ConfigNumber("hdr_saturation", 1.0));
+            const double configured_sharpening = Ryty::ConfigNumber("dlss_sharpening", 0.0);
+            sharpening = std::isfinite(configured_sharpening)
+                             ? static_cast<float>(std::clamp(configured_sharpening, 0.0, 100.0) /
+                                                  100.0)
+                             : 0.0f;
+        }
+        settings.hdr_peak_nits = peak_nits;
+        settings.hdr_gain = gain;
+        settings.sdr_white_nits = sdr_white;
+        settings.hdr_input_709 = input_709 ? 1 : 0;
+        settings.ui_white_nits = ui_white;
+        settings.hdr_saturation = saturation;
+        // The swapchain is HDR10 whenever HDR is allowed; the game's frame may still be SDR.
+        settings.sdr_input = frame.is_hdr && !settings.hdr ? 1 : 0;
+        settings.hdr = frame.is_hdr ? 1 : 0;
+        dlss_sharpening = dlss_scaled ? sharpening : 0.0f;
+    }
+#endif
+    const PostProcessingConstants constants{settings, dlss_sharpening};
+    cmdbuf.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0,
+                         sizeof(constants), &constants);
 
     cmdbuf.beginRendering(rendering_info);
     cmdbuf.draw(3, 1, 0, 0);

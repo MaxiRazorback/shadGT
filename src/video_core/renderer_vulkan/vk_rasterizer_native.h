@@ -100,8 +100,13 @@ public:
         vk::ImageView view;
         u32 width;
         u32 height;
+        vk::ImageView output_view{};
+        vk::ImageView ui_layer{};
+        vk::Extent2D output_size{};
+        bool dlss_scaled = false;
     };
-    std::optional<Display> FindDisplay(const VideoCore::ImageInfo& info, vk::Format view_format);
+    std::optional<Display> FindDisplay(const VideoCore::ImageInfo& info, vk::Format view_format,
+                                       vk::Extent2D output_size);
 
     /// NAT-116: saves the render targets noted while the rasterizer collected a frame.
     void DumpFrame(const std::filesystem::path& dir);
@@ -131,6 +136,7 @@ private:
     struct Targets {
         RenderState state{};
         std::array<const Native::ImageEntry*, 8> colors{};
+        std::array<vk::Format, 8> color_formats{};
         const Native::ImageEntry* depth = nullptr;
     };
 
@@ -208,6 +214,9 @@ private:
     /// drawing into what an earlier pass drew), without waiting for anything else.
     void PassBarrier();
     void PrepareImages();
+    const Native::ImageEntry* CropDisplay(const Native::ImageEntry& entry, vk::Extent2D visible);
+    void CopyDisplayCrop(const Native::ImageEntry& source, Native::ImageEntry& crop,
+                         vk::Extent2D visible);
     void ChunkFlushCheck();
 
     /// Upload memory of the stream's list: (buffer, offset, CPU pointer).
@@ -348,6 +357,10 @@ private:
                                                           bool mirror = false);
 
     bool ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline, Targets& out);
+    bool PrepareUiTarget(Targets& targets, const GraphicsPipeline& pipeline);
+    void ResolveUiDisplay(VAddr address, bool keep);
+    void SyncUiReads(std::span<const Shader::Info* const> stages);
+    void SyncUiRange(VAddr address, u64 size, bool keep);
     void BindStages(std::span<const Shader::Info* const> stages, const AmdGpu::Regs& regs,
                     bool compute, DrawBindings& b);
     void BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& regs, bool compute,
@@ -584,6 +597,9 @@ private:
     DrawBindings bindings;
     u64 frame = 0;
     u64 timing_tick = 0; ///< OPT-001
+    u64 ui_draws = 0;
+    u64 ui_resolves = 0;
+    u64 smooth_ghost_draws = 0;
     /// NAT-142: guest memory the GPU reads or writes in place (64 KB pages, every 8th frame):
     /// vertex buffers, indices, read-only storage through the page table, other storage
     /// buffers read, storage buffers written; NAT-150: then what is bound from video memory

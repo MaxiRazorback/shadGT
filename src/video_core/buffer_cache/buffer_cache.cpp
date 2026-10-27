@@ -20,6 +20,7 @@
 #include <xxhash.h>
 
 #include "common/alignment.h"
+#include "common/allocation_pressure_retry.h"
 #include "common/unmapped_allocations.h"
 #include "common/io_file.h"
 #include "common/perf_monitor.h"
@@ -2430,7 +2431,49 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         .allocationSize = resident_blocks << block_shift,
         .memoryTypeIndex = arena_memory_type_index,
     };
-    const auto device_memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
+    u32 allocation_attempt = 0;
+    const auto allocation = Common::AllocateWithPressureRetry(
+        [&] {
+            ++allocation_attempt;
+            auto result = instance.GetDevice().allocateMemory(alloc_info);
+            if (result.result != vk::Result::eSuccess) {
+                vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+                vk::PhysicalDeviceMemoryProperties2 properties{
+                    .pNext = instance.CanReportMemoryUsage() ? &budget : nullptr,
+                };
+                instance.GetPhysicalDevice().getMemoryProperties2(&properties);
+                const u32 heap =
+                    properties.memoryProperties.memoryTypes[arena_memory_type_index].heapIndex;
+                std::map<vk::DeviceMemory, bool> allocations;
+                u64 resident_bytes = 0;
+                for (const auto& range : resident_ranges) {
+                    allocations.emplace(range.memory, true);
+                    resident_bytes += (range.end - range.start) << block_shift;
+                }
+                LOG_ERROR(Render_Vulkan,
+                          "Sparse allocation failed: result={} attempt={} requested_bytes={} "
+                          "guest={:#x}..{:#x} arena={:#x}+{:#x} memory_type={} heap={} "
+                          "heap_usage_bytes={} heap_budget_bytes={} budget_available={} "
+                          "sparse_resident_bytes={} sparse_allocations={} recycled_bytes={}",
+                          vk::to_string(result.result), allocation_attempt,
+                          alloc_info.allocationSize, first_block << block_shift,
+                          (last_block + 1) << block_shift, arena->CpuAddr(), arena->SizeBytes(),
+                          arena_memory_type_index, heap, budget.heapUsage[heap],
+                          budget.heapBudget[heap], instance.CanReportMemoryUsage(), resident_bytes,
+                          allocations.size(), RecycledImageBytes());
+            }
+            return result;
+        },
+        [&] {
+            const u64 recycled = ReleaseRecycledImages(instance.GetAllocator());
+            const auto empty_blocks = Vulkan::TrimEmptyVmaBlocks(instance.GetAllocator());
+            LOG_WARNING(Render_Vulkan,
+                        "Sparse allocation recovery: released {} recycled bytes and {} empty "
+                        "VMA block bytes; retrying {} bytes once",
+                        recycled, empty_blocks, alloc_info.allocationSize);
+        },
+        vk::Result::eErrorOutOfDeviceMemory);
+    const auto device_memory = Vulkan::Check(allocation);
 
     boost::container::small_vector<vk::BufferCopy, 8> copies;
     const auto staging =

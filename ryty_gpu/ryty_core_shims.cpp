@@ -3,6 +3,7 @@
 // them or to Windows directly.
 
 #include "ryty_gpu/ryty_diag.h"
+#include "ryty_gpu/ryty_pro_mode.h"
 #include <windows.h>
 #include <intrin.h>
 #include <algorithm>
@@ -1016,7 +1017,7 @@ void MemoryManager::NoteEmulatorWrite(VAddr address, u64 size, const void*,
 namespace Libraries::Kernel {
 
 s32 PS4_SYSV_ABI sceKernelIsNeoMode() {
-    return 0;
+    return Ryty::IsProMode(Ryty::GetProMode()) ? 1 : 0;
 }
 
 // libkernel.prx exports these by NID with the System V ABI.

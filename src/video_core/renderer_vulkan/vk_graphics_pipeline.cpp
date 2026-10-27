@@ -593,8 +593,11 @@ GraphicsPipeline::GraphicsPipeline(
     for (s32 i = 0; i < key.num_color_attachments; ++i) {
         const auto& col_buf = key.color_buffers[i];
         const auto format = LiverpoolToVK::SurfaceFormat(col_buf.data_format, col_buf.num_format);
-        const auto color_format =
+        auto color_format =
             instance.GetSupportedFormat(format, vk::FormatFeatureFlagBits2::eColorAttachment);
+        if (col_buf.hdr_ui_layer) {
+            color_format = vk::Format::eR16G16B16A16Sfloat; // ryGT HDR-UI: the UI layer
+        }
         if (!instance.IsFormatSupported(color_format,
                                         vk::FormatFeatureFlagBits2::eColorAttachment)) {
             LOG_WARNING(Render_Vulkan,
@@ -692,6 +695,14 @@ GraphicsPipeline::GraphicsPipeline(
                           vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA
                     : key.write_masks[i],
         };
+
+        // ryGT HDR-UI: the UI layer's alpha is its coverage over the scene ("over").
+        if (key.color_buffers[i].hdr_ui_layer) {
+            attachments[i].srcAlphaBlendFactor = vk::BlendFactor::eOne;
+            attachments[i].dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
+            attachments[i].alphaBlendOp = vk::BlendOp::eAdd;
+            attachments[i].colorWriteMask |= vk::ColorComponentFlagBits::eA;
+        }
 
         // The shader squares its color output for this attachment (see PsColorBuffer), so the
         // factors must not scale the operands again.

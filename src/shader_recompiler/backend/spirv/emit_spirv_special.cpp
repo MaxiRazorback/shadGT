@@ -83,7 +83,63 @@ void ConvertPositionToClipSpace(EmitContext& ctx) {
     ctx.OpStore(ctx.output_position, vector);
 }
 
+// ryGT HDR-UI: the first colour output is SDR (sRGB encoded, BT.709) blended into an HDR10 display
+// buffer; it is encoded as BT.2020 PQ with the UI white at kUiWhiteNits (GT Sport's own
+// actualSDRnit) before the blend.
+[[maybe_unused]] static void EncodeHdrUi(EmitContext& ctx) {
+    constexpr float kUiWhiteNits = 250.0f;
+    const auto& info = ctx.frag_outputs[0];
+    if (!Sirit::ValidId(info.id) || info.is_integer || info.num_components < 3 ||
+        info.component_type.value != ctx.F32[1].value) {
+        return;
+    }
+    const Id f = ctx.F32[1];
+    const auto ptr = [&](u32 element) {
+        return ctx.OpAccessChain(info.pointer_type, info.id, ctx.ConstU32(element));
+    };
+    const Id zero = ctx.ConstF32(0.0f);
+    const Id one = ctx.ConstF32(1.0f);
+    const auto decode = [&](Id c) {
+        c = ctx.OpFMin(f, ctx.OpFMax(f, c, zero), one);
+        const Id low = ctx.OpFDiv(f, c, ctx.ConstF32(12.92f));
+        const Id high = ctx.OpPow(
+            f, ctx.OpFDiv(f, ctx.OpFAdd(f, c, ctx.ConstF32(0.055f)), ctx.ConstF32(1.055f)),
+            ctx.ConstF32(2.4f));
+        return ctx.OpSelect(f, ctx.OpFOrdLessThanEqual(ctx.U1[1], c, ctx.ConstF32(0.04045f)),
+                            low, high);
+    };
+    const Id r = decode(ctx.OpLoad(f, ptr(0)));
+    const Id g = decode(ctx.OpLoad(f, ptr(1)));
+    const Id b = decode(ctx.OpLoad(f, ptr(2)));
+    const auto row = [&](float x, float y, float z) {
+        const Id sum = ctx.OpFAdd(f, ctx.OpFAdd(f, ctx.OpFMul(f, r, ctx.ConstF32(x)),
+                                                ctx.OpFMul(f, g, ctx.ConstF32(y))),
+                                  ctx.OpFMul(f, b, ctx.ConstF32(z)));
+        return ctx.OpFMul(f, sum, ctx.ConstF32(kUiWhiteNits / 10000.0f));
+    };
+    const auto pq = [&](Id y) {
+        const Id p = ctx.OpPow(f, ctx.OpFMax(f, y, zero), ctx.ConstF32(0.1593017578125f));
+        const Id num = ctx.OpFAdd(f, ctx.ConstF32(0.8359375f), ctx.OpFMul(f, p, ctx.ConstF32(18.8515625f)));
+        const Id den = ctx.OpFAdd(f, one, ctx.OpFMul(f, p, ctx.ConstF32(18.6875f)));
+        return ctx.OpPow(f, ctx.OpFDiv(f, num, den), ctx.ConstF32(78.84375f));
+    };
+    const Id r2 = pq(row(0.6274f, 0.3293f, 0.0433f));
+    const Id g2 = pq(row(0.0691f, 0.9195f, 0.0114f));
+    const Id b2 = pq(row(0.0164f, 0.0880f, 0.8956f));
+    ctx.OpStore(ptr(0), r2);
+    ctx.OpStore(ptr(1), g2);
+    ctx.OpStore(ptr(2), b2);
+}
+
 void EmitEpilogue(EmitContext& ctx) {
+    if (ctx.hw_stage == HwStage::Fragment && ctx.runtime_info.hw.fs.color_buffers[0].hdr_ui_alpha1) {
+        const auto& info = ctx.frag_outputs[0];
+        if (Sirit::ValidId(info.id) && !info.is_integer && info.num_components == 4 &&
+            info.component_type.value == ctx.F32[1].value) {
+            ctx.OpStore(ctx.OpAccessChain(info.pointer_type, info.id, ctx.ConstU32(3U)),
+                        ctx.ConstF32(1.0f));
+        }
+    }
     if (ctx.hw_stage == HwStage::Vertex &&
         ctx.runtime_info.hw.vs.emulate_depth_negative_one_to_one) {
         ConvertDepthMode(ctx);

@@ -60,6 +60,7 @@ struct VkData {
     vk::Pipeline pipeline{};
     vk::ShaderModule shader_module_vert{};
     vk::ShaderModule shader_module_frag{};
+    vk::ShaderModule shader_module_frag_hdr{}; // ryGT: for an HDR10 swapchain
 
     std::mutex command_pool_mutex;
     vk::CommandPool command_pool{};
@@ -158,6 +159,7 @@ void main()
     fColor = In.Color * texture(sTexture, In.UV.st);
 }
 */
+#include "imgui/renderer/imgui_hdr_frag.h"
 static uint32_t glsl_shader_frag_spv[] = {
     0x07230203, 0x00010000, 0x00080001, 0x0000001e, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
     0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
@@ -947,6 +949,16 @@ static void CreateShaderModules(vk::Device device, const vk::AllocationCallbacks
         };
         bd->shader_module_frag = CheckVkResult(device.createShaderModule(frag_info, allocator));
     }
+    if (bd->shader_module_frag_hdr == VK_NULL_HANDLE) {
+        // ryGT: the overlay's SDR colours encoded as BT.2020 PQ (200-nit white) on an HDR10
+        // swapchain; written as they are, the splash screen and text came out glaring.
+        vk::ShaderModuleCreateInfo frag_info{
+            .codeSize = sizeof(glsl_shader_frag_hdr_spv),
+            .pCode = glsl_shader_frag_hdr_spv,
+        };
+        bd->shader_module_frag_hdr =
+            CheckVkResult(device.createShaderModule(frag_info, allocator));
+    }
 }
 
 static void CreatePipeline(vk::Device device, const vk::AllocationCallbacks* allocator,
@@ -965,6 +977,8 @@ static void CreatePipeline(vk::Device device, const vk::AllocationCallbacks* all
         },
         {
             .stage = vk::ShaderStageFlagBits::eFragment,
+            // ryGT: the HDR overlay shader (shader_module_frag_hdr) is not used: the user
+            // prefers the splash screen as it was.
             .module = bd->shader_module_frag,
             .pName = "main",
         },
@@ -1201,6 +1215,10 @@ void ImGuiImplVulkanDestroyDeviceObjects() {
     if (bd->shader_module_frag) {
         v.device.destroyShaderModule(bd->shader_module_frag, v.allocator);
         bd->shader_module_frag = VK_NULL_HANDLE;
+    }
+    if (bd->shader_module_frag_hdr) {
+        v.device.destroyShaderModule(bd->shader_module_frag_hdr, v.allocator);
+        bd->shader_module_frag_hdr = VK_NULL_HANDLE;
     }
     if (bd->simple_sampler) {
         v.device.destroySampler(bd->simple_sampler, v.allocator);

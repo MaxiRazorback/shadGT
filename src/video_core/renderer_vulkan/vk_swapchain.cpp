@@ -25,9 +25,16 @@ Swapchain::Swapchain(const Instance& instance_, const Frontend::WindowSDL& windo
     : instance{instance_}, window{window_}, surface{CreateSurface(instance.GetInstance(), window)} {
     FindPresentFormat();
     FindPresentMode();
+#ifdef RYTY_GPU
+    // ryGT: with HDR allowed the swapchain is HDR10 from the start and stays so; SDR frames are
+    // converted by the post-process pass. Recreating it when the game switches to HDR broke DLSS
+    // frame generation (Streamline's queue submits failed, device lost).
+    needs_hdr = supports_hdr;
+#endif
 
     Create(window.GetWidth(), window.GetHeight());
-    ImGui::Core::Initialize(instance, window, image_count, surface_format.format);
+    ImGui::Core::Initialize(instance, window, image_count,
+                            needs_hdr ? SURFACE_FORMAT_HDR.format : surface_format.format);
 }
 
 Swapchain::~Swapchain() {

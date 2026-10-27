@@ -3,6 +3,7 @@
 
 #include <utility>
 #include "common/assert.h"
+#include "common/recoverable.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/frontend/opcodes.h"
@@ -54,8 +55,15 @@ AmdGpu::Buffer VertexAttribute::GetSharp(const Shader::Info& info) const noexcep
 }
 
 const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
+    if (sgpr_base >= info.user_data.size() || info.user_data.size() - sgpr_base < 2) {
+        throw Common::RecoverableFailure("fetch shader pointer lies outside the user-data registers");
+    }
     const u32* code;
     std::memcpy(&code, &info.user_data[sgpr_base], sizeof(code));
+    if (reinterpret_cast<uintptr_t>(code) < 0x10000 ||
+        (reinterpret_cast<uintptr_t>(code) & (alignof(u32) - 1)) != 0) {
+        throw Common::RecoverableFailure("fetch shader pointer is null, low, or unaligned");
+    }
     return code;
 }
 
@@ -68,63 +76,84 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
         out_fetch_data = *static_cast<const FetchShaderData*>(t_replay->fetch);
         return true;
     }
-    out_fetch_data.attributes.clear();
+    // Commit a parse only after its return instruction. Failed parses must not leave a
+    // partially filled attribute layout that another draw could reuse.
+    FetchShaderData parsed;
 
     struct VsharpLoad {
         u32 dword_offset{};
         u32 base_sgpr{};
+        bool valid{};
     };
     std::array<VsharpLoad, 104> loads{};
 
     const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
     const u32* ptr = code;
+    constexpr size_t MaxFetchDwords = 1024;
+    const auto require = [&](bool valid, const char* reason, u32 word) {
+        if (!valid) {
+            throw Common::RecoverableFailure(fmt::format(
+                "invalid fetch shader at {:#x}+{:#x}: {} (word {:#010x})",
+                reinterpret_cast<uintptr_t>(code), (ptr - code - 1) * sizeof(u32), reason, word));
+        }
+    };
     while (true) {
+        require(size_t(ptr - code) < MaxFetchDwords, "missing return instruction", 0);
         const u32 word0 = *(ptr++);
         const auto encoding = GetInstructionEncoding(word0);
 
         if (encoding == InstEncoding::SOP1) {
             const auto opcode = OpcodeSOP1((word0 >> 8) & 0xff);
-            ASSERT(opcode == OpcodeSOP1::S_SETPC_B64);
+            require(opcode == OpcodeSOP1::S_SETPC_B64, "unsupported scalar instruction", word0);
             break;
         } else if (encoding == InstEncoding::SMRD) {
             const auto opcode = OpcodeSMRD((word0 >> 22) & 0x1f);
             const u32 sdst = (word0 >> 15) & 0x7f;
             const u32 sbase = (word0 >> 9) & 0x3f;
             const u32 offset = word0 & 0xff;
-            ASSERT(opcode == OpcodeSMRD::S_LOAD_DWORDX4);
-            loads[sdst] = VsharpLoad{offset, sbase * 2};
+            require(opcode == OpcodeSMRD::S_LOAD_DWORDX4, "unsupported descriptor load", word0);
+            require(sdst < loads.size(), "descriptor destination is out of range", word0);
+            require(sbase * 2 + 1 < info.user_data.size(),
+                    "descriptor pointer lies outside user data", word0);
+            loads[sdst] = VsharpLoad{offset, sbase * 2, true};
         } else if (encoding == InstEncoding::VOP2) {
             const auto opcode = OpcodeVOP2((word0 >> 25) & 0x3f);
             const u32 src0 = word0 & 0x1ff;
             const u32 vsrc1 = (word0 >> 9) & 0xff;
             const u32 vdst = (word0 >> 17) & 0xff;
-            ASSERT(opcode == OpcodeVOP2::V_ADD_I32 && src0 < 16 && vsrc1 == vdst);
+            require(opcode == OpcodeVOP2::V_ADD_I32 && src0 < 16 && vsrc1 == vdst,
+                    "unsupported vertex-offset instruction", word0);
             if (vdst == 0) {
                 // V0 is always the vertex offset
-                out_fetch_data.vertex_offset_sgpr = src0;
+                parsed.vertex_offset_sgpr = src0;
             } else if (vdst == 3) {
                 // V3 is always the instance offset
-                out_fetch_data.instance_offset_sgpr = src0;
+                parsed.instance_offset_sgpr = src0;
             } else {
-                UNREACHABLE();
+                require(false, "unsupported vertex-offset destination", word0);
             }
         } else if (encoding == InstEncoding::MUBUF || encoding == InstEncoding::MTBUF) {
             // SRSRC is in units of 4 SPGRs while SBASE is in pairs of SGPRs
+            require(size_t(ptr - code) < MaxFetchDwords, "truncated buffer instruction", word0);
             const u32 word1 = *(ptr++);
             const u32 srsrc = ((word1 >> 16) & 0x1f) * 4;
-            auto& attrib = out_fetch_data.attributes.emplace_back();
+            require(srsrc < loads.size() && loads[srsrc].valid,
+                    "buffer instruction has no valid descriptor load", word0);
+            auto& attrib = parsed.attributes.emplace_back();
             attrib.dest_vgpr = (word1 >> 8) & 0xff;
             if (encoding == InstEncoding::MUBUF) {
                 const auto opcode = OpcodeMUBUF((word0 >> 18) & 0x7f);
-                ASSERT(opcode >= OpcodeMUBUF::BUFFER_LOAD_FORMAT_X &&
-                       opcode <= OpcodeMUBUF::BUFFER_LOAD_FORMAT_XYZW);
+                require(opcode >= OpcodeMUBUF::BUFFER_LOAD_FORMAT_X &&
+                            opcode <= OpcodeMUBUF::BUFFER_LOAD_FORMAT_XYZW,
+                        "unsupported buffer instruction", word0);
                 attrib.num_elements = (std::to_underlying(opcode) -
                                        std::to_underlying(OpcodeMUBUF::BUFFER_LOAD_FORMAT_X)) +
                                       1;
             } else {
                 const auto opcode = OpcodeMTBUF((word0 >> 16) & 0x7);
-                ASSERT(opcode >= OpcodeMTBUF::TBUFFER_LOAD_FORMAT_X &&
-                       opcode <= OpcodeMTBUF::TBUFFER_LOAD_FORMAT_XYZW);
+                require(opcode >= OpcodeMTBUF::TBUFFER_LOAD_FORMAT_X &&
+                            opcode <= OpcodeMTBUF::TBUFFER_LOAD_FORMAT_XYZW,
+                        "unsupported typed-buffer instruction", word0);
                 attrib.num_elements = (std::to_underlying(opcode) -
                                        std::to_underlying(OpcodeMTBUF::TBUFFER_LOAD_FORMAT_X)) +
                                       1;
@@ -142,19 +171,21 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
             }
         } else if (encoding == InstEncoding::SOPP) {
             const auto opcode = OpcodeSOPP((word0 >> 16) & 0x7f);
-            ASSERT(opcode == OpcodeSOPP::S_WAITCNT);
+            require(opcode == OpcodeSOPP::S_WAITCNT, "unsupported wait instruction", word0);
         } else if (encoding == InstEncoding::VOP1) {
             const auto opcode = OpcodeVOP1((word0 >> 9) & 0xff);
             const u32 src0 = word0 & 0x1ff;
             const u32 vdst = (word0 >> 17) & 0xff;
-            ASSERT(opcode == OpcodeVOP1::V_MOV_B32 && src0 == 242);
+            require(opcode == OpcodeVOP1::V_MOV_B32 && src0 == 242,
+                    "unsupported vector move", word0);
             LOG_WARNING(Render_Recompiler, "Fetch shader has V{} = 1.0 which is ignored", vdst);
         } else {
-            UNREACHABLE_MSG("Unexpected instruction encoding in fetch shader {}", u32(encoding));
+            require(false, "unexpected instruction encoding", word0);
         }
     }
 
-    out_fetch_data.size = (ptr - code) * sizeof(u32);
+    parsed.size = (ptr - code) * sizeof(u32);
+    out_fetch_data = std::move(parsed);
     return true;
 }
 

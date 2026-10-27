@@ -25,6 +25,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
+#include "video_core/renderer_vulkan/vk_ui_hires.h"
 #include "video_core/renderer_vulkan/depth_attachment.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/resource_binding.h"
@@ -44,6 +45,9 @@
 #include "video_core/texture_cache/image_descriptor.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
+#ifdef RYTY_GPU
+#include "ryty_gpu/ryty_ghost.h"
+#endif
 
 namespace Vulkan {
 
@@ -56,6 +60,17 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     push_data.yoffset = regs.viewport_control.yoffset_enable ? regs.viewports[0].yoffset : 0.f;
     push_data.yscale = regs.viewport_control.yscale_enable ? regs.viewports[0].yscale : 1.f;
     push_data.quad_sample_mask = {regs.reg_array[0xa30e], regs.reg_array[0xa30f]};
+#ifdef RYTY_GPU
+    if (RytyGhost::ShouldSmooth(regs)) {
+        push_data.quad_sample_mask = {~0u, ~0u};
+        static std::once_flag logged;
+        std::call_once(logged, [] {
+            LOG_WARNING(Render_Vulkan,
+                        "ryGT ghost: smooth 50% color blend for ghost coverage draws; "
+                        "depth/stencil state and velocity output retained");
+        });
+    }
+#endif
     return push_data;
 }
 
@@ -1733,6 +1748,16 @@ void NoteDrawKey(std::pair<u64, u64> key, int outcome) {
 static void NoteMenuBarDraw(u64 vs, u64 ps); // FIX-127
 static thread_local bool t_frosted_rt = false; // DIAG-139: the draw renders the bar's blur
 
+bool Rasterizer::TemporalOwnsDisplay() {
+#ifdef RYTY_GPU
+    const auto id = ctx->cb_descs[0].image_id;
+    return id && temporalDlss.HasDisplay(g_prepared_frames.load(std::memory_order_relaxed),
+                                        texture_cache.GetImage(id).image_uid);
+#else
+    return false;
+#endif
+}
+
 #ifdef RYTY_GPU
 bool RytyGtsInRace();
 
@@ -1811,6 +1836,7 @@ void Rasterizer::applyTemporalDlss(const GraphicsPipeline* pipeline, const Rende
     }
 }
 #endif
+
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
@@ -2048,6 +2074,14 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RenderState state;
     {
         PhaseTimer t{Phase::BeginRendering};
+        // UI-HIRES: draws into a display buffer after the scene composite go to its proxy.
+        const auto ui_hires =
+            UiHires::Prepare(*ctx, std::bit_width(pipeline->GetGraphicsKey().mrt_mask),
+                             pipeline->GetGraphicsKey().color_buffers[0].hdr_ui_layer, instance,
+                             scheduler, runtime, texture_cache, TemporalOwnsDisplay());
+        if (ui_hires.skip) {
+            return; // HDR-UI: a UI-layer pipeline with no UI layer to draw into
+        }
         state = BeginRendering(pipeline);
         FinalizeTextureLayouts(&state);
         if (frame_dump_collecting) {
@@ -2064,6 +2098,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         if (ctx->needs_barrier) {
             runtime.FlushBarriers();
         }
+        UiHires::Apply(ui_hires, *ctx, state, instance);
     }
 
     {
@@ -2362,6 +2397,13 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (!BindResources(pipeline)) {
         return;
     }
+    const auto ui_hires =
+        UiHires::Prepare(*ctx, std::bit_width(pipeline->GetGraphicsKey().mrt_mask),
+                         pipeline->GetGraphicsKey().color_buffers[0].hdr_ui_layer, instance,
+                         scheduler, runtime, texture_cache, TemporalOwnsDisplay());
+    if (ui_hires.skip) {
+        return; // HDR-UI: a UI-layer pipeline with no UI layer to draw into
+    }
     auto state = BeginRendering(pipeline);
     FinalizeTextureLayouts(&state);
 #ifdef RYTY_GPU
@@ -2371,6 +2413,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (ctx->needs_barrier) {
         runtime.FlushBarriers();
     }
+    UiHires::Apply(ui_hires, *ctx, state, instance);
 
     pipeline->BindResources(ctx->set_writes, ctx->set_write_sets, ctx->push_data);
     UpdateDynamicState(pipeline, is_indexed);
@@ -2437,6 +2480,7 @@ void Rasterizer::DispatchDirect() {
         if (DrawSetEnabled()) NoteDispatch(pipeline, 2);
         return;
     }
+    UiHires::BeforeDispatch(*ctx, scheduler, runtime, texture_cache);
     if (DrawSetEnabled()) NoteDispatch(pipeline, 0);
     if (FrameDumpActive()) {
         FrameDumpDispatch(cs, cs_program, false); // NAT-118
@@ -2489,6 +2533,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     if (!BindResources(pipeline)) {
         return;
     }
+    UiHires::BeforeDispatch(*ctx, scheduler, runtime, texture_cache);
 
     if (ctx->needs_barrier) {
         runtime.FlushBarriers();
@@ -5004,6 +5049,24 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             continue;
         }
 
+        if (!decoded_hit) {
+            constexpr auto sampled = vk::FormatFeatureFlagBits2::eSampledImage;
+            const auto format = instance.GetSupportedFormat(
+                LiverpoolToVK::TrySurfaceFormat(data_fmt, num_fmt), sampled);
+            if (!instance.IsFormatSupported(format, sampled)) {
+                static std::atomic<u64> rejected{};
+                if (const auto count = ++rejected; count <= 20 || count % 1000 == 0) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Binding null image for device-unsupported sampled format {} "
+                                "address={:#x} shader={}_{:#x} sharp_offset={}",
+                                vk::to_string(format), tsharp.Address(), stage.hw_stage,
+                                stage.pgm_hash, image_desc.sharp_fetch.offsets[0]);
+                }
+                bind_null_image();
+                continue;
+            }
+        }
+
         const auto geometry_error =
             decoded_hit ? VideoCore::ImageDescriptorGeometryError::None
                         : VideoCore::CheckImageDescriptorGeometry(tsharp, instance.GetImageLimits());
@@ -6135,6 +6198,7 @@ void Rasterizer::UpdateViewportScissorState() const {
             .offset = {vp_scsr.top_left_x, vp_scsr.top_left_y},
             .extent = {vp_scsr.GetWidth(), vp_scsr.GetHeight()},
         });
+        UiHires::ScaleViewport(viewports.back(), scissors.back());
     }
 
     if (viewports.empty()) {
@@ -6292,7 +6356,13 @@ void Rasterizer::UpdateRasterizationState() const {
 void Rasterizer::UpdateColorBlendingState(const GraphicsPipeline* pipeline) const {
     const auto& regs = liverpool->DrawRegs();
     auto& dynamic_state = DynState(); // NAT-101
+#ifdef RYTY_GPU
+    const auto* fragment = pipeline->GetStages()[static_cast<u32>(Shader::SwStage::Fragment)];
+    dynamic_state.SetBlendConstants(
+        RytyGhost::BlendConstantsForDraw(regs, fragment ? fragment->pgm_hash : 0));
+#else
     dynamic_state.SetBlendConstants(regs.blend_constants);
+#endif
     dynamic_state.SetColorWriteMasks(pipeline->GetGraphicsKey().write_masks);
     dynamic_state.SetAttachmentFeedbackLoopEnabled(ctx->attachment_feedback_loop);
 }

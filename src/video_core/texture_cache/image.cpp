@@ -345,6 +345,21 @@ void TrimUnusedRecycledImages(VmaAllocator allocator) {
     }
 }
 
+u64 ReleaseRecycledImages(VmaAllocator allocator) {
+    std::scoped_lock lock{g_recycle_mutex};
+    const u64 released = g_recycled_bytes;
+    for (const auto& [key, images] : g_recycled) {
+        for (const auto& image : images) {
+            vmaDestroyImage(allocator, image.image, image.allocation);
+            ++g_recycle_dropped;
+        }
+    }
+    g_recycled.clear();
+    g_recycle_order.clear();
+    g_recycled_bytes = 0;
+    return released;
+}
+
 UniqueImage::~UniqueImage() {
     Destroy();
 }

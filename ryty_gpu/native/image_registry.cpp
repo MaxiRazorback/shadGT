@@ -5,15 +5,16 @@
 #include <bit>
 #include <cstring>
 
-#include <array>
-#include <cstdlib>
 #include "common/logging/log.h"
 #include "core/guest_hash.h"
 #include "core/memory.h"
-#include <xxhash.h>
 #include "ryty_gpu/native/image_registry.h"
 #include "video_core/amdgpu/tiling.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/texture_cache/tiling_specialization.h"
+#include <array>
+#include <cstdlib>
+#include <xxhash.h>
 
 #include "video_core/host_shaders/tiling_macro_128_comp.h"
 #include "video_core/host_shaders/tiling_macro_16_comp.h"
@@ -195,7 +196,8 @@ ImageRegistry::ImageRegistry(Rhi::Device& device) : device{device} {
 ImageRegistry::~ImageRegistry() = default;
 
 ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_target, u64 frame,
-                                bool create) {
+                                bool create, bool exact_format) {
+    const bool require_format = exact_format || (render_target && info.num_samples > 1);
     ++stats.lookups;
     Shard& shard = ShardOf(info.guest_address);
     {
@@ -203,6 +205,9 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         const auto [first, last] = shard.images.equal_range(info.guest_address);
         ImageEntry* exact = nullptr;
         for (auto it = first; it != last; ++it) {
+            if (require_format && it->second->info.pixel_format != info.pixel_format) {
+                continue;
+            }
             if (it->second->reused.load(std::memory_order_relaxed)) {
                 continue; // FIX-157: stale
             }
@@ -310,6 +315,7 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                     c.resources.levels >= info.resources.levels &&
                     c.resources.layers >= info.resources.layers &&
                     c.size.width >= info.size.width && c.size.height >= info.size.height &&
+                    (!require_format || c.pixel_format == info.pixel_format) &&
                     (!info.props.is_depth || c.pixel_format == info.pixel_format) &&
                     (!best || u64(c.size.width) * c.size.height <
                                   u64(best->info.size.width) * best->info.size.height)) {
@@ -361,6 +367,7 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         const auto [first, last] = shard.images.equal_range(info.guest_address);
         for (auto it = first; it != last; ++it) {
             if (SameLayout(it->second->info, info) &&
+                (!require_format || it->second->info.pixel_format == info.pixel_format) &&
                 !it->second->reused.load(std::memory_order_relaxed) &&
                 (!render_target || !it->second->from_cpu)) {
                 ++stats.hits;
@@ -440,17 +447,23 @@ bool ImageRegistry::HasImageAt(VAddr address) {
 }
 
 ImageEntry* ImageRegistry::FindExisting(VAddr address,
-                                        const std::function<bool(const ImageEntry&)>& accept) {
+                                        const std::function<bool(const ImageEntry&)>& accept,
+                                        bool prefer_written) {
     Shard& shard = ShardOf(address);
     std::shared_lock lock{shard.mutex};
     const auto [first, last] = shard.images.equal_range(address);
     ImageEntry* best = nullptr;
     for (auto it = first; it != last; ++it) {
-        // The most recently used one, when several layouts live at the address.
-        if (!it->second->reused.load(std::memory_order_relaxed) && accept(*it->second) &&
-            (!best || it->second->last_use.load(std::memory_order_relaxed) >
-                          best->last_use.load(std::memory_order_relaxed))) {
-            best = it->second.get();
+        auto& candidate = *it->second;
+        if (candidate.reused.load(std::memory_order_relaxed) || !accept(candidate)) {
+            continue;
+        }
+        const auto priority = [&](const ImageEntry& entry) {
+            return prefer_written ? entry.write_version.load(std::memory_order_relaxed)
+                                  : entry.last_use.load(std::memory_order_relaxed);
+        };
+        if (!best || priority(candidate) > priority(*best)) {
+            best = &candidate;
         }
     }
     return best;
@@ -984,34 +997,18 @@ std::unique_ptr<Rhi::Buffer> ImageRegistry::TilingParamsBuffer(const VideoCore::
 }
 
 const Rhi::Pipeline* ImageRegistry::TilingPipeline(const VideoCore::ImageInfo& info, bool tiler) {
-    const u64 key = (u64(tiler) << 48) | (u64(info.tile_mode) << 40) | (u64(info.num_bits) << 8) |
-                    info.num_samples;
-    std::scoped_lock lock{untile_mutex};
-    if (const auto it = untile_pipelines.find(key); it != untile_pipelines.end()) {
-        return it->second.get();
-    }
-    const auto micro_tile_mode = AmdGpu::GetMicroTileMode(info.tile_mode);
+  const u64 key = VideoCore::TilingPipelineKey(info, tiler);
+  std::scoped_lock lock{untile_mutex};
+  if (const auto it = untile_pipelines.find(key);
+      it != untile_pipelines.end()) {
+    return it->second.get();
+  }
     const bool macro = AmdGpu::IsMacroTiled(info.array_mode);
+    const auto values = VideoCore::TilingSpecialization(info, tiler);
     std::array<Rhi::SpecConstant, 12> constants{};
     for (u32 i = 0; i < constants.size(); ++i) {
         constants[i].id = i;
-    }
-    constants[0].value = info.num_samples;
-    constants[1].value = u32(micro_tile_mode);
-    constants[2].value = AmdGpu::GetMicroTileThickness(info.array_mode);
-    constants[3].value = tiler ? 1 : 0;
-    if (macro) {
-        const auto macro_tile_mode =
-            AmdGpu::CalculateMacrotileMode(info.tile_mode, info.num_bits, info.num_samples);
-        constants[4].value = u32(info.array_mode);
-        constants[5].value = u32(AmdGpu::GetPipeConfig(info.tile_mode));
-        constants[6].value = AmdGpu::GetBankWidth(macro_tile_mode);
-        constants[7].value = AmdGpu::GetBankHeight(macro_tile_mode);
-        constants[8].value = AmdGpu::GetNumBanks(macro_tile_mode);
-        constants[9].value = std::bit_width(constants[8].value) - 1;
-        constants[10].value = AmdGpu::CalculateTileSplit(info.tile_mode, info.array_mode,
-                                                         micro_tile_mode, info.num_bits);
-        constants[11].value = AmdGpu::GetMacrotileAspect(macro_tile_mode);
+        constants[i].value = values[i];
     }
     const auto code = UntileCode(info.num_bits, macro);
     if (code.empty() || !untile_layout) {

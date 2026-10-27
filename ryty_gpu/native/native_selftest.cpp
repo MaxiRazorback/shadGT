@@ -76,6 +76,8 @@ bool RunCase(Rhi::Device& device, ImageRegistry& registry, Rhi::Fence& fence, u6
     }
     Rhi::CommandList* list = device.AcquireCommandList();
     list->Begin();
+    registry.RecordUploads(*list);
+    list->Barrier(Rhi::ScopeTransfer | Rhi::ScopeCompute, Rhi::ScopeTransfer);
     list->CopyBufferToImage(pattern.get(), target->image.get(), MipCopies(target_info));
     list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
     if (!registry.RecordDownload(*list, *target, *tiled)) {
@@ -138,6 +140,43 @@ bool RunCase(Rhi::Device& device, ImageRegistry& registry, Rhi::Fence& fence, u6
     return wrong == 0 && uploads == 1 && changed;
 }
 
+bool RunResolveFormatCase(ImageRegistry& registry, std::string& log) {
+    auto scalar_info = MakeInfo(AmdGpu::TileMode::Thin1DThin, 480, 270, 1, 0x7100'0000'0000ULL);
+    scalar_info.pixel_format = vk::Format::eR32Sfloat;
+    auto* scalar = registry.Find(scalar_info, true, 1);
+    auto color_info = scalar_info;
+    color_info.pixel_format = vk::Format::eR8G8B8A8Unorm;
+    auto* aliased = registry.Find(color_info, true, 2);
+    auto* color = registry.Find(color_info, true, 3, true, true);
+    auto* repeated = registry.Find(color_info, true, 4, true, true);
+    auto sampled_info = color_info;
+    sampled_info.size.width = 430;
+    sampled_info.UpdateSize();
+    auto* sampled = registry.Find(sampled_info, false, 5);
+    bool linked = false;
+    if (sampled) {
+        for (const auto& link : sampled->sources) {
+            linked |= link.source == color;
+        }
+    }
+    auto ms_scalar_info = scalar_info;
+    ms_scalar_info.guest_address += 0x1000000;
+    ms_scalar_info.num_samples = 2;
+    ms_scalar_info.UpdateSize();
+    auto* ms_scalar = registry.Find(ms_scalar_info, true, 6);
+    auto ms_color_info = ms_scalar_info;
+    ms_color_info.pixel_format = color_info.pixel_format;
+    auto* ms_color = registry.Find(ms_color_info, true, 7);
+    const bool ok =
+        scalar && aliased == scalar && color && color != scalar && repeated == color &&
+        color->image->Desc().format == Rhi::FormatFromVk(u32(color_info.pixel_format)) && linked &&
+        ms_scalar && ms_color && ms_scalar != ms_color &&
+        ms_color->image->Desc().format == color->image->Desc().format;
+    log += fmt::format("resolve format isolation and cropped texture linking: {}\n",
+                       ok ? "passed" : "FAILED");
+    return ok;
+}
+
 bool RunImageSelfTest(std::string& log) {
     std::string error;
     auto device = Rhi::CreateStandaloneVulkanDevice(&error);
@@ -150,6 +189,7 @@ bool RunImageSelfTest(std::string& log) {
     bool ok = true;
     {
         ImageRegistry registry{*device};
+        ok = RunResolveFormatCase(registry, log) && ok;
         for (const auto mode : {AmdGpu::TileMode::Thin1DThin, AmdGpu::TileMode::Thin2DThin,
                                 AmdGpu::TileMode::Display2DThin}) {
             ok = RunCase(*device, registry, *fence, tick, mode, log) && ok;

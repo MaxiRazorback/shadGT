@@ -31,6 +31,7 @@ public:
     void ScaleHud(u64 frame, u64 uid, Viewports& viewports, Scissors& scissors) const;
     vk::ImageView PreparePresent(u64 frame, VideoCore::Image& display, vk::Format viewFormat);
     vk::Extent2D OutputSize() const { return outputSize; }
+    bool HasDisplay(u64 frame, u64 uid) const { return isActive(frame, uid); }
 
 private:
     struct Texture {

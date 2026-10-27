@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -216,7 +218,9 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT,
         vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
         vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR,
-        vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>();
+        vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT,
+        vk::PhysicalDeviceMemoryPriorityFeaturesEXT,
+        vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>();
     features = feature_chain.get().features;
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
@@ -366,6 +370,17 @@ bool Instance::CreateDevice() {
     }
     image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    const char* paging_setting = std::getenv("RYGT_PAGEABLE_VRAM");
+    const bool pageable_memory =
+        (!paging_setting || paging_setting[0] != '0') &&
+        feature_chain.get<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>().memoryPriority &&
+        feature_chain.get<vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>()
+            .pageableDeviceLocalMemory &&
+        add_extension(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME) &&
+        add_extension(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
+    LOG_INFO(Render_Vulkan,
+             "VRAM paging enabled={}: supported device-local allocations may spill to system RAM",
+             pageable_memory);
     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     if (shader_clock) {
         shader_clock_features = feature_chain.get<vk::PhysicalDeviceShaderClockFeaturesKHR>();
@@ -565,7 +580,17 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT{
             .graphicsPipelineLibrary = true,
         },
+        vk::PhysicalDeviceMemoryPriorityFeaturesEXT{
+            .memoryPriority = pageable_memory,
+        },
+        vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT{
+            .pageableDeviceLocalMemory = pageable_memory,
+        },
     };
+    if (!pageable_memory) {
+        device_chain.unlink<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>();
+        device_chain.unlink<vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>();
+    }
     if (!graphics_pipeline_library) {
         device_chain.unlink<vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>();
     }
@@ -621,6 +646,27 @@ bool Instance::CreateDevice() {
     }
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
+    if (device_result != vk::Result::eSuccess) {
+        // ryGT: on some NVIDIA driver and setup combinations the driver rejects the device once
+        // VK_NVX_binary_import (DLSS) is enabled. The game then runs without DLSS, on FSR.
+        const auto is_nvx = [](const char* name) {
+            return std::string_view{name} == VK_NVX_BINARY_IMPORT_EXTENSION_NAME ||
+                   std::string_view{name} == VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME;
+        };
+        const auto nvx = std::remove_if(enabled_extensions.begin(), enabled_extensions.end(), is_nvx);
+        if (nvx != enabled_extensions.end()) {
+            LOG_WARNING(Render_Vulkan,
+                        "Device creation failed ({}) with the DLSS extensions; retrying without them",
+                        vk::to_string(device_result));
+            enabled_extensions.erase(nvx, enabled_extensions.end());
+            auto& create_info = device_chain.get<vk::DeviceCreateInfo>();
+            create_info.enabledExtensionCount = static_cast<u32>(enabled_extensions.size());
+            create_info.ppEnabledExtensionNames = enabled_extensions.data();
+            auto retry = physical_device.createDeviceUnique(device_chain.get());
+            device_result = retry.result;
+            dev = std::move(retry.value);
+        }
+    }
     if (device_result != vk::Result::eSuccess) {
         LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}", vk::to_string(device_result));
         return false;

@@ -31,6 +31,7 @@
 #include "core/debug_state.h"
 #include "core/memory.h"
 #include "input/trigger_feedback.h"
+#include "ryty_gpu/ryty_dlssg.h"
 
 namespace Vulkan {
 void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label); // DIAG-067
@@ -1138,7 +1139,9 @@ using TelemetryUpdateFn = void(PS4_SYSV_ABI*)(void*, void*);
 TelemetryUpdateFn g_telemetry_update{};
 void PS4_SYSV_ABI TelemetryUpdateHook(void* service, void* context) {
     g_telemetry_update(service, context);
-    Input::TriggerFeedback::Publish(static_cast<const u8*>(service) + 0x1dc);
+    const auto* packet = static_cast<const u8*>(service) + 0x1dc;
+    Vulkan::RytyDlssG::PublishTelemetry(packet);
+    Input::TriggerFeedback::Publish(packet);
 }
 void InstallTriggerTelemetry(u8* base) {
     // CUSA03220 v1.69: SimulatorInterface::update virtual slot, converter RVA.
@@ -1148,7 +1151,7 @@ void InstallTriggerTelemetry(u8* base) {
     const u8 magic[] = {0xc7, 0x87, 0xdc, 0x01, 0, 0, 0x30, 0x53, 0x37, 0x47};
     if (*slot != original || std::memcmp(base + 0x68cf53, magic, sizeof(magic)) != 0) return;
     const char* enabled = std::getenv("RYGT_ADAPTIVE_TRIGGERS");
-    if (enabled && enabled[0] == '0') return;
+    if (enabled && enabled[0] == '0' && !ConfigFlag("dlssg_enabled", false)) return;
     DWORD protection;
     if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &protection)) return;
     g_telemetry_update = original;
@@ -1242,9 +1245,28 @@ void InstallFatalErrorDiag(u8* base) {
 }
 } // namespace
 
+// GTS-009 (UI-HIRES): the game's 4K UI images. The UI resolution flag ([0x143056f29], "4K output
+// and not the override at [0x143056f2b]") is set at its two writers instead, so the menus and the
+// HUD load their _4K packs (twice the image detail) while the game renders at 1080 Pro. Drawn at
+// the window size by UI-HIRES, they are sharp at 1440 and above. With GPU.ui_hires or
+// RYGT_UI_4K_IMAGES=1 (=0 off).
+void InstallUi4kImages(u8* base) {
+    bool wanted = ConfigFlag("ui_hires", false);
+    if (const char* env = std::getenv("RYGT_UI_4K_IMAGES")) {
+        wanted = env[0] == '1';
+    }
+    if (!wanted) {
+        return;
+    }
+    // and al, dl -> mov al, 1; and cl, dl -> mov cl, 1
+    Apply(base, Patch{0xe548e2, {0x20, 0xd0}, {0xb0, 0x01}, "GTS-009 4K UI images (1/2)"});
+    Apply(base, Patch{0xf387b2, {0x20, 0xd1}, {0xb1, 0x01}, "GTS-009 4K UI images (2/2)"});
+}
+
 void RytyApplyGamePatches() {
     InstallWideCamera(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallTriggerTelemetry(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
+    InstallUi4kImages(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallMirrorHalfRate(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     if (!WetReflectionsWanted()) {
         // jne (reflect when wet) -> two nops

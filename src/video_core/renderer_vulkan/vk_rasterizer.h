@@ -590,6 +590,7 @@ private:
                            bool beforeDraw = false);
     void prepareNativeHud(RenderState& state);
 #endif
+    bool TemporalOwnsDisplay();
     DrawContext* ctx = &main_ctx;
     /// DIAG-041: buffers and images of the current draw that were bound empty.
     /// DIAG-044: records the current draw or dispatch in the dependency history.

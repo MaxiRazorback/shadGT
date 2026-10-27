@@ -45,6 +45,8 @@ struct Pools {
 /// SHD-005: whether the program stores to memory (buffer, image or GDS writes and atomics).
 [[nodiscard]] bool HasMemoryWrites(std::span<const u32> code);
 
+[[nodiscard]] bool HasSdwaCompareDestination(std::span<const u32> code);
+
 /// DIAG-031: a readable listing of GCN code (pc, opcode, operands, memory offsets).
 [[nodiscard]] std::string ListGcnCode(std::span<const u32> code);
 

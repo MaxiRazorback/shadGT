@@ -189,6 +189,12 @@ struct PsColorBuffer {
     AmdGpu::BlendControl::BlendFactor swizzled_color_dst : 5;
     AmdGpu::BlendControl::BlendFactor swizzled_alpha_src : 5;
     AmdGpu::BlendControl::BlendFactor swizzled_alpha_dst : 5;
+    // ryGT HDR-UI: SDR UI blended into an HDR10 display buffer. Drawn into a separate RGBA16F UI
+    // layer instead (UI-HIRES), composed over the scene in linear light by the presenter.
+    u32 hdr_ui_layer : 1;
+    // ryGT HDR-UI: an opaque UI draw (no blending) in the UI layer; its alpha output is 1 (full
+    // coverage over the scene).
+    u32 hdr_ui_alpha1 : 1;
     AmdGpu::CompMapping swizzle;
 
     bool operator==(const PsColorBuffer& other) const = default;

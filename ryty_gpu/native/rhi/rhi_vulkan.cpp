@@ -12,12 +12,13 @@
 #include <unordered_map>
 #include <vector>
 
+#include "common/allocation_pressure_retry.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "ryty_gpu/native/rhi/rhi_vulkan.h"
+#include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
-#include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 #include <vk_mem_alloc.h>
@@ -653,8 +654,29 @@ std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
     VkBuffer buffer{};
     VmaAllocation allocation{};
     VmaAllocationInfo info{};
-    if (vmaCreateBuffer(allocator, &buffer_ci, &alloc_ci, &buffer, &allocation, &info) != VK_SUCCESS) {
-        return nullptr;
+    struct AllocationResult {
+      VkResult result;
+    };
+    const auto result = Common::AllocateWithPressureRetry(
+        [&] {
+          buffer = VK_NULL_HANDLE;
+          allocation = nullptr;
+          return AllocationResult{vmaCreateBuffer(
+              allocator, &buffer_ci, &alloc_ci, &buffer, &allocation, &info)};
+        },
+        [&] {
+          Collect();
+          const auto reclaimed = Vulkan::TrimEmptyVmaBlocks(allocator);
+          LOG_WARNING(Render_Vulkan,
+                      "Native buffer allocation pressure: {} bytes, {} "
+                      "empty-block bytes reclaimed; retrying once",
+                      desc.size, reclaimed);
+        },
+        VK_ERROR_OUT_OF_DEVICE_MEMORY);
+    if (result.result != VK_SUCCESS) {
+      LOG_ERROR(Render_Vulkan, "Native buffer allocation failed: {} bytes, {}",
+                desc.size, vk::to_string(vk::Result{result.result}));
+      return nullptr;
     }
     u64 address = 0;
     if (desc.usage & BufferUsageDeviceAddress) {
@@ -826,8 +848,30 @@ std::unique_ptr<Image> VulkanDevice::CreateImageFrom(const VkImageCreateInfo& im
     const VmaAllocationCreateInfo alloc_ci{.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     VkImage image{};
     VmaAllocation allocation{};
-    if (vmaCreateImage(allocator, &image_ci, &alloc_ci, &image, &allocation, nullptr) != VK_SUCCESS) {
-        return nullptr;
+    struct AllocationResult {
+      VkResult result;
+    };
+    const auto result = Common::AllocateWithPressureRetry(
+        [&] {
+          image = VK_NULL_HANDLE;
+          allocation = nullptr;
+          return AllocationResult{vmaCreateImage(
+              allocator, &image_ci, &alloc_ci, &image, &allocation, nullptr)};
+        },
+        [&] {
+          Collect();
+          const auto reclaimed = Vulkan::TrimEmptyVmaBlocks(allocator);
+          LOG_WARNING(Render_Vulkan,
+                      "Native image allocation pressure: {}x{}, {} empty-block "
+                      "bytes reclaimed; retrying once",
+                      desc.width, desc.height, reclaimed);
+        },
+        VK_ERROR_OUT_OF_DEVICE_MEMORY);
+    if (result.result != VK_SUCCESS) {
+      LOG_ERROR(Render_Vulkan, "Native image allocation failed: {}x{}, {}",
+                desc.width, desc.height,
+                vk::to_string(vk::Result{result.result}));
+      return nullptr;
     }
     InitImageLayout(image, AspectOf(static_cast<vk::Format>(image_ci.format)));
     return std::make_unique<VulkanImage>(*this, desc, image, allocation);

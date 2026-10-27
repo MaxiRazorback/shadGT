@@ -196,7 +196,7 @@ public:
     /// queued for upload from guest memory; a render target is not. Thread-safe.
     /// OPT-010: `create` false: none when there is none yet (game job threads look ahead).
     ImageEntry* Find(const VideoCore::ImageInfo& info, bool render_target, u64 frame,
-                     bool create = true);
+                     bool create = true, bool exact_format = false);
 
     /// OPT-010: whether no picture was made or dropped over any of the ranges since generation
     /// `since` (false when the log of changes no longer reaches back that far).
@@ -215,7 +215,8 @@ public:
     /// NAT-100: whether any image starts at the address.
     bool HasImageAt(VAddr address);
     /// NAT-100: an image already at the address that `accept` takes (no new image is made).
-    ImageEntry* FindExisting(VAddr address, const std::function<bool(const ImageEntry&)>& accept);
+    ImageEntry* FindExisting(VAddr address, const std::function<bool(const ImageEntry&)>& accept,
+                             bool prefer_written = false);
 
     /// What made textures over a range stale.
     enum class Stale : u8 { CpuWrite, Unmap, GpuWrite, Count };

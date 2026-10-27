@@ -648,7 +648,8 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
     // Equal address
     if (image_info.guest_address == cache_image.info.guest_address) {
         // Cropped descriptors need their own image because views cannot change dimensions.
-        if (image_info.IsSubrectOf(cache_image.info)) {
+        const bool to_subrect = image_info.IsSubrectOf(cache_image.info);
+        if (to_subrect || cache_image.info.IsSubrectOf(image_info)) {
             ImageId result_id = merged_image_id;
             if (!result_id) {
                 result_id = slot_images.Insert(instance, runtime, slot_image_views, image_info);
@@ -656,7 +657,8 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             }
             auto& source = slot_images[cache_image_id];
             auto& destination = slot_images[result_id];
-            if (source.contents_version > destination.contents_version && source.SafeToDownload()) {
+            if (to_subrect && source.contents_version > destination.contents_version &&
+                source.SafeToDownload()) {
                 runtime.CopySubrect(&source, &destination);
             }
             return {result_id, -1, -1};
@@ -936,33 +938,62 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt, FindMemo* memo)
     // address; only then are they collected again below.
     bool registry_changed = false;
 
+    if (desc.type == BindingType::VideoOut) {
+        for (const auto cache_id : same_address) {
+            const auto& source = slot_images[cache_id];
+            if ((source.usage.render_target || source.usage.storage) &&
+                source.info.IsVideoOutSource(info) &&
+                (!image_id ||
+                 source.contents_version > slot_images[image_id].contents_version)) {
+                image_id = cache_id;
+            }
+        }
+        if (image_id) {
+            const auto& source = slot_images[image_id].info;
+            if (info.alt_tile != source.alt_tile || info.bank_swizzle != source.bank_swizzle ||
+                info.guest_size != source.guest_size) {
+                static thread_local u32 layout_adoptions{};
+                if (++layout_adoptions <= 3 || std::has_single_bit(layout_adoptions)) {
+                    LOG_INFO(Render_Vulkan,
+                             "VideoOut uses the rendered surface layout at {:#x}: alt {} -> {}, "
+                             "size {:#x} -> {:#x}",
+                             info.guest_address, info.alt_tile, source.alt_tile,
+                             info.guest_size, source.guest_size);
+                }
+            }
+            desc.info = source;
+        }
+    }
+
     // Check for a perfect match first
-    for (const auto& cache_id : same_address) {
-        auto& cache_image = slot_images[cache_id];
-        if (cache_image.info.guest_address != info.guest_address) {
-            continue;
+    if (!image_id) {
+        for (const auto& cache_id : same_address) {
+            auto& cache_image = slot_images[cache_id];
+            if (cache_image.info.guest_address != info.guest_address) {
+                continue;
+            }
+            if (cache_image.info.guest_size != info.guest_size) {
+                continue;
+            }
+            if (cache_image.info.size != info.size) {
+                continue;
+            }
+            // Depth attachment formats must agree with the pipeline, even when their sampled
+            // aspects are compatible. Let overlap resolution preserve and convert their contents.
+            if (desc.type == BindingType::DepthTarget &&
+                (cache_image.info.pixel_format != info.pixel_format ||
+                 cache_image.info.props.has_stencil != info.props.has_stencil)) {
+                continue;
+            }
+            if (!IsVulkanFormatCompatible(cache_image.info.pixel_format, info.pixel_format) ||
+                (cache_image.info.type != info.type && info.size != Extent3D{1, 1, 1})) {
+                continue;
+            }
+            if (exact_fmt && info.pixel_format != cache_image.info.pixel_format) {
+                continue;
+            }
+            image_id = cache_id;
         }
-        if (cache_image.info.guest_size != info.guest_size) {
-            continue;
-        }
-        if (cache_image.info.size != info.size) {
-            continue;
-        }
-        // Depth attachment formats must agree with the pipeline, even when their sampled
-        // aspects are compatible. Let overlap resolution preserve and convert their contents.
-        if (desc.type == BindingType::DepthTarget &&
-            (cache_image.info.pixel_format != info.pixel_format ||
-             cache_image.info.props.has_stencil != info.props.has_stencil)) {
-            continue;
-        }
-        if (!IsVulkanFormatCompatible(cache_image.info.pixel_format, info.pixel_format) ||
-            (cache_image.info.type != info.type && info.size != Extent3D{1, 1, 1})) {
-            continue;
-        }
-        if (exact_fmt && info.pixel_format != cache_image.info.pixel_format) {
-            continue;
-        }
-        image_id = cache_id;
     }
     const bool perfect_match = static_cast<bool>(image_id);
 
@@ -1586,7 +1617,6 @@ void TextureCache::GarbageCollectImages() {
         if (num_deletions == 0) {
             return true;
         }
-        --num_deletions;
         const bool download = image.SafeToDownload();
         const bool tiled = image.info.IsTiled();
         if (tiled && download) {
@@ -1596,6 +1626,7 @@ void TextureCache::GarbageCollectImages() {
         if (download && !pressured) {
             return false;
         }
+        --num_deletions;
         const auto image_id = slot_images.GetSlotId(image);
         if (download) {
             DownloadImageMemory(image_id);
@@ -1703,17 +1734,24 @@ void TextureCache::ReportMemoryBreakdown() {
         const char* value = std::getenv("RYGT_VRAM_DIAGNOSTICS");
         return value && value[0] == '1';
     }();
-    if (!enabled) return;
     const auto now = std::chrono::steady_clock::now();
     if (now - memory_report_last < std::chrono::seconds{5}) return;
     memory_report_last = now;
+    if (!enabled && (!instance.CanReportMemoryUsage() ||
+                     instance.GetDeviceMemoryUsage() < pressure_gc_memory)) {
+        return;
+    }
     u64 textures = 0, gpu_written = 0, images = 0;
+    u64 protected_tiled_bytes = 0, protected_tiled_images = 0;
     image_lru_cache.ForEachItemBelow(gc_tick, [&](Image& image) {
         ++images;
+        const bool protected_tiled = image.SafeToDownload() && image.info.IsTiled();
+        protected_tiled_images += protected_tiled;
         for (const auto& backing : image.backing_images) {
             textures += backing.image.size_bytes;
             if (True(image.flags & ImageFlagBits::GpuModified))
                 gpu_written += backing.image.size_bytes;
+            if (protected_tiled) protected_tiled_bytes += backing.image.size_bytes;
         }
     });
     VmaBudget heaps[VK_MAX_MEMORY_HEAPS]{};
@@ -1727,18 +1765,32 @@ void TextureCache::ReportMemoryBreakdown() {
         usage += heaps[i].usage;
         budget += heaps[i].budget;
     }
+    if (instance.CanReportMemoryUsage()) {
+        vk::PhysicalDeviceMemoryBudgetPropertiesEXT current_budget{};
+        vk::PhysicalDeviceMemoryProperties2 current_properties{.pNext = &current_budget};
+        instance.GetPhysicalDevice().getMemoryProperties2(&current_properties);
+        usage = budget = 0;
+        for (u32 i = 0; i < current_properties.memoryProperties.memoryHeapCount; ++i) {
+            if (!(current_properties.memoryProperties.memoryHeaps[i].flags &
+                  vk::MemoryHeapFlagBits::eDeviceLocal)) continue;
+            usage += current_budget.heapUsage[i];
+            budget += current_budget.heapBudget[i];
+        }
+    }
     const u64 sparse = buffer_cache.SparseResidentBytes();
     const auto* direct = buffer_cache.GetDirectMemory();
     LOG_DEBUG(Render_Vulkan,
               "VRAM snapshot MiB: heap_usage={} budget={} sparse={} textures={} "
               "gpu_written_textures={} recycled={} vma_alloc={} vma_blocks={} "
-              "vma_slack={} unattributed={} imported_host={} images={} sparse_freed_total={} empty_blocks_freed_total={}",
+              "vma_slack={} unattributed={} imported_host={} images={} sparse_freed_total={} "
+              "empty_blocks_freed_total={} protected_tiled_textures={} protected_tiled_images={}",
               usage >> 20, budget >> 20, sparse >> 20, textures >> 20, gpu_written >> 20,
               RecycledImageBytes() >> 20, allocations >> 20, blocks >> 20,
               (blocks > allocations ? blocks - allocations : 0) >> 20,
               (usage > blocks + sparse ? usage - blocks - sparse : 0) >> 20,
               direct ? direct->ImportedHostBytes() >> 20 : 0, images,
-              buffer_cache.SparseFreedBytes() >> 20, Vulkan::EmptyVmaBytesFreed() >> 20);
+              buffer_cache.SparseFreedBytes() >> 20, Vulkan::EmptyVmaBytesFreed() >> 20,
+              protected_tiled_bytes >> 20, protected_tiled_images);
 }
 
 void TextureCache::RunGarbageCollector() {

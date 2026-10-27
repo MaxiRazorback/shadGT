@@ -37,6 +37,7 @@
 #include "ryty_gpu/native/image_registry.h"
 #include "ryty_gpu/native/job_walker.h"
 #include "ryty_gpu/native/rhi/rhi_vulkan.h"
+#include "ryty_gpu/ryty_ghost.h"
 #include "shader_recompiler/info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/direct_memory.h"
@@ -46,6 +47,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_native_ui.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/image_descriptor.h"
 #include "video_core/texture_cache/sampler.h"
@@ -105,6 +107,9 @@ Shader::PushData UserData(const AmdGpu::Regs& regs) {
     push_data.yoffset = regs.viewport_control.yoffset_enable ? regs.viewports[0].yoffset : 0.f;
     push_data.yscale = regs.viewport_control.yscale_enable ? regs.viewports[0].yscale : 1.f;
     push_data.quad_sample_mask = {regs.reg_array[0xa30e], regs.reg_array[0xa30f]}; // PA_SC_AA_MASK
+    if (RytyGhost::ShouldSmooth(regs)) {
+        push_data.quad_sample_mask = {0xffffffffu, 0xffffffffu};
+    }
     return push_data;
 }
 
@@ -1649,6 +1654,190 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GatherOnGpu(VAddr addr
     return std::pair{dst, u64{0}};
 }
 
+void NativeRenderer::ResolveUiDisplay(VAddr address, bool keep) {
+    auto& state = UiHires::Get();
+    std::scoped_lock lock{state.mutex};
+    const auto found = state.proxies.find(address);
+    if (found == state.proxies.end() || found->second.phase != UiHires::Phase::Ui) {
+        return;
+    }
+    auto& proxy = found->second;
+    if (!proxy.native_stale) {
+        if (!keep) {
+            proxy.phase = UiHires::Phase::Off;
+        }
+        return;
+    }
+    auto* entry = registry->FindExisting(
+        address,
+        [&](const Native::ImageEntry& candidate) {
+            return !candidate.from_cpu && !candidate.info.props.is_depth &&
+                   candidate.info.num_samples == 1 && candidate.info.resources.levels == 1 &&
+                   candidate.info.resources.layers == 1 &&
+                   candidate.info.size.width >= proxy.native.width &&
+                   candidate.info.size.height >= proxy.native.height;
+        },
+        true);
+    if (!entry) {
+        return;
+    }
+    const bool changed = proxy.native_stale;
+    Splice();
+    r.scheduler.EndRendering();
+    UiHires::ResolveNative(r.scheduler.DirectCommandBuffer(),
+                           vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())}, proxy, keep);
+    if (changed) {
+        Written(entry);
+        if (++ui_resolves == 1) {
+            LOG_INFO(
+                Render_Vulkan,
+                "Native UI: synchronized output-resolution UI to a guest display read at {:#x}",
+                address);
+        }
+    }
+    entry->last_use.store(frame, std::memory_order_relaxed);
+}
+
+void NativeRenderer::SyncUiReads(std::span<const Shader::Info* const> stages) {
+    if (!UiHires::Enabled()) {
+        return;
+    }
+    const bool dirty = UiHires::Get().stale.load(std::memory_order_relaxed) != 0;
+    for (const auto* stage : stages) {
+        if (!stage) {
+            continue;
+        }
+        for (const auto& image : stage->images) {
+            if (!dirty && !image.is_written) {
+                continue;
+            }
+            const auto sharp = image.GetSharp(*stage);
+            if (UiHires::KnownAddress(sharp.Address())) {
+                ResolveUiDisplay(sharp.Address(), !image.is_written);
+            }
+        }
+    }
+}
+
+void NativeRenderer::SyncUiRange(VAddr address, u64 size, bool keep) {
+    if (!UiHires::Enabled() || size == 0) {
+        return;
+    }
+    std::vector<VAddr> overlaps;
+    auto& state = UiHires::Get();
+    {
+        std::scoped_lock lock{state.mutex};
+        for (const auto& [base, proxy] : state.proxies) {
+            if (proxy.phase != UiHires::Phase::Ui) {
+                continue;
+            }
+            const auto* entry = registry->FindExisting(base, [](const Native::ImageEntry& image) {
+                return !image.from_cpu && !image.info.props.is_depth;
+            });
+            const u64 bytes =
+                entry ? entry->info.guest_size : u64(proxy.native.width) * proxy.native.height * 4;
+            if ((base >= address && base - address < size) ||
+                (address >= base && address - base < bytes)) {
+                overlaps.push_back(base);
+            }
+        }
+    }
+    for (const auto base : overlaps) {
+        ResolveUiDisplay(base, keep);
+    }
+}
+
+bool NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& pipeline) {
+    auto& state = UiHires::Get();
+    state.scale = 0.f;
+    const bool ui_layer = pipeline.GetGraphicsKey().color_buffers[0].hdr_ui_layer;
+    if (!UiHires::Enabled()) {
+        return !ui_layer;
+    }
+    std::unique_lock lock{state.mutex};
+    for (u32 cb = 0; cb < targets.state.num_color_attachments; ++cb) {
+        const auto* entry = targets.colors[cb];
+        if (!entry) {
+            continue;
+        }
+        const auto found = state.proxies.find(entry->info.guest_address);
+        if (found == state.proxies.end() || found->second.size.width == 0) {
+            continue;
+        }
+        auto& proxy = found->second;
+        const bool supported = targets.state.num_color_attachments == 1 && !targets.depth &&
+                               entry->info.num_samples == 1 && entry->info.resources.layers == 1 &&
+                               entry->info.resources.levels == 1 &&
+                               entry->info.size.width >= proxy.native.width &&
+                               entry->info.size.height >= proxy.native.height &&
+                               targets.state.width >= proxy.native.width &&
+                               targets.state.height >= proxy.native.height;
+        if (proxy.phase == UiHires::Phase::Off) {
+            return !ui_layer;
+        }
+        if (!supported) {
+            if (proxy.phase == UiHires::Phase::Ui) {
+                lock.unlock();
+                ResolveUiDisplay(entry->info.guest_address, false);
+            } else {
+                proxy.phase = UiHires::Phase::Off;
+            }
+            return !ui_layer;
+        }
+        if (!ui_layer && proxy.phase == UiHires::Phase::Idle) {
+            proxy.phase = UiHires::Phase::Scene;
+            return true;
+        }
+        if (proxy.phase != UiHires::Phase::Ui) {
+            if (!UiHires::CreateImages(r.instance, proxy, targets.color_formats[cb])) {
+                proxy.phase = UiHires::Phase::Off;
+                return !ui_layer;
+            }
+            if (proxy.phase == UiHires::Phase::Idle) {
+                Splice();
+                r.scheduler.EndRendering();
+                UiHires::StartWithoutScene(r.scheduler, proxy);
+            } else {
+                auto* source = CropDisplay(*targets.colors[cb], proxy.native);
+                if (!source) {
+                    proxy.phase = UiHires::Phase::Off;
+                    return !ui_layer;
+                }
+                Splice();
+                r.scheduler.EndRendering();
+                VideoCore::ImageViewInfo view_info{};
+                view_info.format = targets.color_formats[cb];
+                const auto view = View(*source, view_info, ViewUse::Sampled);
+                if (!view) {
+                    proxy.phase = UiHires::Phase::Off;
+                    return !ui_layer;
+                }
+                UiHires::UpscaleNative(r.scheduler.DirectCommandBuffer(),
+                                       vk::Image{Handle<VkImage_T>(source->image->NativeHandle())},
+                                       view, view_info.format, proxy);
+            }
+        }
+        auto& attachment = targets.state.color_attachments[cb];
+        attachment.image_view =
+            ui_layer ? *proxy.ui_view
+                     : UiHires::View(r.instance, proxy, targets.color_formats[cb], false);
+        attachment.image_layout = vk::ImageLayout::eGeneral;
+        targets.state.width = proxy.size.width;
+        targets.state.height = proxy.size.height;
+        proxy.ui_used |= ui_layer;
+        UiHires::MarkStale(proxy, true);
+        state.scale = float(proxy.size.width) / proxy.native.width;
+        if (++ui_draws == 1) {
+            LOG_INFO(Render_Vulkan,
+                     "Native UI: drawing {}x{} over a {}x{} scene; DLSS {}, HDR layer {}",
+                     proxy.size.width, proxy.size.height, proxy.native.width, proxy.native.height,
+                     proxy.dlss_used, ui_layer);
+        }
+        return true;
+    }
+    return !ui_layer;
+}
+
 bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline,
                                     Targets& out) {
     const auto& key = pipeline.GetGraphicsKey();
@@ -1691,6 +1880,7 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
                         desc.view_info.range.extent.layers, desc.view_info.range.base.level);
         }
         out.colors[cb] = entry;
+        out.color_formats[cb] = desc.view_info.format;
         // FIX-154: the draw covers the target it names, not the larger picture it may share
         // (a clear of the small one must leave the rest alone).
         const u32 mip = desc.view_info.range.base.level;
@@ -2877,6 +3067,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         // Fast-cleared tiles get the clear colour now when nothing drew into the target since
         // its CMASK was cleared (otherwise the pass that drew started with the clear).
         const auto& col_buf = regs.color_buffers[0];
+        if (UiHires::Enabled() && UiHires::KnownAddress(col_buf.Address())) {
+            ResolveUiDisplay(col_buf.Address(), false);
+        }
         if (col_buf && col_buf.info.fast_clear && cleared_meta.erase(col_buf.CmaskAddress())) {
             const VideoCore::TextureCache::ImageDesc desc{col_buf, r.liverpool->DrawCbExtent(0)};
             if (Native::ImageEntry* entry = registry->Find(desc.info, true, frame)) {
@@ -2985,6 +3178,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             return;
         }
     }
+    if (RytyGhost::ShouldSmooth(regs) && ++smooth_ghost_draws == 1) {
+        const auto& appearance = RytyGhost::GetAppearance();
+        LOG_INFO(Render_Vulkan,
+                 "Native ghost smoothing: body {}%, rubber {}%, rim {}%, rim brightness {}%",
+                 appearance.body_opacity, appearance.rubber_opacity, appearance.rim_opacity,
+                 appearance.rim_brightness);
+    }
+    SyncUiReads(pipeline->GetStages());
     Stream& s = Begin();
     Targets targets;
     {
@@ -3032,6 +3233,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         PhaseClock clock{stats.phase_ns[6]};
         PrepareImages();
     }
+    if (!PrepareUiTarget(targets, *pipeline)) {
+        ++stats.skipped;
+        return;
+    }
+    Begin();
     PhaseClock record_clock{stats.phase_ns[7]};
     {
         PhaseClock part{stats.record_ns[0]}; // OPT-011
@@ -4234,6 +4440,8 @@ void NativeRenderer::DispatchDirect() {
         r.FrameDumpDispatch(pipeline->GetStage(Shader::SwStage::Compute), cs_program,
                             false); // NAT-118
     }
+    UiHires::Get().scale = 0.f;
+    SyncUiReads(pipeline->GetStages());
     Stream& s = Begin();
     DrawBindings& b = bindings;
     b.Clear();
@@ -4279,6 +4487,8 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         r.FrameDumpDispatch(pipeline->GetStage(Shader::SwStage::Compute),
                             r.liverpool->DrawCsRegs(), true); // NAT-118
     }
+    UiHires::Get().scale = 0.f;
+    SyncUiReads(pipeline->GetStages());
     Stream& s = Begin();
     const auto args = GuestBuffer(address + offset, std::max<u32>(size, 12), false);
     if (!args) {
@@ -4307,12 +4517,17 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 }
 
 void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
+    if (UiHires::Enabled()) {
+        ResolveUiDisplay(regs.color_buffers[0].Address(), true);
+        ResolveUiDisplay(regs.color_buffers[1].Address(), false);
+    }
     const VideoCore::TextureCache::ImageDesc src_desc{regs.color_buffers[0],
                                                       r.liverpool->DrawCbExtent(0)};
     const VideoCore::TextureCache::ImageDesc dst_desc{regs.color_buffers[1],
                                                       r.liverpool->DrawCbExtent(1)};
     Native::ImageEntry* src = registry->Find(src_desc.info, true, frame);
-    Native::ImageEntry* dst = registry->Find(dst_desc.info, true, frame);
+    Native::ImageEntry* dst =
+        registry->Find(dst_desc.info, true, frame, true, src_desc.info.num_samples > 1);
     if (!src || !dst) {
         return;
     }
@@ -4376,6 +4591,9 @@ void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is
         return;
     }
     std::scoped_lock lock{mutex};
+    if (!is_gds) {
+        SyncUiRange(address, num_bytes, false);
+    }
     Stream& s = Begin();
     if (is_gds) {
         GlobalBarrier();
@@ -4415,6 +4633,12 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
         return;
     }
     std::scoped_lock lock{mutex};
+    if (!src_gds) {
+        SyncUiRange(src, num_bytes, true);
+    }
+    if (!dst_gds) {
+        SyncUiRange(dst, num_bytes, false);
+    }
     Stream& s = Begin();
     ++stats.copies;
     if (r.FrameDumpActive()) {
@@ -4500,6 +4724,26 @@ bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
 }
 
 void NativeRenderer::OnUnmap(VAddr address, u64 size) {
+    if (UiHires::Enabled()) {
+        auto& ui = UiHires::Get();
+        std::scoped_lock lock{ui.mutex};
+        for (auto it = ui.proxies.begin(); it != ui.proxies.end();) {
+            const auto base = it->first;
+            const u64 bytes = u64(it->second.native.width) * it->second.native.height * 4;
+            if (size != 0 && ((base >= address && base - address < size) ||
+                              (address >= base && address - base < bytes))) {
+                UiHires::MarkStale(it->second, false);
+                UiHires::Retire(ui, it->second);
+                for (auto& known : ui.addresses) {
+                    VAddr expected = base;
+                    known.compare_exchange_strong(expected, 0);
+                }
+                it = ui.proxies.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
     if (Native::WatchedTexture(address, address + size)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: unmap {:#x}+{:#x}", address, size);
     }
@@ -5007,8 +5251,63 @@ void NativeRenderer::Splice() {
     ++stats.splices;
 }
 
+void NativeRenderer::CopyDisplayCrop(const Native::ImageEntry& source, Native::ImageEntry& crop,
+                                     vk::Extent2D visible) {
+    Stream& s = Begin();
+    PrepareImages();
+    GlobalBarrier();
+    const vk::ImageCopy region{
+        .srcSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 1},
+        .dstSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 1},
+        .extent{visible.width, visible.height, 1},
+    };
+    CmdBuf{s.cmd}.copyImage(vk::Image{Handle<VkImage_T>(source.image->NativeHandle())},
+                            vk::ImageLayout::eGeneral,
+                            vk::Image{Handle<VkImage_T>(crop.image->NativeHandle())},
+                            vk::ImageLayout::eGeneral, region);
+    crop.rewrite = Native::ImageEntry::Rewrite::None;
+    Written(&crop);
+    s.read.push_back(&source);
+    s.written.push_back(&crop);
+    s.buffers_written = true;
+    ++s.commands;
+}
+
+const Native::ImageEntry* NativeRenderer::CropDisplay(const Native::ImageEntry& entry,
+                                                      vk::Extent2D visible) {
+    const auto& info = entry.info;
+    if (info.size.width == visible.width && info.size.height == visible.height) {
+        return &entry;
+    }
+    if (visible.width == 0 || visible.height == 0 || info.size.width < visible.width ||
+        info.size.height < visible.height || info.num_samples != 1 || info.props.is_depth ||
+        info.props.is_block || info.type != AmdGpu::ImageType::Color2D ||
+        info.resources.levels != 1 || info.resources.layers != 1) {
+        return nullptr;
+    }
+    auto crop_info = info;
+    crop_info.size.width = visible.width;
+    crop_info.size.height = visible.height;
+    crop_info.UpdateSize();
+    auto* crop = registry->Find(crop_info, false, frame);
+    if (!crop || !crop->image || crop->info.size.width != visible.width ||
+        crop->info.size.height != visible.height) {
+        return nullptr;
+    }
+    CopyDisplayCrop(entry, *crop, visible);
+    static std::atomic<u32> logged{};
+    if (Sample(logged)) {
+        LOG_INFO(Render_Vulkan,
+                 "Native display: cropped {}x{} from {}x{} backing at {:#x}, pitch {}",
+                 visible.width, visible.height, info.size.width, info.size.height,
+                 info.guest_address, info.pitch);
+    }
+    return crop;
+}
+
 std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCore::ImageInfo& info,
-                                                                   vk::Format view_format) {
+                                                                   vk::Format view_format,
+                                                                   vk::Extent2D output_size) {
     std::scoped_lock lock{mutex};
     if (InPlaceSampled()) {
         for (u32 i = 0; i < in_place.pages.size(); ++i) {
@@ -5024,9 +5323,11 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     Native::ImageEntry* entry =
         registry->FindExisting(info.guest_address, [&](const Native::ImageEntry& candidate) {
             return !candidate.from_cpu && !candidate.info.props.is_depth &&
-                   candidate.info.size.width == info.size.width &&
-                   candidate.info.size.height == info.size.height &&
-                   candidate.info.num_bits == info.num_bits;
+                   candidate.info.size.width >= info.size.width &&
+                   candidate.info.size.height >= info.size.height &&
+                   candidate.info.num_bits == info.num_bits && candidate.info.pitch == info.pitch &&
+                   candidate.info.num_samples == 1 && candidate.info.resources.levels == 1 &&
+                   candidate.info.resources.layers == 1;
         });
     if (!entry) {
         static std::atomic<u32> logged{};
@@ -5040,10 +5341,14 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     if (!entry || !entry->image) {
         return std::nullopt;
     }
+    const auto* source = CropDisplay(*entry, {info.size.width, info.size.height});
+    if (!source) {
+        return std::nullopt;
+    }
     VideoCore::ImageViewInfo view_info{};
     view_info.format = view_format;
     view_info.mapping.a = AmdGpu::CompSwizzle::One; // as the presenter: no alpha blending
-    const vk::ImageView view = View(*entry, view_info, ViewUse::Sampled);
+    const vk::ImageView view = View(*source, view_info, ViewUse::Sampled);
     if (!view) {
         return std::nullopt;
     }
@@ -5052,10 +5357,18 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         Begin();
         PrepareImages();
     }
-    ProbeDisplay(*entry); // FIX-175 (diagnosis)
+    ProbeDisplay(*source); // FIX-175 (diagnosis)
     Splice();
-    const Display display{vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())}, view,
-                          entry->info.size.width, entry->info.size.height};
+    Display display{vk::Image{Handle<VkImage_T>(source->image->NativeHandle())}, view,
+                    source->info.size.width, source->info.size.height};
+    if (const auto shown =
+            UiHires::TakeFrame(r.instance, r.scheduler.DirectCommandBuffer(), info.guest_address,
+                               {display.width, display.height}, output_size, view_format)) {
+        display.output_view = shown->view;
+        display.ui_layer = shown->ui;
+        display.output_size = shown->size;
+        display.dlss_scaled = shown->dlss;
+    }
     VerifyMirrors(); // FIX-176 (diagnosis)
     EvictImages(); // (the display picture was just used: it stays)
     return display;

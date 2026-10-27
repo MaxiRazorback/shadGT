@@ -12,6 +12,11 @@
 #include "core/libraries/videoout/video_out.h"
 #include "core/libraries/videoout/videoout_error.h"
 #include "core/platform.h"
+#ifdef RYTY_GPU
+#include "core/libraries/kernel/process.h"
+#include "ryty_gpu/ryty_pro_mode.h"
+#include "ryty_gpu/ryty_hdr_ui.h"
+#endif
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
@@ -136,6 +141,20 @@ s32 PS4_SYSV_ABI sceVideoOutRegisterBuffers(s32 handle, s32 startIndex, void* co
         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
 
+#ifdef RYTY_GPU
+    if (Ryty::IsProMode(Ryty::GetProMode())) {
+        LOG_INFO(Lib_VideoOut,
+                 "PRO-EXPERIMENT: registering {} buffers at index {}, {}x{} pitch {}, format {:#x}, tiling {}",
+                 bufferNum, startIndex, attribute->width, attribute->height,
+                 attribute->pitch_in_pixel, static_cast<u32>(attribute->pixel_format),
+                 static_cast<s32>(attribute->tiling_mode));
+    }
+#endif
+#ifdef RYTY_GPU
+    for (s32 i = 0; i < bufferNum; ++i) {
+        Ryty::AddDisplayAddress(reinterpret_cast<u64>(addresses[i])); // HDR-UI
+    }
+#endif
     return driver->RegisterBuffers(port, startIndex, addresses, bufferNum, attribute);
 }
 
@@ -298,6 +317,12 @@ s32 PS4_SYSV_ABI sceVideoOutGetResolutionStatus(s32 handle, SceVideoOutResolutio
     }
 
     *status = port->resolution;
+#ifdef RYTY_GPU
+    if (Ryty::IsProMode(Ryty::GetProMode())) {
+        LOG_INFO(Lib_VideoOut, "PRO-EXPERIMENT: game queried output {}x{}; pane {}x{}",
+                 status->full_width, status->full_height, status->pane_width, status->pane_height);
+    }
+#endif
     return ORBIS_OK;
 }
 
@@ -368,9 +393,18 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
 s32 PS4_SYSV_ABI sceVideoOutGetDeviceCapabilityInfo(
     s32 handle, SceVideoOutDeviceCapabilityInfo* pDeviceCapabilityInfo) {
     pDeviceCapabilityInfo->capability = 0;
+    LOG_INFO(Lib_VideoOut, "HDR: capability query (swapchain HDR {}, game flag {})",
+             presenter->IsHDRSupported(),
+             Common::ElfInfo::Instance().GetPSFAttributes().support_hdr.Value());
     if (presenter->IsHDRSupported()) {
         auto& game_info = Common::ElfInfo::Instance();
-        if (game_info.GetPSFAttributes().support_hdr) {
+        // ryGT: the converted GT Sport carries no PSF HDR attribute, but the game has HDR10
+        // output; with HDR allowed (GPU.hdr_allowed) it is offered anyway.
+        bool game_hdr = game_info.GetPSFAttributes().support_hdr;
+#ifdef RYTY_GPU
+        game_hdr = true;
+#endif
+        if (game_hdr) {
             pDeviceCapabilityInfo->capability |= ORBIS_VIDEO_OUT_DEVICE_CAPABILITY_BT2020_PQ;
         }
     }
@@ -439,14 +473,24 @@ s32 PS4_SYSV_ABI sceVideoOutConfigureOutputMode_(s32 handle, u32 reserved, const
         return ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE;
     }
 
+    LOG_INFO(Lib_VideoOut, "HDR: output mode colorimetry {} (swapchain HDR {})",
+             static_cast<u32>(mode->colorimetry), presenter->IsHDRSupported());
     switch (mode->colorimetry) {
     case OrbisVideoOutColorimetry::Any:
         port->is_hdr = false;
+#ifdef RYTY_GPU
+        Ryty::g_hdr_output = false;
+#endif
         break;
     case OrbisVideoOutColorimetry::Bt2020PQ:
+#ifdef RYTY_GPU
+        port->is_hdr = presenter->IsHDRSupported(); // ryGT: see sceVideoOutGetDeviceCapabilityInfo
+        Ryty::g_hdr_output = port->is_hdr;
+#else
         if (Common::ElfInfo::Instance().GetPSFAttributes().support_hdr) {
             port->is_hdr = true;
         }
+#endif
         break;
     default:
         return ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE;
@@ -471,8 +515,18 @@ s32 PS4_SYSV_ABI sceVideoOutSetWindowModeMargins(s32 handle, s32 top, s32 bottom
 }
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
+#ifdef RYTY_GPU
+    const auto mode = Ryty::GetProMode();
+    const auto [width, height] = Ryty::ProOutputSize(mode, EmulatorSettings.GetInternalScreenWidth(),
+                                                  EmulatorSettings.GetInternalScreenHeight());
+    driver = std::make_unique<VideoOutDriver>(width, height);
+    LIB_FUNCTION("WslcK1FQcGI", "libkernel", 1, "libkernel", Kernel::sceKernelIsNeoMode);
+    LOG_INFO(Lib_VideoOut, "PRO-EXPERIMENT: hardware {}, reported output {}x{}",
+             Ryty::IsProMode(mode) ? "Neo" : "base", width, height);
+#else
     driver = std::make_unique<VideoOutDriver>(EmulatorSettings.GetInternalScreenWidth(),
                                               EmulatorSettings.GetInternalScreenHeight());
+#endif
 
     LIB_FUNCTION("SbU3dwp80lQ", "libSceVideoOut", 1, "libSceVideoOut", sceVideoOutGetFlipStatus);
     LIB_FUNCTION("U46NwOiJpys", "libSceVideoOut", 1, "libSceVideoOut", sceVideoOutSubmitFlip);

@@ -41,6 +41,7 @@
 #include "imgui/shadnet_notifications_layer.h"
 #include "ryty_gpu/ryty_input_bridge.h"
 #include "ryty_gpu/ryty_library.h"
+#include "ryty_gpu/ryty_pro_mode.h"
 
 namespace Ryty {
 static void (*g_overlay_draw)() = nullptr;
@@ -64,6 +65,16 @@ Emulator::Emulator() : memory{}, controllers{}, linker{} {
     game_info.raw_firmware_ver = 0x05050000;
     game_info.sdk_ver = 0x05050001;
     game_info.game_folder = std::filesystem::current_path() / "app0";
+
+    const bool pro = Ryty::IsProMode(Ryty::GetProMode());
+    game_info.psf_attributes.support_neo_mode.Assign(pro);
+    EmulatorSettings.SetNeo(pro);
+
+    // HDR (GPU.hdr_allowed): GT Sport's param.sfo marks it HDR-capable, which shadGT's video
+    // out checks before it offers the game a BT.2020 PQ output mode.
+    if (EmulatorSettings.IsHdrAllowed()) {
+        game_info.psf_attributes.support_hdr.Assign(1);
+    }
 
     const auto sce_sys = game_info.game_folder / "sce_sys";
 

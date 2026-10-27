@@ -19,7 +19,11 @@ namespace Serialization {
 // Synthetic dual-source exports change the fragment shader interface. Version 13 adds the
 // general swizzled factor blend, which also changes the runtime color-buffer layout.
 static constexpr u32 ShaderBinaryVersion = 15u;
+// Only masked fragment permutations need the extra push constants. Keep ordinary cached
+// shaders compatible; older renderers must skip the new permutations on rollback.
 static constexpr u32 ShaderBinaryVersionQuadSampleMask = 16u;
+static constexpr u32 ShaderBinaryVersionMsaaRead = 17u;
+static constexpr u32 ShaderBinaryVersionMsaaReadQuadSampleMask = 18u;
 static_assert(sizeof(Shader::HwFragmentRuntimeInfo) == 248 && sizeof(Shader::RuntimeInfo) == 312,
               "Legacy metadata compatibility requires the runtime-info layout to stay unchanged");
 // Stored output metadata and runtime color-buffer flags include swizzled-alpha emulation.
@@ -43,6 +47,31 @@ static constexpr u32 PipelineKeyVersionOldQuadHelpers = 9u;
 } // namespace Serialization
 
 namespace Vulkan {
+
+static bool HasMsaaImage(const Shader::StageSpecialization& spec) {
+    return std::ranges::any_of(spec.images, [](const auto& image) {
+        return image.type == AmdGpu::ImageType::Color2DMsaa ||
+               image.type == AmdGpu::ImageType::Color2DMsaaArray;
+    });
+}
+
+static u32 ShaderBinaryVersionFor(const Shader::StageSpecialization& spec) {
+    const bool masked_fragment = spec.runtime_info.hw_stage == Shader::HwStage::Fragment &&
+                                 spec.runtime_info.hw.fs.quad_sample_mask;
+    if (HasMsaaImage(spec)) {
+        return masked_fragment ? Serialization::ShaderBinaryVersionMsaaReadQuadSampleMask
+                               : Serialization::ShaderBinaryVersionMsaaRead;
+    }
+    return masked_fragment ? Serialization::ShaderBinaryVersionQuadSampleMask
+                           : Serialization::ShaderBinaryVersion;
+}
+
+static bool IsKnownShaderBinaryVersion(u32 version) {
+    return version == Serialization::ShaderBinaryVersion ||
+           version == Serialization::ShaderBinaryVersionQuadSampleMask ||
+           version == Serialization::ShaderBinaryVersionMsaaRead ||
+           version == Serialization::ShaderBinaryVersionMsaaReadQuadSampleMask;
+}
 
 void RegisterPipelineData(const ComputePipelineKey& key,
                           ComputePipeline::SerializationSupport& sdata) {
@@ -96,8 +125,7 @@ bool PeekShaderMeta(std::vector<u8>&& blob, u64& pgm_hash, size_t& perm_idx) {
     }
     u32 binary_version{};
     meta.Read(binary_version);
-    if (binary_version != Serialization::ShaderBinaryVersion &&
-        binary_version != Serialization::ShaderBinaryVersionQuadSampleMask) {
+    if (!IsKnownShaderBinaryVersion(binary_version)) {
         return false;
     }
     u64 perm_hash{};
@@ -257,10 +285,7 @@ void RegisterShaderMeta(const Shader::Info& info,
     Serialization::Writer meta{ar};
 
     meta.Write(Serialization::ShaderMetaVersion);
-    const bool masked_fragment = spec.runtime_info.hw_stage == Shader::HwStage::Fragment &&
-                                 spec.runtime_info.hw.fs.quad_sample_mask;
-    meta.Write(masked_fragment ? Serialization::ShaderBinaryVersionQuadSampleMask
-                               : Serialization::ShaderBinaryVersion);
+    meta.Write(ShaderBinaryVersionFor(spec));
 
     meta.Write(perm_hash);
     meta.Write(perm_idx);
@@ -297,8 +322,7 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 binary_version{};
     meta.Read(binary_version);
-    if (binary_version != Serialization::ShaderBinaryVersion &&
-        binary_version != Serialization::ShaderBinaryVersionQuadSampleMask) {
+    if (!IsKnownShaderBinaryVersion(binary_version)) {
         return false;
     }
 
@@ -309,7 +333,11 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     spec.Deserialize(ar);
     if (binary_version == Serialization::ShaderBinaryVersion &&
         spec.runtime_info.hw_stage == Shader::HwStage::Fragment) {
+        // This byte was padding before quad-mask emulation, and need not have been zero.
         spec.runtime_info.hw.fs.quad_sample_mask = false;
+    }
+    if (binary_version != ShaderBinaryVersionFor(spec)) {
+        return false;
     }
     info.Deserialize(ar, perm_hash_ar,
                      meta_version != Serialization::ShaderMetaVersionWithoutAttributeFlags);

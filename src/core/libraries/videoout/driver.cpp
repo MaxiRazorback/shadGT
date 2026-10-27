@@ -16,6 +16,9 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "ryty_gpu/ryty_diag.h"
+#ifdef RYTY_GPU
+#include "ryty_gpu/ryty_pro_mode.h"
+#endif
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
@@ -243,7 +246,7 @@ namespace {
 struct FlipStats {
     std::mutex mutex;
     std::chrono::steady_clock::time_point window{};
-    u32 flips{}, vblanks{}, idle_vblanks{}, max_queue{};
+    u32 flips{}, vblanks{}, idle_vblanks{}, max_queue{}, early_flips{};
     double latency_ms{}, max_latency_ms{}, present_ms{}, max_present_ms{};
 };
 FlipStats g_flip_stats;
@@ -259,12 +262,12 @@ void ReportFlipStats() {
         return;
     }
     LOG_WARNING(Lib_VideoOut,
-                "Flips in {:.1f} s: {} flips, {} vblanks ({} with no flip ready), max queued {}, "
+                "Flips in {:.1f} s: {} flips ({} between vblanks), {} vblanks ({} with no flip ready), max queued {}, "
                 "submit-to-flip avg {:.2f} ms max {:.2f} ms, Present avg {:.2f} ms max {:.2f} ms",
-                std::chrono::duration<double>(now - s.window).count(), s.flips, s.vblanks,
+                std::chrono::duration<double>(now - s.window).count(), s.flips, s.early_flips, s.vblanks,
                 s.idle_vblanks, s.max_queue, s.flips ? s.latency_ms / s.flips : 0.0,
                 s.max_latency_ms, s.flips ? s.present_ms / s.flips : 0.0, s.max_present_ms);
-    s.flips = s.vblanks = s.idle_vblanks = s.max_queue = 0;
+    s.flips = s.vblanks = s.idle_vblanks = s.max_queue = s.early_flips = 0;
     s.latency_ms = s.max_latency_ms = s.present_ms = s.max_present_ms = 0;
     s.window = now;
 }
@@ -399,11 +402,32 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
 void VideoOutDriver::PresentThread(std::stop_token token) {
     const std::chrono::nanoseconds vblank_period(1000000000 /
                                                  EmulatorSettings.GetVblankFrequency());
+    // FAST-FLIP (ryGT): a frame finished between two vblanks is flipped at once instead of at
+    // the next vblank, so a 25 ms frame shows after 25 ms rather than 33 ms (GT Sport's races
+    // otherwise snap to 30 fps). The loop runs four times per vblank; the game's vblank events
+    // and status still come once per vblank. GPU.fast_flips in the game's config (the
+    // launcher's option) or RYGT_FAST_FLIPS=1.
+    static const u32 ticks_per_vblank = [] {
+        bool fast = false;
+        if (const char* env = std::getenv("RYGT_FAST_FLIPS")) {
+            fast = env[0] == '1';
+        } else {
+#ifdef RYTY_GPU
+            fast = Ryty::ConfigTrue("fast_flips");
+#endif
+        }
+        if (fast) {
+            LOG_INFO(Lib_VideoOut, "FAST-FLIP: frames flip when ready, between vblanks");
+        }
+        return fast ? 4u : 1u;
+    }();
+    const auto tick_period = vblank_period / ticks_per_vblank;
+    u32 tick = 0;
 
     Common::SetCurrentThreadName("shadGT:PresentThread");
-    Common::SetCurrentThreadRealtime(vblank_period);
+    Common::SetCurrentThreadRealtime(tick_period);
 
-    Common::AccurateTimer timer{vblank_period};
+    Common::AccurateTimer timer{tick_period};
 
     const auto receive_request = [this] -> Request {
         std::scoped_lock lk{mutex};
@@ -461,6 +485,22 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         }();
         const int flip_rate =
             LockedFlipRate(main_port.flip_rate, fps_lock, EmulatorSettings.GetVblankFrequency());
+        const bool vblank_tick = tick++ % ticks_per_vblank == 0;
+        if (!vblank_tick) {
+            // FAST-FLIP: between vblanks, only a ready frame is flipped.
+            if (flip_rate == 0) {
+                if (const auto request = receive_request()) {
+                    {
+                        std::scoped_lock lk{g_flip_stats.mutex};
+                        ++g_flip_stats.early_flips;
+                    }
+                    Flip(request);
+                    FRAME_END;
+                }
+            }
+            timer.End();
+            continue;
+        }
         if (vblank_status.count % (flip_rate + 1) == 0) {
             {
                 std::scoped_lock lk{mutex, g_flip_stats.mutex};

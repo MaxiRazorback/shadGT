@@ -868,6 +868,11 @@ void PatchImageArgs(IR::Inst& inst, Info& info) {
     IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
     auto inst_info = inst.Flags<IR::TextureInstInfo>();
     const auto view_type = image.GetViewType(image_res.is_array);
+    const auto has_ms = view_type == AmdGpu::ImageType::Color2DMsaa ||
+                        view_type == AmdGpu::ImageType::Color2DMsaaArray;
+    if (has_ms && inst.GetOpcode() == IR::Opcode::ImageRead) {
+        inst_info.has_lod.Assign(false);
+    }
 
     // Now that we know the image type, adjust texture coordinate vector.
     IR::Inst* body = inst.Arg(1).Inst();
@@ -908,8 +913,6 @@ void PatchImageArgs(IR::Inst& inst, Info& info) {
         }
     }();
 
-    const auto has_ms = view_type == AmdGpu::ImageType::Color2DMsaa ||
-                        view_type == AmdGpu::ImageType::Color2DMsaaArray;
     ASSERT(!inst_info.has_lod || !has_ms);
     // If we are binding a single mip level as fallback, drop the argument
     const auto lod =

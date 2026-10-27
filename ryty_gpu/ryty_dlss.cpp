@@ -111,6 +111,9 @@ bool Load() {
         return false;
     }
     g_plugin.module = module;
+    // RivaTuner's (RTSS) Vulkan layer crashes inside vkCreateDevice once the DLSS device
+    // extensions are enabled. The loader reads this switch when the instance is created.
+    SetEnvironmentVariableA("DISABLE_RTSS_LAYER", "1");
     LOG_INFO(Render_Vulkan, "ryGT DLSS: plugin loaded");
     return true;
 }
@@ -207,6 +210,68 @@ bool EvaluateTemporal(vk::CommandBuffer cmdbuf, const RygtDlssFrame& frame) {
     if (g_plugin.evaluate_temporal(cmdbuf, &frame) != 0) {
         LOG_ERROR(Render_Vulkan, "ryGT temporal DLSS: {}", LastError());
         return false;
+    }
+    return true;
+}
+
+bool CanScale(vk::Extent2D input_size, vk::Extent2D output_size) {
+    return g_plugin.ready && g_plugin.supports(input_size.width, input_size.height,
+                                               output_size.width, output_size.height);
+}
+
+bool ScaleInto(vk::CommandBuffer cmdbuf, vk::Image input_image, vk::ImageView input,
+               vk::Format input_format, vk::Extent2D input_size, vk::Image output_image,
+               vk::ImageView output, vk::Extent2D output_size) {
+    if (!CanScale(input_size, output_size)) {
+        return false;
+    }
+    const vk::MemoryBarrier2 input_barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+    };
+    const vk::ImageMemoryBarrier2 output_barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+        .oldLayout = vk::ImageLayout::eUndefined,
+        .newLayout = vk::ImageLayout::eGeneral,
+        .image = output_image,
+        .subresourceRange{.aspectMask = vk::ImageAspectFlagBits::eColor, .levelCount = 1,
+                          .layerCount = 1},
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &input_barrier,
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &output_barrier,
+    });
+    const RygtDlssImage in{
+        .image = static_cast<VkImage>(input_image),
+        .view = static_cast<VkImageView>(input),
+        .format = static_cast<VkFormat>(input_format),
+        .width = input_size.width,
+        .height = input_size.height,
+    };
+    const RygtDlssImage out{
+        .image = static_cast<VkImage>(output_image),
+        .view = static_cast<VkImageView>(output),
+        .format = VK_FORMAT_R16G16B16A16_SFLOAT,
+        .width = output_size.width,
+        .height = output_size.height,
+    };
+    if (g_plugin.evaluate(static_cast<VkCommandBuffer>(cmdbuf), &in, &out, 0.0f) != 0) {
+        LOG_ERROR(Render_Vulkan, "ryGT DLSS (UI-HIRES): {}", LastError());
+        return false;
+    }
+    static vk::Extent2D logged_in{}, logged_out{};
+    if (input_size != logged_in || output_size != logged_out) {
+        logged_in = input_size;
+        logged_out = output_size;
+        LOG_INFO(Render_Vulkan, "ryGT DLSS: UI-HIRES scene {}x{} to {}x{}", input_size.width,
+                 input_size.height, output_size.width, output_size.height);
     }
     return true;
 }

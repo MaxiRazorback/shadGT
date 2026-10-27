@@ -176,6 +176,23 @@ bool HasLegacyMad(std::span<const u32> code) {
     return false;
 }
 
+bool HasSdwaCompareDestination(std::span<const u32> code) {
+    using namespace Gcn;
+    GcnCodeSlice slice(code.data(), code.data() + code.size());
+    GcnDecodeContext decoder;
+    while (!slice.atEnd()) {
+        const auto inst = decoder.decodeInstruction(slice);
+        if (inst.encoding == InstEncoding::VOPC &&
+            inst.dst[1].field != OperandField::VccLo) {
+            return true;
+        }
+        if (inst.opcode == Opcode::S_ENDPGM) {
+            break;
+        }
+    }
+    return false;
+}
+
 bool HasEmptyScopeBeforeElse(std::span<const u32> code) {
     using namespace Gcn;
     Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
