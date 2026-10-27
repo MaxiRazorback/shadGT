@@ -431,6 +431,47 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
 
     usage_flags = ImageUsageFlags(instance, info);
     format_features = FormatFeatureFlags(usage_flags);
+    // FIX-211: AMD's driver refuses storage use for some block-compressed formats even with
+    // extended usage (BC5 and BC6H on an RX 7600), where NVIDIA's accepts it. The image was made
+    // anyway, outside what the driver supports, and textures came out garbled (broken colours
+    // on car dashboards). Shaders only sample these, so storage use is dropped.
+    if (info.props.is_block && (usage_flags & vk::ImageUsageFlagBits::eStorage)) {
+        static std::mutex refused_mutex;
+        static std::unordered_map<u64, bool> refused_cache;
+        const u64 refused_key = (u64(info.pixel_format) << 40) ^
+                                (u64(ConvertImageType(info.type)) << 36) ^
+                                (u64(VkImageUsageFlags(usage_flags)) << 16) ^
+                                u64(VkImageCreateFlags(flags));
+        std::optional<bool> refused;
+        {
+            std::scoped_lock lk{refused_mutex};
+            if (const auto it = refused_cache.find(refused_key); it != refused_cache.end()) {
+                refused = it->second;
+            }
+        }
+        if (!refused) {
+            const auto result = instance.GetPhysicalDevice()
+                                    .getImageFormatProperties2(vk::PhysicalDeviceImageFormatInfo2{
+                                        .format = info.pixel_format,
+                                        .type = ConvertImageType(info.type),
+                                        .tiling = vk::ImageTiling::eOptimal,
+                                        .usage = usage_flags,
+                                        .flags = flags,
+                                    })
+                                    .result;
+            refused = result == vk::Result::eErrorFormatNotSupported;
+            if (*refused) {
+                LOG_INFO(Render_Vulkan, "FIX-211: format {} made without storage use",
+                         vk::to_string(info.pixel_format));
+            }
+            std::scoped_lock lk{refused_mutex};
+            refused_cache.emplace(refused_key, *refused);
+        }
+        if (*refused) {
+            usage_flags &= ~vk::ImageUsageFlagBits::eStorage;
+            format_features = FormatFeatureFlags(usage_flags);
+        }
+    }
     if (info.props.is_depth) {
         aspect_mask = vk::ImageAspectFlagBits::eDepth;
         if (info.props.has_stencil) {
