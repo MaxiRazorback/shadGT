@@ -294,6 +294,16 @@ void GtsDlssPass::Resolve(u64 frame, VideoCore::Image& display) {
                     : fsr.Evaluate(instance.GetPhysicalDevice(), instance.GetDevice(),
                                    scheduler.DirectCommandBuffer(), fsrFrame);
         scheduler.GetDynamicState().Invalidate();
+        if (!ok && useXess && evaluatedFrames == 0 && fsr.Available()) {
+            // XESS-210: XeSS that does not start on this GPU (an older Radeon) hands the scene to
+            // FSR 3.1 from the next frame, instead of leaving it unreconstructed.
+            LOG_WARNING(Render_Vulkan, "XESS-210: XeSS did not start on this GPU; using {} instead",
+                        RytyFsr3::ActiveVersionName());
+            useXess = false;
+            useFsr = true;
+            reset = true;
+            return;
+        }
         if (!ok) { failed = true; return; }
         ++evaluatedFrames;
         static u32 loggedFrames = 0;
