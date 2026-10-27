@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstdlib>
+#include <fstream>
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/polyfill_thread.h"
@@ -118,8 +119,43 @@ void DataBase::Open() {
             // SHD-002: stage descriptor sets: translations of their own.
             cache_path += "-direct-sets";
         }
+        // FIX-213: stored translations load unchecked, so after an update that changes how
+        // shaders are translated, the store kept the old translations and drew with them (a
+        // magenta car and red scenery on an RX 7600 after updating to PR #88, until the folder
+        // was deleted by hand). The store now carries a version: a store without this one is
+        // set aside as <store>.outdated and starts again, and the launcher's shader pack stamp
+        // goes with it, so the next Play prepares the pack into the new store. Raise the
+        // version whenever a change makes stored translations wrong.
+        static constexpr std::string_view StoreVersion = "RyGT shader store 1";
+        const auto version_path = cache_path / "store-version.txt";
+        std::error_code ec;
+        if (std::filesystem::exists(cache_path, ec)) {
+            std::string version;
+            if (std::ifstream file{version_path}; file) {
+                std::getline(file, version);
+            }
+            if (version != StoreVersion) {
+                auto outdated = cache_path;
+                outdated += ".outdated";
+                std::filesystem::remove_all(outdated, ec);
+                std::filesystem::rename(cache_path, outdated, ec);
+                if (ec) {
+                    LOG_ERROR(Render, "FIX-213: could not set aside the outdated shader store {}: "
+                              "{}", cache_path.string(), ec.message());
+                } else {
+                    std::filesystem::remove(GetUserPath(PathType::CacheDir) / "shaders-pack.txt",
+                                            ec);
+                    LOG_WARNING(Render, "FIX-213: shader store of another version ('{}') set "
+                                "aside as {}; shaders are translated again",
+                                version, outdated.string());
+                }
+            }
+        }
         if (!std::filesystem::exists(cache_path)) {
             std::filesystem::create_directories(cache_path);
+        }
+        if (!std::filesystem::exists(version_path, ec)) {
+            std::ofstream{version_path} << StoreVersion << '\n';
         }
     }
 
