@@ -234,8 +234,7 @@ private:
     void PrewarmRead(std::stop_token stop);
     void ReportPrewarm(std::chrono::steady_clock::time_point now);
     /// PERF-034: waits while a worker builds a pipeline, starting builds for the states the
-    /// command thread queues meanwhile. Returns at once if no worker took the build, which
-    /// FinishBuild then does on this thread.
+    /// command thread queues meanwhile. Compilation is owned exclusively by the workers.
     void WaitForBuild(PipelineBuild& build, const DrawIndirectParams params);
     /// Selects swizzled-alpha blend emulation for a lane-dependent blend, or reports it once.
     void RefreshSwizzledBlend(u32 cb, Shader::PsColorBuffer& color_buffer,
@@ -498,7 +497,9 @@ private:
     bool AsyncTranslation() const;
     /// FIX-078 (lookup lock held): moves the finished translations of a program to its ready
     /// list, first waiting for its unfinished ones when `wait`.
-    void HarvestTranslations(u64 hash, bool wait);
+    void HarvestTranslations(u64 hash, bool wait, Shader::HwStage hw_stage,
+                             Shader::SwStage sw_stage, const Shader::RuntimeInfo& runtime_info,
+                             const Shader::Backend::Bindings& binding);
     /// FIX-078 (lookup lock held): a ready translation made for the inputs of this lookup. A draw
     /// (`insert`) adds it as a permutation; the read-ahead only learns it exists. Translations
     /// no draw matches (made from read-ahead states that were never drawn) are dropped later.

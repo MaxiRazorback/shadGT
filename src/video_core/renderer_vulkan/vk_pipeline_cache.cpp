@@ -49,6 +49,8 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/build_queue.h"
+#include "video_core/renderer_vulkan/compiler_worker_budget.h"
+#include "video_core/renderer_vulkan/translation_job_match.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/spirv_check.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -146,8 +148,8 @@ public:
 private:
     void Run(std::stop_token stop, u32 index) {
         Common::SetCurrentThreadName(fmt::format("shadGT:ShaderTranslate{}", index).c_str());
-        Common::PreferEfficiencyCores(); // PERF-097
-        bool below_game = false;
+        Common::AllowAllCores();
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
         while (!stop.stop_requested()) {
             std::shared_ptr<TranslateJob> job;
             {
@@ -158,11 +160,6 @@ private:
                 }
                 job = std::move(queue.front());
                 queue.pop_front();
-            }
-            if (const bool low = CompileBelowGame(); low != below_game) { // PERF-310
-                below_game = low;
-                Common::SetCurrentThreadPriority(low ? Common::ThreadPriority::Low
-                                                     : Common::ThreadPriority::Normal);
             }
             try {
                 // Release temporary IR allocations after each job, including failed jobs.
@@ -331,11 +328,10 @@ PrecompileProgress GetPrecompileProgress() {
 class PipelineCache::PipelineBuildWorkers {
 public:
     PipelineBuildWorkers()
-        : queue{CompileConcurrency(), std::max(1u, NumWorkers() / 4), CompileConcurrency()} {
-        // PERF-102: extra workers precompile on the splash screen (the queue's boost), but keep
-        // concurrent driver pipeline compilations bounded. Large bursts can overwhelm the driver
-        // while the game and its pipeline linker are already using the GPU.
-        for (u32 i = 0; i < AllCores(); ++i) {
+        : queue{NumWorkers(), std::max(1u, NumWorkers() / 4), NumWorkers()} {
+        // Translation and pipeline pools share a topology-derived CPU budget.
+        // Idle workers sleep; compiler priority leaves critical game threads first choice.
+        for (u32 i = 0; i < NumWorkers(); ++i) {
             threads.emplace_back([this](std::stop_token stop) { Work(stop); });
         }
     }
@@ -346,11 +342,11 @@ public:
         queue.NotifyAll();
     }
 
-    void Push(std::function<void()>&& job, bool urgent) {
-        queue.Push(std::move(job), urgent ? BuildQueue::Kind::Urgent : BuildQueue::Kind::Normal);
+    void Push(std::function<void()>&& job, bool urgent, bool heavy = false) {
+        queue.Push(std::move(job), urgent ? BuildQueue::Kind::Urgent : BuildQueue::Kind::Normal, heavy);
     }
-    void PushBackground(std::function<void()>&& job) {
-        queue.Push(std::move(job), BuildQueue::Kind::Background);
+    void PushBackground(std::function<void()>&& job, bool heavy = false) {
+        queue.Push(std::move(job), BuildQueue::Kind::Background, heavy);
     }
     void PauseBackground(BuildQueue::Clock::time_point until) {
         queue.PauseBackground(until);
@@ -366,72 +362,26 @@ public:
     }
 
 private:
-    static u32 AllCores() {
-        return std::max(std::thread::hardware_concurrency(), NumWorkers());
-    }
-
     static u32 NumWorkers() {
-        const u32 cores = std::max(std::thread::hardware_concurrency(), 4u);
-        // PERF-021: all but two cores (the command thread and the game's own main thread).
-        return std::clamp(cores - 2, 2u, 14u);
-    }
-
-    static u32 CompileConcurrency() {
-        // Keep driver pipeline creation to a small burst even on large CPUs. Four concurrent
-        // builds still use the parallel compiler without sending a dozen expensive requests to
-        // the graphics driver at once.
-        return std::clamp(AllCores() / 3, 2u, 4u);
+        return CompilerWorkerBudget::ForLogicalThreads(
+            std::thread::hardware_concurrency()).pipeline;
     }
 
     void Work(std::stop_token stop) {
         Common::SetCurrentThreadName("shadGT:PipelineBuild");
-        // PERF-097: driver compiles stay off the cores the game and the recorder run on.
-        Common::PreferEfficiencyCores();
-        bool low_priority = false;
-        bool all_cores = false;
-        bool backlog = false;
-        // PERF-160: when new pipelines pile up (a new menu, the first seconds on a new track), the
-        // workers may use every core, at low priority so the game's own threads keep theirs; on
-        // Intel hybrid CPUs they otherwise stay on the efficiency cores (PERF-097), where a pile of
-        // compiles took several times longer. -DisablePerf 160 keeps them there.
-        static const bool backlog_cores = Common::PerfFeatureEnabled(160);
+        Common::AllowAllCores();
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
         while (true) {
             BuildQueue::Job job;
-            bool background = false;
-            if (!queue.Pop(job, background, stop)) {
+            bool background = false, heavy = false;
+            if (!queue.Pop(job, background, stop, &heavy)) {
                 return;
-            }
-            // PERF-102: while the game waits on the splash screen for the precompile, every core
-            // builds (and at normal priority); afterwards only the efficiency cores.
-            const bool boosted = queue.Boosted();
-            if (backlog_cores) {
-                const size_t pending = queue.Pending();
-                if (pending >= 16) {
-                    backlog = true;
-                } else if (pending <= 2) {
-                    backlog = false;
-                }
-            }
-            const bool wide = boosted || backlog;
-            if (wide != all_cores) {
-                all_cores = wide;
-                if (all_cores) {
-                    Common::AllowAllCores();
-                } else {
-                    Common::PreferEfficiencyCores();
-                }
-            }
-            const bool low = !boosted && (background || backlog || CompileBelowGame());
-            if (low != low_priority) {
-                low_priority = low;
-                Common::SetCurrentThreadPriority(low_priority ? Common::ThreadPriority::Low
-                                                              : Common::ThreadPriority::Normal);
             }
             job();
             if (background) {
-                queue.FinishedBackground();
+                queue.FinishedBackground(heavy);
             } else {
-                queue.FinishedForeground();
+                queue.FinishedForeground(heavy);
             }
         }
     }
@@ -460,8 +410,7 @@ struct PipelineCache::PipelineBuild {
     bool preloading{};
     // PERF-076: a new pipeline its draws skip until a worker has built it.
     bool async{};
-    // Whoever sets this first builds the pipeline: a worker, or the command thread when a
-    // draw needs it before a worker got to it.
+    // A worker claims the build once; cancellation claims an unstarted job without compiling.
     std::atomic<bool> started{};
     // The cached infos the copies were made from; the pipeline points at them once built.
     std::array<const Shader::Info*, MaxShaderStages> canonical{};
@@ -910,9 +859,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     if (const char* dir = std::getenv("SHADGT_DUMP_STORE"); dir && *dir) {
         static std::jthread dump_store{[this, d = std::string{dir}] { DumpStore(d); }};
     }
-    // FIX-078: a quarter of the hardware threads (at least 2) translate read-ahead shaders.
-    if (Common::PerfFeatureEnabled(102)) {
-        const u32 count = std::max(2u, std::thread::hardware_concurrency() / 4);
+    // Reserve translation capacity within the combined compiler budget.
+    if (const u32 count = CompilerWorkerBudget::ForLogicalThreads(
+            std::thread::hardware_concurrency()).translation;
+        Common::PerfFeatureEnabled(102) && count != 0) {
         translate_workers =
             std::make_unique<TranslateWorkers>(profile, instance.GetDevice(), count);
         translate_stats.since = std::chrono::steady_clock::now();
@@ -923,6 +873,12 @@ PipelineCache::~PipelineCache() {
     if (liverpool) {
         liverpool->on_command_buffer_start = nullptr;
     }
+    // Join producers and compiler workers while their cache, shader modules and descriptor
+    // heap are still alive. Do not serialize the driver cache concurrently with teardown.
+    prewarm_reader.request_stop();
+    if (prewarm_reader.joinable()) prewarm_reader.join();
+    translate_workers.reset();
+    build_workers.reset();
     SaveDriverCache(true);
 }
 
@@ -1195,9 +1151,8 @@ std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::MakePipelineBuild()
 }
 
 void PipelineCache::FinishBuild(PipelineBuild& build) {
-    // FIX-044: the GPU thread waiting for (or doing) a pipeline build holds the guest clocks.
-    Common::GuestClock::CompilePause hold;
     if (!build.started.exchange(true)) {
+      try {
         build.pipeline = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, build.key, *pipeline_cache, build.infos,
             build.runtime_infos, build.fetch ? &*build.fetch : nullptr, build.modules, build.sdata,
@@ -1207,8 +1162,12 @@ void PipelineCache::FinishBuild(PipelineBuild& build) {
         build.info_copies = {};
         build.user_data = {};
         build.promise.set_value();
+      } catch (...) {
+        // Publish failures as well as success: no stranded waiter or exception escaping a
+        // worker thread. The command thread observes the exception through done.get().
+        build.promise.set_exception(std::current_exception());
+      }
     }
-    build.done.wait();
 }
 
 void PipelineCache::QueueBuild(const std::shared_ptr<PipelineBuild>& build, bool urgent) {
@@ -1220,7 +1179,9 @@ void PipelineCache::QueueBuild(const std::shared_ptr<PipelineBuild>& build, bool
             FinishBuild(*build);
         }
     };
-    build_workers->Push(std::move(job), urgent);
+    build_workers->Push(std::move(job), urgent,
+        Common::PerfFeatureEnabled(79) &&
+        build->infos[u32(Shader::SwStage::TessellationControl)] != nullptr);
 }
 
 std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::StartPipelineBuild(bool urgent) {
@@ -1330,7 +1291,7 @@ void PipelineCache::RebuildFromPrograms() {
     // 12,590 shaders in 36 s on one). -DisablePerf 161 uses one.
     static const bool parallel = Common::PerfFeatureEnabled(161);
     const u32 threads =
-        parallel ? std::clamp(std::thread::hardware_concurrency() - 2, 1u, 12u) : 1u;
+        parallel ? (std::thread::hardware_concurrency() > 2 ? std::thread::hardware_concurrency() - 2 : 1u) : 1u;
     const auto work = [&] {
         Shader::Pools pools;
         for (size_t i = next++; i < metas.size(); i = next++) {
@@ -1896,6 +1857,11 @@ bool PipelineCache::LegacyWaits() const {
 
 std::chrono::microseconds PipelineCache::QuickWait() {
     if (CompileMode() == 2) return std::chrono::microseconds{0};
+#ifdef RYTY_GPU
+    // Deferrable race draws poll the worker result, rather than spending up to 4 ms per
+    // frame waiting. Memory-writing and never-skipped draws still take the required wait.
+    if (RytyGtsInRace()) return std::chrono::microseconds{0};
+#endif
     // FIX-114: a draw whose new pipeline is building waits for it a little, so the pipelines
     // that build quickly (the driver had them, or small ones) are drawn at once and only the
     // slow ones pop in a moment later. At most 4 ms of waiting in any 16 ms, 2 ms per draw.
@@ -1956,7 +1922,8 @@ void PipelineCache::QueueBackgroundBuild(const std::shared_ptr<PipelineBuild>& b
             ++prewarm_built;
         }
         ++g_precompile_done; // PERF-098
-    });
+    }, Common::PerfFeatureEnabled(79) &&
+       build->infos[u32(Shader::SwStage::TessellationControl)] != nullptr);
 }
 
 void PipelineCache::ReadAheadAtBufferStart() {
@@ -2137,16 +2104,15 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
 void PipelineCache::WaitForBuild(PipelineBuild& build, const DrawIndirectParams params) {
     using namespace std::chrono_literals;
     BuildQueuedStates(params, true);
-    // An urgent build is at the front of the workers' queue, and an idle worker takes it at
-    // once; with every worker busy, this thread builds it (FinishBuild). So does a read-ahead
-    // build no worker has reached yet.
+    // An urgent build goes to the front of the compiler queue. While it is pending this
+    // thread can discover more builds, but it never claims a compiler job itself.
     if (build.urgent) {
         const auto grace = std::chrono::steady_clock::now() + 200us;
         while (!build.started.load() && std::chrono::steady_clock::now() < grace) {
             std::this_thread::yield();
         }
     }
-    while (build.started.load() && build.done.wait_for(500us) != std::future_status::ready) {
+    while (build.done.wait_for(500us) != std::future_status::ready) {
         BuildQueuedStates(params, true);
     }
 #ifdef RYTY_GPU
@@ -2335,7 +2301,6 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(S().graphics_key);
     if (is_new) {
-        Common::GuestClock::CompilePause hold; // FIX-044
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(S().graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
         // DIAG-050: the parts of new keys of tessellated pipelines (GT Sport's race summary built
@@ -2447,6 +2412,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             auto stored = pending->second;
             if (stored->done.wait_for(stored->async ? QuickWait() : std::chrono::microseconds{0}) ==
                 std::future_status::ready) {
+                stored->done.get();
                 // PERF-038: built in the background before the draw needed it; no miss.
                 pending_builds.erase(pending);
                 stored->pipeline->SetStageInfos(S().infos);
@@ -2509,7 +2475,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             // PERF-034: a worker builds it while this thread starts the builds the command
             // thread's read-ahead queues meanwhile.
             build = StartPipelineBuild(true);
-        } else if (CompileMode() == 2 && AsyncPipelines()) {
+        } else {
             // Queue even when read-ahead/draw-pipe helpers are disabled. Retain the job
             // in pending_builds below so a later draw installs its completed pipeline.
             build = StartPipelineBuild(true);
@@ -2534,12 +2500,29 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             return nullptr;
         }
         if (build) {
+            // A read-ahead job becomes urgent once this draw actually needs it.
+            // Requeue the shared build at the front rather than waiting behind
+            // unrelated cosmetic jobs. FinishBuild's atomic claim permits only
+            // one worker to compile it; the old queued closure becomes a no-op.
+            if (!build->urgent && !build->started.load(std::memory_order_acquire) &&
+                build->done.wait_for(std::chrono::microseconds{0}) != std::future_status::ready) {
+                build->urgent = true;
+                QueueBuild(build, true);
+            }
             const auto wait_start = std::chrono::steady_clock::now();
+            // Queueing a cosmetic job must not freeze input/audio clocks. Hold
+            // them only while this command actually needs an unfinished build.
+            std::optional<Common::GuestClock::CompilePause> hold;
+            if (build->done.wait_for(std::chrono::microseconds{0}) != std::future_status::ready)
+                hold.emplace();
             if (queued_states) {
                 Common::Nvtx::Scope nvtx{"wait for pipeline build"}; // DIAG-056
                 WaitForBuild(*build, params);
             }
-            FinishBuild(*build);
+            // Only compiler workers claim and execute builds. Required draws can wait for
+            // completion, but never run the compiler on the GPU command/recorder thread.
+            build->done.get();
+            hold.reset();
             const auto now = std::chrono::steady_clock::now();
             if (queued_states) {
                 ++queued_state_stats.waits;
@@ -2567,12 +2550,6 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             build->pipeline->SetStageInfos(S().infos);
             sdata = build->sdata;
             it.value() = std::move(build->pipeline);
-        } else {
-            Common::Nvtx::Scope nvtx{"build pipeline here"}; // DIAG-056
-            RYDIAG_SCOPE(PipelineBuild, pipeline_hash);
-            it.value() = std::make_unique<GraphicsPipeline>(
-                instance, scheduler, desc_heap, profile, S().graphics_key, *pipeline_cache, S().infos,
-                S().runtime_infos, S().fetch_shader, S().modules, sdata);
         }
 
         if (!S().key_uses_legacy) { // D10: old translations are not in this store
@@ -2624,9 +2601,31 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         ComputePipeline::SerializationSupport sdata{};
         ++Common::GetWorkCounters().pipelines_compiled;
         RYDIAG_SCOPE(PipelineBuild, pipeline_hash);
-        it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
-                                                       *pipeline_cache, compute_key, *S().infos[0],
-                                                       S().modules[0], sdata);
+        // Compute dispatches cannot be dropped: later draws may consume their writes. Own the
+        // shader inputs on a bounded compiler worker and publish the completed pipeline before
+        // recording the dispatch; do not hand the worker mutable command-thread state.
+        struct ComputeBuild {
+            Shader::Info info;
+            std::vector<u32> user_data;
+            ComputePipeline::SerializationSupport sdata{};
+        };
+        auto inputs = std::make_shared<ComputeBuild>();
+        inputs->info = *S().infos[0];
+        inputs->user_data.assign(inputs->info.user_data.begin(), inputs->info.user_data.end());
+        inputs->info.user_data = inputs->user_data;
+        const auto key = compute_key;
+        const auto module = S().modules[0];
+        auto job = std::make_shared<std::packaged_task<std::unique_ptr<ComputePipeline>()>>(
+            [this, inputs, key, module] {
+                return std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
+                    *pipeline_cache, key, inputs->info, module, inputs->sdata);
+            });
+        auto completion = job->get_future();
+        if (!build_workers) build_workers = std::make_unique<PipelineBuildWorkers>();
+        build_workers->Push([job] { (*job)(); }, true);
+        it.value() = completion.get();
+        it.value()->SetStageInfo(*S().infos[0]);
+        sdata = inputs->sdata;
         if (!S().key_uses_legacy) { // D10
             RegisterPipelineData(compute_key, sdata);
         }
@@ -4060,7 +4059,7 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
                                      const Shader::Backend::Bindings& start) {
     auto& jobs = translate_jobs[params.hash];
     for (const auto& job : jobs) {
-        if (job->hw_stage == hw_stage && job->runtime_info == runtime_info && job->start == start) {
+        if (MatchesTranslationRequest(*job, hw_stage, sw_stage, runtime_info, start)) {
             ++translate_stats.duplicate;
             return false;
         }
@@ -4138,7 +4137,9 @@ bool PipelineCache::TakeReadyTranslation(HwStage hw_stage, SwStage sw_stage, u64
     return false;
 }
 
-void PipelineCache::HarvestTranslations(u64 hash, bool wait) {
+void PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, SwStage sw_stage,
+                                       const Shader::RuntimeInfo& runtime_info,
+                                       const Shader::Backend::Bindings& binding) {
     const auto it = translate_jobs.find(hash);
     if (it == translate_jobs.end()) {
         return;
@@ -4148,7 +4149,8 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait) {
         const auto wait_start = std::chrono::steady_clock::now();
         bool waited = false;
         for (const auto& job : jobs) {
-            if (!job->done) {
+            if (MatchesTranslationRequest(*job, hw_stage, sw_stage, runtime_info, binding) &&
+                !job->done) {
                 // As CompileModule: the game never sees a PS4 wait for a shader.
                 Common::GuestClock::CompilePause hold;
                 RYDIAG_SCOPE(ShaderCompile, hash);
@@ -4502,7 +4504,8 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
     // translations draw meanwhile); only when there are none (fallback_nested).
     const bool skip_wait = SkipTranslationWait(sw_stage, params); // SHD-005
     HarvestTranslations(params.hash, regs_override == nullptr && !force_legacy && !skip_wait &&
-                                         (!legacy_fallback || fallback_nested));
+                                         (!legacy_fallback || fallback_nested),
+                        hw_stage, sw_stage, runtime_info, binding);
     // D10: a key is made of new translations only, or (forced) of old ones only.
     if (force_legacy) {
         if (auto legacy = TryLegacyProgram(hw_stage, params, runtime_info, binding)) {
@@ -4550,7 +4553,8 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
                     Common::PhaseTimer spec_timer{Common::Phase::SelSpec};
                     return TryMatchingSpecialization(info, runtime_info, profile, binding);
                 }();
-            if (current_spec && permutation.spec == *current_spec) {
+            if (current_spec && permutation.spec == *current_spec &&
+                !(AsyncTranslation() && !info.attribute_flags_known && IsTessEmulatedDraw())) {
                 if (!info.attribute_flags_known && IsTessEmulatedDraw()) {
                     RecoverAttributeFlags(info, permutation.spec, params, runtime_info,
                                           program->last_match);
@@ -4591,6 +4595,11 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
         }
         if (memo_stage && !memo_usable) {
             flats.push_back(info.flattened_ud_buf);
+        }
+        // Old cache metadata needs a fresh translation to recover attribute flags.
+        // Let the existing worker miss path do it instead of recompiling here.
+        if (AsyncTranslation() && !info.attribute_flags_known && IsTessEmulatedDraw()) {
+            continue;
         }
         bool matches;
         if (memo_usable) {
@@ -4685,6 +4694,19 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
             }
             return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
         }
+        // A required command (compute, depth bake or other dependency) cannot be
+        // dropped, but its translation can still execute on the worker. Retry
+        // once if a prior job used different guest resource specializations.
+        for (u32 attempt = 0; attempt < 2; ++attempt) {
+            QueueTranslation(hw_stage, sw_stage, params, runtime_info, binding);
+            HarvestTranslations(params.hash, true, hw_stage, sw_stage, runtime_info, binding);
+            if (TakeReadyTranslation(hw_stage, sw_stage, params.hash, *program, params,
+                                     runtime_info, binding, true)) {
+                return GetProgram(hw_stage, sw_stage, params, binding);
+            }
+        }
+        // Retain the required-draw fallback below if worker snapshot/translation
+        // failed. In particular, never silently omit a one-time shadow bake.
     }
 
     // PERF-013: runtime permutations used to take the next free slot of this session, which

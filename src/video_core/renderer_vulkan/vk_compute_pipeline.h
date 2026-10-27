@@ -50,6 +50,11 @@ public:
                     vk::ShaderModule module, SerializationSupport& sdata);
     ~ComputePipeline();
 
+    void SetStageInfo(const Shader::Info& info) {
+        stages[int(Shader::SwStage::Compute)] = &info;
+        canonical_stages[int(Shader::SwStage::Compute)] = &info;
+    }
+
 private:
     ComputePipelineKey compute_key;
 };
