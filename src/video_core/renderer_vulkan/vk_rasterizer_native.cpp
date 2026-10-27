@@ -4560,7 +4560,7 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
         return env && *env ? env[0] == '1' : r.instance.GetVendorID() == 0x1002;
     }();
     const bool descriptor_composition = composition_descriptors &&
-        stage.sw_stage == Shader::SwStage::Fragment && stage.pgm_hash == 0xb33ec4df;
+        stage.sw_stage == Shader::SwStage::Fragment && IsSceneCompositionShader(stage.pgm_hash);
     static const bool postprocess_descriptors = [&] {
         const char* env = std::getenv("RYGT_POSTPROCESS_BUFFER_DESCRIPTORS");
         return env && *env ? env[0] == '1' : r.instance.GetVendorID() == 0x1002;
