@@ -929,10 +929,14 @@ void Instance::CollectDeviceParameters() {
 
     LOG_INFO(Render_Vulkan, "GPU_Vendor: {}", vendor_name);
     LOG_INFO(Render_Vulkan, "GPU_Model: {}", model_name);
-    // AMD-312: Radeon RX 9000 cards (RDNA4) get a shader store of their own version.
-    if (driver_id == vk::DriverId::eAmdProprietary &&
-        model_name.find("Radeon RX 9") != std::string::npos) {
-        g_store_gpu_family = StoreGpuFamily::AmdRdna4;
+    // AMD-312: Radeon RX 9000 cards (RDNA4) and RX 7000 cards (RDNA3) get shader stores of
+    // their own versions; RX 7000 cards also leave FIX-215/216 out (AMD-313).
+    if (driver_id == vk::DriverId::eAmdProprietary) {
+        if (model_name.find("Radeon RX 9") != std::string::npos) {
+            g_store_gpu_family = StoreGpuFamily::AmdRdna4;
+        } else if (model_name.find("Radeon RX 7") != std::string::npos) {
+            g_store_gpu_family = StoreGpuFamily::AmdRdna3;
+        }
     }
     LOG_INFO(Render_Vulkan, "GPU_Integrated: {}", IsIntegrated() ? "Yes" : "No");
     LOG_INFO(Render_Vulkan, "GPU_Vulkan_Driver: {}", driver_name);

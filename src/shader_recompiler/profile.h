@@ -50,6 +50,8 @@ struct Profile {
     /// AMD-311: which of the six vertex orders per-vertex reads use with AMD's explicit vertex
     /// parameter extension (index into AmdVertexOrders in spirv_emit_context.cpp; 0 as before).
     u32 amd_vertex_order{};
+    /// AMD-313: FIX-215/216's NaN rules for MED3/MIN3/MAX3 on AMD's trinary path (default on).
+    bool amd_nan_rules{true};
     bool has_broken_spirv_clamp{};
     bool lower_left_origin_mode{};
     bool needs_manual_interpolation{};

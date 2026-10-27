@@ -63,14 +63,23 @@ Id EmitFPMin64(EmitContext& ctx, Id a, Id b) {
 // yellow glows and banded skies, as NaNs in GT Sport's bloom and exposure do. The driver still
 // compiles the pair into one min3/max3 instruction.
 Id EmitFPMinTri32(EmitContext& ctx, Id a, Id b, Id c) {
+    if (ctx.profile.supports_trinary_minmax && !ctx.profile.amd_nan_rules) { // AMD-313
+        return ctx.OpFMin3AMD(ctx.F32[1], a, b, c);
+    }
     return ctx.OpNMin(ctx.F32[1], a, ctx.OpNMin(ctx.F32[1], b, c));
 }
 
 Id EmitFPMaxTri32(EmitContext& ctx, Id a, Id b, Id c) {
+    if (ctx.profile.supports_trinary_minmax && !ctx.profile.amd_nan_rules) { // AMD-313
+        return ctx.OpFMax3AMD(ctx.F32[1], a, b, c);
+    }
     return ctx.OpNMax(ctx.F32[1], a, ctx.OpNMax(ctx.F32[1], b, c));
 }
 
 Id EmitFPMedTri32(EmitContext& ctx, Id a, Id b, Id c) {
+    if (ctx.profile.supports_trinary_minmax && !ctx.profile.amd_nan_rules) { // AMD-313
+        return ctx.OpFMid3AMD(ctx.F32[1], a, b, c);
+    }
     if (ctx.profile.supports_trinary_minmax) {
         // FIX-215: GCN MED3 with a quiet NaN returns the minimum of the numeric operands.
         // SPV_AMD_shader_trinary_minmax leaves FMid3AMD with a NaN operand undefined; GT Sport's

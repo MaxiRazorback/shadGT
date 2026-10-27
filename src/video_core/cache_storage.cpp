@@ -131,12 +131,22 @@ void DataBase::Open() {
         // Brands Hatch as streaks with a store made earlier and right once it was translated
         // again. Other GPUs (the RX 7000 series) keep store 3, so their store stays in use.
         const char* order_env = std::getenv("SHADGT_AMD_VERTEX_ORDER");
-        const bool rdna4 = Vulkan::GetStoreGpuFamily() == Vulkan::StoreGpuFamily::AmdRdna4;
+        // AMD-313: RX 7000 cards leave FIX-215/216 out (purple car); their store 5 sets aside
+        // stores translated with them.
+        const auto family = Vulkan::GetStoreGpuFamily();
         const std::string StoreVersion =
-            std::string{rdna4 ? "RyGT shader store 4 (FIX-215/216 NaN on AMD, AMD-311 vertex order)"
-                              : "RyGT shader store 3 (FIX-215/216 MED3, MIN3, MAX3 NaN on AMD)"} +
+            std::string{family == Vulkan::StoreGpuFamily::AmdRdna4
+                            ? "RyGT shader store 4 (FIX-215/216 NaN on AMD, AMD-311 vertex order)"
+                        : family == Vulkan::StoreGpuFamily::AmdRdna3
+                            ? "RyGT shader store 5 (RX 7000: FIX-215/216 off, AMD-313)"
+                            : "RyGT shader store 3 (FIX-215/216 MED3, MIN3, MAX3 NaN on AMD)"} +
             (order_env && *order_env ? fmt::format(", SHADGT_AMD_VERTEX_ORDER={}", order_env[0])
-                                     : std::string{});
+                                     : std::string{}) +
+            [] {
+                const char* env = std::getenv("SHADGT_AMD_NAN_RULES"); // AMD-313
+                return env && *env ? fmt::format(", SHADGT_AMD_NAN_RULES={}", env[0])
+                                   : std::string{};
+            }();
         const auto version_path = cache_path / "store-version.txt";
         std::error_code ec;
         if (std::filesystem::exists(cache_path, ec)) {

@@ -812,6 +812,14 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supports_fragment_shader_barycentric = instance_.IsFragmentShaderBarycentricSupported(),
         .supports_shader_subgroup_clock = instance_.IsShaderSubgroupClockSupported(),
         .amd_vertex_order = instance_.GetAmdVertexOrder(), // AMD-311
+        // AMD-313: FIX-215/216 drew the purple car again on an RX 7600 (fresh store), so RX 7000
+        // cards leave them out; SHADGT_AMD_NAN_RULES=0/1 overrides for any GPU.
+        .amd_nan_rules = [] {
+            if (const char* env = std::getenv("SHADGT_AMD_NAN_RULES"); env && *env) {
+                return env[0] != '0';
+            }
+            return GetStoreGpuFamily() != StoreGpuFamily::AmdRdna3;
+        }(),
         .needs_manual_interpolation = instance.IsFragmentShaderBarycentricSupported() &&
                                       instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
