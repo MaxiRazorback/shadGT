@@ -109,7 +109,7 @@ public:
     ) {
 #ifdef RYTY_GPU
         framegen.Prepare(cmdbuf, swapchain, extent, needs_hdr, scene, fresh_frame);
-        RytyDlssG::Prepare(instance.GetDevice(), instance.GetAllocator(), cmdbuf, extent);
+        RytyDlssG::Prepare(instance.GetDevice(), instance.GetAllocator(), cmdbuf, extent, scene);
 #endif
     }
 

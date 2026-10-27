@@ -84,12 +84,8 @@ struct Streamline {
     u64 presented_frames{};
     u64 multiple_present_samples{};
     std::mutex mutex;
-    // No motion vectors or depth from the game: zero motion and a flat depth image.
+    // Scene resources belong to the presentation Frame and remain alive through present.
     vk::Extent2D aux_size{};
-    VideoCore::UniqueImage motion_vectors;
-    VideoCore::UniqueImage depth;
-    vk::UniqueImageView motion_vectors_view;
-    vk::UniqueImageView depth_view;
 };
 Streamline g_sl;
 
@@ -150,86 +146,6 @@ bool LoadFeatureFunctions() {
         g_sl.reflex_set_options(reflex);
     }
     return true;
-}
-
-void CreateAuxImages(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf,
-                     vk::Extent2D size) {
-    g_sl.aux_size = size;
-    g_sl.motion_vectors_view.reset();
-    g_sl.depth_view.reset();
-    g_sl.motion_vectors.Destroy();
-    g_sl.depth.Destroy();
-    g_sl.motion_vectors = VideoCore::UniqueImage(device, allocator);
-    g_sl.depth = VideoCore::UniqueImage(device, allocator);
-    const auto make = [&](VideoCore::UniqueImage& image, vk::Format format,
-                          vk::UniqueImageView& view) {
-        image.Create(vk::ImageCreateInfo{
-            .imageType = vk::ImageType::e2D,
-            .format = format,
-            .extent{.width = size.width, .height = size.height, .depth = 1},
-            .mipLevels = 1,
-            .arrayLayers = 1,
-            .samples = vk::SampleCountFlagBits::e1,
-            .usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst |
-                     vk::ImageUsageFlagBits::eTransferSrc,
-            .initialLayout = vk::ImageLayout::eUndefined,
-        });
-        auto [result, created] = device.createImageViewUnique(vk::ImageViewCreateInfo{
-            .image = image,
-            .viewType = vk::ImageViewType::e2D,
-            .format = format,
-            .subresourceRange{.aspectMask = vk::ImageAspectFlagBits::eColor,
-                              .levelCount = 1,
-                              .layerCount = 1},
-        });
-        if (result == vk::Result::eSuccess) {
-            view = std::move(created);
-        }
-    };
-    make(g_sl.motion_vectors, vk::Format::eR16G16Sfloat, g_sl.motion_vectors_view);
-    make(g_sl.depth, vk::Format::eR32Sfloat, g_sl.depth_view);
-
-    constexpr vk::ImageSubresourceRange range = {
-        .aspectMask = vk::ImageAspectFlagBits::eColor,
-        .levelCount = 1,
-        .layerCount = 1,
-    };
-    const std::array<vk::Image, 2> images = {g_sl.motion_vectors, g_sl.depth};
-    std::array<vk::ImageMemoryBarrier2, 2> to_clear{};
-    std::array<vk::ImageMemoryBarrier2, 2> to_read{};
-    for (size_t i = 0; i < images.size(); ++i) {
-        to_clear[i] = vk::ImageMemoryBarrier2{
-            .srcStageMask = vk::PipelineStageFlagBits2::eNone,
-            .dstStageMask = vk::PipelineStageFlagBits2::eClear,
-            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
-            .oldLayout = vk::ImageLayout::eUndefined,
-            .newLayout = vk::ImageLayout::eTransferDstOptimal,
-            .image = images[i],
-            .subresourceRange = range,
-        };
-        to_read[i] = vk::ImageMemoryBarrier2{
-            .srcStageMask = vk::PipelineStageFlagBits2::eClear,
-            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
-            .oldLayout = vk::ImageLayout::eTransferDstOptimal,
-            .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-            .image = images[i],
-            .subresourceRange = range,
-        };
-    }
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .imageMemoryBarrierCount = static_cast<u32>(to_clear.size()),
-        .pImageMemoryBarriers = to_clear.data(),
-    });
-    const vk::ClearColorValue zero{std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f}};
-    for (const vk::Image image : images) {
-        cmdbuf.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal, zero, range);
-    }
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .imageMemoryBarrierCount = static_cast<u32>(to_read.size()),
-        .pImageMemoryBarriers = to_read.data(),
-    });
 }
 
 sl::float4x4 Identity() {
@@ -394,7 +310,7 @@ PFN_vkGetInstanceProcAddr LoadInterposer() {
 }
 
 void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf,
-             vk::Extent2D size) {
+             vk::Extent2D size, const RytyFrameGen::SceneInputs* scene) {
     if (!Active()) {
         return;
     }
@@ -408,7 +324,10 @@ void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
         std::scoped_lock telemetry_lock{g_sl.telemetry_mutex};
         gameplay_ready = g_sl.gameplay.Ready(now);
     }
-    gameplay_ready = gameplay_ready && RytyGtsInRace() &&
+    const bool scene_valid = scene && scene->valid && scene->size.width && scene->size.height &&
+        scene->depth && scene->motion && scene->depth_view && scene->motion_view &&
+        scene->hudless && scene->hudless_view && scene->hudless_size == size;
+    gameplay_ready = gameplay_ready && scene_valid && RytyGtsInRace() &&
                      !Common::GuestClock::IsPaused() && !DebugState.IsGuestThreadsPaused();
     const bool resized = size != g_sl.aux_size;
     const auto reason =
@@ -422,9 +341,9 @@ void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     if (!enabled) {
         g_sl.reset_pending = true;
     }
-    if (resized || !g_sl.motion_vectors_view || !g_sl.depth_view) {
+    if (resized) {
+        g_sl.aux_size = size;
         g_sl.reset_pending = true;
-        CreateAuxImages(device, allocator, cmdbuf, size);
     }
     ++g_sl.frame_index;
     if (g_sl.new_frame_token(g_sl.frame, &g_sl.frame_index) != sl::Result::eOk || !g_sl.frame) {
@@ -444,8 +363,11 @@ void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
     constants.clipToLensClip = Identity();
     constants.clipToPrevClip = Identity();
     constants.prevClipToClip = Identity();
-    constants.jitterOffset = sl::float2(0.0f, 0.0f);
-    constants.mvecScale = sl::float2(1.0f, 1.0f);
+    constants.jitterOffset = scene_valid ? sl::float2(scene->jitter_x, scene->jitter_y)
+                                       : sl::float2(0.0f, 0.0f);
+    constants.mvecScale = scene_valid
+        ? sl::float2(scene->motion_scale_x / scene->size.width,
+                     scene->motion_scale_y / scene->size.height) : sl::float2(1.0f, 1.0f);
     constants.cameraPinholeOffset = sl::float2(0.0f, 0.0f);
     constants.cameraPos = sl::float3(0.0f, 0.0f, 0.0f);
     constants.cameraUp = sl::float3(0.0f, 1.0f, 0.0f);
@@ -464,34 +386,46 @@ void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf
 
     const sl::Extent extent{0, 0, size.width, size.height};
     sl::Resource mvec{sl::ResourceType::eTex2d,
-                      static_cast<VkImage>(static_cast<vk::Image>(g_sl.motion_vectors)), nullptr,
-                      static_cast<VkImageView>(*g_sl.motion_vectors_view),
+                      static_cast<VkImage>(scene_valid ? scene->motion : vk::Image{}), nullptr,
+                      static_cast<VkImageView>(scene_valid ? scene->motion_view : vk::ImageView{}),
                       static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)};
-    mvec.width = size.width;
-    mvec.height = size.height;
+    const auto render_size = scene_valid ? scene->size : size;
+    const sl::Extent render_extent{0, 0, render_size.width, render_size.height};
+    mvec.width = render_size.width;
+    mvec.height = render_size.height;
     mvec.nativeFormat = static_cast<uint32_t>(VK_FORMAT_R16G16_SFLOAT);
     mvec.mipLevels = 1;
     mvec.arrayLayers = 1;
     mvec.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     sl::Resource dep{sl::ResourceType::eTex2d,
-                     static_cast<VkImage>(static_cast<vk::Image>(g_sl.depth)), nullptr,
-                     static_cast<VkImageView>(*g_sl.depth_view),
+                     static_cast<VkImage>(scene_valid ? scene->depth : vk::Image{}), nullptr,
+                     static_cast<VkImageView>(scene_valid ? scene->depth_view : vk::ImageView{}),
                      static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)};
-    dep.width = size.width;
-    dep.height = size.height;
+    dep.width = render_size.width;
+    dep.height = render_size.height;
     dep.nativeFormat = static_cast<uint32_t>(VK_FORMAT_R32_SFLOAT);
     dep.mipLevels = 1;
     dep.arrayLayers = 1;
     dep.usage = mvec.usage;
     // The backbuffer tag only carries the extent (Streamline knows the swapchain image).
     sl::Resource backbuffer{sl::ResourceType::eTex2d, nullptr, nullptr, nullptr};
+    sl::Resource hudless{sl::ResourceType::eTex2d,
+        static_cast<VkImage>(scene_valid ? scene->hudless : vk::Image{}), nullptr,
+        static_cast<VkImageView>(scene_valid ? scene->hudless_view : vk::ImageView{}),
+        static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)};
+    hudless.width = size.width; hudless.height = size.height;
+    hudless.nativeFormat = scene_valid ? static_cast<uint32_t>(scene->hudless_format) : 0;
+    hudless.mipLevels = 1; hudless.arrayLayers = 1;
+    hudless.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     const sl::ResourceTag tags[] = {
         sl::ResourceTag{valid_inputs ? &backbuffer : nullptr, sl::kBufferTypeBackbuffer,
                         sl::ResourceLifecycle::eValidUntilPresent, &extent},
         sl::ResourceTag{valid_inputs ? &mvec : nullptr, sl::kBufferTypeMotionVectors,
-                        sl::ResourceLifecycle::eValidUntilPresent, &extent},
+                        sl::ResourceLifecycle::eValidUntilPresent, &render_extent},
         sl::ResourceTag{valid_inputs ? &dep : nullptr, sl::kBufferTypeDepth,
+                        sl::ResourceLifecycle::eValidUntilPresent, &render_extent},
+        sl::ResourceTag{valid_inputs ? &hudless : nullptr, sl::kBufferTypeHUDLessColor,
                         sl::ResourceLifecycle::eValidUntilPresent, &extent},
     };
     auto* command_buffer =
@@ -569,10 +503,6 @@ void PresentEnd() {
 void Shutdown() {
     std::scoped_lock lock{g_sl.mutex};
     RytyFrameGen::ReportWorking(false);
-    g_sl.motion_vectors_view.reset();
-    g_sl.depth_view.reset();
-    g_sl.motion_vectors.Destroy();
-    g_sl.depth.Destroy();
     g_sl.aux_size = {};
     g_sl.options = {};
     g_sl.fresh_frame = false;

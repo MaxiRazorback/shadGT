@@ -19,6 +19,7 @@ namespace Vulkan::RytyFrameGen {
 // FG preparation, and its present fence protects reuse/reallocation.
 struct SceneInputs {
     vk::Image depth{}, motion{}, hudless{};
+    vk::ImageView depth_view{}, motion_view{}, hudless_view{};
     vk::Extent2D hudless_size{};
     vk::Format hudless_format{};
     vk::Extent2D size{};
@@ -29,6 +30,7 @@ struct SceneInputs {
 };
 struct SceneSnapshot {
     VideoCore::UniqueImage depth, motion;
+    vk::UniqueImageView depth_view, motion_view;
     vk::Extent2D size{};
     bool initialized{};
     SceneInputs inputs{};

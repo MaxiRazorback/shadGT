@@ -8,14 +8,17 @@
 
 VK_DEFINE_HANDLE(VmaAllocator)
 
+namespace Vulkan::RytyFrameGen { struct SceneInputs; }
+
 namespace Vulkan::RytyDlssG {
 
 /// ryGT: NVIDIA DLSS frame generation (GPU.dlssg_enabled) through Streamline: dlss\sl.interposer.dll
 /// and its plugins (sl.dlss_g, sl.reflex, sl.pcl, sl.common, nvngx_dlssg.dll) next to GTSport.exe.
 /// Streamline's interposer stands in for vulkan-1.dll: the renderer's dispatcher is loaded from it,
 /// so the instance, device, surface and swapchain calls go through Streamline, which adds what
-/// DLSS-G needs and shows the generated frames from its own present path. The game picture comes
-/// without motion vectors or depth, so zero motion vectors and a flat depth image are tagged.
+/// DLSS-G needs and shows the generated frames from its own present path. Inputs are tagged
+/// with per-presentation scene depth, motion, jitter and a HUD-less reference. Scenes without
+/// matching inputs keep frame generation suspended.
 
 /// True when DLSS frame generation is on in the config (the AMD frame generation then stays off).
 bool Requested();
@@ -34,7 +37,7 @@ void SetFreshFrame(bool fresh);
 /// Per presented game frame, before the frame's command buffer is submitted: starts a Streamline
 /// frame, records the tags (motion vectors, depth) and sets the constants and options.
 void Prepare(vk::Device device, VmaAllocator allocator, vk::CommandBuffer cmdbuf,
-             vk::Extent2D size);
+             vk::Extent2D size, const RytyFrameGen::SceneInputs* scene = nullptr);
 
 /// Around the swapchain present (Reflex/PCL markers DLSS-G needs to pair frames).
 void PresentStart();

@@ -389,7 +389,7 @@ GtsSceneImage NativeRenderer::TemporalImage(const Native::ImageEntry& entry) {
 
 void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Targets& targets,
                                      const DrawBindings& bindings) {
-    if (!RytyFsr3::TemporalRequested() || !r.temporalDlss.Enabled()) return;
+    if (!r.temporalDlss.Enabled()) return;
     const auto& regs = r.liverpool->DrawRegs();
     const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
     if (!fs || regs.num_indices > 6 ||
@@ -448,7 +448,7 @@ void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Ta
 
 bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, const Targets& targets,
                                    const DrawBindings& bindings) {
-    if (!RytyFsr3::TemporalRequested() || !r.temporalDlss.Enabled()) return false;
+    if (!r.temporalDlss.Enabled()) return false;
     const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
     const auto& regs = r.liverpool->DrawRegs();
     if (!fs || fs->pgm_hash != 0xb33ec4df || regs.num_indices > 6 ||

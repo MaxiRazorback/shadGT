@@ -7,6 +7,7 @@
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "ryty_gpu/ryty_gts_dlss.h"
+#include "ryty_gpu/ryty_dlssg.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -175,12 +176,11 @@ bool GtsDlssPass::Capture(u64 frame, GtsSceneImage color, GtsSceneImage sourceDe
     const float ratio = RytyFsr3::UpscaleRatio();
     const auto scaled = vk::Extent2D{std::min(u32(std::lround(input.width * ratio)), 8192u),
                                      std::min(u32(std::lround(input.height * ratio)), 8192u)};
-    const auto output = (useFsr || useXess)
+    const auto output = (quality != RYGT_DLSS_QUALITY_DLAA || useFsr || useXess)
                             ? ratio >= 1.0f ? scaled
                                             : vk::Extent2D{std::max(requestedSize.width, input.width),
                                                            std::max(requestedSize.height, input.height)}
-                        : quality == RYGT_DLSS_QUALITY_DLAA ? input
-                                                            : requestedSize;
+                        : input;
     if (input != renderSize || output != outputSize || depth.format != sourceDepth.info.pixel_format) {
         RygtDlssOptimalSettings settings{};
         if (!useFsr && !useXess &&
@@ -200,7 +200,7 @@ bool GtsDlssPass::Capture(u64 frame, GtsSceneImage color, GtsSceneImage sourceDe
         create(this->color, color.info.pixel_format, input);
         create(depth, sourceDepth.info.pixel_format, input, sourceDepth.aspect_mask);
         create(motion, sourceMotion.info.pixel_format, input);
-        if (useFsr || useXess) {
+        {
             create(fsrDepth, vk::Format::eR32Sfloat, input);
             depthCopy = std::make_unique<VideoCore::UniqueBuffer>(instance.GetDevice(),
                                                                   instance.GetAllocator());
@@ -244,7 +244,7 @@ bool GtsDlssPass::Capture(u64 frame, GtsSceneImage color, GtsSceneImage sourceDe
     jitterX = constants[20] * constants[14];
     jitterY = constants[21] * constants[15];
     copyInput(sourceDepth, depth);
-    if (useFsr || useXess) {
+    {
         if (sourceDepth.info.props.is_depth) copyDepthForFsr();
         else copyInput(sourceDepth, fsrDepth);
     }
@@ -286,12 +286,14 @@ bool GtsDlssPass::CopyFrameGenerationInputs(u64 frame, RytyFrameGen::SceneSnapsh
                                             bool native_hudless) {
     snapshot.inputs = {};
     snapshot.hudless_scene_valid = false;
-    if (!RytyFrameGen::Requested() || failed || (!useFsr && !useXess) ||
+    if ((!RytyFrameGen::Requested() && !RytyDlssG::Requested()) || failed ||
         sceneFrame != frame || !renderSize.width || !renderSize.height ||
         fsrDepth.format != vk::Format::eR32Sfloat || motion.format != vk::Format::eR16G16Sfloat)
         return false;
     if (snapshot.size != renderSize) {
         // GetRenderFrame has waited for this Frame's presentation fence.
+        snapshot.depth_view.reset();
+        snapshot.motion_view.reset();
         snapshot.depth = VideoCore::UniqueImage{instance.GetDevice(), instance.GetAllocator()};
         snapshot.motion = VideoCore::UniqueImage{instance.GetDevice(), instance.GetAllocator()};
         const auto make = [&](VideoCore::UniqueImage& image, vk::Format format) {
@@ -302,6 +304,13 @@ bool GtsDlssPass::CopyFrameGenerationInputs(u64 frame, RytyFrameGen::SceneSnapsh
         };
         make(snapshot.depth, vk::Format::eR32Sfloat);
         make(snapshot.motion, vk::Format::eR16G16Sfloat);
+        const auto view = [&](vk::Image image, vk::Format format) {
+            return Check<"create FG scene input view">(instance.GetDevice().createImageViewUnique({
+                .image = image, .viewType = vk::ImageViewType::e2D, .format = format,
+                .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}}));
+        };
+        snapshot.depth_view = view(snapshot.depth, vk::Format::eR32Sfloat);
+        snapshot.motion_view = view(snapshot.motion, vk::Format::eR16G16Sfloat);
         snapshot.size = renderSize;
         snapshot.initialized = false;
     }
@@ -366,7 +375,9 @@ bool GtsDlssPass::CopyFrameGenerationInputs(u64 frame, RytyFrameGen::SceneSnapsh
     }
     snapshot.initialized = true;
     RytyFrameGen::EndGpuTiming(scheduler.DirectCommandBuffer(), timing);
-    snapshot.inputs = {.depth = snapshot.depth, .motion = snapshot.motion, .size = renderSize,
+    snapshot.inputs = {.depth = snapshot.depth, .motion = snapshot.motion,
+        .depth_view = snapshot.depth_view.get(), .motion_view = snapshot.motion_view.get(),
+        .size = renderSize,
         .jitter_x = jitterX, .jitter_y = jitterY,
         .motion_scale_x = -float(renderSize.width) * .5f,
         .motion_scale_y = float(renderSize.height) * .5f,
@@ -477,7 +488,8 @@ void GtsDlssPass::Resolve(u64 frame, GtsSceneImage display) {
         return;
     }
     VideoCore::ImageViewInfo viewInfo{};
-    viewInfo.format = vk::Format::eA2R10G10B10UnormPack32;
+    viewInfo.format = display.cached ? vk::Format::eA2R10G10B10UnormPack32
+                                     : display.info.pixel_format;
     const auto view = display.View(viewInfo.format);
     RygtDlssFrame desc{};
     desc.struct_size = sizeof(desc);
@@ -486,7 +498,7 @@ void GtsDlssPass::Resolve(u64 frame, GtsSceneImage display) {
     desc.color = {static_cast<VkImage>(display.GetImage()), static_cast<VkImageView>(view),
                   static_cast<VkFormat>(viewInfo.format),
                   renderSize.width, renderSize.height};
-    desc.depth = depth.Descriptor();
+    desc.depth = fsrDepth.Descriptor();
     desc.motion = motion.Descriptor();
     desc.output = reconstruction.Descriptor();
     desc.quality = quality;
@@ -508,7 +520,18 @@ void GtsDlssPass::Resolve(u64 frame, GtsSceneImage display) {
     reset = false;
     transit(reconstruction, vk::ImageLayout::eShaderReadOnlyOptimal);
     transit(native, vk::ImageLayout::eColorAttachmentOptimal);
-    colorCopy->CopyColorViews(outputSize, native.format, reconstruction.presentView.get(), native.view.get());
+    if (display.cached) {
+        colorCopy->CopyColorViews(outputSize, native.format, reconstruction.presentView.get(), native.view.get());
+    } else {
+        // Native supplies the real color format, so no channel-swizzle correction is needed.
+        transit(reconstruction, vk::ImageLayout::eTransferSrcOptimal);
+        transit(native, vk::ImageLayout::eTransferDstOptimal);
+        scheduler.DirectCommandBuffer().blitImage(reconstruction.image,
+            vk::ImageLayout::eTransferSrcOptimal, native.image,
+            vk::ImageLayout::eTransferDstOptimal, Blit(outputSize, outputSize), vk::Filter::eNearest);
+        transit(reconstruction, vk::ImageLayout::eShaderReadOnlyOptimal);
+        transit(native, vk::ImageLayout::eColorAttachmentOptimal);
+    }
     displayUid = display.image_uid;
     outputFrame = frame;
     nativeDirty = true;

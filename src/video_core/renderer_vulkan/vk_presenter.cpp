@@ -1109,6 +1109,7 @@ void Presenter::PrepareHudlessReference(Frame& frame, vk::CommandBuffer cmd, vk:
     cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &after});
     snapshot.hudless_output_initialized = true;
     snapshot.inputs.hudless = snapshot.hudless_output;
+    snapshot.inputs.hudless_view = snapshot.hudless_output_view.get();
     snapshot.inputs.hudless_format = output_format;
     snapshot.inputs.hudless_size = output_size;
     RytyFrameGen::EndGpuTiming(cmd, timing);
