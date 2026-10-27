@@ -106,5 +106,9 @@ u64 ShownFrames();
 bool Working();
 void ReportWorking(bool working);
 
+// Optional bounded diagnostics; stage 0 snapshots, stage 1 HUD-reference conversion.
+int BeginGpuTiming(vk::CommandBuffer cmd, u64 sequence, u32 stage);
+void EndGpuTiming(vk::CommandBuffer cmd, int query);
+
 
 } // namespace Vulkan::RytyFrameGen

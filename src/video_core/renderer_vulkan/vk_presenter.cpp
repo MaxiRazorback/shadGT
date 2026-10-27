@@ -1055,6 +1055,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 void Presenter::PrepareHudlessReference(Frame& frame, vk::CommandBuffer cmd, vk::Format input_format) {
     auto& snapshot = frame.framegen_scene;
     if (!snapshot.inputs.valid || !snapshot.hudless_scene_valid) return;
+    const int timing = RytyFrameGen::BeginGpuTiming(cmd, snapshot.inputs.sequence, 1);
     const auto output_format = swapchain.GetSurfaceFormat().format;
     const vk::Extent2D output_size{frame.width, frame.height};
     if (!snapshot.hudless_scene_view) {
@@ -1110,6 +1111,7 @@ void Presenter::PrepareHudlessReference(Frame& frame, vk::CommandBuffer cmd, vk:
     snapshot.inputs.hudless = snapshot.hudless_output;
     snapshot.inputs.hudless_format = output_format;
     snapshot.inputs.hudless_size = output_size;
+    RytyFrameGen::EndGpuTiming(cmd, timing);
 }
 
 Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,

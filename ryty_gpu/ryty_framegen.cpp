@@ -37,6 +37,141 @@ struct Api {
 };
 Api g_api;
 
+// Opt-in, fixed-size trace. Never reuse queries or wait for GPU results in the frame loop.
+struct TimingTrace {
+    static constexpr u32 Count = 16;
+    vk::Device device{};
+    vk::QueryPool pool{};
+    double period{};
+    u64 mask{};
+    u32 used{};
+    std::array<std::atomic<u64>, Count> ids{};
+    std::array<std::atomic<bool>, Count> generated{};
+    std::array<bool, Count> reported{};
+    std::array<std::atomic<u64>, Count * 2> extra_ids{};
+    std::array<bool, Count * 2> extra_reported{};
+    std::array<u32, 2> extra_used{}; // recorder thread only
+    struct CpuEvent { const char* kind{}; s64 begin{}, end{}; };
+    std::array<CpuEvent, 128> cpu_events{};
+    u32 cpu_used{}; // present thread only
+    std::atomic<bool> cpu_armed{};
+
+    static s64 Now() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    void Cpu(const char* kind, s64 begin) {
+        if (!cpu_armed.load(std::memory_order_relaxed) || cpu_used == cpu_events.size()) return;
+        cpu_events[cpu_used++] = {kind, begin, Now()};
+        if (cpu_used == cpu_events.size()) {
+            const auto origin = cpu_events[0].begin;
+            for (const auto& event : cpu_events)
+                LOG_INFO(Render_Vulkan, "FG host timing: {} at {:.3f} ms duration {:.3f} ms",
+                    event.kind, (event.begin - origin) / 1e6, (event.end - event.begin) / 1e6);
+        }
+    }
+    int BeginExtra(vk::CommandBuffer cmd, u64 sequence, u32 stage) {
+        if (!pool || !cpu_armed.load(std::memory_order_relaxed) ||
+            stage >= 2 || extra_used[stage] == Count) return -1;
+        const u32 slot = stage * Count + extra_used[stage]++;
+        // Sequence + 1 reserves zero for an unused slot.
+        extra_ids[slot].store(sequence + 1, std::memory_order_release);
+        const u32 query = Count * 4 + slot * 2;
+        cmd.resetQueryPool(pool, query, 2);
+        cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool, query);
+        return static_cast<int>(query);
+    }
+
+    void Create(const Instance& instance) {
+        const char* option = std::getenv("RYGT_FG_GPU_TIMING");
+        if (!option || std::string{option} != "1") return;
+        const auto families = instance.GetPhysicalDevice().getQueueFamilyProperties();
+        const auto bits = families[instance.GetGraphicsQueueFamilyIndex()].timestampValidBits;
+        if (!bits) return;
+        device = instance.GetDevice();
+        period = instance.GetPhysicalDevice().getProperties().limits.timestampPeriod;
+        mask = bits == 64 ? ~0ULL : ((1ULL << bits) - 1);
+        VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        info.queryCount = Count * 8;
+        VkQueryPool handle{};
+        if (VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateQueryPool(device, &info, nullptr, &handle) == VK_SUCCESS) {
+            pool = handle;
+            LOG_INFO(Render_Vulkan, "FG GPU timing: armed for {} frames", Count);
+        }
+    }
+    int Begin(vk::CommandBuffer cmd, u64 id, bool generation) {
+        if (!pool) return -1;
+        u32 slot{};
+        if (generation) {
+            for (; slot < Count; ++slot)
+                if (ids[slot].load(std::memory_order_acquire) == id) break;
+            if (slot == Count || generated[slot].exchange(true)) return -1;
+        } else {
+            if (used == Count) return -1;
+            slot = used++;
+            ids[slot].store(id, std::memory_order_release);
+        }
+        const u32 query = slot * 4 + (generation ? 2 : 0);
+        cmd.resetQueryPool(pool, query, 2);
+        cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool, query);
+        return static_cast<int>(query);
+    }
+    void End(vk::CommandBuffer cmd, int query) {
+        if (query >= 0)
+            cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool, query + 1);
+    }
+    void Poll(u64 current) {
+        if (!pool) return;
+        for (u32 slot = 0; slot < Count * 2; ++slot) {
+            const u64 sequence = extra_ids[slot].load(std::memory_order_acquire);
+            if (!sequence || extra_reported[slot]) continue;
+            struct Result { u64 value, available; } values[2]{};
+            const auto result = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueryPoolResults(
+                device, pool, Count * 4 + slot * 2, 2, sizeof(values), values, sizeof(Result),
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+            if (result != VK_SUCCESS || !values[0].available || !values[1].available) continue;
+            extra_reported[slot] = true;
+            LOG_INFO(Render_Vulkan, "FG GPU timing: scene {} {} {:.3f} ms",
+                sequence - 1, slot < Count ? "snapshot copies" : "HUD conversion",
+                ((values[1].value - values[0].value) & mask) * period / 1e6);
+        }
+        for (u32 slot = 0; slot < used; ++slot) {
+            const u64 id = ids[slot].load(std::memory_order_acquire);
+            if (reported[slot] || current < id + 8 || !generated[slot].load()) continue;
+            struct Result { u64 value, available; } values[4]{};
+            const auto result = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueryPoolResults(
+                device, pool, slot * 4, 4, sizeof(values), values, sizeof(Result),
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+            if (result != VK_SUCCESS) continue;
+            if (!values[0].available || !values[1].available ||
+                !values[2].available || !values[3].available) continue;
+            reported[slot] = true;
+            LOG_INFO(Render_Vulkan, "FG GPU timing: frame {} prepare {:.3f} ms interpolation {:.3f} ms",
+                id, ((values[1].value - values[0].value) & mask) * period / 1e6,
+                ((values[3].value - values[2].value) & mask) * period / 1e6);
+        }
+    }
+    void Destroy() {
+        // Called after the FG contexts stop their callbacks and the swapchain is idle.
+        if (pool) device.destroyQueryPool(pool);
+        pool = nullptr;
+        used = 0;
+        extra_used = {};
+        cpu_used = 0;
+        cpu_armed.store(false);
+        for (u32 i = 0; i < Count * 2; ++i) {
+            extra_ids[i].store(0);
+            extra_reported[i] = false;
+        }
+        for (u32 i = 0; i < Count; ++i) {
+            ids[i].store(0);
+            generated[i].store(false);
+            reported[i] = false;
+        }
+    }
+} g_timing;
+
 bool Load() {
     if (g_api.tried) {
         return g_api.module != nullptr;
@@ -109,12 +244,22 @@ ffxReturnCode_t DispatchGeneration(ffxDispatchDescFrameGeneration* params, void*
         hdr ? FFX_API_BACKBUFFER_TRANSFER_FUNCTION_PQ : FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
     params->minMaxLuminance[0] = 0.0001f;
     params->minMaxLuminance[1] = 1000.0f;
-    return g_api.dispatch(context, &params->header);
+    const vk::CommandBuffer cmd{static_cast<VkCommandBuffer>(params->commandList)};
+    const int timing = g_timing.Begin(cmd, params->frameID, true);
+    const auto result = g_api.dispatch(context, &params->header);
+    g_timing.End(cmd, timing);
+    return result;
 }
 
 } // namespace
 
 std::atomic<u64> g_shown_frames{};
+int BeginGpuTiming(vk::CommandBuffer cmd, u64 sequence, u32 stage) {
+    return g_timing.BeginExtra(cmd, sequence, stage);
+}
+void EndGpuTiming(vk::CommandBuffer cmd, int query) {
+    g_timing.End(cmd, query);
+}
 namespace {
 std::atomic<s64> g_generated_at{};
 struct GenerationWindow {
@@ -237,6 +382,7 @@ bool FrameGen::CreateSwapchain(const Instance& instance, const vk::SwapchainCrea
         return false;
     }
     framegen_context = new_framegen_context;
+    g_timing.Create(instance);
     display_size = info.imageExtent;
     format = info.imageFormat;
     frame_id = 0;
@@ -268,6 +414,7 @@ void FrameGen::Destroy() {
         swapchain_context = nullptr;
     }
     get_images = nullptr;
+    g_timing.Destroy();
     acquire = nullptr;
     present = nullptr;
 }
@@ -291,15 +438,21 @@ vk::Result FrameGen::GetImages(vk::Device device_, vk::SwapchainKHR swapchain,
 
 vk::Result FrameGen::Acquire(vk::Device device_, vk::SwapchainKHR swapchain,
                              vk::Semaphore semaphore, u32* image_index) const {
-    return static_cast<vk::Result>(acquire(static_cast<VkDevice>(device_),
+    const auto begin = TimingTrace::Now();
+    const auto result = static_cast<vk::Result>(acquire(static_cast<VkDevice>(device_),
                                            static_cast<VkSwapchainKHR>(swapchain), UINT64_MAX,
                                            static_cast<VkSemaphore>(semaphore), VK_NULL_HANDLE,
                                            image_index));
+    g_timing.Cpu("acquire", begin);
+    return result;
 }
 
 vk::Result FrameGen::Present(vk::Queue queue, const vk::PresentInfoKHR& info) const {
     const VkPresentInfoKHR raw = info;
-    return static_cast<vk::Result>(present(static_cast<VkQueue>(queue), &raw));
+    const auto begin = TimingTrace::Now();
+    const auto result = static_cast<vk::Result>(present(static_cast<VkQueue>(queue), &raw));
+    g_timing.Cpu("present", begin);
+    return result;
 }
 
 void FrameGen::Prepare(vk::CommandBuffer cmdbuf, vk::SwapchainKHR swapchain, vk::Extent2D size,
@@ -456,7 +609,11 @@ void FrameGen::Prepare(vk::CommandBuffer cmdbuf, vk::SwapchainKHR swapchain, vk:
     prepare.motionVectors = Resource(scene_valid ? scene->motion : vk::Image{motion_vectors}, vk::Format::eR16G16Sfloat, input_size,
                                      FFX_API_RESOURCE_USAGE_READ_ONLY,
                                      FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ);
+    g_timing.Poll(frame_id);
+    const int timing = g_timing.Begin(cmdbuf, frame_id, false);
+    if (timing >= 0) g_timing.cpu_armed.store(true, std::memory_order_relaxed);
     result = g_api.dispatch(reinterpret_cast<ffxContext*>(&framegen_context), &prepare.header);
+    g_timing.End(cmdbuf, timing);
     if (result != FFX_API_RETURN_OK) {
         static bool logged = false;
         if (!logged) {

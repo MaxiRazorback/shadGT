@@ -342,6 +342,8 @@ bool GtsDlssPass::CopyFrameGenerationInputs(u64 frame, RytyFrameGen::SceneSnapsh
                                                .pImageMemoryBarriers = &after});
         transit(source, vk::ImageLayout::eShaderReadOnlyOptimal);
     };
+    const auto timing_cmd = scheduler.DirectCommandBuffer();
+    const int timing = RytyFrameGen::BeginGpuTiming(timing_cmd, frame, 0);
     copy(fsrDepth, snapshot.depth, renderSize, snapshot.initialized);
     copy(motion, snapshot.motion, renderSize, snapshot.initialized);
     if (native_hudless) {
@@ -363,6 +365,7 @@ bool GtsDlssPass::CopyFrameGenerationInputs(u64 frame, RytyFrameGen::SceneSnapsh
         snapshot.hudless_scene_valid = true;
     }
     snapshot.initialized = true;
+    RytyFrameGen::EndGpuTiming(scheduler.DirectCommandBuffer(), timing);
     snapshot.inputs = {.depth = snapshot.depth, .motion = snapshot.motion, .size = renderSize,
         .jitter_x = jitterX, .jitter_y = jitterY,
         .motion_scale_x = -float(renderSize.width) * .5f,
