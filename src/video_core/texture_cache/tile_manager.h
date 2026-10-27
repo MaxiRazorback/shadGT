@@ -19,6 +19,7 @@ namespace VideoCore {
 
 struct ImageInfo;
 struct Image;
+class BufferCache;
 
 class TileManager {
     struct TilingKey {
@@ -45,7 +46,7 @@ class TileManager {
 
 public:
     explicit TileManager(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
-                         Vulkan::Runtime& runtime, StreamBuffer& stream_buffer);
+                         Vulkan::Runtime& runtime, BufferCache& buffer_cache);
     ~TileManager();
 
     void TileImage(Image& in_image, std::span<vk::BufferImageCopy> buffer_copies,
@@ -62,7 +63,7 @@ private:
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
     Vulkan::Runtime& runtime;
-    StreamBuffer& stream_buffer;
+    BufferCache& buffer_cache;
     vk::UniqueDescriptorSetLayout desc_layout;
     vk::UniquePipelineLayout pl_layout;
     std::unordered_map<TilingKey, vk::UniquePipeline, TilingKey::Hash> tiling_pipelines;

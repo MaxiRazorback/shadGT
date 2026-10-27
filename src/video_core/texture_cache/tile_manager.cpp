@@ -9,6 +9,7 @@
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/tile_manager.h"
+#include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/texture_cache/tiling_specialization.h"
 
 #include "video_core/host_shaders/tiling_macro_128_comp.h"
@@ -37,8 +38,8 @@ struct TilingInfo {
 };
 
 TileManager::TileManager(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
-                         Vulkan::Runtime& runtime_, StreamBuffer& stream_buffer_)
-    : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, stream_buffer{stream_buffer_} {
+                         Vulkan::Runtime& runtime_, BufferCache& buffer_cache_)
+    : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, buffer_cache{buffer_cache_} {
     const auto device = instance.GetDevice();
     const std::array<vk::DescriptorSetLayoutBinding, 3> bindings = {{
         {
@@ -196,8 +197,8 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     }
 
     const vk::DescriptorBufferInfo params_buffer_info{
-        .buffer = stream_buffer.Handle(),
-        .offset = stream_buffer.Copy(&params, sizeof(params), instance.UniformMinAlignment()),
+        .buffer = buffer_cache.GetStreamBuffer().Handle(),
+        .offset = buffer_cache.GetStreamBuffer().Copy(&params, sizeof(params), instance.UniformMinAlignment()),
         .range = sizeof(params),
     };
 
@@ -294,8 +295,8 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     }
 
     const vk::DescriptorBufferInfo params_buffer_info{
-        .buffer = stream_buffer.Handle(),
-        .offset = stream_buffer.Copy(&params, sizeof(params), instance.UniformMinAlignment()),
+        .buffer = buffer_cache.GetStreamBuffer().Handle(),
+        .offset = buffer_cache.GetStreamBuffer().Copy(&params, sizeof(params), instance.UniformMinAlignment()),
         .range = sizeof(params),
     };
 

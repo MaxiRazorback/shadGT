@@ -51,6 +51,12 @@
 #include "ryty_gpu/ryty_diag.h"
 #endif
 
+#ifdef RYTY_GPU
+namespace Vulkan {
+bool NativeModeRequested();
+}
+#endif
+
 namespace VideoCore {
 
 namespace {
@@ -225,9 +231,6 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       staging_pool{runtime_.GetStagingPool()}, liverpool{liverpool_},
       memory{Core::Memory::Instance()}, texture_cache{texture_cache_},
       memory_tracker{std::make_unique<MemoryTracker>(tracker)}, page_manager{tracker},
-      stream_buffer{instance, scheduler, StreamRingType(), StreamBufferSize(instance_)},
-      ahead_stream{instance, scheduler, MemoryType::Stream, StreamBufferSize(instance_)},
-      ahead_staging{instance, scheduler, MemoryType::HostUncached, StreamBufferSize(instance_)},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       memory_semaphore{instance},
       // PERF-011 is disabled: skipping GPU-written bytes in uploads loses CPU stores to those
@@ -243,11 +246,18 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     if (DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported()) { // D1
         direct_memory = std::make_unique<DirectMemory>(instance, scheduler);
     }
-    for (u32 i = 1; i < StageWorkerCount(); ++i) { // R5
-        worker_streams[i] = std::make_unique<StreamBuffer>(instance, scheduler, MemoryType::Stream,
-                                                           StreamBufferSize(instance_) / 2);
-        worker_stagings[i] = std::make_unique<StreamBuffer>(
-            instance, scheduler, MemoryType::HostUncached, StreamBufferSize(instance_) / 2);
+    bool lazy_stage_rings = false;
+#ifdef RYTY_GPU
+    // Native disables the buffer-stage worker and has its own timeline-owned uploads.
+    // Keep the old full-size rings available on demand, rather than allocating unused ones.
+    lazy_stage_rings = Vulkan::NativeModeRequested();
+#endif
+    if (!lazy_stage_rings) {
+        GetStreamBuffer();
+        for (u32 i = 0; i < StageWorkerCount(); ++i) {
+            StageStream(i);
+            StageStaging(i);
+        }
     }
     const vk::BufferCreateInfo probe_ci = {
         .flags =
@@ -1747,7 +1757,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     if (diag_time) {
         const u64 start = __rdtsc();
         const auto result = ObtainBufferImpl(device_addr, size, is_written, is_texel_buffer);
-        const int kind = result.first == &stream_buffer ? 0
+        const int kind = result.first == allocated_stream.load(std::memory_order_acquire) ? 0
                          : result.first->mem_type == MemoryType::HostUncached ? 3 // P2 in place
                          : is_written ? 2 : 1;
         g_obtain_cycles[kind] += __rdtsc() - start;
@@ -1855,6 +1865,7 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferShared(
     ApplyCompletedReadbacks();
     ++Common::GetWorkCounters().obtain_buffer;
     if (stream && !IsRegionGpuModified(device_addr, size)) {
+        auto& stream_buffer = GetStreamBuffer();
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         memory->CopySparseMemory(device_addr, data, size, read_capture);
         stream_buffer.Commit();
@@ -2049,6 +2060,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferImpl(VAddr device_addr, u
         return env && env[0] == '1';
     }();
     if (ceil_stream && !is_written && size <= STREAM_THRESHOLD && !read_capture) {
+        auto& stream_buffer = GetStreamBuffer();
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         memory->CopySparseMemory(device_addr, data, size);
         stream_buffer.Commit();
@@ -2166,6 +2178,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferImpl(VAddr device_addr, u
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size) &&
         ((skip_alias_walk && !images_overlap) || !HasGpuImageAlias(device_addr, size))) {
+        auto& stream_buffer = GetStreamBuffer();
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         memory->CopySparseMemory(device_addr, data, size, read_capture);
         stream_buffer.Commit();
@@ -2726,6 +2739,35 @@ std::optional<std::pair<const Buffer*, u64>> BufferCache::ObtainBufferAhead(
         }
     }
     return std::pair<const Buffer*, u64>{arena, arena->Offset(device_addr)};
+}
+
+StreamBuffer& BufferCache::GetStreamBuffer() {
+    std::call_once(stream_init, [this] {
+        const u64 bytes = StreamBufferSize(instance);
+        stream_buffer = std::make_unique<StreamBuffer>(instance, scheduler, StreamRingType(), bytes);
+        allocated_stream.store(stream_buffer.get(), std::memory_order_release);
+    });
+    return *stream_buffer;
+}
+
+StreamBuffer& BufferCache::StageStream(u32 index) {
+    ASSERT(index < MaxStageWorkers);
+    std::call_once(worker_stream_init[index], [this, index] {
+        const u64 bytes = StreamBufferSize(instance) / (index == 0 ? 1 : 2);
+        worker_streams[index] = std::make_unique<StreamBuffer>(
+            instance, scheduler, MemoryType::Stream, bytes);
+    });
+    return *worker_streams[index];
+}
+
+StreamBuffer& BufferCache::StageStaging(u32 index) {
+    ASSERT(index < MaxStageWorkers);
+    std::call_once(worker_staging_init[index], [this, index] {
+        const u64 bytes = StreamBufferSize(instance) / (index == 0 ? 1 : 2);
+        worker_stagings[index] = std::make_unique<StreamBuffer>(
+            instance, scheduler, MemoryType::HostUncached, bytes);
+    });
+    return *worker_stagings[index];
 }
 
 u32 BufferCache::StageWorkerCount() {

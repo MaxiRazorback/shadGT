@@ -94,9 +94,7 @@ public:
     }
 
     /// Retrieves the stream buffer.
-    [[nodiscard]] StreamBuffer& GetStreamBuffer() noexcept {
-        return stream_buffer;
-    }
+    [[nodiscard]] StreamBuffer& GetStreamBuffer();
 
     /// Returns minimum granularity of a sparse memory bind.
     u32 GetSparsePageShift() const noexcept {
@@ -509,10 +507,10 @@ private:
     std::unique_ptr<MemoryTracker> memory_tracker;
     PageManager& page_manager; // FIX-063
 
-    StreamBuffer stream_buffer;
+    std::unique_ptr<StreamBuffer> stream_buffer;
+    std::atomic<StreamBuffer*> allocated_stream{};
+    std::once_flag stream_init;
     // PERF-067: rings the buffer stage fills ahead of the recorder.
-    StreamBuffer ahead_stream;
-    StreamBuffer ahead_staging;
 public:
     /// R5: buffer stage workers (SHADGT_STAGE_WORKERS, 1-4). Each has its own rings; worker 0
     /// uses the ones above.
@@ -541,14 +539,18 @@ public:
 private:
     static inline thread_local u32 t_stage_worker{};
     static inline thread_local bool t_recorder_thread{};
-    StreamBuffer& AheadStream() noexcept {
-        return t_stage_worker == 0 ? ahead_stream : *worker_streams[t_stage_worker];
+    StreamBuffer& AheadStream() {
+        return StageStream(t_stage_worker);
     }
-    StreamBuffer& AheadStaging() noexcept {
-        return t_stage_worker == 0 ? ahead_staging : *worker_stagings[t_stage_worker];
+    StreamBuffer& AheadStaging() {
+        return StageStaging(t_stage_worker);
     }
+    StreamBuffer& StageStream(u32 index);
+    StreamBuffer& StageStaging(u32 index);
     std::array<std::unique_ptr<StreamBuffer>, MaxStageWorkers> worker_streams;
     std::array<std::unique_ptr<StreamBuffer>, MaxStageWorkers> worker_stagings;
+    std::array<std::once_flag, MaxStageWorkers> worker_stream_init;
+    std::array<std::once_flag, MaxStageWorkers> worker_staging_init;
     struct WorkerSync {
         std::atomic<VAddr> begin{};
         std::atomic<VAddr> end{};
