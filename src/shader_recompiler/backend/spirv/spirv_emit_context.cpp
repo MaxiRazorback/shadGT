@@ -322,15 +322,17 @@ void EmitContext::DefineAmdPerVertexAttribs() {
         auto& param = input_params[i];
         const Id pointer = param.id;
         const Id type = F32[param.num_components];
-        const std::array<Id, 3> values{OpInterpolateAtVertexAMD(type, pointer, ConstU32(order[0])),
-                                       OpInterpolateAtVertexAMD(type, pointer, ConstU32(order[1])),
-                                       OpInterpolateAtVertexAMD(type, pointer, ConstU32(order[2]))};
+        // The driver's raw vertices 0, 1, 2. AMD-307's check finds raw indices, so it selects
+        // among these directly; AMD-311's fixed order applies only without the check.
+        const std::array<Id, 3> values{OpInterpolateAtVertexAMD(type, pointer, ConstU32(0U)),
+                                       OpInterpolateAtVertexAMD(type, pointer, ConstU32(1U)),
+                                       OpInterpolateAtVertexAMD(type, pointer, ConstU32(2U))};
         for (u32 k = 0; k < 3; ++k) {
             if (!order_check) {
-                param.id_array[k] = values[k];
+                param.id_array[k] = values[order[k]];
                 continue;
             }
-            // AMD-307: vertex k of the barycentrics is the per-vertex value at order[k].
+            // AMD-307: vertex k of the barycentrics is the raw per-vertex value at (*order_check)[k].
             param.id_array[k] = OpSelect(
                 type, OpIEqual(U1[1], (*order_check)[k], ConstU32(0U)), values[0],
                 OpSelect(type, OpIEqual(U1[1], (*order_check)[k], ConstU32(1U)), values[1],
@@ -575,7 +577,8 @@ void EmitContext::DefineInputs() {
 
         // AMD-307: a shader with per-vertex reads reads the position copies the stage before
         // wrote, to find the vertex order (see FindVertexOrder).
-        if (profile.vertex_order_check && profile.supports_amd_shader_explicit_vertex_parameter) {
+        if (runtime_info.hw.fs.vertex_order_check &&
+            profile.supports_amd_shader_explicit_vertex_parameter) {
             bool per_vertex = false;
             u32 last_location = 0;
             for (s32 i = 0; i < num_inputs; i++) {
@@ -707,6 +710,27 @@ void EmitContext::DefineInputs() {
     }
 }
 
+u32 EmitContext::LastParamOutputLocation() const {
+    // AMD-307: the highest location a parameter output of this stage takes (0 if none), using
+    // the same offsets as DefineOutputs. The order check only takes 30/31 when this is below.
+    u32 last = 0;
+    if (sw_stage == SwStage::Geometry) {
+        return info.gs_copy_data.num_attrs > 0 ? info.gs_copy_data.num_attrs - 1 : 0;
+    }
+    const bool clip_offset = hw_stage == HwStage::Vertex && profile.needs_clip_distance_emulation &&
+                             info.stores.GetAny(IR::Attribute::ClipDistance);
+    const bool layer_offset = sw_stage == SwStage::Vertex &&
+                              runtime_info.sw.vs.tess_emulated_primitive &&
+                              info.stores.GetAny(IR::Attribute::RenderTargetIndex);
+    const u32 offset = (clip_offset ? 1 : 0) + (layer_offset ? 1 : 0);
+    for (u32 i = 0; i < IR::NumParams; i++) {
+        if (info.stores.GetAny(IR::Attribute::Param0 + i)) {
+            last = std::max(last, i + offset);
+        }
+    }
+    return std::max(last, offset);
+}
+
 void EmitContext::DefineVertexBlock() {
     const std::array<Id, 8> zero{f32_zero_value, f32_zero_value, f32_zero_value, f32_zero_value,
                                  f32_zero_value, f32_zero_value, f32_zero_value, f32_zero_value};
@@ -714,7 +738,8 @@ void EmitContext::DefineVertexBlock() {
     // AMD-307: the stage that feeds the rasterizer also writes the position to two locations the
     // pixel shader reads interpolated and per vertex (see DefineAmdPerVertexAttribs).
     if (profile.vertex_order_check &&
-        (hw_stage == HwStage::Vertex || sw_stage == SwStage::Geometry)) {
+        (hw_stage == HwStage::Vertex || sw_stage == SwStage::Geometry) &&
+        LastParamOutputLocation() < OrderCheckRefLocation) {
         order_ref_out = Name(DefineOutput(F32[4], OrderCheckRefLocation), "order_ref_out");
         order_vertex_out = Name(DefineOutput(F32[4], OrderCheckVertexLocation), "order_vertex_out");
     }

@@ -703,6 +703,13 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
               !regs.stage_enable.IsStageEnabled(static_cast<u32>(HwStage::Local))) ||
              lowers_user_clip_planes) &&
             profile.needs_clip_distance_emulation;
+        // AMD-307: the vertex order check takes locations 30/31. The stage feeding the
+        // rasterizer exports NumExports() parameters, at most two locations further on (clip
+        // distances, layer), so the pixel shader reads the check only when those stay below 30;
+        // the vertex side checks its own outputs the same way and then always writes it.
+        info.hw.fs.vertex_order_check =
+            profile.vertex_order_check &&
+            regs.vs_output_config.NumExports() + 2 <= 30; // OrderCheckRefLocation
         break;
     }
     case HwStage::Compute: {
@@ -850,6 +857,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     profile.native_cube_sampling = NativeModeRequested() && instance.IsImageCubeArraySupported();
 #endif
     const char* barycentric_env = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC");
+    SetVertexOrderCheckCacheEnabled(profile.vertex_order_check); // AMD-307
     SetSingleSampleBarycentricCacheEnabled(UseSingleSampleBarycentric(
         instance.GetVendorID(), profile.supports_fragment_shader_barycentric, 1,
         !barycentric_env || std::strcmp(barycentric_env, "0") != 0));

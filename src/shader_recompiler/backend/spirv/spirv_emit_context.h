@@ -308,6 +308,7 @@ public:
     Id bary_coord_nopersp{};
     Id bary_coord_nopersp_sample{};
     // AMD-307: the position copies for the per-triangle vertex order check.
+    u32 LastParamOutputLocation() const; ///< AMD-307
     Id order_ref_out{};
     Id order_vertex_out{};
     Id order_ref_in{};
