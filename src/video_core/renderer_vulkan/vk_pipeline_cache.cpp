@@ -1,3 +1,4 @@
+#include "video_core/renderer_vulkan/driver_cache_snapshot.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -139,6 +140,15 @@ static void KeepCompiledTessellationLayout(Shader::StageSpecialization& spec,
     }
 }
 
+// Frontend resolution runs under the caller's captured draw state. Workers must
+// never follow guest descriptor-table pointers after the handoff.
+struct OwnedTranslation {
+    Shader::Pools pools;
+    Shader::RuntimeInfo compiled_runtime;
+    std::optional<Shader::IR::Program> program;
+    explicit OwnedTranslation(const Shader::RuntimeInfo& runtime) : compiled_runtime{runtime} {}
+};
+
 class PipelineCache::TranslateWorkers {
 public:
     TranslateWorkers(const Shader::Profile& profile_, vk::Device device_, u32 count)
@@ -211,44 +221,28 @@ private:
 
     void Translate(TranslateJob& job, Shader::Pools& pools) {
         TranslationActivity activity;
-        const Shader::ShaderParams params{
-            .user_data = std::span<const u32, Shader::ShaderParams::NumShaderUserData>{job.user_data},
-            .code = job.code,
-            .hash = job.hash,
-        };
-        auto info = std::make_unique<Shader::Info>(job.hw_stage, job.sw_stage, params);
-        // The decoder reads the owned snapshot; guest-relative resources retain the original base.
-        info->pgm_base = job.code_base;
-        auto runtime_info = job.runtime_info;
+        auto prepared = std::static_pointer_cast<OwnedTranslation>(job.prepared_translation);
+        ASSERT(prepared && prepared->program && job.info);
+        auto& info = job.info;
         auto binding = job.start;
         const auto start = std::chrono::steady_clock::now();
-        Shader::Optimization::g_diag_compiling_code = job.code;
-        Shader::Optimization::g_diag_compiling_hash = job.hash;
-        struct RestoreFetchInputs {
-            const std::vector<Common::FetchCodeSnapshot>* previous;
-            ~RestoreFetchInputs() { Shader::t_fetch_code_snapshots = previous; }
-        } restore_fetch{Shader::t_fetch_code_snapshots};
-        Shader::t_fetch_code_snapshots = &job.fetch_code;
         try {
             Common::RecoverableScope recoverable;
-            const auto program = Shader::TranslateProgram(job.code, pools, *info, runtime_info,
-                                                          profile);
-            job.spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, program, binding);
-            if (job.sw_stage == Shader::SwStage::TessellationControl || job.sw_stage == Shader::SwStage::TessellationEval) {
-                job.spec = Shader::StageSpecialization(*info, job.runtime_info, profile, job.start,
-                                                       info->translated_fetch_shader.get());
-                KeepCompiledTessellationLayout(job.spec, runtime_info);
-            }
+            job.spv = Shader::Backend::SPIRV::EmitSPIRV(
+                profile, prepared->compiled_runtime, *prepared->program, binding);
+            job.spec = Shader::StageSpecialization(*info, job.runtime_info, profile, job.start,
+                                                   info->translated_fetch_shader.get(), &prepared->compiled_runtime);
+            KeepCompiledTessellationLayout(job.spec, prepared->compiled_runtime);
         } catch (const Common::RecoverableFailure&) {
-            // Translated again on the command thread when needed, which reports the failure.
+            job.prepared_translation.reset();
             return;
         }
+        job.prepared_translation.reset();
         if (!Common::PerfFeatureEnabled(44)) {
             info->resource_usage_known = false;
         }
         job.module = CompileSPV(job.spv, device);
-        job.info = std::move(info);
-        job.translate_ms =
+        job.translate_ms +=
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
                 .count();
     }
@@ -936,19 +930,11 @@ PipelineCache::~PipelineCache() {
     SaveDriverCache(true);
 }
 
-// FIX-165 (RyGT): the driver's pipeline cache file is off unless RYGT_DRIVER_CACHE=1. GT Sport's grew to
-// 3.7 GB: it was loaded whole at start, and each save (every 30 s while new pipelines were made)
-// held the driver for 1.4-4.3 s and then wrote for 11 s. Lance's Lago Maggiore races dropped to
-// 10 fps and back again and again, and once the menus froze for a minute. The driver keeps its
-// own shader cache, and races ran no slower without the file (2026-10-16). With
-// RYGT_DRIVER_CACHE=1 the file is loaded, and saved only when the game ends.
+// Bounded persistence is automatic; the environment variable is a diagnostic opt-out.
 static bool DriverCacheFileEnabled() {
 #ifdef RYTY_GPU
-    static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_DRIVER_CACHE");
-        return env && env[0] == '1';
-    }();
-    return enabled && EmulatorSettings.IsPipelineCacheEnabled();
+    const char* env = std::getenv("RYGT_DRIVER_CACHE");
+    return !env || env[0] != '0';
 #else
     return EmulatorSettings.IsPipelineCacheEnabled();
 #endif
@@ -956,29 +942,22 @@ static bool DriverCacheFileEnabled() {
 
 void PipelineCache::CreateDriverCache() {
     std::vector<u8> data;
-#ifdef RYTY_GPU
-    if (!DriverCacheFileEnabled()) {
-        const auto& game_serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
-        const auto unused = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
-                            fmt::format("{}.vkpipelinecache", game_serial);
-        std::error_code ec;
-        if (std::filesystem::exists(unused, ec)) {
-            LOG_WARNING(Render_Vulkan,
-                        "FIX-165: the driver pipeline cache file is not used (RYGT_DRIVER_CACHE=1 "
-                        "turns it on); {} ({} MB) can be deleted",
-                        unused.string(), std::filesystem::file_size(unused, ec) >> 20);
-        }
-    }
-#endif
     if (DriverCacheFileEnabled()) {
         const auto& serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
+        const auto identity = instance.GetPhysicalDevice().getProperties();
+        std::string uuid;
+        for (auto byte : identity.pipelineCacheUUID) uuid += fmt::format("{:02x}", byte);
         driver_cache_path = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
-                            fmt::format("{}.vkpipelinecache", serial);
+            fmt::format("{}-{:04x}-{:04x}-{:08x}-{}.vkpipelinecache", serial,
+                        identity.vendorID, identity.deviceID, identity.driverVersion, uuid);
         const Common::FS::IOFile file{driver_cache_path, Common::FS::FileAccessMode::Read};
-        if (file.IsOpen()) {
-            data.resize(file.GetSize());
-            if (file.Read(data) != data.size()) {
+        if (file.IsOpen() && file.GetSize() <= DriverCacheDiskBudget) {
+            try {
+                data.resize(file.GetSize());
+                if (file.Read(data) != data.size()) data.clear();
+            } catch (const std::bad_alloc&) {
                 data.clear();
+                LOG_WARNING(Render_Vulkan, "CACHE-LOAD-DEFER: allocation failed; starting with an empty cache");
             }
         }
         // Header (Vulkan spec, VkPipelineCacheHeaderVersionOne): size, version, vendor,
@@ -995,7 +974,8 @@ void PipelineCache::CreateDriverCache() {
             data.clear();
         } else {
             std::memcpy(&header, data.data(), sizeof(Header));
-            if (header.version != static_cast<u32>(vk::PipelineCacheHeaderVersion::eOne) ||
+            if (header.size < sizeof(Header) || header.size > data.size() ||
+                header.version != static_cast<u32>(vk::PipelineCacheHeaderVersion::eOne) ||
                 header.vendor_id != props.vendorID || header.device_id != props.deviceID ||
                 std::memcmp(header.uuid.data(), props.pipelineCacheUUID.data(), VK_UUID_SIZE)) {
                 LOG_INFO(Render_Vulkan, "Driver pipeline cache is from another GPU or driver");
@@ -1020,7 +1000,9 @@ void PipelineCache::CreateDriverCache() {
     pipeline_cache = std::move(cache);
     pipelines_at_driver_save = num_new_pipelines;
     driver_cache_saved_at = std::chrono::steady_clock::now();
-    LOG_INFO(Render_Vulkan, "Driver pipeline cache: loaded {} bytes", data.size());
+    LOG_INFO(Render_Vulkan, "Driver pipeline cache: loaded {} bytes, hash {:016x}, file {}",
+             data.size(), data.empty() ? 0ull : XXH3_64bits(data.data(), data.size()),
+             driver_cache_path.string());
 }
 
 // A disk-cache snapshot is optional. Query its size before allocating, and never let an
@@ -1028,38 +1010,22 @@ void PipelineCache::CreateDriverCache() {
 // overload, this makes a single bounded read rather than reallocating while the cache grows.
 static std::vector<u8> ReadDriverCacheSnapshot(vk::Device device, vk::PipelineCache cache) {
     try {
-        size_t size = 0;
-        auto result = device.getPipelineCacheData(cache, &size, nullptr);
-        if (result != vk::Result::eSuccess || size == 0) {
-            return {};
-        }
+        u64 available = std::numeric_limits<u64>::max();
 #ifdef _WIN32
         MEMORYSTATUSEX memory{};
         memory.dwLength = sizeof(memory);
-        constexpr u64 CommitReserve = u64{1} << 30;
-        if (!GlobalMemoryStatusEx(&memory) || size > memory.ullAvailPageFile ||
-            memory.ullAvailPageFile - size < CommitReserve) {
-            LOG_WARNING(Render_Vulkan,
-                        "CACHE-SAVE-DEFER: snapshot needs {} MB, available system commit {} MB; "
-                        "keeping the previous disk cache",
-                        size >> 20, memory.ullAvailPageFile >> 20);
-            return {};
-        }
+        if (!GlobalMemoryStatusEx(&memory)) return {};
+        available = memory.ullAvailPageFile;
 #endif
-        std::vector<u8> data(size);
-        result = device.getPipelineCacheData(cache, &size, data.data());
-        if (result != vk::Result::eSuccess || size > data.size()) {
-            LOG_WARNING(Render_Vulkan,
-                        "CACHE-SAVE-DEFER: driver cache read returned {}; keeping the previous "
-                        "disk cache",
-                        vk::to_string(result));
-            return {};
+        auto data = ReadBoundedDriverCache([&](size_t* size, void* bytes) {
+            return static_cast<int>(device.getPipelineCacheData(cache, size, bytes));
+        }, available);
+        if (data.empty()) {
+            LOG_WARNING(Render_Vulkan, "CACHE-SAVE-DEFER: no usable bounded driver snapshot; keeping previous cache");
         }
-        data.resize(size);
         return data;
     } catch (const std::bad_alloc&) {
-        LOG_WARNING(Render_Vulkan,
-                    "CACHE-SAVE-DEFER: snapshot allocation failed; keeping the previous disk cache");
+        LOG_WARNING(Render_Vulkan, "CACHE-SAVE-DEFER: bounded snapshot allocation failed; keeping previous cache");
         return {};
     }
 }
@@ -1089,11 +1055,23 @@ void PipelineCache::SaveDriverCache(bool wait) {
         {
             const Common::FS::IOFile file{temp, Common::FS::FileAccessMode::Create};
             if (!file.IsOpen() || file.Write(data) != data.size()) {
-                return;
+                LOG_WARNING(Render_Vulkan, "CACHE-SAVE-DEFER: temporary cache write failed");
+                return false;
             }
         }
+#ifdef _WIN32
+        const bool replaced = MoveFileExW(temp.c_str(), path.c_str(),
+                                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
         std::error_code ec;
         std::filesystem::rename(temp, path, ec);
+        const bool replaced = !ec;
+#endif
+        if (!replaced) LOG_WARNING(Render_Vulkan, "CACHE-SAVE-DEFER: cache replacement failed; keeping previous cache");
+        if (replaced) LOG_INFO(Render_Vulkan,
+            "CACHE-SAVED: {} bytes, hash {:016x}, file {}", data.size(),
+            XXH3_64bits(data.data(), data.size()), path.string());
+        return replaced;
     };
     const vk::Device device = instance.GetDevice();
     const vk::PipelineCache cache = *pipeline_cache;
@@ -1111,7 +1089,7 @@ void PipelineCache::SaveDriverCache(bool wait) {
                 const auto read_end = std::chrono::steady_clock::now();
                 if (!data.empty()) {
                     const size_t size = data.size();
-                    write(std::move(data));
+                    if (!write(std::move(data))) return;
                     LOG_WARNING(Render_Vulkan,
                                 "PERF-036: driver pipeline cache saved off the GPU thread: {} MB, "
                                 "read {:.0f} ms, written {:.0f} ms",
@@ -4136,6 +4114,13 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
             return false;
         }
     }
+    // Bound retained frontend pools as well as worker work. A required draw can
+    // fall back to the existing synchronous path when the queue is full.
+    size_t outstanding{};
+    for (const auto& [queued_hash, queued_jobs] : translate_jobs) {
+        for (const auto& queued : queued_jobs) outstanding += !queued->done;
+    }
+    if (outstanding >= 8) return false;
     auto job = std::make_shared<TranslateJob>(runtime_info);
     job->hw_stage = hw_stage;
     job->sw_stage = sw_stage;
@@ -4189,6 +4174,29 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
         return false; // A real draw can retry; no worker may read the rejected pointer.
     }
     job->start = start;
+    try {
+        Common::RecoverableScope recoverable;
+        const Shader::ShaderParams owned_params{
+            .user_data = std::span<const u32, Shader::ShaderParams::NumShaderUserData>{job->user_data},
+            .code = job->code, .hash = job->hash,
+        };
+        job->info = std::make_unique<Shader::Info>(hw_stage, sw_stage, owned_params);
+        job->info->pgm_base = job->code_base;
+        auto prepared = std::make_shared<OwnedTranslation>(runtime_info);
+        const auto* previous_fetch = Shader::t_fetch_code_snapshots;
+        SCOPE_EXIT { Shader::t_fetch_code_snapshots = previous_fetch; };
+        Shader::t_fetch_code_snapshots = &job->fetch_code;
+        const auto preparation_start = std::chrono::steady_clock::now();
+        prepared->program.emplace(Shader::TranslateProgram(job->code, prepared->pools, *job->info,
+                                                           prepared->compiled_runtime, profile));
+        job->translate_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - preparation_start).count();
+        job->prepared_translation = std::move(prepared);
+    } catch (const Common::RecoverableFailure&) {
+        return false;
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
     jobs.push_back(job);
     ++translate_stats.queued;
     translate_workers->Queue(std::move(job));
@@ -4291,10 +4299,7 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
         translate_stats.translate_ms += job->translate_ms;
         // Tessellation keys were captured on the translating worker, not from
         // whatever the guest wrote to the constant buffer before harvesting.
-        if (job->sw_stage != SwStage::TessellationControl && job->sw_stage != SwStage::TessellationEval) {
-            job->spec = Shader::StageSpecialization(*job->info, job->runtime_info, profile, job->start,
-                                                   job->info->translated_fetch_shader.get());
-        }
+        // The worker captured every stage key from the owned compilation inputs.
         job->ready_since = now;
         ready.push_back(job);
         return true;
