@@ -2993,9 +2993,11 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         return;
     }
     // SHD-002: each stage's writes go to its own set; one set may be pushed.
-    std::array<boost::container::small_vector<vk::WriteDescriptorSet, 32>,
-               Shader::Backend::MaxDescriptorSets>
-        by_set;
+    // Recorder-local scratch retains capacity only; descriptor contents are rebuilt
+    // for every draw. Vulkan consumes the writes before this function returns.
+    static thread_local std::array<boost::container::small_vector<vk::WriteDescriptorSet, 32>,
+                                  Shader::Backend::MaxDescriptorSets> by_set;
+    for (auto& writes : by_set) writes.clear();
     for (size_t i = 0; i < b.writes.size(); ++i) {
         by_set[i < b.write_sets.size() ? b.write_sets[i] : 0].push_back(b.writes[i]);
     }
@@ -3021,7 +3023,9 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         }
         first_unbound = limit;
     };
-    std::array<boost::container::small_vector<u64, 128>, Shader::Backend::MaxDescriptorSets> keys;
+    static thread_local std::array<boost::container::small_vector<u64, 128>,
+                                  Shader::Backend::MaxDescriptorSets> keys;
+    for (auto& key : keys) key.clear();
     std::array<u64, Shader::Backend::MaxDescriptorSets> hashes{};
     std::array<bool, Shader::Backend::MaxDescriptorSets> cacheable_sets{};
     std::array<vk::DescriptorSetLayout, Shader::Backend::MaxDescriptorSets> missing_layouts{};
@@ -3126,7 +3130,8 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
             }
         }
         if (success) {
-            boost::container::small_vector<vk::WriteDescriptorSet, 64> updates;
+            static thread_local boost::container::small_vector<vk::WriteDescriptorSet, 64> updates;
+            updates.clear();
             for (u32 i = 0; i < missing_count; ++i) {
                 const u32 index = missing_indices[i];
                 if (counts[i]) {
