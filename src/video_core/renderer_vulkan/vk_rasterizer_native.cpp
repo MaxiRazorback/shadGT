@@ -1228,8 +1228,8 @@ std::tuple<vk::Buffer, u64, u8*> NativeRenderer::Allocate(u64 size, u64 align) {
 
 vk::DescriptorBufferInfo NativeRenderer::UploadFlatData(u32 stage, const u8* source, u32 size) {
     auto& previous = stream.flat_uploads[stage];
-    if (previous.data && previous.binding.range == size &&
-        UploadBytesEqual(previous.data, source, size)) {
+    if (previous.binding.buffer && previous.bytes.size() == size &&
+        UploadBytesEqual(previous.bytes.data(), source, size)) {
         ++stats.flat_upload_hits;
         stats.flat_upload_bytes_saved += size;
         return previous.binding;
@@ -1238,7 +1238,15 @@ vk::DescriptorBufferInfo NativeRenderer::UploadFlatData(u32 stage, const u8* sou
     const auto [buffer, offset, data] = Allocate(size, r.instance.StorageMinAlignment());
     std::memcpy(data, source, size);
     const vk::DescriptorBufferInfo binding{buffer, offset, size};
-    previous = {data, binding};
+    // Upload heaps are sequential-write memory and can be uncached/write-combined.
+    // Keep comparisons in normal CPU memory; bound retained capacity per stage.
+    if (size <= 64 * 1024) {
+        previous.bytes.assign(source, source + size);
+        previous.binding = binding;
+    } else {
+        previous.bytes.clear();
+        previous.binding = {};
+    }
     return binding;
 }
 
@@ -6356,7 +6364,10 @@ void NativeRenderer::Splice() {
             retiring_pools.emplace_back(tick, pool);
         }
     }
-    s.flat_uploads = {}; // no upload pointers survive command-list retirement
+    for (auto& upload : s.flat_uploads) {
+        upload.bytes.clear(); // retain bounded CPU capacity, discard every retired binding
+        upload.binding = {};
+    }
     s.chunks.clear();
     s.chunk_used = 0;
     s.descriptor_reserve.Clear(); // unused handles retire with the same pools

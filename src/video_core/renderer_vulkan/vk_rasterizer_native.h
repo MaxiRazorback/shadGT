@@ -199,7 +199,7 @@ private:
         // Flattened user data is read-only. Keep the last immutable upload for each
         // stage until this command list retires; compare bytes, never just addresses.
         struct FlatUpload {
-            const u8* data = nullptr;
+            std::vector<u8> bytes; // CPU-cached reference; never read back upload memory
             vk::DescriptorBufferInfo binding{};
         };
         std::array<FlatUpload, Shader::MaxStageTypes> flat_uploads{};
