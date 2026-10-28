@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <vector>
 namespace Vulkan {
-inline constexpr std::size_t DriverCacheDiskBudget = 256ull << 20;
+inline constexpr std::size_t DriverCacheDiskBudget = 2ull << 30;
 inline constexpr std::uint64_t DriverCacheCommitReserve = 1ull << 30;
 inline std::size_t DriverCacheSnapshotBudget(std::size_t reported, std::uint64_t available) {
     if (available <= DriverCacheCommitReserve) return 0;

@@ -268,6 +268,7 @@ private:
     std::unordered_map<VAddr, std::unique_ptr<std::array<u8, 4096>>> page_snapshots;
     std::atomic<u32> logged_partial{};
     void SortRegionWrites();
+    bool HasImageBacking(VAddr address, u64 size);
     Region* RegionOver(VAddr address, u64 size);
     Region* MakeRegion(VAddr address, u64 size);
     void RefreshRegion(Region& region, VAddr address, u64 size);
