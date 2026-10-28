@@ -146,10 +146,11 @@ void DataBase::Open() {
             (order_env && *order_env ? fmt::format(", SHADGT_AMD_VERTEX_ORDER={}", order_env[0])
                                      : std::string{}) +
             [] {
-                // AMD-313, AMD-306, AMD-307: the switches that change translations.
+                // AMD-313, AMD-306, AMD-307, AMD-308: the switches that change translations.
                 std::string parts;
                 for (const char* name :
-                     {"SHADGT_AMD_NAN_RULES", "SHADGT_QUAD_CONTROL", "SHADGT_VERTEX_ORDER"}) {
+                     {"SHADGT_AMD_NAN_RULES", "SHADGT_QUAD_CONTROL", "SHADGT_VERTEX_ORDER",
+                      "SHADGT_FP32_IMAGE_ATOMICS"}) {
                     if (const char* env = std::getenv(name); env && *env) {
                         parts += fmt::format(", {}={}", name, env[0]);
                     }

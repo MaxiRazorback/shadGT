@@ -491,6 +491,16 @@ bool Instance::CreateDevice() {
     if (shader_atomic_float2) {
         shader_atomic_float2_features =
             feature_chain.get<vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT>();
+        // AMD-308: of the features the shader translator uses, the only one an RX 6000 (RDNA2)
+        // has and an RX 7600 (RDNA3) lacks is float min/max on images; the format arrays of the
+        // two are the same. With AMD's older shader compiler, image float min/max is made from
+        // integer atomics as on the RX 7600, so both run the same translated shaders there.
+        // SHADGT_FP32_IMAGE_ATOMICS=1 keeps the native atomics.
+        if (const char* env = std::getenv("SHADGT_FP32_IMAGE_ATOMICS");
+            env ? env[0] == '0' : IsAmdLegacyShaderCompiler()) {
+            shader_atomic_float2_features.shaderImageFloat32AtomicMinMax = false;
+            LOG_INFO(Render_Vulkan, "AMD-308: image float min/max from integer atomics");
+        }
         LOG_INFO(Render_Vulkan, "- shaderBufferFloat32AtomicMinMax: {}",
                  shader_atomic_float2_features.shaderBufferFloat32AtomicMinMax);
         LOG_INFO(Render_Vulkan, "- shaderImageFloat32AtomicMinMax: {}",
