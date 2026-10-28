@@ -814,6 +814,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             }
             return GetStoreGpuFamily() != StoreGpuFamily::AmdRdna3;
         }(),
+        .supports_quad_derivatives = instance_.IsQuadDerivativesSupported(), // AMD-306
+        .vertex_order_check = instance_.IsVertexOrderCheckEnabled(),        // AMD-307
         .needs_manual_interpolation = instance.IsFragmentShaderBarycentricSupported() &&
                                       instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||

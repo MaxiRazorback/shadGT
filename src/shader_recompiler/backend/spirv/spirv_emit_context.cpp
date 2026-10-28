@@ -312,6 +312,7 @@ void EmitContext::DefineAmdPerVertexAttribs() {
         return;
     }
     const auto& order = AmdVertexOrders[profile.amd_vertex_order % AmdVertexOrders.size()];
+    const std::optional<std::array<Id, 3>> order_check = FindVertexOrder();
     for (s32 i = 0; i < runtime_info.hw.fs.num_inputs; i++) {
         const auto& input = runtime_info.hw.fs.inputs[i];
         if (input.IsDefault() || !info.loads.GetAny(IR::Attribute::Param0 + i) ||
@@ -320,12 +321,69 @@ void EmitContext::DefineAmdPerVertexAttribs() {
         }
         auto& param = input_params[i];
         const Id pointer = param.id;
+        const Id type = F32[param.num_components];
+        const std::array<Id, 3> values{OpInterpolateAtVertexAMD(type, pointer, ConstU32(order[0])),
+                                       OpInterpolateAtVertexAMD(type, pointer, ConstU32(order[1])),
+                                       OpInterpolateAtVertexAMD(type, pointer, ConstU32(order[2]))};
         for (u32 k = 0; k < 3; ++k) {
-            param.id_array[k] =
-                OpInterpolateAtVertexAMD(F32[param.num_components], pointer, ConstU32(order[k]));
+            if (!order_check) {
+                param.id_array[k] = values[k];
+                continue;
+            }
+            // AMD-307: vertex k of the barycentrics is the per-vertex value at order[k].
+            param.id_array[k] = OpSelect(
+                type, OpIEqual(U1[1], (*order_check)[k], ConstU32(0U)), values[0],
+                OpSelect(type, OpIEqual(U1[1], (*order_check)[k], ConstU32(1U)), values[1],
+                         values[2]));
         }
         param.is_loaded = true;
     }
+}
+
+std::optional<std::array<Id, 3>> EmitContext::FindVertexOrder() {
+    // AMD-307: VK_AMD_shader_explicit_vertex_parameter leaves the vertex numbering of
+    // InterpolateAtVertexAMD to the driver, and FIX-191's reads combine it with BaryCoordSmoothAMD.
+    // AMD's older shader compiler (RX 6600 XT) numbered them differently from the RX 7600's, and
+    // terrain, kerbs and walls smeared. The position is written interpolated and per vertex; of
+    // the six vertex orders, the one whose barycentric blend of the per-vertex copy reproduces the
+    // interpolated copy is the driver's, whatever it is.
+    if (!ValidId(order_ref_in)) {
+        return std::nullopt;
+    }
+    const Id bary = OpLoad(F32[2], bary_coord_smooth);
+    const Id weight_i = OpCompositeExtract(F32[1], bary, 0U);
+    const Id weight_j = OpCompositeExtract(F32[1], bary, 1U);
+    const std::array<Id, 3> weights{
+        OpFSub(F32[1], OpFSub(F32[1], ConstF32(1.0f), weight_i), weight_j), weight_i, weight_j};
+    const std::array<Id, 3> corners{
+        OpInterpolateAtVertexAMD(F32[4], order_vertex_in, ConstU32(0U)),
+        OpInterpolateAtVertexAMD(F32[4], order_vertex_in, ConstU32(1U)),
+        OpInterpolateAtVertexAMD(F32[4], order_vertex_in, ConstU32(2U))};
+    const Id reference = OpLoad(F32[4], order_ref_in);
+    const Id ones = ConstF32(1.0f, 1.0f, 1.0f, 1.0f);
+    constexpr std::array<std::array<u32, 3>, 6> orders{{
+        {0, 1, 2}, {1, 2, 0}, {2, 0, 1}, {0, 2, 1}, {2, 1, 0}, {1, 0, 2}}};
+    Id best_error{};
+    std::array<Id, 3> best{};
+    for (const auto& order : orders) {
+        Id blend = OpVectorTimesScalar(F32[4], corners[order[0]], weights[0]);
+        blend = OpFAdd(F32[4], blend, OpVectorTimesScalar(F32[4], corners[order[1]], weights[1]));
+        blend = OpFAdd(F32[4], blend, OpVectorTimesScalar(F32[4], corners[order[2]], weights[2]));
+        const Id error = OpDot(F32[1], OpFAbs(F32[4], OpFSub(F32[4], blend, reference)), ones);
+        if (!ValidId(best_error)) {
+            best_error = error;
+            for (u32 k = 0; k < 3; ++k) {
+                best[k] = ConstU32(order[k]);
+            }
+            continue;
+        }
+        const Id better = OpFOrdLessThan(U1[1], error, best_error);
+        best_error = OpSelect(F32[1], better, error, best_error);
+        for (u32 k = 0; k < 3; ++k) {
+            best[k] = OpSelect(U32[1], better, ConstU32(order[k]), best[k]);
+        }
+    }
+    return best;
 }
 
 void EmitContext::DefineWorkgroupIndex() {
@@ -515,6 +573,32 @@ void EmitContext::DefineInputs() {
                                                false, false, primary == Qualifier::PerVertex);
         }
 
+        // AMD-307: a shader with per-vertex reads reads the position copies the stage before
+        // wrote, to find the vertex order (see FindVertexOrder).
+        if (profile.vertex_order_check && profile.supports_amd_shader_explicit_vertex_parameter) {
+            bool per_vertex = false;
+            u32 last_location = 0;
+            for (s32 i = 0; i < num_inputs; i++) {
+                const auto& input = runtime_info.hw.fs.inputs[i];
+                if (input.IsDefault() || !info.loads.GetAny(IR::Attribute::Param0 + i)) {
+                    continue;
+                }
+                per_vertex |= info.fs_interpolation[i].primary == Qualifier::PerVertex;
+                last_location = std::max<u32>(
+                    last_location, input.param_index + (has_clip_distance_inputs ? 1 : 0));
+            }
+            if (per_vertex && last_location < OrderCheckRefLocation) {
+                order_ref_in = Name(DefineInput(F32[4], OrderCheckRefLocation), "order_ref_in");
+                order_vertex_in =
+                    Name(DefineInput(F32[4], OrderCheckVertexLocation), "order_vertex_in");
+                Decorate(order_vertex_in, spv::Decoration::ExplicitInterpAMD);
+                if (!ValidId(bary_coord_smooth)) {
+                    bary_coord_smooth = DefineVariable(F32[2], spv::BuiltIn::BaryCoordSmoothAMD,
+                                                       spv::StorageClass::Input);
+                }
+            }
+        }
+
         if (has_clip_distance_inputs) {
             const auto type = F32[MaxEmulatedClipDistances];
             const auto attr_id = Name(DefineInput(type, 0), fmt::format("cldist_attr{}", 0));
@@ -627,6 +711,13 @@ void EmitContext::DefineVertexBlock() {
     const std::array<Id, 8> zero{f32_zero_value, f32_zero_value, f32_zero_value, f32_zero_value,
                                  f32_zero_value, f32_zero_value, f32_zero_value, f32_zero_value};
     output_position = DefineVariable(F32[4], spv::BuiltIn::Position, spv::StorageClass::Output);
+    // AMD-307: the stage that feeds the rasterizer also writes the position to two locations the
+    // pixel shader reads interpolated and per vertex (see DefineAmdPerVertexAttribs).
+    if (profile.vertex_order_check &&
+        (hw_stage == HwStage::Vertex || sw_stage == SwStage::Geometry)) {
+        order_ref_out = Name(DefineOutput(F32[4], OrderCheckRefLocation), "order_ref_out");
+        order_vertex_out = Name(DefineOutput(F32[4], OrderCheckVertexLocation), "order_vertex_out");
+    }
     const bool needs_clip_distance_emulation = sw_stage == SwStage::Vertex &&
                                                hw_stage == HwStage::Vertex &&
                                                profile.needs_clip_distance_emulation;
