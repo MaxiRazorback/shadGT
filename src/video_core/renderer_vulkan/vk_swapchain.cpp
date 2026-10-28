@@ -154,6 +154,7 @@ bool Swapchain::AcquireNextImage() {
     case vk::Result::eSuboptimalKHR:
     case vk::Result::eErrorSurfaceLostKHR:
     case vk::Result::eErrorOutOfDateKHR:
+    case static_cast<vk::Result>(VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT): // FIX-218
     case vk::Result::eErrorUnknown:
         needs_recreation = true;
         break;
@@ -184,7 +185,11 @@ bool Swapchain::Present() {
 #else
     auto result = instance.GetPresentQueue().presentKHR(present_info);
 #endif
-    if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR) {
+    // FIX-218: a lost surface or exclusive fullscreen (Alt+Tab) recreates the swapchain too,
+    // instead of stopping the game.
+    if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR ||
+        result == vk::Result::eErrorSurfaceLostKHR ||
+        result == static_cast<vk::Result>(VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT)) {
         needs_recreation = true;
     } else {
         ASSERT_MSG(result == vk::Result::eSuccess, "Swapchain presentation failed: {}",
