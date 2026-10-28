@@ -491,6 +491,8 @@ private:
         /// Set when harvested: its specialization, and when it became ready.
         Shader::StageSpecialization spec;
         std::chrono::steady_clock::time_point ready_since{};
+        std::chrono::steady_clock::time_point retry_after{};
+        bool failure_reported{};
         std::atomic<bool> done{};
         std::mutex mutex;
         std::condition_variable cv;
@@ -514,7 +516,7 @@ private:
     bool QueueTranslation(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
                           const Shader::ShaderParams& params,
                           const Shader::RuntimeInfo& runtime_info,
-                          const Shader::Backend::Bindings& start);
+                          const Shader::Backend::Bindings& start, bool speculative = false);
     tsl::robin_map<u64, std::vector<std::shared_ptr<TranslateJob>>> translate_jobs;
     tsl::robin_map<u64, std::vector<std::shared_ptr<TranslateJob>>> ready_translations;
     /// FIX-078: while set, a draw's own missing translations are queued (all its stages at

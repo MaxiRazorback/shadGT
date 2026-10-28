@@ -565,3 +565,13 @@ foreach(kind grouping vertex_input prepared_keys)
     target_link_libraries(native_${kind}_test PRIVATE Vulkan::Headers)
     add_test(NAME native_${kind} COMMAND native_${kind}_test)
 endforeach()
+
+# Compiler scheduling and immutable descriptor cache regressions.
+find_package(Threads REQUIRED)
+foreach(kind memo_filter translation_priority translation_retry library_future)
+    add_executable(native_${kind}_test native_descriptors/test_${kind}.cpp)
+    target_compile_features(native_${kind}_test PRIVATE cxx_std_20)
+    target_include_directories(native_${kind}_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(native_${kind}_test PRIVATE Threads::Threads)
+    add_test(NAME native_${kind} COMMAND native_${kind}_test)
+endforeach()

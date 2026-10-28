@@ -4000,7 +4000,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                    quad_triangles, trusted)) {
             vi = prepared->vertex_index.get(); // OPT-011
         } else {
-            vertex_index = {};
+            vertex_index.Clear();
             ResolveVertexBuffers(*pipeline, regs, vertex_index);
             if (!ResolveIndices(regs, is_indexed, index_offset, quad_triangles, vertex_index)) {
                 ++stats.skipped;
@@ -4922,7 +4922,7 @@ bool NativeRenderer::PrepareVertices(PreparedDraw& p, const AmdGpu::Regs& regs,
         p.vertex_index = std::make_unique<VertexIndexState>();
     }
     VertexIndexState& v = *p.vertex_index;
-    v = {};
+    v.Clear();
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
     VertexInputs<AmdGpu::Buffer> guest_buffers;
     pipeline.GetVertexInputs(v.attributes, v.input_bindings, divisors, guest_buffers,

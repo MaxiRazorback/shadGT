@@ -323,6 +323,9 @@ public:
     using Owner = std::shared_ptr<vk::UniquePipeline>;
     static StageLibraryCache& Instance() { static StageLibraryCache cache; return cache; }
     Owner Find(vk::Device device, u64 key) { return libraries.Find({device, key}); }
+    std::shared_future<Owner> Pending(vk::Device device, u64 key) {
+        return libraries.Pending({device, key});
+    }
     template<class Factory>
     Owner Acquire(vk::Device device, u64 key, bool share, Factory&& factory) {
         bool created = false;
@@ -971,7 +974,10 @@ GraphicsPipeline::GraphicsPipeline(
         // PERF-018: the two shader libraries are compiled at the same time, the fragment one
         // on another thread.
         std::future<StageLibraryCache::Owner> fragment_future;
-        if (!fragment_library && share_libraries) {
+        const auto pending_fragment = !fragment_library && share_libraries
+            ? library_cache.Pending(device, fragment_hash)
+            : std::shared_future<StageLibraryCache::Owner>{};
+        if (!fragment_library && share_libraries && !pending_fragment.valid()) {
             fragment_future = std::async(std::launch::async, [&] {
                 return library_cache.Acquire(device, fragment_hash, true, [&] { return create_library(2); });
             });
@@ -984,7 +990,10 @@ GraphicsPipeline::GraphicsPipeline(
             pre_raster_library = **pre_raster_owner;
         }
         library_handles[3] = create_library(3);
-        if (fragment_future.valid()) {
+        if (pending_fragment.valid()) {
+            fragment_owner = pending_fragment.get();
+            fragment_library = **fragment_owner;
+        } else if (fragment_future.valid()) {
             fragment_owner = fragment_future.get();
             fragment_library = **fragment_owner;
         } else if (!fragment_library) {

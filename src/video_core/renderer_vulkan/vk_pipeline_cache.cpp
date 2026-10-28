@@ -51,6 +51,8 @@
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/build_queue.h"
 #include "video_core/renderer_vulkan/compiler_worker_budget.h"
+#include "video_core/renderer_vulkan/translation_priority.h"
+#include "video_core/renderer_vulkan/translation_retry.h"
 #include "video_core/renderer_vulkan/single_sample_barycentric.h"
 #include "video_core/renderer_vulkan/translation_job_match.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -139,6 +141,14 @@ public:
         cv.notify_all();
     }
 
+    void Prioritize(const std::shared_ptr<TranslateJob>& job) {
+        {
+            std::scoped_lock lk{mutex};
+            PrioritizeTranslation(queue, job);
+        }
+        cv.notify_one();
+    }
+
     void Queue(std::shared_ptr<TranslateJob> job) {
         {
             std::scoped_lock lk{mutex};
@@ -177,6 +187,9 @@ private:
             }
             {
                 std::scoped_lock lk{job->mutex};
+                if (!job->module) {
+                    job->retry_after = std::chrono::steady_clock::now() + std::chrono::milliseconds{250};
+                }
                 job->done = true;
             }
             job->cv.notify_all();
@@ -4091,8 +4104,14 @@ bool PipelineCache::AsyncTranslation() const {
 bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
                                      const Shader::ShaderParams& params,
                                      const Shader::RuntimeInfo& runtime_info,
-                                     const Shader::Backend::Bindings& start) {
+                                     const Shader::Backend::Bindings& start, bool speculative) {
     auto& jobs = translate_jobs[params.hash];
+    const auto now = std::chrono::steady_clock::now();
+    std::erase_if(jobs, [&](const auto& job) {
+        if (!job->done || job->module) return false;
+        const bool same_inputs = std::ranges::equal(job->user_data, params.user_data);
+        return !DelayFailedTranslationRetry(job->retry_after, now, speculative, same_inputs);
+    });
     for (const auto& job : jobs) {
         if (MatchesTranslationRequest(*job, hw_stage, sw_stage, runtime_info, start)) {
             ++translate_stats.duplicate;
@@ -4222,6 +4241,8 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
                 // As CompileModule: the game never sees a PS4 wait for a shader.
                 Common::GuestClock::CompilePause hold;
                 RYDIAG_SCOPE(ShaderCompile, hash);
+                // The draw needs this shader now; don't wait behind speculative work.
+                translate_workers->Prioritize(job);
                 std::unique_lock lk{job->mutex};
                 job->cv.wait(lk, [&] { return job->done.load(); });
                 waited = true;
@@ -4241,8 +4262,13 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
             return false;
         }
         if (!job->info || !job->module) {
-            ++translate_stats.failed;
-            return true;
+            if (!job->failure_reported) {
+                ++translate_stats.failed;
+                job->failure_reported = true;
+            }
+            // Keep a brief negative result only for optional draws. Required
+            // dependencies still retry/fall back, and changed user data bypasses it.
+            return !DelayFailedTranslationRetry(job->retry_after, now, !wait, true);
         }
         translate_stats.translate_ms += job->translate_ms;
         job->spec = Shader::StageSpecialization(*job->info, job->runtime_info, profile, job->start,
@@ -4740,7 +4766,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
         // old renderer's translations (GetGraphicsPipeline / GetComputePipeline). Without them,
         // the usual way (fallback_nested).
         if (legacy_fallback && !read_ahead && !fallback_nested) {
-            if (QueueTranslation(hw_stage, sw_stage, params, runtime_info, binding)) {
+            if (QueueTranslation(hw_stage, sw_stage, params, runtime_info, binding, true)) {
                 ++legacy_stats.queued;
             }
             fallback_miss = true;
@@ -4754,7 +4780,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
             // of the draw at once and skips it.
             if (!S().stage_deferred || skip_wait) {
                 S().stage_deferred = true;
-                QueueTranslation(hw_stage, sw_stage, params, runtime_info, binding);
+                QueueTranslation(hw_stage, sw_stage, params, runtime_info, binding, true);
             }
             if (!read_ahead) {
                 deferred_miss = true;

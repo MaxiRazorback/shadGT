@@ -15,6 +15,13 @@ public:
         const auto it = ready.find(key);
         return it == ready.end() ? nullptr : it->second.lock();
     }
+    // A consumer can overlap other work with an existing creation without
+    // launching a thread whose only task would be future.get().
+    std::shared_future<Pointer> Pending(const Key& key) {
+        std::scoped_lock lock{mutex};
+        const auto it = pending.find(key);
+        return it == pending.end() ? std::shared_future<Pointer>{} : it->second;
+    }
     template<class Factory> Pointer GetOrCreate(const Key& key, Factory&& factory) {
         std::shared_future<Pointer> future;
         std::shared_ptr<std::promise<Pointer>> owner;
