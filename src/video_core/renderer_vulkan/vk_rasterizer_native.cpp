@@ -4532,7 +4532,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobGuestBuffer(VAddr a
             if (address < region->begin || address + size > region->end) {
                 return std::nullopt; // the region grows over it first
             }
-            p.regions.push_back(region);
+            p.regions.push_back({region, address, size});
             return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
                              u64{address - region->begin}};
         }
@@ -4854,9 +4854,8 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobVertexBuffer(VAddr 
             if (address < region->begin || address + size > region->end) {
                 return std::nullopt;
             }
-            if (p.regions.empty() || p.regions.back() != region) {
-                p.regions.push_back(region);
-            }
+            // Different vertex/index ranges can share one backing region.
+            p.regions.push_back({region, address, size});
             return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
                              u64{address - region->begin}};
         }
@@ -5035,8 +5034,9 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
         return reject(4);
     }
     // The ordered part, as BindBuffers and BindTextures do it.
-    for (Region* region : p.regions) {
-        RefreshRegion(*region, region->begin, region->end - region->begin);
+    for (const auto& use : p.regions) {
+        // Match the non-prepared path: unrelated dirty allocations remain pending.
+        RefreshRegion(*use.region, use.address, use.size);
         ++stats.region_binds;
     }
     const u64 alignment = r.instance.StorageMinAlignment();

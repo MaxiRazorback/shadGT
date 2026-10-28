@@ -510,7 +510,12 @@ private:
         u64 buffer_seq = 0;
         u64 unmap_gen = 0;
         DrawBindings bindings;
-        boost::container::small_vector<Region*, 4> regions;
+        struct RegionUse {
+            Region* region;
+            VAddr address;
+            u64 size;
+        };
+        boost::container::small_vector<RegionUse, 4> regions;
         std::vector<std::pair<VAddr, VAddr>> image_ranges;
         std::vector<std::pair<VAddr, VAddr>> buffer_ranges;
         /// Upload memory (flattened user data, clip planes, D3 tables): bytes copied at commit
