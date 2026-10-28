@@ -573,6 +573,34 @@ bool Instance::CreateDevice() {
         LOG_INFO(Render_Vulkan, "AMD-306: whole quads in pixel shader branches: {} (driver {})",
                  quad_control, driver_info);
     }
+    // AMD-316: one line naming the Radeon generation, the shader compiler and the AMD fixes this
+    // device runs with, so a log shows at once which path a card took.
+    if (driver_id == vk::DriverId::eAmdProprietary) {
+        const std::string model{GetModelName()};
+        const auto has = [&](std::string_view text) {
+            return model.find(text) != std::string::npos;
+        };
+        const char* generation = has("Radeon RX 9")   ? "RDNA4 (RX 9000)"
+                                 : has("Radeon RX 7") ? "RDNA3 (RX 7000)"
+                                 : has("Radeon RX 6") ? "RDNA2 (RX 6000)"
+                                 : has("Radeon RX 55") || has("Radeon RX 56") || has("Radeon RX 57")
+                                     ? "RDNA1 (RX 5000)"
+                                 : has("Vega") ? "GCN 5 (Vega)"
+                                 : has("Radeon RX 4") || has("Radeon RX 5") ? "GCN 4 (RX 400/500)"
+                                                                            : "other Radeon";
+        const bool legacy = IsAmdLegacyShaderCompiler();
+        LOG_INFO(Render_Vulkan,
+                 "AMD-316: {} on driver {} ({}), shader compiler {}; quad control {}, vertex "
+                 "order check {}, KHR barycentrics {}",
+                 generation, GetDriverVersionName(), driver_info, legacy ? "older (non-LLPC)" : "LLPC",
+                 quad_control, vertex_order_check, fragment_shader_barycentric);
+        if (legacy && !quad_control && !std::getenv("SHADGT_QUAD_CONTROL")) {
+            LOG_WARNING(Render_Vulkan,
+                        "AMD-316: this driver has no VK_KHR_shader_quad_control; textures in "
+                        "shader branches may pick wrong mip levels. Updating the AMD driver may "
+                        "help.");
+        }
+    }
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
 #ifdef RYTY_GPU
