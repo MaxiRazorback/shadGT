@@ -367,9 +367,12 @@ static IR::F32 ReadTessControlPointAttribute(IR::U32 addr, const u32 stride, IR:
     if (off_dw > 0) {
         addr = ir.IAdd(addr, ir.Imm32(off_dw));
     }
-    const IR::U32 control_point_index = ir.IDiv(addr, ir.Imm32(stride));
-    const IR::U32 opt_addr = TryOptimizeAddressModulo(addr, stride, ir);
-    const IR::U32 offset = ir.IMod(opt_addr, ir.Imm32(stride));
+    // FIX-217: a stride of 0 (no control point data in this region) divided the address by 0;
+    // the address is then an offset within control point 0.
+    const IR::U32 control_point_index =
+        stride != 0 ? ir.IDiv(addr, ir.Imm32(stride)) : ir.Imm32(0U);
+    const IR::U32 offset =
+        stride != 0 ? ir.IMod(TryOptimizeAddressModulo(addr, stride, ir), ir.Imm32(stride)) : addr;
     const IR::U32 attr_index = ir.ShiftRightLogical(offset, ir.Imm32(4u));
     const IR::U32 comp_index =
         ir.ShiftRightLogical(ir.BitwiseAnd(offset, ir.Imm32(0xFU)), ir.Imm32(2u));
@@ -482,8 +485,11 @@ void HullShaderTransform(IR::Program& program, const RuntimeInfo& runtime_info) 
                         }
                         const u32 stride = runtime_info.sw.tcs.hs_output_cp_stride;
                         // Invocation ID array index is implicit, handled by SPIRV backend
-                        const IR::U32 opt_addr = TryOptimizeAddressModulo(addr, stride, ir);
-                        const IR::U32 offset = ir.IMod(opt_addr, ir.Imm32(stride));
+                        // FIX-217: with a stride of 0 the address is the offset itself.
+                        const IR::U32 offset =
+                            stride != 0 ? ir.IMod(TryOptimizeAddressModulo(addr, stride, ir),
+                                                  ir.Imm32(stride))
+                                        : addr;
                         const IR::U32 attr_index = ir.ShiftRightLogical(offset, ir.Imm32(4u));
                         const IR::U32 comp_index = ir.ShiftRightLogical(
                             ir.BitwiseAnd(offset, ir.Imm32(0xFU)), ir.Imm32(2u));
