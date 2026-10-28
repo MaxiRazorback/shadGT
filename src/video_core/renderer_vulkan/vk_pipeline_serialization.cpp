@@ -39,6 +39,8 @@ static constexpr u32 ShaderBinaryVersionVertexFetch = 277u;
 static constexpr u32 ShaderBinaryVersionNativeCube = 279u;
 // AMD single-sample KHR barycentrics change the fragment interface and interpolation.
 static constexpr u32 ShaderBinaryVersionSingleSampleBarycentric = 282u;
+// Tessellation modules and keys must use the same translation-time layout.
+static constexpr u32 ShaderBinaryVersionTessellationLayout = 283u;
 
 static bool UsesScalarPrefix(const Shader::Info& info) {
     return info.hw_stage == Shader::HwStage::Compute &&
@@ -84,6 +86,10 @@ static bool HasMsaaImage(const Shader::StageSpecialization& spec) {
 
 static u32 ShaderBinaryVersionFor(const Shader::StageSpecialization& spec,
                                   bool scalar_prefix = false) {
+    if (spec.runtime_info.sw_stage == Shader::SwStage::TessellationControl ||
+        spec.runtime_info.sw_stage == Shader::SwStage::TessellationEval) {
+        return Serialization::ShaderBinaryVersionTessellationLayout;
+    }
     if (spec.runtime_info.hw_stage == Shader::HwStage::Fragment &&
         spec.runtime_info.hw.fs.single_sample_barycentric) {
         return Serialization::ShaderBinaryVersionSingleSampleBarycentric;
@@ -117,6 +123,7 @@ static bool IsKnownShaderBinaryVersion(u32 version) {
     // Recognize old metadata for prewarm discovery, but LoadShaderMeta below rejects its
     // binary revision and retranslates it. Never relabel an old binary as corrected.
     version |= 0x100u;
+    if (version == Serialization::ShaderBinaryVersionTessellationLayout) return true;
     if (version == Serialization::ShaderBinaryVersionSingleSampleBarycentric) {
         return single_sample_barycentric_cache_enabled.load(std::memory_order_relaxed);
     }

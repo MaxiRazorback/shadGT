@@ -1088,6 +1088,18 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list) {
         if (info.num_samples > 1) {
             continue;
         }
+        // The guest may unmap a valid image after it was queued. Recheck before
+        // allocating or importing its complete span; CPU-readable is not required.
+        if (backing_validator && !backing_validator(info.guest_address, size)) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                LOG_WARNING(Render_Vulkan,
+                    "IMAGE-BACKING: cancelled unmapped queued image {:#x}+{:#x} {}x{} pitch {} mips {} layers {}",
+                    info.guest_address, size, info.size.width, info.size.height,
+                    info.pitch, info.resources.levels, info.resources.layers);
+            }
+            continue;
+        }
         if (upload_hook && entry->from_cpu) {
             upload_hook(*entry); // NAT-105: CPU writes from here on are seen
         }

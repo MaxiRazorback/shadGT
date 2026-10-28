@@ -171,6 +171,9 @@ public:
         image_factory = std::move(factory);
     }
     /// NAT-100: how much of a guest range is mapped (uploads copy only that much).
+    void SetBackingValidator(std::function<bool(VAddr, u64)> validate) {
+        backing_validator = std::move(validate);
+    }
     void SetMemoryClamp(std::function<u64(VAddr, u64)> clamp) {
         memory_clamp = std::move(clamp);
     }
@@ -319,6 +322,7 @@ private:
 
     Rhi::Device& device;
     ImageFactory image_factory;
+    std::function<bool(VAddr, u64)> backing_validator;
     std::function<u64(VAddr, u64)> memory_clamp;
     std::function<void(ImageEntry&)> upload_hook;
     std::function<UploadSource(const ImageEntry&, Rhi::CommandList&)> upload_source;

@@ -609,6 +609,9 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
     registry->SetImageFactory([this](const VideoCore::ImageInfo& info, bool render_target) {
         return MakeImage(info, render_target);
     });
+    registry->SetBackingValidator([](VAddr address, u64 size) {
+        return Core::RytyMemory::IsValidMapping(address, size);
+    });
     registry->SetMemoryClamp([this](VAddr address, u64 size) -> u64 {
         // Mapped, and readable by the CPU (GPU-only memory is not: NAT-106).
         if (!r.memory->IsValidMapping(address)) {
@@ -2917,6 +2920,25 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             continue;
         }
         const VideoCore::TextureCache::ImageDesc desc{tsharp, image_desc};
+        // A valid base address is not sufficient: stale optional descriptors can
+        // span gigabytes beyond their allocation. Reject before image creation,
+        // guest-memory import, staging allocation or a detiling dispatch.
+        if (!Core::RytyMemory::IsValidMapping(desc.info.guest_address, desc.info.guest_size)) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                LOG_WARNING(Render_Vulkan,
+                    "IMAGE-BACKING: rejected ps/vs {:#x} image {:#x}+{:#x} {}x{}x{} pitch {} "
+                    "mips {} layers {} tile {} bits {}; raw {:016x} {:016x} {:016x} {:016x}",
+                    stage.pgm_hash, desc.info.guest_address, desc.info.guest_size,
+                    desc.info.size.width, desc.info.size.height, desc.info.size.depth,
+                    desc.info.pitch, desc.info.resources.levels, desc.info.resources.layers,
+                    u32(desc.info.tile_mode), desc.info.num_bits,
+                    raw_sharp[0], raw_sharp[1], raw_sharp[2], raw_sharp[3]);
+            }
+            bind_null(4);
+            continue;
+        }
+
         // FIX-046: an image must start inside the guest address space. FIX-081: GT Sport's grass
         // shader reads garbage T#s from one slot when the texture is unused; from there only an
         // image the game already made is bound.
@@ -4000,7 +4022,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                    quad_triangles, trusted)) {
             vi = prepared->vertex_index.get(); // OPT-011
         } else {
-            vertex_index.Clear();
+            vertex_index = {};
             ResolveVertexBuffers(*pipeline, regs, vertex_index);
             if (!ResolveIndices(regs, is_indexed, index_offset, quad_triangles, vertex_index)) {
                 ++stats.skipped;
@@ -4789,6 +4811,25 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
             continue;
         }
         const VideoCore::TextureCache::ImageDesc desc{tsharp, image_desc};
+        // A valid base address is not sufficient: stale optional descriptors can
+        // span gigabytes beyond their allocation. Reject before image creation,
+        // guest-memory import, staging allocation or a detiling dispatch.
+        if (!Core::RytyMemory::IsValidMapping(desc.info.guest_address, desc.info.guest_size)) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                LOG_WARNING(Render_Vulkan,
+                    "IMAGE-BACKING: rejected ps/vs {:#x} image {:#x}+{:#x} {}x{}x{} pitch {} "
+                    "mips {} layers {} tile {} bits {}; raw {:016x} {:016x} {:016x} {:016x}",
+                    stage.pgm_hash, desc.info.guest_address, desc.info.guest_size,
+                    desc.info.size.width, desc.info.size.height, desc.info.size.depth,
+                    desc.info.pitch, desc.info.resources.levels, desc.info.resources.layers,
+                    u32(desc.info.tile_mode), desc.info.num_bits,
+                    raw_sharp[0], raw_sharp[1], raw_sharp[2], raw_sharp[3]);
+            }
+            bind_null();
+            continue;
+        }
+
         if (!r.IsMappedStart(desc.info.guest_address)) {
             bind_null();
             continue;
@@ -4922,7 +4963,7 @@ bool NativeRenderer::PrepareVertices(PreparedDraw& p, const AmdGpu::Regs& regs,
         p.vertex_index = std::make_unique<VertexIndexState>();
     }
     VertexIndexState& v = *p.vertex_index;
-    v.Clear();
+    v = {};
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
     VertexInputs<AmdGpu::Buffer> guest_buffers;
     pipeline.GetVertexInputs(v.attributes, v.input_bindings, divisors, guest_buffers,

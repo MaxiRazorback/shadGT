@@ -420,18 +420,7 @@ private:
         u64 index_offset = 0;
         vk::IndexType index_type = vk::IndexType::eUint32;
         u32 index_count = 0;
-        void Clear() {
-            attributes.clear();
-            input_bindings.clear();
-            buffers.clear();
-            offsets.clear();
-            sizes.clear();
-            strides.clear();
-            index_buffer = nullptr;
-            index_offset = 0;
-            index_type = vk::IndexType::eUint32;
-            index_count = 0;
-        }
+
     };
     void ResolveVertexBuffers(const GraphicsPipeline& pipeline, const AmdGpu::Regs& regs,
                               VertexIndexState& v);

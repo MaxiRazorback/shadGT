@@ -1,3 +1,4 @@
+#include "common/recoverable.h"
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -592,6 +593,9 @@ void EmitContext::DefineInputs() {
         tess_coord = DefineInput(F32[3], std::nullopt, spv::BuiltIn::TessCoord);
         primitive_id = DefineVariable(U32[1], spv::BuiltIn::PrimitiveId, spv::StorageClass::Input);
 
+        if (runtime_info.sw.tes.hs_output_cp_stride > 64u * 1024u) {
+            throw Common::RecoverableFailure{"Tessellation interface stride exceeds 64 KiB LDS"};
+        }
         const u32 num_attrs = Common::AlignUp(runtime_info.sw.tes.hs_output_cp_stride, 16) >> 4;
         if (num_attrs > 0) {
             const Id per_vertex_type{TypeArray(F32[4], ConstU32(num_attrs))};
@@ -715,6 +719,9 @@ void EmitContext::DefineOutputs() {
             Decorate(output_tess_level_inner, spv::Decoration::Patch);
         }
 
+        if (runtime_info.sw.tcs.hs_output_cp_stride > 64u * 1024u) {
+            throw Common::RecoverableFailure{"Tessellation interface stride exceeds 64 KiB LDS"};
+        }
         const u32 num_attrs = Common::AlignUp(runtime_info.sw.tcs.hs_output_cp_stride, 16) >> 4;
         if (num_attrs > 0) {
             const Id per_vertex_type{TypeArray(F32[4], ConstU32(num_attrs))};

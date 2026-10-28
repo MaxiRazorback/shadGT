@@ -126,6 +126,19 @@ static void ReportShaderAllocationFailure(Shader::HwStage stage, u64 hash, VAddr
               stage, hash, base, words, phase, sizeof(Shader::Gcn::GcnInst), available_commit >> 20);
 }
 
+// The key for a new module must describe the bytes translation actually used.
+// Looking up an existing module still reads the current draw's constants normally.
+static void KeepCompiledTessellationLayout(Shader::StageSpecialization& spec,
+                                           const Shader::RuntimeInfo& compiled) {
+    if (compiled.sw_stage == Shader::SwStage::TessellationEval) {
+        spec.runtime_info.sw.tes.hs_output_cp_stride = compiled.sw.tes.hs_output_cp_stride;
+    } else if (compiled.sw_stage == Shader::SwStage::TessellationControl) {
+        spec.runtime_info.sw.tcs.ls_stride = compiled.sw.tcs.ls_stride;
+        spec.runtime_info.sw.tcs.hs_output_cp_stride = compiled.sw.tcs.hs_output_cp_stride;
+        spec.runtime_info.sw.tcs.hs_output_base = compiled.sw.tcs.hs_output_base;
+    }
+}
+
 class PipelineCache::TranslateWorkers {
 public:
     TranslateWorkers(const Shader::Profile& profile_, vk::Device device_, u32 count)
@@ -221,6 +234,11 @@ private:
             const auto program = Shader::TranslateProgram(job.code, pools, *info, runtime_info,
                                                           profile);
             job.spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, program, binding);
+            if (job.sw_stage == Shader::SwStage::TessellationControl || job.sw_stage == Shader::SwStage::TessellationEval) {
+                job.spec = Shader::StageSpecialization(*info, job.runtime_info, profile, job.start,
+                                                       info->translated_fetch_shader.get());
+                KeepCompiledTessellationLayout(job.spec, runtime_info);
+            }
         } catch (const Common::RecoverableFailure&) {
             // Translated again on the command thread when needed, which reports the failure.
             return;
@@ -4271,8 +4289,12 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
             return !DelayFailedTranslationRetry(job->retry_after, now, !wait, true);
         }
         translate_stats.translate_ms += job->translate_ms;
-        job->spec = Shader::StageSpecialization(*job->info, job->runtime_info, profile, job->start,
-                                               job->info->translated_fetch_shader.get());
+        // Tessellation keys were captured on the translating worker, not from
+        // whatever the guest wrote to the constant buffer before harvesting.
+        if (job->sw_stage != SwStage::TessellationControl && job->sw_stage != SwStage::TessellationEval) {
+            job->spec = Shader::StageSpecialization(*job->info, job->runtime_info, profile, job->start,
+                                                   job->info->translated_fetch_shader.get());
+        }
         job->ready_since = now;
         ready.push_back(job);
         return true;
@@ -4833,6 +4855,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
         return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
     }
     auto spec = Shader::StageSpecialization(*info, runtime_info, profile, start);
+    KeepCompiledTessellationLayout(spec, compile_runtime_info);
     RegisterShaderMeta(*info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
     const auto* info_ptr = info.get();
     program->InsertPermut(module, std::move(spec), std::move(info), perm_idx);
