@@ -332,11 +332,12 @@ void EmitContext::DefineAmdPerVertexAttribs() {
                 param.id_array[k] = values[order[k]];
                 continue;
             }
-            // AMD-307: vertex k of the barycentrics is the raw per-vertex value at (*order_check)[k].
-            param.id_array[k] = OpSelect(
-                type, OpIEqual(U1[1], (*order_check)[k], ConstU32(0U)), values[0],
-                OpSelect(type, OpIEqual(U1[1], (*order_check)[k], ConstU32(1U)), values[1],
-                         values[2]));
+            // AMD-307: vertex k of the barycentrics is the raw per-vertex value at
+            // (*order_check)[k].
+            param.id_array[k] =
+                OpSelect(type, OpIEqual(U1[1], (*order_check)[k], ConstU32(0U)), values[0],
+                         OpSelect(type, OpIEqual(U1[1], (*order_check)[k], ConstU32(1U)), values[1],
+                                  values[2]));
         }
         param.is_loaded = true;
     }
@@ -363,8 +364,8 @@ std::optional<std::array<Id, 3>> EmitContext::FindVertexOrder() {
         OpInterpolateAtVertexAMD(F32[4], order_vertex_in, ConstU32(2U))};
     const Id reference = OpLoad(F32[4], order_ref_in);
     const Id ones = ConstF32(1.0f, 1.0f, 1.0f, 1.0f);
-    constexpr std::array<std::array<u32, 3>, 6> orders{{
-        {0, 1, 2}, {1, 2, 0}, {2, 0, 1}, {0, 2, 1}, {2, 1, 0}, {1, 0, 2}}};
+    constexpr std::array<std::array<u32, 3>, 6> orders{
+        {{0, 1, 2}, {1, 2, 0}, {2, 0, 1}, {0, 2, 1}, {2, 1, 0}, {1, 0, 2}}};
     Id best_error{};
     std::array<Id, 3> best{};
     for (const auto& order : orders) {

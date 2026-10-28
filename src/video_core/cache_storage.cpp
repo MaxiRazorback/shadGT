@@ -141,7 +141,8 @@ void DataBase::Open() {
                         : family == Vulkan::StoreGpuFamily::AmdRdna3
                             ? "RyGT shader store 5 (RX 7000: FIX-215/216 off, AMD-313)"
                         : family == Vulkan::StoreGpuFamily::AmdLegacy
-                            ? "RyGT shader store 8 (RX 6000 to RX 400: AMD-306/307/308/315, order check gated)"
+                            ? "RyGT shader store 8 (RX 6000 to RX 400: AMD-306/307/308/315, order "
+                              "check gated)"
                             : "RyGT shader store 3 (FIX-215/216 MED3, MIN3, MAX3 NaN on AMD)"} +
             (order_env && *order_env ? fmt::format(", SHADGT_AMD_VERTEX_ORDER={}", order_env[0])
                                      : std::string{}) +

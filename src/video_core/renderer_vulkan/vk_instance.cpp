@@ -475,8 +475,8 @@ bool Instance::CreateDevice() {
                              (order_env ? order_env[0] == '1' : IsAmdLegacyShaderCompiler());
         LOG_INFO(Render_Vulkan, "AMD-307: barycentrics from {}, vertex order check {}",
                  amd_shader_explicit_vertex_parameter ? "VK_AMD_shader_explicit_vertex_parameter"
-                 : fragment_shader_barycentric       ? "VK_KHR_fragment_shader_barycentric"
-                                                     : "none",
+                 : fragment_shader_barycentric        ? "VK_KHR_fragment_shader_barycentric"
+                                                      : "none",
                  vertex_order_check);
     }
     provoking_vertex = add_extension(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
@@ -585,15 +585,16 @@ bool Instance::CreateDevice() {
                                  : has("Radeon RX 6") ? "RDNA2 (RX 6000)"
                                  : has("Radeon RX 55") || has("Radeon RX 56") || has("Radeon RX 57")
                                      ? "RDNA1 (RX 5000)"
-                                 : has("Vega") ? "GCN 5 (Vega)"
+                                 : has("Vega")                              ? "GCN 5 (Vega)"
                                  : has("Radeon RX 4") || has("Radeon RX 5") ? "GCN 4 (RX 400/500)"
                                                                             : "other Radeon";
         const bool legacy = IsAmdLegacyShaderCompiler();
         LOG_INFO(Render_Vulkan,
                  "AMD-316: {} on driver {} ({}), shader compiler {}; quad control {}, vertex "
                  "order check {}, KHR barycentrics {}",
-                 generation, GetDriverVersionName(), driver_info, legacy ? "older (non-LLPC)" : "LLPC",
-                 quad_control, vertex_order_check, fragment_shader_barycentric);
+                 generation, GetDriverVersionName(), driver_info,
+                 legacy ? "older (non-LLPC)" : "LLPC", quad_control, vertex_order_check,
+                 fragment_shader_barycentric);
         if (legacy && !quad_control && !std::getenv("SHADGT_QUAD_CONTROL")) {
             LOG_WARNING(Render_Vulkan,
                         "AMD-316: this driver has no VK_KHR_shader_quad_control; textures in "
@@ -723,8 +724,7 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceVulkan13Features{
             .robustImageAccess = vk13_features.robustImageAccess,
             // FIX-188: Intel Arc (#65).
-            .pipelineCreationCacheControl =
-                IsIntel() && vk13_features.pipelineCreationCacheControl,
+            .pipelineCreationCacheControl = IsIntel() && vk13_features.pipelineCreationCacheControl,
             .shaderDemoteToHelperInvocation = vk13_features.shaderDemoteToHelperInvocation,
             .subgroupSizeControl = vk13_features.subgroupSizeControl,
             .computeFullSubgroups = IsIntel() && vk13_features.computeFullSubgroups,

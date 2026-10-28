@@ -306,9 +306,8 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     const auto layers = GetInstanceLayers(enable_validation, enable_crash_diagnostic);
     const auto extensions = GetLayerExtensions(GetInstanceExtensions(window_type, true), layers);
 
+    // AMD-317: the driver and AMD Software see the game; the engine name is unchanged.
     const vk::ApplicationInfo application_info = {
-        // AMD-317: the driver (and AMD Software's game detection and overlay) sees the game, not
-        // the emulator; the engine name stays, so profiles keyed on it still apply.
         .pApplicationName = "Gran Turismo Sport",
         .applicationVersion = VK_MAKE_VERSION(1, 0, 0),
         .pEngineName = "shadPS4 Vulkan",
