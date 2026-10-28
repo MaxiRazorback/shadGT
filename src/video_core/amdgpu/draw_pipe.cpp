@@ -303,6 +303,9 @@ void DrawPipe::RedoWindow() {
         }
     }
     for (auto& item : window) {
+        if (!item->job.prepare) {
+            continue; // completed neutral entries have no speculative plan to redo
+        }
         const auto prepare_start = std::chrono::steady_clock::now();
         item->ok = item->job.prepare();
         stage_prepare_us.fetch_add(MicrosecondsSince(prepare_start), std::memory_order_relaxed);
@@ -336,6 +339,15 @@ void DrawPipe::RunDispatcher(std::stop_token stop) {
             }
             job = std::move(stage_queue.front());
             stage_queue.pop_front();
+        }
+        if (job.kind == JobKind::Neutral && !job.prepare && !job.order) {
+            // Already prepared jobs need no worker. Keep their FIFO position without
+            // draining preceding preparation; later jobs can still use idle workers.
+            auto item = std::make_unique<InFlight>();
+            item->job = std::move(job);
+            item->done.store(true, std::memory_order_release);
+            window.push_back(std::move(item));
+            continue;
         }
         if (job.kind == JobKind::Barrier || !job.prepare) {
             // Everything before it goes to the recorder first; a barrier is then waited for.
