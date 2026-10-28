@@ -1,3 +1,4 @@
+#include "video_core/renderer_vulkan/freshness_range_search.h"
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -609,8 +610,8 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
     registry->SetImageFactory([this](const VideoCore::ImageInfo& info, bool render_target) {
         return MakeImage(info, render_target);
     });
-    registry->SetBackingValidator([](VAddr address, u64 size) {
-        return Core::RytyMemory::IsValidMapping(address, size);
+    registry->SetBackingValidator([this](VAddr address, u64 size) {
+        return HasImageBacking(address, size);
     });
     registry->SetMemoryClamp([this](VAddr address, u64 size) -> u64 {
         // Mapped, and readable by the CPU (GPU-only memory is not: NAT-106).
@@ -1303,6 +1304,27 @@ vk::DescriptorPool NativeRenderer::TakeDescriptorPool() {
     });
     ASSERT_MSG(result == vk::Result::eSuccess, "NAT-100: no descriptor pool");
     return pool;
+}
+
+bool NativeRenderer::HasImageBacking(VAddr address, u64 size) {
+    // GPU-written regions are authoritative even without complete CPU backing.
+    // Require containment, not just overlap; malformed spans still fail closed.
+    constexpr VAddr MaxGpuAddress = 0x10000000000;
+    if (!address || !size || address >= MaxGpuAddress || size > MaxGpuAddress - address) {
+        return false;
+    }
+    {
+        std::shared_lock lock{buffer_map_mutex};
+        auto it = regions.upper_bound(address);
+        if (it != regions.begin()) {
+            const auto& region = std::prev(it)->second;
+            if (address >= region.begin && address < region.end &&
+                size <= region.end - address) {
+                return true;
+            }
+        }
+    }
+    return Core::RytyMemory::IsValidMapping(address, size);
 }
 
 NativeRenderer::Region* NativeRenderer::RegionOver(VAddr address, u64 size) {
@@ -2923,7 +2945,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
         // A valid base address is not sufficient: stale optional descriptors can
         // span gigabytes beyond their allocation. Reject before image creation,
         // guest-memory import, staging allocation or a detiling dispatch.
-        if (!Core::RytyMemory::IsValidMapping(desc.info.guest_address, desc.info.guest_size)) {
+        if (!HasImageBacking(desc.info.guest_address, desc.info.guest_size)) {
             static std::atomic<u32> logged{};
             if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
                 LOG_WARNING(Render_Vulkan,
@@ -4366,13 +4388,10 @@ bool NativeRenderer::ChangeLog::Untouched(u64 since,
     if (now - since > entries.size()) {
         return false;
     }
+    const FreshnessRangeSearch<VAddr> search{ranges};
     for (u64 at = since + 1; at <= now; ++at) {
         const Entry& entry = entries[at % entries.size()];
-        for (const auto& [begin, end] : ranges) {
-            if (entry.begin < end && entry.end > begin) {
-                return false;
-            }
-        }
+        if (search.Intersects(entry.begin, entry.end)) return false;
     }
     return true;
 }
@@ -4814,7 +4833,7 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
         // A valid base address is not sufficient: stale optional descriptors can
         // span gigabytes beyond their allocation. Reject before image creation,
         // guest-memory import, staging allocation or a detiling dispatch.
-        if (!Core::RytyMemory::IsValidMapping(desc.info.guest_address, desc.info.guest_size)) {
+        if (!HasImageBacking(desc.info.guest_address, desc.info.guest_size)) {
             static std::atomic<u32> logged{};
             if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
                 LOG_WARNING(Render_Vulkan,

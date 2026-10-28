@@ -98,6 +98,15 @@ void RunWindowThread() {
         (*controllers)[slot]->SetTriggerFeedback(released, released, 0, 0);
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(50)); // Flush queued HID releases.
+    try {
+        if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
+            LOG_INFO(Render_Vulkan, "CACHE-EXIT: saving driver pipelines before process termination");
+            rasterizer->GetPipelineCache().PersistDriverCacheForExit();
+        }
+    } catch (const std::exception& error) {
+        LOG_WARNING(Render_Vulkan, "CACHE-EXIT: save failed: {}", error.what());
+    }
+    Common::Log::Flush();
     TerminateProcess(GetCurrentProcess(), 0);
 }
 

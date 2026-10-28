@@ -98,7 +98,8 @@ struct StageSpecialization {
     StageSpecialization() = default;
     StageSpecialization(const Info& info_, RuntimeInfo runtime_info_, const Profile& profile_,
                         Backend::Bindings start_,
-                        const Gcn::FetchShaderData* translated_fetch = nullptr)
+                        const Gcn::FetchShaderData* translated_fetch = nullptr,
+                        const RuntimeInfo* compiled_tess_layout = nullptr)
         : info{&info_}, runtime_info{runtime_info_}, start{start_} {
         bool parsed_fetch = false;
         if (info_.sw_stage == SwStage::Vertex) {
@@ -206,6 +207,16 @@ struct StageSpecialization {
         // Initialize runtime_info fields that rely on analysis in tessellation passes
         if (info->sw_stage == SwStage::TessellationControl ||
             info->sw_stage == SwStage::TessellationEval) {
+            if (compiled_tess_layout) {
+                if (info->sw_stage == SwStage::TessellationControl) {
+                    runtime_info.sw.tcs.ls_stride = compiled_tess_layout->sw.tcs.ls_stride;
+                    runtime_info.sw.tcs.hs_output_cp_stride = compiled_tess_layout->sw.tcs.hs_output_cp_stride;
+                    runtime_info.sw.tcs.hs_output_base = compiled_tess_layout->sw.tcs.hs_output_base;
+                } else {
+                    runtime_info.sw.tes.hs_output_cp_stride = compiled_tess_layout->sw.tes.hs_output_cp_stride;
+                }
+                return;
+            }
             TessellationDataConstantBuffer tess_constants{};
             info->ReadTessConstantBuffer(tess_constants);
             runtime_info.InitFromTessConstants(tess_constants);

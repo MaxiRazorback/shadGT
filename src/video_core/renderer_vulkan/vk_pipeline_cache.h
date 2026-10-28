@@ -140,6 +140,13 @@ public:
     /// PERF-047: with pipelines selected on the command thread, both GPU threads look pipelines
     /// up; every GetGraphicsPipeline/GetComputePipeline call holds this lock, and so does any
     /// read of the infos below or copy of a cached info.
+    // Ryty deliberately skips DLL destructors on window close. Save explicitly
+    // while the renderer and Vulkan device are alive, excluding cache lookups.
+    void PersistDriverCacheForExit() {
+        std::unique_lock lock{lookup_mutex};
+        SaveDriverCache(true);
+    }
+
     LookupLock& LookupMutex() {
         return lookup_mutex;
     }
@@ -485,6 +492,8 @@ private:
         Shader::RuntimeInfo runtime_info;
         Shader::Backend::Bindings start;
         std::unique_ptr<Shader::Info> info;
+        // Owns the resolved frontend IR/pools through worker emission.
+        std::shared_ptr<void> prepared_translation;
         std::vector<u32> spv;
         vk::ShaderModule module{};
         double translate_ms{};
