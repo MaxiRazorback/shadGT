@@ -556,3 +556,12 @@ if (WIN32)
     target_compile_definitions(shadgt_wave64_inspect PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
         NTDDI_VERSION=0x0A000006 _WIN32_WINNT=0x0A00 WINVER=0x0A00 _CRT_SECURE_NO_WARNINGS)
 endif()
+
+# Standalone CPU checks for immutable Native descriptors and vertex-state reuse.
+foreach(kind grouping vertex_input prepared_keys)
+    add_executable(native_${kind}_test native_descriptors/test_${kind}.cpp)
+    target_compile_features(native_${kind}_test PRIVATE cxx_std_20)
+    target_include_directories(native_${kind}_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(native_${kind}_test PRIVATE Vulkan::Headers)
+    add_test(NAME native_${kind} COMMAND native_${kind}_test)
+endforeach()

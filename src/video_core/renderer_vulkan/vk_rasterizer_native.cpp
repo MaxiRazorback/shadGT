@@ -14,6 +14,8 @@
 
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
 #include "video_core/renderer_vulkan/upload_bytes_equal.h"
+#include "video_core/renderer_vulkan/vertex_input_equal.h"
+#include "video_core/renderer_vulkan/descriptor_write_groups.h"
 #include "video_core/renderer_vulkan/scene_region_scale.h"
 
 #include <algorithm>
@@ -377,9 +379,28 @@ bool NativeModeRequested() {
     return requested;
 }
 
+void NativeRenderer::DrawBindings::PrepareDescriptorKeys(const Pipeline& pipeline) {
+    if (!groups_ready) PrepareWriteGroups();
+    for (u32 set = 0; set < grouped_writes.size(); ++set) {
+        if (grouped_writes[set].empty() || set == pipeline.PushSet()) continue;
+        descriptor_keys[set].Build(pipeline.SetLayout(set), grouped_writes[set]);
+    }
+    key_layout = pipeline.GetLayout();
+}
+
+void NativeRenderer::DrawBindings::PrepareWriteGroups() {
+    grouped_writes = GroupDescriptorWrites<vk::WriteDescriptorSet>(
+        std::span<const vk::WriteDescriptorSet>{writes.data(), writes.size()},
+        std::span<const u8>{write_sets.data(), write_sets.size()}, grouped_storage);
+    groups_ready = true;
+}
+
 void NativeRenderer::DrawBindings::Clear() {
     writes.clear();
     write_sets.clear();
+    grouped_writes = {};
+    groups_ready = false;
+    key_layout = nullptr;
     buffers.clear();
     images.clear();
     push = {};
@@ -3002,14 +3023,11 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         return;
     }
     // SHD-002: each stage's writes go to its own set; one set may be pushed.
-    // Recorder-local scratch retains capacity only; descriptor contents are rebuilt
-    // for every draw. Vulkan consumes the writes before this function returns.
-    static thread_local std::array<boost::container::small_vector<vk::WriteDescriptorSet, 32>,
-                                  Shader::Backend::MaxDescriptorSets> by_set;
-    for (auto& writes : by_set) writes.clear();
-    for (size_t i = 0; i < b.writes.size(); ++i) {
-        by_set[i < b.write_sets.size() ? b.write_sets[i] : 0].push_back(b.writes[i]);
-    }
+    // Prepared draws group on their preparation thread. Fallback/compute draws
+    // prepare once here; every span still references this draw's own storage.
+    if (!b.groups_ready) b.PrepareWriteGroups();
+    const auto& by_set = b.grouped_writes;
+    if (b.key_layout != pipeline.GetLayout()) b.PrepareDescriptorKeys(pipeline);
     std::array<vk::DescriptorSet, Shader::Backend::MaxDescriptorSets> sets{};
     // Preserve ascending set order: a lower incompatible bind can disturb
     // a higher push set. Flush lower ordinary sets before every push.
@@ -3032,9 +3050,6 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         }
         first_unbound = limit;
     };
-    static thread_local std::array<boost::container::small_vector<u64, 128>,
-                                  Shader::Backend::MaxDescriptorSets> keys;
-    for (auto& key : keys) key.clear();
     std::array<u64, Shader::Backend::MaxDescriptorSets> hashes{};
     std::array<bool, Shader::Backend::MaxDescriptorSets> cacheable_sets{};
     std::array<vk::DescriptorSetLayout, Shader::Backend::MaxDescriptorSets> missing_layouts{};
@@ -3050,30 +3065,19 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
             continue; // Recorded in set order after ordinary sets are ready.
         }
         const vk::DescriptorSetLayout layout = pipeline.SetLayout(index);
-        // Cache values, never pointers into per-draw binding storage. Rebind even
-        // on a hit so pipeline-layout switches and intervening passes remain safe.
-        auto& key = keys[index];
-        key.push_back(u64(VkDescriptorSetLayout(layout)));
-        bool cacheable = true;
-        for (const auto& write : writes) {
-            key.insert(key.end(), {u64(write.dstBinding), u64(write.dstArrayElement),
-                                   u64(write.descriptorCount), u64(write.descriptorType)});
-            if (write.pNext || write.pTexelBufferView) { cacheable = false; break; }
-            if (write.pBufferInfo) {
-                for (u32 i = 0; i < write.descriptorCount; ++i) {
-                    const auto& info = write.pBufferInfo[i];
-                    key.insert(key.end(), {u64(VkBuffer(info.buffer)), info.offset, info.range});
-                }
-            } else if (write.pImageInfo) {
-                for (u32 i = 0; i < write.descriptorCount; ++i) {
-                    const auto& info = write.pImageInfo[i];
-                    key.insert(key.end(), {u64(VkSampler(info.sampler)),
-                        u64(VkImageView(info.imageView)), u64(info.imageLayout)});
-                }
-            } else { cacheable = false; break; }
-        }
+        // Worker-prepared metadata and image keys stay fixed; ordered commit
+        // updates buffer slots, which must be refreshed before exact-key lookup.
+        auto& prepared_key = b.descriptor_keys[index];
+        // Sparse keys benefit from hashing just the changing words. Dense
+        // buffer-only keys retain vectorized full hashing (measured faster).
+        const bool sparse_key = prepared_key.buffers.size() <= 3;
+        if (sparse_key) prepared_key.RefreshBuffers();
+        else prepared_key.RefreshBuffers<false>();
+        const auto& key = prepared_key.words;
+        const bool cacheable = prepared_key.cacheable;
         const std::span<const u64> descriptor_key{key.data(), key.size()};
-        const u64 key_hash = cacheable ? XXH3_64bits(key.data(), key.size() * sizeof(u64)) : 0;
+        const u64 key_hash = cacheable ? (sparse_key ? prepared_key.hash
+            : XXH3_64bits(key.data(), key.size() * sizeof(u64))) : 0;
         if (cacheable) {
             if (const auto reused = s.descriptor_sets.Find(key_hash, descriptor_key)) {
                 sets[index] = reused;
@@ -3087,6 +3091,7 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         missing_indices[missing_count++] = index;
     }
     if (missing_count) {
+        // At most the spare budget plus one required set per descriptor set.
         constexpr u32 MaxReserved = decltype(s.descriptor_reserve)::SpareLimit +
                                     Shader::Backend::MaxDescriptorSets;
         std::array<vk::DescriptorSet, MaxReserved> allocated{};
@@ -3163,7 +3168,7 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
             for (u32 i = 0; i < missing_count; ++i) {
                 const u32 index = missing_indices[i];
                 if (cacheable_sets[index]) {
-                    s.descriptor_sets.Store(hashes[index], keys[index], sets[index]);
+                    s.descriptor_sets.Store(hashes[index], b.descriptor_keys[index].words, sets[index]);
                 }
             }
         } else {
@@ -3499,8 +3504,8 @@ void NativeRenderer::RecordVertexIndex(const VertexIndexState& v) {
     const bool known = s.vertex_state_known;
     s.vertex_state_known = true;
     if (dynamic_input) {
-        if (!known || !std::ranges::equal(s.input_bindings, v.input_bindings) ||
-            !std::ranges::equal(s.attributes, v.attributes)) {
+        if (!known || !VertexInputBytesEqual(s.input_bindings, v.input_bindings) ||
+            !VertexInputBytesEqual(s.attributes, v.attributes)) {
             cmdbuf.setVertexInputEXT(v.input_bindings, v.attributes);
             s.input_bindings.assign(v.input_bindings.begin(), v.input_bindings.end());
             s.attributes.assign(v.attributes.begin(), v.attributes.end());
@@ -3522,8 +3527,12 @@ void NativeRenderer::RecordVertexIndex(const VertexIndexState& v) {
             }
             s.vertex_buffers.assign(v.buffers.begin(), v.buffers.end());
             s.vertex_offsets.assign(v.offsets.begin(), v.offsets.end());
-            s.vertex_sizes.assign(v.sizes.begin(), v.sizes.end());
-            s.vertex_strides.assign(v.strides.begin(), v.strides.end());
+            if (!dynamic_input) {
+                // Dynamic vertex input binds only buffers/offsets; its sizes and
+                // strides are not read by this device's recording path.
+                s.vertex_sizes.assign(v.sizes.begin(), v.sizes.end());
+                s.vertex_strides.assign(v.strides.begin(), v.strides.end());
+            }
         }
     }
     if (v.index_buffer) {
@@ -4499,6 +4508,10 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
         FreePrepared(p);
         return;
     }
+    // Records reference this pooled draw's stable buffer/image slots. Commit
+    // updates buffer values before the recorder hashes and consumes the groups.
+    p->bindings.PrepareWriteGroups();
+    p->bindings.PrepareDescriptorKeys(pipeline);
     // OPT-011: the vertex and index buffers too, when they need nothing ordered.
     constexpr u32 VertexStage = static_cast<u32>(Shader::SwStage::Vertex);
     if (VertexStage < count && stages[VertexStage]) {

@@ -4,6 +4,7 @@
 // NAT-100: native mode (RYGT_NATIVE=1, ryGT builds); see vk_rasterizer_native.cpp.
 
 #pragma once
+#include "video_core/renderer_vulkan/prepared_descriptor_key.h"
 
 #include <array>
 #include <atomic>
@@ -150,6 +151,13 @@ private:
     struct DrawBindings {
         Pipeline::DescriptorWrites writes;
         Pipeline::WriteSets write_sets; ///< SHD-002: the set of each write
+        std::array<std::vector<vk::WriteDescriptorSet>, Shader::Backend::MaxDescriptorSets> grouped_storage;
+        std::array<std::span<const vk::WriteDescriptorSet>, Shader::Backend::MaxDescriptorSets> grouped_writes{};
+        bool groups_ready = false;
+        void PrepareWriteGroups();
+        std::array<PreparedDescriptorKey, Shader::Backend::MaxDescriptorSets> descriptor_keys;
+        vk::PipelineLayout key_layout{};
+        void PrepareDescriptorKeys(const Pipeline& pipeline);
         boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffers;
         boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> images;
         Shader::PushData push{};
