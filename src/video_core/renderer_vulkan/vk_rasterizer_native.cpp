@@ -13,6 +13,7 @@
 // own threads with this code (ryty_gpu/native/DESIGN.md, N4).
 
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
+#include "video_core/renderer_vulkan/upload_bytes_equal.h"
 #include "video_core/renderer_vulkan/scene_region_scale.h"
 
 #include <algorithm>
@@ -1228,7 +1229,7 @@ std::tuple<vk::Buffer, u64, u8*> NativeRenderer::Allocate(u64 size, u64 align) {
 vk::DescriptorBufferInfo NativeRenderer::UploadFlatData(u32 stage, const u8* source, u32 size) {
     auto& previous = stream.flat_uploads[stage];
     if (previous.data && previous.binding.range == size &&
-        std::memcmp(previous.data, source, size) == 0) {
+        UploadBytesEqual(previous.data, source, size)) {
         ++stats.flat_upload_hits;
         stats.flat_upload_bytes_saved += size;
         return previous.binding;
