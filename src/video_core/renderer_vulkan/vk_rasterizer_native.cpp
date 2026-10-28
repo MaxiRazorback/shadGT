@@ -3087,7 +3087,8 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         missing_indices[missing_count++] = index;
     }
     if (missing_count) {
-        constexpr u32 MaxReserved = Shader::Backend::MaxDescriptorSets * 8;
+        constexpr u32 MaxReserved = decltype(s.descriptor_reserve)::SpareLimit +
+                                    Shader::Backend::MaxDescriptorSets;
         std::array<vk::DescriptorSet, MaxReserved> allocated{};
         std::array<vk::DescriptorSetLayout, MaxReserved> layouts{};
         std::array<u32, Shader::Backend::MaxDescriptorSets> starts{}, counts{};

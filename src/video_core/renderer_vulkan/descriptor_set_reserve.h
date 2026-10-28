@@ -13,6 +13,7 @@ template<class Layout, class Set, std::size_t Limit = 64> class DescriptorSetRes
     std::unordered_map<Layout, Entry> entries;
     std::size_t spare = 0;
 public:
+    static constexpr std::size_t SpareLimit = Limit;
     Set Take(Layout layout) {
         const auto it = entries.find(layout);
         if (it == entries.end() || it->second.unused.empty()) return {};
@@ -23,7 +24,7 @@ public:
     std::size_t BatchSize(Layout layout, std::size_t pending_extra = 0) {
         auto& entry = entries[layout];
         if (++entry.misses == 1 || spare + pending_extra >= Limit) return 1;
-        return std::min<std::size_t>(8, 1 + Limit - spare - pending_extra);
+        return std::min<std::size_t>(32, 1 + Limit - spare - pending_extra);
     }
     void Store(Layout layout, std::span<const Set> sets) {
         auto& unused = entries[layout].unused;
