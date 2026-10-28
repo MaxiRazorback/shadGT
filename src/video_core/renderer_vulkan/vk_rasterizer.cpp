@@ -1888,6 +1888,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     ++Common::GetWorkCounters().draws;
 #ifdef RYTY_GPU
     if (native) {
+        Common::PhaseTimer native_total_timer{Common::Phase::DrawTotal};
         native->Draw(is_indexed, index_offset); // NAT-100
         return;
     }
@@ -2498,6 +2499,7 @@ void Rasterizer::DispatchDirect() {
     ++Common::GetWorkCounters().dispatches;
 #ifdef RYTY_GPU
     if (native) {
+        Common::PhaseTimer native_total_timer{Common::Phase::DispatchTotal};
         native->DispatchDirect(); // NAT-100
         return;
     }
@@ -2552,6 +2554,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     ++Common::GetWorkCounters().dispatches;
 #ifdef RYTY_GPU
     if (native) {
+        Common::PhaseTimer native_total_timer{Common::Phase::DispatchTotal};
         native->DispatchIndirect(address, offset, size); // NAT-100
         return;
     }
