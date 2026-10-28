@@ -141,7 +141,7 @@ void DataBase::Open() {
                         : family == Vulkan::StoreGpuFamily::AmdRdna3
                             ? "RyGT shader store 5 (RX 7000: FIX-215/216 off, AMD-313)"
                         : family == Vulkan::StoreGpuFamily::AmdLegacy
-                            ? "RyGT shader store 6 (RX 6000 to RX 400: AMD-306/307/308, FIX-214)"
+                            ? "RyGT shader store 7 (RX 6000 to RX 400: AMD-306/307/308/315)"
                             : "RyGT shader store 3 (FIX-215/216 MED3, MIN3, MAX3 NaN on AMD)"} +
             (order_env && *order_env ? fmt::format(", SHADGT_AMD_VERTEX_ORDER={}", order_env[0])
                                      : std::string{}) +
@@ -150,7 +150,7 @@ void DataBase::Open() {
                 std::string parts;
                 for (const char* name :
                      {"SHADGT_AMD_NAN_RULES", "SHADGT_QUAD_CONTROL", "SHADGT_VERTEX_ORDER",
-                      "SHADGT_FP32_IMAGE_ATOMICS"}) {
+                      "SHADGT_FP32_IMAGE_ATOMICS", "SHADGT_MANUAL_INTERP"}) {
                     if (const char* env = std::getenv(name); env && *env) {
                         parts += fmt::format(", {}={}", name, env[0]);
                     }
