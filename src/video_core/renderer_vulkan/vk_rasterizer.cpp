@@ -3080,7 +3080,17 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
         const char* env = std::getenv("SHADGT_DIRECT_HOLD_FLUSH");
         return env && env[0] == '1';
     }();
-    if (flush || hold_flush || readbacks_pending || address_pending || !direct_hold) {
+    // PERF-200: a fence deferred only to stay behind an earlier deferred one (DIAG-068 "behind an
+    // earlier one") rides the next submit too, as a held fence does. In races on an RX 7600 these
+    // were ~58 submits per frame, which kept the recorder thread at 80% and the frame at ~34 FPS.
+    // SHADGT_ORDER_FENCE_FLUSH=1 submits them at once as before.
+    static const bool order_flush = [] {
+        const char* env = std::getenv("SHADGT_ORDER_FENCE_FLUSH");
+        return env && env[0] == '1';
+    }();
+    const bool order_only = earlier_deferred && !order_flush;
+    if (flush || hold_flush || readbacks_pending || address_pending ||
+        (!direct_hold && !order_only)) {
         scheduler.Flush();
         deferred_unflushed.store(false, std::memory_order_relaxed);
     } else {
