@@ -2797,6 +2797,9 @@ bool PipelineCache::RefreshGraphicsKey() {
                              : AmdGpu::DepthBuffer::StencilFormat::Invalid;
     key.depth_clamp_enable = !regs.depth_render_override.disable_viewport_clamp;
     key.depth_clip_enable = regs.clipper_control.ZclipEnable();
+    // FIX-220: DB_ALPHA_TO_MASK. GT Sport draws the track-edge overlays (grass and kerb paint over
+    // the asphalt) with alpha to coverage; without it their noise-masked alpha showed as dots.
+    key.alpha_to_coverage = regs.db_alpha_to_mask & 1;
     key.clip_space = regs.clipper_control.clip_space;
     key.provoking_vtx_last = regs.polygon_control.provoking_vtx_last;
     key.prim_type =
