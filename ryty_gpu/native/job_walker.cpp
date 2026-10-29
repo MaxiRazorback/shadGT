@@ -57,23 +57,64 @@ namespace {
 // NAT-147: 64 KiB granules of the low 1 TiB known to be readable (committed, not no-access),
 // so the recorder's checks don't call VirtualQuery per draw (with many pages protected one by
 // one for write tracking, VirtualQuery walked them one region at a time: a quarter of the
-// recorder's time). Only "readable" is remembered; unmapping forgets it (ForgetReadable).
+// recorder's time). Only "readable" is remembered; mapping/protection notifications forget it.
 constexpr u32 GranuleBits = 16;
 constexpr u64 Granules = (u64{1} << 40) >> GranuleBits;
 std::atomic<u64> readable_bits[Granules / 64];
+std::atomic<u64> readable_generation{1};
+struct ReadableRegion {
+    u64 begin{}, end{}, generation{};
+};
+thread_local ReadableRegion recent_readable_region;
+
+bool RangeKnownReadable(u64 address, u64 size) {
+    const auto& recent = recent_readable_region;
+    return recent.generation == readable_generation.load(std::memory_order_acquire) &&
+           address >= recent.begin && address <= recent.end && size <= recent.end - address;
+}
 
 bool GranuleKnown(u64 granule) {
     return granule < Granules &&
            (readable_bits[granule / 64].load(std::memory_order_relaxed) >> (granule % 64)) & 1;
 }
 
+// VirtualQuery can scan a large mapped view even when asked about a few bytes.
+// Keep all complete granules established by that answer, within a bounded window,
+// instead of repeating the same region query for each 64 KiB granule. Partial
+// granules are never promoted; ForgetReadable still clears every changed granule.
+void RememberReadableRegion(const MEMORY_BASIC_INFORMATION& info, const u8* queried,
+                            u64 generation) {
+    constexpr u64 GranuleSize = u64{1} << GranuleBits;
+    constexpr u64 MaxRememberedGranules = (16ull << 20) >> GranuleBits;
+    const u64 base = reinterpret_cast<u64>(info.BaseAddress);
+    const u64 end = base + info.RegionSize;
+    const u64 recent_begin = std::max(base, reinterpret_cast<u64>(queried));
+    recent_readable_region = {recent_begin, recent_begin + std::min<u64>(end - recent_begin, 16ull << 20),
+                              generation};
+    const u64 first = std::max((base + GranuleSize - 1) >> GranuleBits,
+                              reinterpret_cast<u64>(queried) >> GranuleBits);
+    const u64 last = std::min({end >> GranuleBits, Granules,
+                              first + MaxRememberedGranules});
+    for (u64 granule = first; granule < last;) {
+        const u64 word = granule / 64;
+        const u64 stop = std::min(last, (word + 1) * 64);
+        const u32 lo = static_cast<u32>(granule % 64);
+        const u32 hi = static_cast<u32>(stop - word * 64);
+        const u64 mask = (~u64{0} << lo) & (~u64{0} >> (64 - hi));
+        readable_bits[word].fetch_or(mask, std::memory_order_relaxed);
+        granule = stop;
+    }
+}
+
 bool QueryReadable(const u8* p, const u8* end) {
     while (p < end) {
+        const u64 generation = readable_generation.load(std::memory_order_acquire);
         MEMORY_BASIC_INFORMATION info{};
         if (!VirtualQuery(p, &info, sizeof(info)) || info.State != MEM_COMMIT ||
             (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
             return false;
         }
+        RememberReadableRegion(info, p, generation);
         p = static_cast<const u8*>(info.BaseAddress) + info.RegionSize;
     }
     return true;
@@ -100,6 +141,7 @@ void ForgetReadable(u64 address, u64 size) {
     if (size == 0) {
         return;
     }
+    readable_generation.fetch_add(1, std::memory_order_acq_rel);
     for (u64 granule = address >> GranuleBits;
          granule <= (address + size - 1) >> GranuleBits && granule < Granules; ++granule) {
         readable_bits[granule / 64].fetch_and(~(u64{1} << (granule % 64)),
@@ -108,6 +150,9 @@ void ForgetReadable(u64 address, u64 size) {
 }
 
 u64 ReadablePrefix(const void* address, u64 size) {
+    if (size == 0 || RangeKnownReadable(reinterpret_cast<u64>(address), size)) {
+        return size;
+    }
     {
         // NAT-147: whole readable granules first.
         const u64 begin = reinterpret_cast<u64>(address);
@@ -124,17 +169,22 @@ u64 ReadablePrefix(const void* address, u64 size) {
     const u8* p = start;
     const u8* const end = start + size;
     while (p < end) {
+        const u64 generation = readable_generation.load(std::memory_order_acquire);
         MEMORY_BASIC_INFORMATION info{};
         if (!VirtualQuery(p, &info, sizeof(info)) || info.State != MEM_COMMIT ||
             (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
             break;
         }
+        RememberReadableRegion(info, p, generation);
         p = static_cast<const u8*>(info.BaseAddress) + info.RegionSize;
     }
     return static_cast<u64>(std::min(p, end) - start);
 }
 
 bool Readable(const void* address, size_t size) {
+    if (size == 0 || RangeKnownReadable(reinterpret_cast<u64>(address), size)) {
+        return true;
+    }
     {
         // NAT-147: every granule of the range known readable (or found readable now).
         const u64 begin = reinterpret_cast<u64>(address);
@@ -154,11 +204,13 @@ bool Readable(const void* address, size_t size) {
     const u8* p = static_cast<const u8*>(address);
     const u8* const end = p + size;
     while (p < end) {
+        const u64 generation = readable_generation.load(std::memory_order_acquire);
         MEMORY_BASIC_INFORMATION info{};
         if (!VirtualQuery(p, &info, sizeof(info)) || info.State != MEM_COMMIT ||
             (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
             return false;
         }
+        RememberReadableRegion(info, p, generation);
         p = static_cast<const u8*>(info.BaseAddress) + info.RegionSize;
     }
     return true;

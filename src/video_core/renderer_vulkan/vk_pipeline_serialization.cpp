@@ -57,7 +57,7 @@ static_assert(sizeof(Shader::HwFragmentRuntimeInfo) == 248 && sizeof(Shader::Run
 // their flags recovered on first use by a rect/quad-list pipeline.
 // 16: the resource usage FIX-043 keys permutations by follows the Info. Versions 14 and 15
 // still load, as translations of unknown usage (keyed on every resource property, as stored).
-// 17: asynchronous translation owns resolved descriptors and compile-time keys.
+// 17: worker translations own resolved descriptor inputs and compile-time keys.
 static constexpr u32 ShaderMetaVersion = 17u;
 static constexpr u32 ShaderMetaVersionWithoutResourceUsage = 15u;
 static constexpr u32 ShaderMetaVersionWithoutAttributeFlags = 14u;
@@ -610,3 +610,30 @@ bool StageSpecialization::Deserialize(Serialization::Archive& ar) {
 }
 
 } // namespace Shader
+
+#include <filesystem>
+#include <fstream>
+extern "C" __declspec(dllexport) int RytyTraceTessMeta(const char* directory, const char* destination) {
+    try {
+        std::string result="["; unsigned count=0;
+        for(const auto& path:std::filesystem::directory_iterator(directory)) {
+            if(path.path().extension()!=".meta")continue;
+            std::ifstream file(path.path(),std::ios::binary);
+            std::vector<u8> bytes((std::istreambuf_iterator<char>(file)),{});
+            if(bytes.size()>16*1024*1024)continue;
+            const u64 hashes[]={0xf8543343ull,0xeae56230ull};bool found=false;
+            for(auto hash:hashes)for(size_t i=0;i+8<=bytes.size();++i){u64 value;std::memcpy(&value,bytes.data()+i,8);if(value==hash){found=true;break;}}
+            if(!found)continue;
+            Serialization::Archive ar{std::move(bytes)};Shader::Info info{};Shader::StageSpecialization spec{};size_t permutation{};
+            if(!Vulkan::LoadShaderMeta(ar,info,spec,permutation))continue;
+            if(info.pgm_hash!=hashes[0]&&info.pgm_hash!=hashes[1])continue;
+            if(count++)result+=",";
+            const auto stride=info.sw_stage==Shader::SwStage::TessellationEval?spec.runtime_info.sw.tes.hs_output_cp_stride:spec.runtime_info.sw.tcs.hs_output_cp_stride;
+            result+=fmt::format(R"({{"file":"{}","hash":{},"stage":{},"stride":{},"pointer_register":{},"descriptor_dword":{},"flat_dwords":{},"buffers":[)",path.path().filename().string(),info.pgm_hash,u32(info.sw_stage),stride,u32(info.tess_consts_ptr_base),info.tess_consts_dword_offset,info.flattened_ud_buf.size());
+            unsigned n=0;for(const auto& buffer:info.buffers){if(buffer.IsSpecial())continue;const auto sharp=buffer.GetSharp(info);std::array<u32,4> raw{};std::memcpy(raw.data(),&sharp,16);if(n++)result+=",";result+=fmt::format(R"({{"address":{},"stride":{},"records":{},"words":[{},{},{},{}]}})",u64(sharp.base_address),u32(sharp.stride),u32(sharp.num_records),raw[0],raw[1],raw[2],raw[3]);}
+            result+="]}";
+            auto bin=std::filesystem::path(destination).parent_path()/(path.path().filename().string()+".flat");std::ofstream flat(bin,std::ios::binary);flat.write(reinterpret_cast<const char*>(info.flattened_ud_buf.data()),info.flattened_ud_buf.size()*4);
+        }
+        result+="]";std::ofstream report(destination);report<<result;return count;
+    }catch(...){return -1;}
+}

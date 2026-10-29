@@ -56,6 +56,10 @@ public:
     /// page of the range is now mapped for the GPU.
     bool EnsureImported(VAddr address, u64 size);
 
+    /// Best-effort worker warm-up: never waits for the view mutex, imports at most
+    /// eight small views per visit, and does not run pending-release callbacks.
+    void WarmImported(VAddr address, u64 size);
+
     /// D6: the imported buffer holding the whole range and the range's offset in it, when one
     /// view holds it (call EnsureImported first).
     std::optional<std::pair<const Buffer*, u64>> FindBuffer(VAddr address, u64 size) const;

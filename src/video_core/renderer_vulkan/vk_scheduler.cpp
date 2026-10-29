@@ -516,14 +516,17 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         EndSession(); // FIX-188: Intel Arc (#65)
     }
 
+    const auto callback_start = std::chrono::steady_clock::now();
     if (on_submit) {
         on_submit(info);
     }
 
+    const auto callback_end = std::chrono::steady_clock::now();
     if (!instance.IsIntel()) {
         EndSession();
     }
 
+    const auto session_end = std::chrono::steady_clock::now();
     info.AddSignal(work_semaphore.Handle(), signal_value);
     if (ring) {
         ring->RecordControl([info, signal_value](Scheduler& scheduler) mutable {
@@ -533,10 +536,22 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         SubmitSessions(info, signal_value);
     }
 
+    const auto queue_end = std::chrono::steady_clock::now();
     BeginSession();
 
     // Apply pending operations
+    const auto begin_end = std::chrono::steady_clock::now();
     PopPendingOperations();
+    const auto finish = std::chrono::steady_clock::now();
+    const auto ms = [](auto end, auto begin) {
+        return std::chrono::duration<double, std::milli>(end - begin).count();
+    };
+    if (ms(finish, callback_start) >= 4.0) {
+        LOG_WARNING(Render_Vulkan,
+                    "NAT: slow submit callback {:.2f} ms, end {:.2f}, enqueue/submit {:.2f}, begin {:.2f}, pending {:.2f}",
+                    ms(callback_end, callback_start), ms(session_end, callback_end),
+                    ms(queue_end, session_end), ms(begin_end, queue_end), ms(finish, begin_end));
+    }
 }
 
 void Scheduler::SubmitSessions(SubmitInfo& info, u64 signal_value) {
