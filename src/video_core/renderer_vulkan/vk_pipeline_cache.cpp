@@ -1940,10 +1940,10 @@ std::chrono::microseconds PipelineCache::QuickWait() {
 }
 
 bool PipelineCache::MenusWait() {
-    // Match shadgt7: keep-going skips ordinary menu draws while their
-    // pipeline builds, then installs it when a later draw finds it ready.
-    // Required memory writes and depth-only bakes retain their separate guards.
-    if (CompileMode() == 2) return false;
+    // FIX-219: this holds in the asynchronous compile mode (2, the default) too. Skipping menu
+    // draws there left the car thumbnails black: the car list, the garage and a new save's gift
+    // car draw each thumbnail once into a texture they keep showing. SHADGT_ASYNC_MENUS=1 still
+    // skips them for animated menus.
     // FIX-110: in GT Sport's menus a draw waits for its new pipeline (the guest clocks are held
     // meanwhile, as in the "pause" compile mode); only races skip draws. Some menu scenes draw
     // once into a texture they keep showing: the GR86 slide of the home screen played on black
