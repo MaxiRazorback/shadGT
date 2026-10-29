@@ -217,6 +217,18 @@ static void RecordFrontendWait(FrontendWait kind, uintptr_t address,
     window_start = now;
 }
 
+// PERF-201: a compute RELEASE_MEM submits its work at once only when it raises an interrupt the
+// game may wait for; a memory-only release rides the next submit or the recorder's idle flush
+// (D5). In races on an RX 7600 these releases were ~1400 submits per second, with the recorder
+// thread at ~78%. SHADGT_RELEASE_MEM_FLUSH=1 submits every release as before.
+static bool ReleaseMemSubmits(const PM4CmdReleaseMem& release) {
+    static const bool always = [] {
+        const char* env = std::getenv("SHADGT_RELEASE_MEM_FLUSH");
+        return env && env[0] == '1';
+    }();
+    return always || release.int_sel != InterruptSelect::None;
+}
+
 // PERF-014: the bytes a fence packet writes, when they are known when it is processed.
 static std::vector<u8> FenceValueBytes(DataSelect data_sel, u32 low, u64 qword) {
     std::vector<u8> bytes;
@@ -3416,7 +3428,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                             },
                             true,
                             FenceValueBytes(release.data_sel.Value(), release.DataDWord(),
-                                            release.DataQWord()));
+                                            release.DataQWord()),
+                            ReleaseMemSubmits(release));
                     if (deferred) {
                         return;
                     }
