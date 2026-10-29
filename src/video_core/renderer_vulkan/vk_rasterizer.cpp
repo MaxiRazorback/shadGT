@@ -3383,7 +3383,12 @@ void Rasterizer::FrameDumpPass(const AmdGpu::Regs& regs, const RenderState& stat
     if (!frame_dump_collecting) {
         return;
     }
-    if (!frame_dump_events.empty() && frame_dump_events.back().draws != 0 &&
+    // DIAG-203 (RYGT_FRAME_DUMP_DRAWS=1): every draw gets its own line, not only a pass's first.
+    static const bool every_draw = [] {
+        const char* env = std::getenv("RYGT_FRAME_DUMP_DRAWS");
+        return env && env[0] == '1';
+    }();
+    if (!every_draw && !frame_dump_events.empty() && frame_dump_events.back().draws != 0 &&
         frame_dump_events.back().key == text) {
         ++frame_dump_events.back().draws;
         return;

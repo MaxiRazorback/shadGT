@@ -2689,6 +2689,28 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
             const auto vsharp = desc.GetSharp(stage);
             const u64 base = vsharp.base_address;
             const u64 sharp_size = vsharp.GetSize();
+            // DIAG-204 (RYGT_PROBE_SHADER=<hash>): that program's buffers and their first bytes.
+            static const u64 probe_hash = [] {
+                const char* env = std::getenv("RYGT_PROBE_SHADER");
+                return env && *env ? std::strtoull(env, nullptr, 16) : 0;
+            }();
+            if (probe_hash != 0 && stage.pgm_hash == probe_hash) {
+                static std::atomic<u32> probes{};
+                if (const u32 n = probes++; n < 64) {
+                    std::array<u32, 16> head{};
+                    const bool read = base != 0 && Core::RytyMemory::GuardedCopy(
+                        head.data(), reinterpret_cast<const void*>(base), sizeof(head));
+                    LOG_WARNING(Render_Vulkan,
+                                "DIAG-204: {:#x} buffer {} V# base {:#x} stride {} records {} "
+                                "dfmt {} nfmt {} swizzle {} tid {}: {}",
+                                stage.pgm_hash, buffer_index, base, vsharp.GetStride(),
+                                vsharp.num_records, u32(vsharp.GetDataFmt()),
+                                u32(vsharp.GetNumberFmt()), u32(vsharp.swizzle_enable),
+                                u32(vsharp.add_tid_enable),
+                                read ? fmt::format("{:08x}", fmt::join(head, " "))
+                                     : std::string{"unreadable"});
+                }
+            }
             // FIX-031 / FIX-036 / FIX-046: V#s that are not buffers are bound empty.
             const bool impossible =
                 vsharp.num_records != UINT32_MAX &&
@@ -4707,6 +4729,28 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
             const auto vsharp = desc.GetSharp(stage);
             const u64 base = vsharp.base_address;
             const u64 sharp_size = vsharp.GetSize();
+            // DIAG-204 (RYGT_PROBE_SHADER=<hash>): that program's buffers and their first bytes.
+            static const u64 probe_hash = [] {
+                const char* env = std::getenv("RYGT_PROBE_SHADER");
+                return env && *env ? std::strtoull(env, nullptr, 16) : 0;
+            }();
+            if (probe_hash != 0 && stage.pgm_hash == probe_hash) {
+                static std::atomic<u32> probes{};
+                if (const u32 n = probes++; n < 64) {
+                    std::array<u32, 16> head{};
+                    const bool read = base != 0 && Core::RytyMemory::GuardedCopy(
+                        head.data(), reinterpret_cast<const void*>(base), sizeof(head));
+                    LOG_WARNING(Render_Vulkan,
+                                "DIAG-204: {:#x} buffer {} V# base {:#x} stride {} records {} "
+                                "dfmt {} nfmt {} swizzle {} tid {}: {}",
+                                stage.pgm_hash, buffer_index, base, vsharp.GetStride(),
+                                vsharp.num_records, u32(vsharp.GetDataFmt()),
+                                u32(vsharp.GetNumberFmt()), u32(vsharp.swizzle_enable),
+                                u32(vsharp.add_tid_enable),
+                                read ? fmt::format("{:08x}", fmt::join(head, " "))
+                                     : std::string{"unreadable"});
+                }
+            }
             const bool impossible =
                 vsharp.num_records != UINT32_MAX &&
                 (sharp_size >= GpuAddressLimit || base + sharp_size > GpuAddressLimit ||
