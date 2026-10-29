@@ -57,11 +57,16 @@ struct PreparedDescriptorKey {
         }
         RefreshBuffers();
     }
-    template<bool Hash = true> void RefreshBuffers() {
+    template<bool Hash = true> bool RefreshBuffers() {
         if constexpr (Hash) hash = fixed_hash;
-        if (!cacheable) return;
+        if (!cacheable) return false;
+        bool changed = false;
         for (const auto& patch : buffers) {
-            words[patch.word] = std::uint64_t(VkBuffer(patch.info->buffer));
+            const std::uint64_t buffer = std::uint64_t(VkBuffer(patch.info->buffer));
+            changed |= words[patch.word] != buffer ||
+                       words[patch.word + 1] != patch.info->offset ||
+                       words[patch.word + 2] != patch.info->range;
+            words[patch.word] = buffer;
             words[patch.word + 1] = patch.info->offset;
             words[patch.word + 2] = patch.info->range;
             if constexpr (Hash) {
@@ -70,6 +75,7 @@ struct PreparedDescriptorKey {
                 hash ^= WordHash(words[patch.word + 2], patch.word + 2);
             }
         }
+        return changed;
     }
 };
 } // namespace Vulkan

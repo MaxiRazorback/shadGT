@@ -492,7 +492,7 @@ private:
         Shader::RuntimeInfo runtime_info;
         Shader::Backend::Bindings start;
         std::unique_ptr<Shader::Info> info;
-        // Owns the resolved frontend IR/pools through worker emission.
+        // Owns the IR pools and resolved inputs until worker emission completes.
         std::shared_ptr<void> prepared_translation;
         std::vector<u32> spv;
         vk::ShaderModule module{};
