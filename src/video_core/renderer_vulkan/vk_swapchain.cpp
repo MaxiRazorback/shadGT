@@ -215,6 +215,7 @@ bool Swapchain::Present() {
         .pImageIndices = &image_index,
     };
 
+    instance.AntiLagUpdate(true); // PERF-210
 #ifdef RYTY_GPU
     RytyDlssG::PresentStart();
     auto result = framegen.Active() ? framegen.Present(instance.GetPresentQueue(), present_info)

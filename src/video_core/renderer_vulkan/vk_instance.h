@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <mutex>
 #include <span>
 #include <unordered_map>
 
@@ -133,6 +134,8 @@ public:
     }
 
     /// Returns true if VK_KHR_maintenance8 is supported
+    void AntiLagUpdate(bool present) const; // PERF-210
+
     bool IsMaintenance8Supported() const {
         return maintenance_8;
     }
@@ -610,6 +613,9 @@ private:
     bool workgroup_memory_explicit_layout{};
     bool maintenance_5{};
     bool maintenance_8{};
+    bool anti_lag{};
+    mutable u64 anti_lag_frame{};
+    mutable std::mutex anti_lag_mutex;
     bool attachment_feedback_loop{};
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
