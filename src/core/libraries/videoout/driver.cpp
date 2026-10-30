@@ -350,6 +350,10 @@ bool VideoOutDriver::DrawLastFrame() {
     return false;
 }
 
+void VideoOutDriver::AntiLagInput() {
+    presenter->AntiLagInput(); // PERF-210
+}
+
 bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
                                 bool is_eop /*= false*/) {
     RyDiag::Mark(RyDiag::Zone::GameFlip, u64(index));
