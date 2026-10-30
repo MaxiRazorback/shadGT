@@ -2924,6 +2924,11 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             add_write();
         };
         if (null_slot) {
+            static std::atomic<u32> logged{};
+            if (logged++ < 16) {
+                LOG_WARNING(Render_Vulkan, "DIAG-207: {:#x} texture slot {} bound empty",
+                            stage.pgm_hash, slot - 1);
+            }
             bind_null(0);
             continue;
         }
