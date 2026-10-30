@@ -55,6 +55,11 @@ inline void ReportResolution(unsigned output_width, unsigned output_height,
     // FSR-205: "<upscaler> {window}, <output> From <scene>"; the window thread fills in {window}.
     if (const auto suffix = upscaler.find(" temporal"); suffix != std::string::npos)
         upscaler.erase(suffix);
+    // Major version only: FSR 4.1.2 shows as FSR 4, XeSS 3.0.2 as XeSS 3.
+    if (const auto dot = upscaler.find('.'); dot != std::string::npos) {
+        const auto end = upscaler.find(' ', dot);
+        upscaler.erase(dot, end == std::string::npos ? end : end - dot);
+    }
     if (upscaler.empty() || upscaler == "no upscaling" || upscaler == "high-resolution UI")
         upscaler = "No upscaling";
     if (generating_frames) upscaler += " FG";
