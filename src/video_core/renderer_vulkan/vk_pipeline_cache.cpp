@@ -2037,8 +2037,10 @@ std::chrono::microseconds PipelineCache::QuickWait() {
 }
 
 bool PipelineCache::MenusWait() {
-    // Keep going: rendering must not wait for a cosmetic pipeline.
-    if (CompileMode() == 2) return false;
+    // FIX-219: this holds in the asynchronous compile mode (2, the default) too. Skipping menu
+    // draws there left the car thumbnails black: the car list, the garage and a new save's gift
+    // car draw each thumbnail once into a texture they keep showing. SHADGT_ASYNC_MENUS=1 still
+    // skips them for animated menus.
     // FIX-110: in GT Sport's menus a draw waits for its new pipeline (the guest clocks are held
     // meanwhile, as in the "pause" compile mode); only races skip draws. Some menu scenes draw
     // once into a texture they keep showing: the GR86 slide of the home screen played on black
@@ -2892,6 +2894,9 @@ bool PipelineCache::RefreshGraphicsKey() {
                              : AmdGpu::DepthBuffer::StencilFormat::Invalid;
     key.depth_clamp_enable = !regs.depth_render_override.disable_viewport_clamp;
     key.depth_clip_enable = regs.clipper_control.ZclipEnable();
+    // FIX-220: DB_ALPHA_TO_MASK. GT Sport draws the track-edge overlays (grass and kerb paint over
+    // the asphalt) with alpha to coverage; without it their noise-masked alpha showed as dots.
+    key.alpha_to_coverage = regs.db_alpha_to_mask & 1;
     key.clip_space = regs.clipper_control.clip_space;
     key.provoking_vtx_last = regs.polygon_control.provoking_vtx_last;
     key.prim_type =

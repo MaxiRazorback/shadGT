@@ -72,8 +72,8 @@ void RunWindowThread() {
     static Frontend::WindowSDL window(EmulatorSettings.GetWindowWidth(),
                                       EmulatorSettings.GetWindowHeight(), controllers,
                                       Vulkan::NativeModeRequested()
-                                          ? "ryGT - Gran Turismo Sport (Native renderer)"
-                                          : "ryGT - Gran Turismo Sport (ShadGT renderer)");
+                                          ? "GTSport"
+                                          : "GTSport");
     window.SetIcon({}); // shadGT's Gran Turismo Sport icon
     {
         std::scoped_lock lock{g_window_mutex};
@@ -90,7 +90,12 @@ void RunWindowThread() {
     while (window.IsOpen()) {
         window.WaitEvent();
         if (const auto status = Vulkan::RytyUpscalerStatus::Take()) { // FSR-204
-            const std::string title = "ryGT - Gran Turismo Sport | " + *status;
+            int width = 0, height = 0;
+            SDL_GetWindowSizeInPixels(window.GetSDLWindow(), &width, &height);
+            std::string title = "GTSport " + *status;
+            if (const auto at = title.find("{window}"); at != std::string::npos) {
+                title.replace(at, 8, std::to_string(width) + "x" + std::to_string(height));
+            }
             SDL_SetWindowTitle(window.GetSDLWindow(), title.c_str());
         }
     }

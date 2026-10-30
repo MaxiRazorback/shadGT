@@ -404,6 +404,15 @@ bool Instance::CreateDevice() {
     // Optional
     maintenance_5 = add_extension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
     maintenance_8 = add_extension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+    // PERF-210 (RYGT_ANTI_LAG=1): AMD Anti-Lag, see AntiLagUpdate.
+    if (const char* env = std::getenv("RYGT_ANTI_LAG"); env && env[0] == '1') {
+        const auto chain = physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
+                                                        vk::PhysicalDeviceAntiLagFeaturesAMD>();
+        anti_lag = chain.get<vk::PhysicalDeviceAntiLagFeaturesAMD>().antiLag &&
+                   add_extension(VK_AMD_ANTI_LAG_EXTENSION_NAME);
+        LOG_WARNING(Render_Vulkan, "PERF-210: AMD Anti-Lag {}",
+                    anti_lag ? "on" : "not supported by this driver");
+    }
     attachment_feedback_loop = add_extension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
     if (attachment_feedback_loop) {
         attachment_feedback_loop =
@@ -830,6 +839,9 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceFaultFeaturesEXT{
             .deviceFault = true, // DIAG-206
         },
+        vk::PhysicalDeviceAntiLagFeaturesAMD{
+            .antiLag = true, // PERF-210
+        },
         vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR{
             .shaderMaximalReconvergence = true, // AMD-306
         },
@@ -843,6 +855,9 @@ bool Instance::CreateDevice() {
     }
     if (!device_fault) {
         device_chain.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
+    }
+    if (!anti_lag) {
+        device_chain.unlink<vk::PhysicalDeviceAntiLagFeaturesAMD>();
     }
     if (!xess_mutable_descriptor) {
         device_chain.unlink<vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT>();
@@ -1247,6 +1262,27 @@ void Instance::LogDeviceFault() const {
         LOG_CRITICAL(Render_Vulkan, "DIAG-206: vendor fault {:#x} data {:#x}: {}",
                      entry.vendorFaultCode, entry.vendorFaultData, entry.description);
     }
+}
+
+// PERF-210: the input stage runs on the game thread that submits the flip, so the driver can hold
+// the game there and start its next frame later; the present stage closes that frame.
+void Instance::AntiLagUpdate(bool present) const {
+    if (!anti_lag) {
+        return;
+    }
+    std::scoped_lock lock{anti_lag_mutex};
+    if (!present) {
+        ++anti_lag_frame;
+    }
+    const vk::AntiLagPresentationInfoAMD info{
+        .stage = present ? vk::AntiLagStageAMD::ePresent : vk::AntiLagStageAMD::eInput,
+        .frameIndex = anti_lag_frame,
+    };
+    device->antiLagUpdateAMD(vk::AntiLagDataAMD{
+        .mode = vk::AntiLagModeAMD::eOn,
+        .maxFPS = 0,
+        .pPresentationInfo = &info,
+    });
 }
 
 } // namespace Vulkan

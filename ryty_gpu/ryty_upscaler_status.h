@@ -52,28 +52,21 @@ inline void ReportResolution(unsigned output_width, unsigned output_height,
     const auto scene = g_scene_extent.load(std::memory_order_relaxed);
     const unsigned width = scene ? unsigned(scene >> 32) : fallback_width;
     const unsigned height = scene ? unsigned(scene) : fallback_height;
-    std::string status = std::to_string(output_width) + "x" + std::to_string(output_height) +
-                         " -> " + std::to_string(width) + "x" + std::to_string(height);
-    // The presenter supplies the backend that actually produced this frame.
-    if (!upscaler.empty() && upscaler != "no upscaling" && upscaler != "high-resolution UI") {
-        if (const auto suffix = upscaler.find(" temporal"); suffix != std::string::npos)
-            upscaler.erase(suffix);
-        if (upscaler.starts_with("FSR 3.1")) upscaler = "FSR 3.1";
-        const double ratio = output_width && output_height
-            ? std::max(double(width) / output_width, double(height) / output_height) : 1.0;
-        const char* scale = "Custom";
-        const struct { double ratio; const char* name; } presets[] = {
-            {1.0, "Native"}, {2.0 / 3.0, "Quality"}, {1.0 / 1.7, "Balanced"},
-            {0.5, "Performance"}, {1.0 / 3.0, "Ultra Performance"}};
-        double best = 0.035;
-        for (const auto& preset : presets) {
-            const double difference = std::abs(ratio - preset.ratio);
-            if (difference < best) { best = difference; scale = preset.name; }
-        }
-        if (upscaler == "DLSS" && std::string_view(scale) == "Native") upscaler = "DLAA";
-        if (generating_frames) upscaler += " FG";
-        status = upscaler + " | " + scale;
+    // FSR-205: "<upscaler> {window}, <output> From <scene>"; the window thread fills in {window}.
+    if (const auto suffix = upscaler.find(" temporal"); suffix != std::string::npos)
+        upscaler.erase(suffix);
+    // Major version only: FSR 4.1.2 shows as FSR 4; XeSS has no number.
+    if (const auto dot = upscaler.find('.'); dot != std::string::npos) {
+        const auto end = upscaler.find(' ', dot);
+        upscaler.erase(dot, end == std::string::npos ? end : end - dot);
     }
+    if (upscaler.starts_with("XeSS")) upscaler = "XeSS";
+    if (upscaler.empty() || upscaler == "no upscaling" || upscaler == "high-resolution UI")
+        upscaler = "No upscaling";
+    if (generating_frames) upscaler += " FG";
+    std::string status = upscaler + " {window}, " + std::to_string(output_width) + "x" +
+                         std::to_string(output_height) + " From " + std::to_string(width) + "x" +
+                         std::to_string(height);
     Report(std::move(status));
 }
 

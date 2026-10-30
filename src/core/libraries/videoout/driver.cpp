@@ -350,9 +350,16 @@ bool VideoOutDriver::DrawLastFrame() {
     return false;
 }
 
+void VideoOutDriver::AntiLagInput() {
+    presenter->AntiLagInput(); // PERF-210
+}
+
 bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
                                 bool is_eop /*= false*/) {
     RyDiag::Mark(RyDiag::Zone::GameFlip, u64(index));
+    if (!is_eop) {
+        presenter->AntiLagInput(); // PERF-210: on the game's thread, never the command thread
+    }
     {
         std::unique_lock lock{port->port_mutex};
         if (index != -1 && port->flip_status.flip_pending_num > 16) {

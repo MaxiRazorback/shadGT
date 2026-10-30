@@ -28,6 +28,7 @@
 #include "video_core/renderer_vulkan/upload_chunk_tail.h"
 #include "video_core/renderer_vulkan/upload_chunk_cache.h"
 
+#include <fstream>
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -2891,6 +2892,28 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
             const auto vsharp = desc.GetSharp(stage);
             const u64 base = vsharp.base_address;
             const u64 sharp_size = vsharp.GetSize();
+            // DIAG-204 (RYGT_PROBE_SHADER=<hash>): that program's buffers and their first bytes.
+            static const u64 probe_hash = [] {
+                const char* env = std::getenv("RYGT_PROBE_SHADER");
+                return env && *env ? std::strtoull(env, nullptr, 16) : 0;
+            }();
+            if (probe_hash != 0 && stage.pgm_hash == probe_hash) {
+                static std::atomic<u32> probes{};
+                if (const u32 n = probes++; n < 64) {
+                    std::array<u32, 16> head{};
+                    const bool read = base != 0 && Core::RytyMemory::GuardedCopy(
+                        head.data(), reinterpret_cast<const void*>(base), sizeof(head));
+                    LOG_WARNING(Render_Vulkan,
+                                "DIAG-204: {:#x} buffer {} V# base {:#x} stride {} records {} "
+                                "dfmt {} nfmt {} swizzle {} tid {}: {}",
+                                stage.pgm_hash, buffer_index, base, vsharp.GetStride(),
+                                vsharp.num_records, u32(vsharp.GetDataFmt()),
+                                u32(vsharp.GetNumberFmt()), u32(vsharp.swizzle_enable),
+                                u32(vsharp.add_tid_enable),
+                                read ? fmt::format("{:08x}", fmt::join(head, " "))
+                                     : std::string{"unreadable"});
+                }
+            }
             // FIX-031 / FIX-036 / FIX-046: V#s that are not buffers are bound empty.
             const bool impossible =
                 vsharp.num_records != UINT32_MAX &&
@@ -3059,7 +3082,23 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
 
 void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs& regs,
                                   Shader::Backend::Bindings& binding, DrawBindings& b) {
+    // DIAG-207 (RYGT_NULL_TEXTURES=<hash>:<hex slot mask>): that program's chosen texture slots
+    // are bound empty, to see which one carries a wrong colour. Recorder-side draws only.
+    static const std::pair<u64, u64> null_textures = [] {
+        const char* env = std::getenv("RYGT_NULL_TEXTURES");
+        if (!env || !*env) {
+            return std::pair<u64, u64>{0, 0};
+        }
+        char* end{};
+        const u64 hash = std::strtoull(env, &end, 16);
+        const u64 mask = end && *end == ':' ? std::strtoull(end + 1, nullptr, 16) : ~u64{0};
+        return std::pair<u64, u64>{hash, mask};
+    }();
+    u32 slot = 0;
     for (const auto& image_desc : stage.images) {
+        const bool null_slot = null_textures.first != 0 && stage.pgm_hash == null_textures.first &&
+                               slot < 64 && ((null_textures.second >> slot) & 1);
+        ++slot;
         auto tsharp = image_desc.GetSharp(stage);
         MatchExperimentalCompositionTexture(tsharp, stage, image_desc, *registry);
         const bool cube_sampling = image_desc.post_op == Shader::SharpFetchPostOp::NativeCubeSampling;
@@ -3087,6 +3126,15 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             ++stats.null_reasons[reason];
             add_write();
         };
+        if (null_slot) {
+            static std::atomic<u32> logged{};
+            if (logged++ < 16) {
+                LOG_WARNING(Render_Vulkan, "DIAG-207: {:#x} texture slot {} bound empty",
+                            stage.pgm_hash, slot - 1);
+            }
+            bind_null(0);
+            continue;
+        }
         // OPT-002: the picture and views this T# resolved to last time.
         ++stats.texture_lookups;
         TextureMemo* memo = nullptr;
@@ -3964,6 +4012,18 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
     }
 }
 
+// DIAG-208: purple pixels of the garage cockpit view, and what each draw left there.
+namespace {
+constexpr VAddr TracedTarget = 0x1005000000;
+constexpr std::array<std::pair<s32, s32>, 4> TracedPixels{
+    {{266, 190}, {538, 306}, {273, 195}, {571, 322}}};
+constexpr u64 PixelTraceDraws = 8192;
+struct PixelTrace {
+    std::unique_ptr<Native::Rhi::Buffer> buffer;
+    std::vector<std::pair<u64, u64>> hashes;
+} g_pixel_trace;
+} // namespace
+
 void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     std::scoped_lock lock{mutex};
     const auto start = std::chrono::steady_clock::now();
@@ -4132,6 +4192,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         const Shader::Info* fs = stages[u32(Shader::SwStage::Fragment)];
         if (fs && std::ranges::find(skip_ps, fs->pgm_hash) != skip_ps.end()) {
             ++stats.skipped;
+            static std::atomic<u32> logged{};
+            if (logged++ < 32) {
+                LOG_WARNING(Render_Vulkan, "DIAG-152: draw with ps {:#x} skipped", fs->pgm_hash);
+            }
             return;
         }
     }
@@ -4449,6 +4513,48 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         feedback_layout(vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT,
                         vk::ImageLayout::eGeneral);
         s.buffers_written = true;
+    }
+
+    // DIAG-208 (RYGT_PIXEL_TRACE=1): while a frame is dumped, the scene target's traced pixels
+    // are copied after each draw into it, to name the draw that first writes a wrong colour.
+    static const bool pixel_trace = [] {
+        const char* env = std::getenv("RYGT_PIXEL_TRACE");
+        return env && env[0] == '1';
+    }();
+    if (pixel_trace && r.FrameDumpCollecting() && targets.colors[0] &&
+        targets.colors[0]->info.guest_address == TracedTarget &&
+        g_pixel_trace.hashes.size() < PixelTraceDraws) {
+        if (!g_pixel_trace.buffer) {
+            g_pixel_trace.buffer = device->CreateBuffer(
+                {.size = PixelTraceDraws * TracedPixels.size() * 4,
+                 .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageTransferDst,
+                 .memory = Native::Rhi::MemoryKind::Readback,
+                 .name = "pixel trace"});
+        }
+        if (g_pixel_trace.buffer && g_pixel_trace.buffer->Mapped()) {
+            EndRendering();
+            GlobalBarrier();
+            const u64 base = g_pixel_trace.hashes.size() * TracedPixels.size() * 4;
+            std::array<vk::BufferImageCopy, TracedPixels.size()> copies;
+            for (size_t i = 0; i < copies.size(); ++i) {
+                copies[i] = vk::BufferImageCopy{
+                    .bufferOffset = base + i * 4,
+                    .imageSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                      .mipLevel = 0,
+                                      .baseArrayLayer = 0,
+                                      .layerCount = 1},
+                    .imageOffset = {TracedPixels[i].first, TracedPixels[i].second, 0},
+                    .imageExtent = {1, 1, 1}};
+            }
+            stream.cmd.copyImageToBuffer(
+                vk::Image{Handle<VkImage_T>(targets.colors[0]->image->NativeHandle())},
+                vk::ImageLayout::eGeneral,
+                vk::Buffer{Handle<VkBuffer_T>(g_pixel_trace.buffer->NativeHandle())}, copies);
+            GlobalBarrier();
+            const auto* vs = pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
+            const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+            g_pixel_trace.hashes.emplace_back(vs ? vs->pgm_hash : 0, ps ? ps->pgm_hash : 0);
+        }
     }
 
     if (native_fsr_composition) FinishNativeFsr(targets);
@@ -4794,6 +4900,15 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobGuestBuffer(VAddr a
 bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Regs& regs,
                                     Shader::Backend::Bindings& binding, PreparedDraw& p) {
     // As BindBuffers, without its side effects.
+    // DIAG-205 (RYGT_RECORDER_SHADER=<hash>): that program's draws go to the recorder, which
+    // reads their buffers later (tests whether the job threads read per-frame constants early).
+    static const u64 recorder_hash = [] {
+        const char* env = std::getenv("RYGT_RECORDER_SHADER");
+        return env && *env ? std::strtoull(env, nullptr, 16) : 0;
+    }();
+    if (recorder_hash != 0 && stage.pgm_hash == recorder_hash) {
+        return false; // the recorder
+    }
     DrawBindings& b = p.bindings;
     const u64 alignment = r.instance.StorageMinAlignment();
     // Match BindBuffers: prepared and recorder-side draws must choose the same path.
@@ -4880,6 +4995,28 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
             const auto vsharp = desc.GetSharp(stage);
             const u64 base = vsharp.base_address;
             const u64 sharp_size = vsharp.GetSize();
+            // DIAG-204 (RYGT_PROBE_SHADER=<hash>): that program's buffers and their first bytes.
+            static const u64 probe_hash = [] {
+                const char* env = std::getenv("RYGT_PROBE_SHADER");
+                return env && *env ? std::strtoull(env, nullptr, 16) : 0;
+            }();
+            if (probe_hash != 0 && stage.pgm_hash == probe_hash) {
+                static std::atomic<u32> probes{};
+                if (const u32 n = probes++; n < 64) {
+                    std::array<u32, 16> head{};
+                    const bool read = base != 0 && Core::RytyMemory::GuardedCopy(
+                        head.data(), reinterpret_cast<const void*>(base), sizeof(head));
+                    LOG_WARNING(Render_Vulkan,
+                                "DIAG-204: {:#x} buffer {} V# base {:#x} stride {} records {} "
+                                "dfmt {} nfmt {} swizzle {} tid {}: {}",
+                                stage.pgm_hash, buffer_index, base, vsharp.GetStride(),
+                                vsharp.num_records, u32(vsharp.GetDataFmt()),
+                                u32(vsharp.GetNumberFmt()), u32(vsharp.swizzle_enable),
+                                u32(vsharp.add_tid_enable),
+                                read ? fmt::format("{:08x}", fmt::join(head, " "))
+                                     : std::string{"unreadable"});
+                }
+            }
             const bool impossible =
                 vsharp.num_records != UINT32_MAX &&
                 (sharp_size >= GpuAddressLimit || base + sharp_size > GpuAddressLimit ||
@@ -7094,6 +7231,19 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
     }
     Splice();
     r.scheduler.Finish();
+    if (!g_pixel_trace.hashes.empty()) {
+        std::ofstream out{dir / "pixel-trace.txt"};
+        const auto* words = reinterpret_cast<const u32*>(g_pixel_trace.buffer->Mapped());
+        for (size_t i = 0; i < g_pixel_trace.hashes.size(); ++i) {
+            out << fmt::format("{} vs {:#x} ps {:#x}", i, g_pixel_trace.hashes[i].first,
+                               g_pixel_trace.hashes[i].second);
+            for (size_t p = 0; p < TracedPixels.size(); ++p) {
+                out << fmt::format(" {:08x}", words[i * TracedPixels.size() + p]);
+            }
+            out << "\n";
+        }
+        g_pixel_trace.hashes.clear();
+    }
     for (const auto& readback : readbacks) {
         const auto& info = readback.entry->info;
         const auto& desc = readback.entry->image->Desc();

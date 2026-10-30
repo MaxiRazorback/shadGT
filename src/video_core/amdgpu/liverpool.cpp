@@ -299,6 +299,28 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 
 std::array<u8, 48_KB> Liverpool::ConstantEngine::constants_heap;
 
+// DIAG-206 (RYGT_WATCH_WRITES=<hex address>,<hex size>): GPU-command writes into that range.
+static void WatchWrite(VAddr dst, u64 size, VAddr src, const char* what) {
+    static const std::pair<u64, u64> watch = [] {
+        const char* env = std::getenv("RYGT_WATCH_WRITES");
+        if (!env || !*env) {
+            return std::pair<u64, u64>{0, 0};
+        }
+        char* end{};
+        const u64 base = std::strtoull(env, &end, 16);
+        const u64 len = end && *end == ',' ? std::strtoull(end + 1, nullptr, 16) : 0x1000;
+        return std::pair<u64, u64>{base, len};
+    }();
+    if (watch.second == 0 || dst >= watch.first + watch.second || dst + size <= watch.first) {
+        return;
+    }
+    static std::atomic<u32> count{};
+    if (count++ < 256) {
+        LOG_WARNING(Render, "DIAG-206: {} writes {:#x} size {:#x} from {:#x}", what, dst, size,
+                    src);
+    }
+}
+
 // FIX-035: DMA_DATA with a register source or destination address space (SAS/DAS = 1). GT
 // Sport issues it on the graphics queue in the main menu; its exact effect is undocumented in
 // the sources available, so the packet is reported once per destination and skipped rather
@@ -915,6 +937,8 @@ static_assert(REG_DWORD(index_base_address) == ReadAheadStates::PerDrawRegisters
               REG_DWORD(max_index_size) == ReadAheadStates::PerDrawRegisters[3] &&
               REG_DWORD(num_indices) == ReadAheadStates::PerDrawRegisters[4] &&
               sizeof(Regs::index_base_address) == 2 * sizeof(u32));
+// FIX-220: DB_ALPHA_TO_MASK is context register 0x2DC, DB_DEPTH_CONTROL 0x200.
+static_assert(REG_DWORD(db_alpha_to_mask) - REG_DWORD(depth_control) == 0x2DC - 0x200);
 #undef REG_DWORD
 
 // FIX-014: draws the rasterizer filters out (Rasterizer::FilterDraw) never get a pipeline.
@@ -2436,6 +2460,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     dma.dst_sel == DmaDataDst::Memory || dma.dst_sel == DmaDataDst::MemoryUsingL2;
                 const bool src_memory = dma.src_sel == DmaDataSrc::Memory ||
                                         dma.src_sel == DmaDataSrc::MemoryUsingL2;
+                if (to_memory) {
+                    WatchWrite(dma.DstAddress<VAddr>(), dma.NumBytes(),
+                               src_memory ? dma.SrcAddress<VAddr>() : 0, "gfx DMA_DATA");
+                }
                 RecordDma([this, dma] {
                     const auto* dma_data = &dma;
                     if (dma_data->src_sel == DmaDataSrc::Data &&
@@ -2480,6 +2508,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
                 const u32 data_size = (header->type3.count.Value() - 2) * 4;
                 u64* address = write_data->Address<u64*>();
+                WatchWrite(reinterpret_cast<VAddr>(address), data_size, 0, "gfx WRITE_DATA");
                 if (rasterizer) {
                     if (auto* direct = rasterizer->GetBufferCache().GetDirectMemory()) {
                         direct->MarkVolatile(reinterpret_cast<VAddr>(address), data_size); // D4
@@ -3094,6 +3123,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (SkipRegisterSpaceDmaData(dma_data, "compute")) {
                 break;
             }
+            if (dma_data->dst_sel == DmaDataDst::Memory ||
+                dma_data->dst_sel == DmaDataDst::MemoryUsingL2) {
+                const bool src_memory = dma_data->src_sel == DmaDataSrc::Memory ||
+                                        dma_data->src_sel == DmaDataSrc::MemoryUsingL2;
+                WatchWrite(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(),
+                           src_memory ? dma_data->SrcAddress<VAddr>() : 0, "compute DMA_DATA");
+            }
             BumpPendingAscEpoch(); // PERF-095: this queue now reads memory
             // PERF-031: copies run on the recorder thread in order with the dispatches around them.
             if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
@@ -3249,6 +3285,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
+            WatchWrite(write_data->Address<VAddr>(), data_size, 0, "compute WRITE_DATA");
             if (rasterizer) {
                 if (auto* direct = rasterizer->GetBufferCache().GetDirectMemory()) {
                     direct->MarkVolatile(write_data->Address<VAddr>(), data_size); // D4

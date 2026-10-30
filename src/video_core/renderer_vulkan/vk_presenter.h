@@ -75,6 +75,10 @@ public:
         return window;
     }
 
+    void AntiLagInput() {
+        instance.AntiLagUpdate(false); // PERF-210
+    }
+
     Rasterizer& GetRasterizer() const {
         return *rasterizer.get();
     }

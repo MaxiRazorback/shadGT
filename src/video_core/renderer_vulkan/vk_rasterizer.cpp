@@ -3238,6 +3238,25 @@ void Rasterizer::FrameDumpFlip() {
         }
         frame_dump_mem.clear();
     }
+    // DIAG-202: a frame-dump.now file next to GTSport.exe dumps the next frame into
+    // user\log\dump-native-exp (or dump-old-exp), as RYGT_FRAME_DUMP_AT does at a fixed time.
+    {
+        static auto last_check = std::chrono::steady_clock::now();
+        const auto check_now = std::chrono::steady_clock::now();
+        if (!frame_dump_collecting && frame_dump_mem.empty() &&
+            check_now - last_check > std::chrono::milliseconds(500)) {
+            last_check = check_now;
+            static const auto trigger =
+                Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path() /
+                "frame-dump.now";
+            std::error_code trigger_error;
+            if (std::filesystem::remove(trigger, trigger_error)) {
+                LOG_WARNING(Render_Vulkan, "DIAG-202: frame-dump.now: dumping the next frame");
+                exposure_dump_requested = true;
+                frame_dump_done = false;
+            }
+        }
+    }
     if ((dump_at < 0 && !exposure_dump_requested && !frame_dump_collecting) || frame_dump_done) {
         return;
     }
@@ -3333,7 +3352,12 @@ void Rasterizer::FrameDumpPass(const AmdGpu::Regs& regs, const RenderState& stat
     if (!frame_dump_collecting) {
         return;
     }
-    if (!frame_dump_events.empty() && frame_dump_events.back().draws != 0 &&
+    // DIAG-203 (RYGT_FRAME_DUMP_DRAWS=1): every draw gets its own line, not only a pass's first.
+    static const bool every_draw = [] {
+        const char* env = std::getenv("RYGT_FRAME_DUMP_DRAWS");
+        return env && env[0] == '1';
+    }();
+    if (!every_draw && !frame_dump_events.empty() && frame_dump_events.back().draws != 0 &&
         frame_dump_events.back().key == text) {
         ++frame_dump_events.back().draws;
         return;

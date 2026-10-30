@@ -110,6 +110,9 @@ FfxApiResource Resource(vk::Image image, vk::Format format, vk::Extent2D size, u
     return ffxApiGetResourceVK(static_cast<VkImage>(image), description, state);
 }
 
+bool g_sdk2 = false;
+constexpr uint64_t SDK2_BACKEND_VK = 0x01000003u;
+
 bool LoadApi() {
     if (g_api.tried) {
         return g_api.module != nullptr;
@@ -120,7 +123,14 @@ bool LoadApi() {
     std::wstring dir{exe};
     dir = dir.substr(0, dir.find_last_of(L"\\/"));
     const std::wstring path = dir + L"\\amd_fidelityfx_vk.dll";
-    HMODULE module = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    // FSR-210: SDK 2.x splits the effects; its loader finds amd_fidelityfx_upscaler_vk.dll beside
+    // it. Older builds keep the single amd_fidelityfx_vk.dll.
+    const std::wstring loader = dir + L"\\amd_fidelityfx_loader_vk.dll";
+    HMODULE module = LoadLibraryExW(loader.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    g_sdk2 = module != nullptr;
+    if (!module) {
+        module = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    }
     if (!module) {
         LOG_WARNING(Render_Vulkan,
                     "FSR 3.1: fsr3_enabled is on but amd_fidelityfx_vk.dll could not be loaded "
@@ -146,6 +156,11 @@ bool LoadApi() {
     return true;
 }
 
+// FSR-210: SDK 2.x renumbered the Vulkan backend descriptor; its fields stayed the same.
+uint64_t BackendDescType() {
+    return g_sdk2 ? SDK2_BACKEND_VK : FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+}
+
 // FSR-201: the upscaler major version GPU.fsr_upscaler asks for (3 or 4).
 u32 RequestedMajor() {
     static const u32 major = [] {
@@ -162,12 +177,15 @@ u32 RequestedMajor() {
 
 // FSR-201: the version id to create upscalers with: the newest one of the requested major version
 // in the DLL, else the newest 3.x. Zero leaves the DLL's default.
-uint64_t SelectedVersion() {
-    static const uint64_t selected = [] {
+uint64_t SelectedVersion(const ffxCreateBackendVKDesc& backend) {
+    static const uint64_t selected = [&] {
         uint64_t count = 0;
         ffxQueryDescGetVersions query{};
         query.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
         query.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+        // FSR-210: SDK 2.x lists driver-provided versions (FSR 4) only for a given device. The
+        // three handles are laid out as its VkDeviceContext.
+        query.device = const_cast<VkDevice*>(&backend.vkDevice);
         query.outputCount = &count;
         if (g_api.query(nullptr, &query.header) != FFX_API_RETURN_OK || count == 0) {
             return uint64_t{0};
@@ -253,7 +271,7 @@ bool Pass::CreateContext(vk::Extent2D input_size, vk::Extent2D output_size) {
     const vk::Extent2D max_output{std::max(output_size.width, MinUpscaleSize.width),
                                   std::max(output_size.height, MinUpscaleSize.height)};
     ffxCreateBackendVKDesc backend{};
-    backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+    backend.header.type = BackendDescType();
     backend.vkDevice = static_cast<VkDevice>(device);
     backend.vkPhysicalDevice = static_cast<VkPhysicalDevice>(physical_device);
     backend.vkDeviceProcAddr = &GetDeviceProcAddr;
@@ -261,7 +279,7 @@ bool Pass::CreateContext(vk::Extent2D input_size, vk::Extent2D output_size) {
     ffxOverrideVersion version_override{};
     version_override.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
     version_override.header.pNext = &backend.header;
-    version_override.versionId = SelectedVersion();
+    version_override.versionId = SelectedVersion(backend);
 
     ffxCreateContextDescUpscale desc{};
     desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
@@ -613,14 +631,14 @@ bool Temporal::Evaluate(vk::PhysicalDevice physical_device, vk::Device device,
             context = nullptr;
         }
         ffxCreateBackendVKDesc backend{};
-        backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+        backend.header.type = BackendDescType();
         backend.vkDevice = static_cast<VkDevice>(device);
         backend.vkPhysicalDevice = static_cast<VkPhysicalDevice>(physical_device);
         backend.vkDeviceProcAddr = &GetDeviceProcAddr;
         ffxOverrideVersion version_override{};
         version_override.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
         version_override.header.pNext = &backend.header;
-        version_override.versionId = SelectedVersion();
+        version_override.versionId = SelectedVersion(backend);
         ffxCreateContextDescUpscale desc{};
         desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
         desc.header.pNext = version_override.versionId ? &version_override.header : &backend.header;
