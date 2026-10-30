@@ -4643,6 +4643,15 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobGuestBuffer(VAddr a
 bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Regs& regs,
                                     Shader::Backend::Bindings& binding, PreparedDraw& p) {
     // As BindBuffers, without its side effects.
+    // DIAG-205 (RYGT_RECORDER_SHADER=<hash>): that program's draws go to the recorder, which
+    // reads their buffers later (tests whether the job threads read per-frame constants early).
+    static const u64 recorder_hash = [] {
+        const char* env = std::getenv("RYGT_RECORDER_SHADER");
+        return env && *env ? std::strtoull(env, nullptr, 16) : 0;
+    }();
+    if (recorder_hash != 0 && stage.pgm_hash == recorder_hash) {
+        return false; // the recorder
+    }
     DrawBindings& b = p.bindings;
     const u64 alignment = r.instance.StorageMinAlignment();
     // Match BindBuffers: prepared and recorder-side draws must choose the same path.
