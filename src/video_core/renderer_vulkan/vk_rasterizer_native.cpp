@@ -4012,6 +4012,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         const Shader::Info* fs = stages[u32(Shader::SwStage::Fragment)];
         if (fs && std::ranges::find(skip_ps, fs->pgm_hash) != skip_ps.end()) {
             ++stats.skipped;
+            static std::atomic<u32> logged{};
+            if (logged++ < 32) {
+                LOG_WARNING(Render_Vulkan, "DIAG-152: draw with ps {:#x} skipped", fs->pgm_hash);
+            }
             return;
         }
     }
