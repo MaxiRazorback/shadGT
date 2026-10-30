@@ -33,6 +33,7 @@ using spdlog_stdout = spdlog::sinks::stdout_color_sink_mt;
 #include "common/recoverable.h"
 #include "common/logging/log.h"
 #include "common/logging/stdout_level.h"
+#include "common/logging/stdout_async.h"
 #include "common/logging/log_file_sink.h"
 #include "common/path_util.h"
 #include "common/thread.h"
@@ -45,6 +46,7 @@ static std::shared_ptr<spdlog::sinks::sink> g_console_sink;
 static std::shared_ptr<LogFileSink> g_shad_file_sink;
 #ifdef RYTY_GPU
 static std::unique_ptr<spdlog::logger> g_stdout_logger;
+static std::shared_ptr<spdlog::sinks::async_sink> g_stdout_async;
 #endif
 static std::array<std::unique_ptr<spdlog::logger>, NUM_LOG_CLASSES> ALL_LOGGERS{};
 
@@ -171,13 +173,18 @@ void Setup(std::string_view shadps4_filename) {
     g_console_sink->set_pattern("%^%v%$");
 #ifdef RYTY_GPU
     const auto root = std::filesystem::current_path();
-    g_stdout_logger = std::make_unique<spdlog::logger>("stdout", g_console_sink);
+    g_stdout_async = MakeAsyncStdoutSink(g_console_sink, [] {
+        Common::SetCurrentThreadName("shadGT:DiagnosticOutput");
+        Common::AllowAllCores();
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+    });
+    g_stdout_logger = std::make_unique<spdlog::logger>("stdout", g_stdout_async);
     // ShadGT output is diagnostic data: opt in with Trace, Debug or Info (the launcher's level and
     // everything above it; Info carries the frame-time windows).
     const auto stdout_level = StdoutLevel::Read(root / "RyGT.ini");
     g_stdout_logger->set_level(stdout_level <= static_cast<unsigned>(Level::Info)
         ? static_cast<spdlog::level>(stdout_level) : spdlog::level::off);
-    g_stdout_logger->flush_on(spdlog::level::trace);
+    g_stdout_logger->flush_on(spdlog::level::err);
 #endif
 
 #ifndef RYTY_GPU
@@ -216,6 +223,11 @@ void Shutdown() {
     g_shad_file_sink.reset();
 #ifdef RYTY_GPU
     g_stdout_logger.reset();
+    if (g_stdout_async && g_stdout_async->get_overrun_counter() != 0) {
+        std::fprintf(stderr, "Diagnostic output queue replaced %zu old records\n",
+                     g_stdout_async->get_overrun_counter());
+    }
+    g_stdout_async.reset(); // drains queued output before the console sink goes away
 #endif
     g_console_sink.reset();
 }
@@ -225,9 +237,11 @@ void Flush() {
         g_shad_file_sink->flush();
     }
 
-    if (g_console_sink != nullptr) {
-        g_console_sink->flush();
-    }
+#ifdef RYTY_GPU
+    if (g_stdout_async) g_stdout_async->flush();
+#else
+    if (g_console_sink != nullptr) g_console_sink->flush();
+#endif
 }
 
 void UpdateSinks() {

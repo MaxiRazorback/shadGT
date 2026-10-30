@@ -31,8 +31,10 @@ u64 MicrosecondsSince(std::chrono::steady_clock::time_point start) {
 }
 } // namespace
 
-DrawPipe::DrawPipe(std::function<void()> thread_init_, size_t max_pending_)
-    : max_pending{max_pending_}, thread_init{std::move(thread_init_)} {
+DrawPipe::DrawPipe(std::function<void()> thread_init_, size_t max_pending_,
+                   std::function<void()> idle_hook_)
+    : max_pending{max_pending_}, thread_init{std::move(thread_init_)},
+      idle_hook{std::move(idle_hook_)} {
     recorder = std::jthread{[this](std::stop_token stop) { Run(stop); }};
     // Push and Drain may need the recorder's id (OnRecorderThread) as soon as this returns.
     while (recorder_id.load(std::memory_order_acquire) == std::thread::id{}) {
@@ -471,13 +473,19 @@ void DrawPipe::Run(std::stop_token stop) {
     while (true) {
         RunUrgent();
         if (idle_hook) {
-            bool empty;
+            bool run_idle;
             {
                 std::scoped_lock lk{mutex};
-                empty = queue.empty();
+                run_idle = queue.empty() && !exclusive && !stop.stop_requested();
+                // Drain must not hand rasterizer ownership to the command
+                // processor while this hook is submitting recorded work.
+                if (run_idle) urgent_running = true;
             }
-            if (empty) {
+            if (run_idle) {
                 idle_hook(); // D5
+                std::scoped_lock lk{mutex};
+                urgent_running = false;
+                done_cv.notify_all();
             }
         }
         {

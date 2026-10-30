@@ -15,9 +15,12 @@
 #endif
 
 #include "common/logging/log.h"
+#include "common/thread.h"
 #include "core/memory.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/direct_memory.h"
+#include "video_core/buffer_cache/defer_import_releases.h"
+#include "video_core/buffer_cache/import_cleanup_worker.h"
 #include "ryty_gpu/native/slow_call_trace.h"
 #include "video_core/buffer_cache/proto_import.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -56,23 +59,10 @@ UnmapAliasFn UnmapAlias() {
 }
 
 struct PendingRelease {
-    u64 tick;
     void* alias;
     VkDeviceMemory memory;
     std::shared_ptr<Buffer> wrapper; // owns the VkBuffer (D6)
 };
-std::mutex g_pending_mutex;
-std::vector<PendingRelease> g_pending;
-std::atomic<bool> g_has_pending{false}; // checked on every bind without the lock
-// D7: views a thread found lately, valid while no view was unmapped since (lock-free check).
-std::atomic<u64> g_unmap_generation{1};
-struct RecentView {
-    u64 generation;
-    VAddr begin;
-    VAddr end;
-};
-thread_local std::array<RecentView, 8> t_recent_views{};
-thread_local u32 t_recent_next = 0;
 
 } // namespace
 
@@ -88,6 +78,13 @@ DirectMemory::DirectMemory(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     std::memset(l1->mapped_data.data(), 0, l1->mapped_data.size());
     l2_index.assign(L1Entries, 0);
     volatile_bits = std::make_unique<std::atomic<u64>[]>(VolatileWords);
+    import_cleanup = std::make_shared<ImportCleanupWorker>([] {
+        Common::SetCurrentThreadName("shadGT:ImportCleanup");
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+#ifdef _WIN32
+        SetThreadPriorityBoost(GetCurrentThread(), TRUE);
+#endif
+    });
     LOG_WARNING(Render_Vulkan, "D1: direct memory on (page table L1 at {:#x})",
                 l1->BufferDeviceAddress());
 }
@@ -187,20 +184,7 @@ void DirectMemory::UnmapPages(VAddr begin, VAddr end) {
 }
 
 bool DirectMemory::Covered(VAddr address, u64 size) const {
-    std::scoped_lock lk{mutex};
-    const VAddr first = address & ~(PageSize - 1);
-    for (VAddr page = first; page < address + size; page += PageSize) {
-        const u64 index = page >> (PageBits + L2Bits);
-        if (index >= L1Entries || l2_index[index] == 0) {
-            return false;
-        }
-        const u64* l2 = reinterpret_cast<const u64*>(l2_pool->mapped_data.data()) +
-                        (l2_index[index] - 1) * L2Entries;
-        if (l2[(page >> PageBits) & (L2Entries - 1)] == 0) {
-            return false;
-        }
-    }
-    return true;
+    return imported_coverage.Covers(address, size);
 }
 
 std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindBuffer(VAddr address,
@@ -244,7 +228,8 @@ bool DirectMemory::ImportView(VAddr address) {
         }
         return false;
     };
-    if (end <= base || (base & (PageSize - 1)) != 0 || ((end - base) & (PageSize - 1)) != 0) {
+    if (end <= base || end > ImportedPageCoverage<>::Limit ||
+        (base & (PageSize - 1)) != 0 || ((end - base) & (PageSize - 1)) != 0) {
         return fail("not whole pages");
     }
     const auto map_alias = MapAlias();
@@ -317,12 +302,19 @@ bool DirectMemory::ImportView(VAddr address) {
                                            buffer};
     trace.Next(5);
     const vk::DeviceAddress device_address = d.vkGetBufferDeviceAddress(device, &address_info);
+    if (!device_address) {
+        d.vkDestroyBuffer(device, buffer, nullptr);
+        d.vkFreeMemory(device, memory, nullptr);
+        UnmapAlias()(alias);
+        return fail("no device address");
+    }
     trace.Next(6);
     MapPages(base, end, device_address);
     trace.Next(7);
     auto wrapper = std::make_shared<Buffer>(instance, base, end - base, vk::Buffer{buffer});
     views.emplace(base, View{base, end, alias, memory, buffer, device_address, std::move(wrapper)});
     imported_bytes += end - base;
+    imported_coverage.Publish(base, end); // publish only the completed view and page table
     if (views.size() <= 20 || views.size() % 100 == 0) {
         LOG_WARNING(Render_Vulkan, "D1: imported view {:#x}+{:#x} ({} views, {} MiB)", base,
                     end - base, views.size(), imported_bytes.load() >> 20);
@@ -353,6 +345,32 @@ bool DirectMemory::ForEachPart(VAddr address, u64 size,
     return true;
 }
 
+bool DirectMemory::TryForEachPart(
+    VAddr address, u64 size, const std::function<bool()>& ready,
+    const std::function<void(const Buffer&, u64, u64, u64)>& fn) const {
+    if (address > ImportedPageCoverage<>::Limit ||
+        size == 0 || size > ImportedPageCoverage<>::Limit - address) return false;
+    std::unique_lock lock{mutex, std::try_to_lock};
+    if (!lock.owns_lock()) return false;
+    const VAddr end = address + size;
+    // Two passes: a missing suffix must not leave a partially recorded copy.
+    for (VAddr cursor = address; cursor < end;) {
+        const auto it = views.upper_bound(cursor);
+        if (it == views.begin()) return false;
+        const View& view = std::prev(it)->second;
+        if (cursor < view.begin || cursor >= view.end || !view.wrapper) return false;
+        cursor = std::min(end, view.end);
+    }
+    if (!ready()) return false;
+    for (VAddr cursor = address; cursor < end;) {
+        const View& view = std::prev(views.upper_bound(cursor))->second;
+        const u64 bytes = std::min(end, view.end) - cursor;
+        fn(*view.wrapper, cursor - view.begin, cursor - address, bytes);
+        cursor += bytes;
+    }
+    return true;
+}
+
 void DirectMemory::WarmImported(VAddr address, u64 size) {
     // Speculative preparation must not wait behind another worker or the recorder.
     // Bound both driver calls and time spent holding the shared view mutex. Large
@@ -360,7 +378,8 @@ void DirectMemory::WarmImported(VAddr address, u64 size) {
     // not eagerly pin hundreds of MiB of unrelated backing.
     constexpr u64 MaxWarmViewBytes = 4ull << 20;
     constexpr u32 MaxWarmImports = 8;
-    if (size == 0 || size > (64ull << 20) || address > ~VAddr{0} - size) {
+    if (size == 0 || size > (64ull << 20) || address > ImportedPageCoverage<>::Limit ||
+        size > ImportedPageCoverage<>::Limit - address) {
         return;
     }
     std::unique_lock lock{mutex, std::try_to_lock};
@@ -411,33 +430,22 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
         {"pending-lock", "completion-query", "destroy-wrapper", "free-memory", "unmap-alias",
          "recent-cache", "view-mutex", "mapping-generation", "lookup-import"}};
     trace.Next(0, address, size);
-    if (g_has_pending.load(std::memory_order_relaxed)) {
-        // Aliases of unmapped views the GPU no longer uses.
-        std::scoped_lock lk{g_pending_mutex};
-        const auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;
-        std::erase_if(g_pending, [&](PendingRelease& p) {
-            trace.Next(1);
-            if (!scheduler.IsFree(p.tick)) {
-                return false;
-            }
-            trace.Next(2);
-            p.wrapper.reset();
-            trace.Next(3);
-            d.vkFreeMemory(instance.GetDevice(), p.memory, nullptr);
-            trace.Next(4);
-            UnmapAlias()(p.alias);
-            return true;
-        });
-        g_has_pending.store(!g_pending.empty(), std::memory_order_relaxed);
-    }
+    // Imported-view destruction is queued at OnUnmap to the scheduler's
+    // GPU-gated background runner. Never drain old imports on a draw's bind path.
+    if (address > ImportedPageCoverage<>::Limit ||
+        size > ImportedPageCoverage<>::Limit - address) return false;
     const VAddr end = address + size;
     trace.Next(5);
-    const u64 generation = g_unmap_generation.load(std::memory_order_acquire);
-    for (const RecentView& recent : t_recent_views) {
-        if (recent.generation == generation && address >= recent.begin && end <= recent.end) {
-            return true;
+    static thread_local u64 coverage_hits{}, coverage_misses{};
+    if (imported_coverage.Covers(address, size)) {
+        if ((++coverage_hits & 65535) == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "IMPORT-COVERAGE: {} completed-range hits without view lock, {} misses",
+                     coverage_hits, coverage_misses);
         }
+        return true;
     }
+    ++coverage_misses;
     trace.Next(6);
     std::scoped_lock lk{mutex};
 #ifdef RYTY_GPU
@@ -452,6 +460,12 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
 #endif
     trace.Next(8);
     for (VAddr page = address & ~(PageSize - 1); page < end;) {
+        // The bitmap skips already imported prefixes even when a later view in
+        // the request is missing. Retry each missing view through the old path.
+        if (const auto missing = imported_coverage.FirstMissing(page, end - page)) {
+            page = *missing;
+            if (page >= end) break;
+        }
         // A failed view is retried by many draws (and again by the gather fallback).
         // Its bounds are already known: avoid querying Windows for its base each time.
         const auto failure = failed.upper_bound(page);
@@ -462,10 +476,6 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
         if (it != views.begin()) {
             const auto& view = std::prev(it)->second;
             if (page >= view.begin && page < view.end) {
-                if (address >= view.begin && end <= view.end) {
-                    t_recent_views[t_recent_next++ % t_recent_views.size()] = {
-                        generation, view.begin, view.end};
-                }
                 page = view.end;
                 continue;
             }
@@ -474,16 +484,14 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
             return false;
         }
     }
-    // The complete range was verified under the view mutex. Remember that union,
-    // not just ranges fitting one view: large textures otherwise repeat hundreds
-    // of ordered-map lookups at every upload. Any unmap expires it via generation.
-    t_recent_views[t_recent_next++ % t_recent_views.size()] = {generation, address, end};
     return true;
 }
 
 void DirectMemory::OnUnmap(VAddr address, u64 size) {
-    std::scoped_lock lk{mutex};
-    g_unmap_generation.fetch_add(1, std::memory_order_acq_rel); // D7
+    std::vector<PendingRelease> releases;
+    std::unique_lock lk{mutex};
+    {
+    auto invalidate_coverage = imported_coverage.Invalidate();
     const VAddr end = address + size;
     auto it = views.upper_bound(address);
     if (it != views.begin()) {
@@ -496,6 +504,7 @@ void DirectMemory::OnUnmap(VAddr address, u64 size) {
             ++it;
             continue;
         }
+        imported_coverage.Clear(view.begin, view.end);
         UnmapPages(view.begin, view.end);
         imported_bytes -= view.end - view.begin;
         // DIAG-132: views dropped while GPU work may still read them.
@@ -507,17 +516,34 @@ void DirectMemory::OnUnmap(VAddr address, u64 size) {
                         view.begin, view.end - view.begin, address, size, tick,
                         scheduler.CurrentTick(), n);
         }
-        {
-            std::scoped_lock pending_lk{g_pending_mutex};
-            g_pending.push_back({tick, view.alias, view.memory, std::move(view.wrapper)});
-            g_has_pending.store(true, std::memory_order_relaxed);
-        }
+        releases.push_back({view.alias, view.memory, std::move(view.wrapper)});
         it = views.erase(it);
     }
     // Even a partial unmap can replace part of a failed view with importable memory.
     std::erase_if(failed, [&](const auto& view) {
         return view.first < end && (view.second > address || view.first >= address);
     });
+    }
+    // Invalidate the GPU page table and coverage before publishing releases.
+    // The runner waits for its captured CurrentTick before invoking callbacks;
+    // a later tick is conservative if the recorder advanced during this unmap.
+    lk.unlock();
+    const auto device = instance.GetDevice();
+    const auto unmap_alias = UnmapAlias();
+    DeferImportReleases(std::move(releases),
+        [this, cleanup = import_cleanup](auto callback) {
+            // The scheduler gate establishes GPU completion. Keep its fence
+            // runner free: driver destruction belongs to a separate worker.
+            scheduler.DeferPriorityOperation(
+                [cleanup, callback = std::move(callback)]() mutable {
+                    cleanup->Enqueue(std::move(callback));
+                });
+        },
+        [device, unmap_alias](PendingRelease& release) {
+            release.wrapper.reset();
+            VULKAN_HPP_DEFAULT_DISPATCHER.vkFreeMemory(device, release.memory, nullptr);
+            unmap_alias(release.alias);
+        });
 }
 
 DirectMemory::Stats DirectMemory::GetStats() const {

@@ -106,6 +106,8 @@ public:
     u8 upload_kind = 0;
     /// NAT-109: the GPU wrote its memory (the CPU can't tell what changed yet): upload.
     std::atomic<bool> force_upload{false};
+    // Sticky: a later CPU write does not replace untouched GPU-owned bytes.
+    std::atomic<bool> gpu_backing_written{false};
     bool from_cpu = false; ///< texture data the CPU wrote; render targets are GPU-only
     std::atomic<bool> needs_upload{false};
     std::atomic<u64> last_use{0};
@@ -164,6 +166,9 @@ class ImageRegistry {
 public:
     explicit ImageRegistry(Rhi::Device& device);
     ~ImageRegistry();
+    // Recorder-only. Reuse is ordered by barriers on the same graphics queue.
+    Rhi::Buffer* AcquireUploadGatherScratch(Rhi::CommandList& list, u64 size);
+
 
     /// NAT-100: images are made by `factory` instead of from the RHI description (native mode
     /// makes them as the texture cache does: its formats and usage).
@@ -250,8 +255,18 @@ public:
     void GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern, bool exact,
                   u64 clock);
     /// NAT-120: uploads the image from guest memory before its next use.
+    // Admission happens on actual image use, not on each intermediate streaming write.
+    // Duplicate requests are harmless: RecordUploads atomically consumes needs_upload.
+    void QueueUploadForUse(ImageEntry& entry) {
+        if (entry.from_cpu && entry.info.guest_size >= (4ull << 20) &&
+            entry.needs_upload.load(std::memory_order_acquire)) {
+            std::scoped_lock lock{upload_mutex};
+            pending_uploads.push_back(&entry);
+        }
+    }
     void RequestUpload(ImageEntry& entry) {
         MarkStale(entry, Stale::GpuWrite);
+        QueueUploadForUse(entry); // explicit rewrite requests must still run immediately
     }
 
     /// NAT-109: CPU writes to [address, address + size) (a page fault: the page stops being
@@ -266,7 +281,7 @@ public:
     /// has finished the work recorded so far. Returns how many went.
     /// FIX-157: `keep` may keep one past its idle time (asked with no lock held).
     u32 Evict(u64 before, const std::function<void(ImageEntry&)>& on_evict,
-              const std::function<bool(ImageEntry&)>& keep = {});
+              const std::function<bool(ImageEntry&)>& keep = {}, u32 max_retired = ~u32{0});
     /// FIX-157: whether guest memory under a picture the GPU wrote still holds what it held
     /// when the picture was last uploaded from it (its content hash).
     bool MemoryUnchanged(const ImageEntry& entry);
@@ -329,6 +344,9 @@ private:
     std::function<UploadSource(const ImageEntry&, Rhi::CommandList&)> upload_source;
     UploadStats upload_stats{};
     std::array<Shard, NumShards> shards;
+    // Eviction runs on the recorder only. Rotate bounded scans so a busy address
+    // shard cannot starve cold entries in the other shards.
+    u32 eviction_shard_cursor = 0;
     std::mutex upload_mutex;
     std::vector<ImageEntry*> pending_uploads;
     std::atomic<u64> generation{0}; ///< OPT-002
@@ -345,6 +363,7 @@ private:
     void NoteChanges(std::span<const std::pair<VAddr, VAddr>> ranges);
     // Recorder-only scratch shared by sequential untile dispatch/copy pairs.
     std::unique_ptr<Rhi::Buffer> upload_scratch;
+    std::unique_ptr<Rhi::Buffer> upload_gather_scratch;
     std::unique_ptr<Rhi::PipelineLayout> untile_layout;
     std::mutex untile_mutex;
     std::unordered_map<u64, std::unique_ptr<Rhi::Pipeline>> untile_pipelines;

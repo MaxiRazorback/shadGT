@@ -1,5 +1,8 @@
+#include "video_core/renderer_vulkan/page_coverage.h"
+#include "video_core/renderer_vulkan/page_watch_tracker.h"
 #include "video_core/renderer_vulkan/descriptor_set_reserve.h"
 #include "video_core/renderer_vulkan/prepared_descriptor_key.h"
+#include "video_core/renderer_vulkan/optional_mirror_budget.h"
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -64,6 +67,8 @@ class Fence;
 } // namespace Native
 
 namespace Vulkan {
+
+template <class Buffer> class AsyncMirrorBuffer;
 
 class Rasterizer;
 struct GtsSceneImage;
@@ -319,6 +324,7 @@ private:
     u64 mirror_bytes = 0;
     std::unordered_map<VAddr, MirrorCandidate> mirror_candidates; ///< by page of the range start
     std::vector<std::pair<VAddr, VAddr>> pending_mirrors;          ///< made at a list's start
+    OptionalMirrorBudget mirror_promotion_budget; ///< shared across lists of this frame
     std::unordered_map<u64, u64> mirror_writes;    ///< granule -> frame the CPU wrote a mirror there
     std::unordered_map<u64, u64> dynamic_granules; ///< granule -> frame it was found CPU-written
     /// The first mirror that may overlap memory from `begin` on.
@@ -642,6 +648,7 @@ private:
 
     Rasterizer& r;
     std::unique_ptr<Native::Rhi::Device> device;
+    std::unique_ptr<AsyncMirrorBuffer<Native::Rhi::Buffer>> mirror_preparation;
     std::unique_ptr<Native::Rhi::Fence> timeline;
     std::unique_ptr<Native::ImageRegistry> registry;
     std::unique_ptr<Native::Rhi::Buffer> gds;
@@ -662,16 +669,11 @@ private:
     /// buffers read, storage buffers written; NAT-150: then what is bound from video memory
     /// instead (mirrors, regions).
     struct InPlace {
-        std::array<std::unordered_set<u64>, 7> pages;
+        std::array<PageCoverage, 7> pages;
         std::array<u64, 7> total{};
         u64 frames = 0;
         void Note(u32 kind, VAddr address, u64 size) {
-            if (size == 0) {
-                return;
-            }
-            for (u64 page = address >> 16; page <= (address + size - 1) >> 16; ++page) {
-                pages[kind].insert(page);
-            }
+            pages[kind].Add(address, size);
         }
     } in_place;
     bool InPlaceSampled() const {
@@ -708,8 +710,7 @@ private:
 
     /// NAT-105: the pages native textures watch (each watched once in the page manager, which
     /// counts at most 255 watchers a page; many textures share pages).
-    std::mutex watch_mutex;
-    std::unordered_set<VAddr> watched_pages;
+    PageWatchTracker page_watches;
 
     /// CMASK / HTILE addresses the game cleared: the next pass into their target clears it.
     std::unordered_set<VAddr> cleared_meta;

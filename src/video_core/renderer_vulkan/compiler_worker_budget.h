@@ -6,6 +6,10 @@ struct CompilerWorkerBudget {
     // Concurrent tessellation compiles exhausted system commit in NVIDIA LLVM.
     // Share one admission limit between dispatch and direct driver calls.
     static constexpr unsigned HeavyPipelineLimit = 1;
+    // Splash-screen work may use every logical processor; gameplay stays bounded.
+    static constexpr unsigned StartupPipelineWorkers(unsigned logical) {
+        return std::max(1u, logical);
+    }
     unsigned translation;
     unsigned pipeline;
     static constexpr CompilerWorkerBudget ForLogicalThreads(unsigned logical) {

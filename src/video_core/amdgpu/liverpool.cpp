@@ -391,6 +391,11 @@ void Liverpool::StartDrawPipe() {
 #ifdef __linux__
         recorder_tid = gettid();
 #endif
+    }, DrawPipe::DefaultMaxPending, [this] {
+        // A held label may be the very thing the guest waits for before
+        // publishing its next command buffer. Submit it before the recorder
+        // sleeps instead of requiring another draw or EOP to trigger a flush.
+        if (rasterizer) rasterizer->FlushDeferredFences();
     });
     pipe_report_start = std::chrono::steady_clock::now();
     pipelined.store(true, std::memory_order_release);

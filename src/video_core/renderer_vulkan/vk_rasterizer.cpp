@@ -16,6 +16,7 @@
 #include "common/debug.h"
 #include "common/path_util.h"
 #include "common/perf_monitor.h"
+#include "ryty_gpu/native/slow_call_trace.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/guest_hash.h"
@@ -6047,30 +6048,40 @@ bool Rasterizer::IsMappedStart(VAddr address) {
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
+    Native::SlowCallTrace<5> trace{true, "guest-unmap",
+        {"native-invalidate", "import-invalidate", "buffer-invalidate", "gpu-command-sync", "mapped-ranges"}};
+    trace.Next(0, addr, size);
     tsharp_epoch.fetch_add(1, std::memory_order_release); // FIX-046
 #ifdef RYTY_GPU
     if (native) {
         native->OnUnmap(addr, size); // NAT-100
     }
 #endif
+    trace.Next(1);
     if (auto* direct = buffer_cache.GetDirectMemory()) {
         direct->OnUnmap(addr, size); // D1
     }
+    trace.Next(2);
     buffer_cache.InvalidateMemory(addr, size);
     // FIX-026: the texture cache has no cache-wide lock since upstream #5219; freeing images here
     // on a game thread raced with the GPU thread freeing the same image ("Trying to unregister an
     // already unregistered image" when starting a race). Free them on the GPU thread and wait,
     // as CPU fault flushes already do. -DisablePerf 35 frees them here.
     static const bool unmap_on_gpu_thread = Common::PerfFeatureEnabled(35);
-    if (unmap_on_gpu_thread && !IsGpuThread()) {
-        liverpool->SendCommand<true>([&] {
-            texture_cache.UnmapMemory(addr, size);
-            buffer_cache.ReleaseUnmappedArenaMemory(addr, size);
-        });
-    } else {
+    const auto release_unmapped = [&] {
+        Native::SlowCallTrace<2> inner{true, "guest-unmap-gpu-work", {"texture-invalidate", "arena-release"}};
+        inner.Next(0, addr, size);
         texture_cache.UnmapMemory(addr, size);
+        inner.Next(1);
         buffer_cache.ReleaseUnmappedArenaMemory(addr, size);
+    };
+    trace.Next(3);
+    if (unmap_on_gpu_thread && !IsGpuThread()) {
+        liverpool->SendCommand<true>(release_unmapped);
+    } else {
+        release_unmapped();
     }
+    trace.Next(4);
     {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges -= decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);

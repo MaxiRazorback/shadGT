@@ -1,3 +1,4 @@
+#include "video_core/renderer_vulkan/ordered_parallel_read.h"
 #include "video_core/renderer_vulkan/driver_cache_snapshot.h"
 #include "video_core/renderer_vulkan/pipeline_retention_budget.h"
 #include "video_core/renderer_vulkan/draw_preparation_options.h"
@@ -434,7 +435,7 @@ PrecompileProgress GetPrecompileProgress() {
 class PipelineCache::PipelineBuildWorkers {
 public:
     PipelineBuildWorkers()
-        : queue{NumWorkers(), std::max(1u, NumWorkers() / 4), NumWorkers()} {
+        : queue{NumWorkers(), std::max(1u, NumWorkers() / 4), StartupWorkers()} {
         // Translation and pipeline pools share a topology-derived CPU budget.
         // Idle workers sleep; compiler priority leaves critical game threads first choice.
         for (u32 i = 0; i < NumWorkers(); ++i) {
@@ -458,6 +459,17 @@ public:
         queue.PauseBackground(until);
     }
     void SetBoost(bool on) {
+        if (on && threads.size() < StartupWorkers()) {
+            // Only startup creates extra workers. They sleep behind the shared
+            // gameplay admission limit after the splash screen ends.
+            const auto previous = threads.size();
+            while (threads.size() < StartupWorkers()) {
+                threads.emplace_back([this](std::stop_token stop) { Work(stop); });
+            }
+            LOG_INFO(Render_Vulkan, "PRECOMPILE-CPU: {} startup workers (was {}); "
+                     "{} gameplay pipeline workers; heavy limit {}",
+                     threads.size(), previous, NumWorkers(), CompilerWorkerBudget::HeavyPipelineLimit);
+        }
         queue.SetBoost(on);
     }
     size_t BackgroundQueued() {
@@ -473,15 +485,26 @@ private:
             std::thread::hardware_concurrency()).pipeline;
     }
 
+    static u32 StartupWorkers() {
+        return CompilerWorkerBudget::StartupPipelineWorkers(std::thread::hardware_concurrency());
+    }
+
     void Work(std::stop_token stop) {
         Common::SetCurrentThreadName("shadGT:PipelineBuild");
         Common::AllowAllCores();
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+        bool startup_priority = false;
         while (true) {
             BuildQueue::Job job;
             bool background = false, heavy = false;
             if (!queue.Pop(job, background, stop, &heavy)) {
                 return;
+            }
+            const bool startup = queue.Boosted();
+            if (startup != startup_priority) {
+                Common::SetCurrentThreadPriority(startup ? Common::ThreadPriority::Normal
+                                                        : Common::ThreadPriority::Low);
+                startup_priority = startup;
             }
             job();
             if (background) {
@@ -1397,7 +1420,7 @@ void PipelineCache::RebuildFromPrograms() {
     // 12,590 shaders in 36 s on one). -DisablePerf 161 uses one.
     static const bool parallel = Common::PerfFeatureEnabled(161);
     const u32 threads =
-        parallel ? (std::thread::hardware_concurrency() > 2 ? std::thread::hardware_concurrency() - 2 : 1u) : 1u;
+        parallel ? CompilerWorkerBudget::StartupPipelineWorkers(std::thread::hardware_concurrency()) : 1u;
     const auto work = [&] {
         Shader::Pools pools;
         for (size_t i = next++; i < metas.size(); i = next++) {
@@ -3401,13 +3424,16 @@ void PipelineCache::PrewarmRead(std::stop_token stop) {
     g_precompile_done = 0;
     LOG_WARNING(Render_Vulkan, "PERF-038: building {} stored pipelines in the background",
                 keys.size());
-    std::unordered_set<u64> listed;
+    const auto read_start = std::chrono::steady_clock::now();
+    // miniz uses one mutable archive cursor. Independent files can be read in parallel.
+    const unsigned readers = EmulatorSettings.IsPipelineCacheArchived() ? 1u :
+        CompilerWorkerBudget::StartupPipelineWorkers(std::thread::hardware_concurrency());
+    const size_t window = std::max<size_t>(32, size_t{readers} * 2);
+    LOG_INFO(Render_Vulkan, "PRECOMPILE-READ: {} file readers, {}-record window", readers, window);
     u64 skipped = 0;
-    for (const auto& [name, time] : keys) {
-        if (stop.stop_requested()) {
-            return;
-        }
-        ++prewarm_read;
+    const bool complete = OrderedParallelRead(keys.size(), readers, window, stop,
+      [&](size_t index) {
+        const auto& name = keys[index].first;
         auto record = std::make_unique<PrewarmRecord>();
         bool valid = false;
         try {
@@ -3438,7 +3464,9 @@ void PipelineCache::PrewarmRead(std::stop_token stop) {
                 }
                 record->pgm[stage] = pgm_hash;
                 record->perm[stage] = perm_idx;
-                if (listed.insert(pgm_hash).second) {
+                if (std::ranges::none_of(record->listings, [pgm_hash](const auto& listing) {
+                        return listing.pgm_hash == pgm_hash;
+                    })) {
                     record->listings.push_back(ReadStoredListing(pgm_hash));
                 }
                 store.Load(Storage::BlobType::ShaderBinary,
@@ -3448,19 +3476,24 @@ void PipelineCache::PrewarmRead(std::stop_token stop) {
             // RecoverableFailure, or a corrupt entry (std::bitset rejects bad text).
             valid = false;
         }
-        if (!valid) {
-            ++skipped;
-            ++g_precompile_done; // PERF-098
-            continue;
-        }
+        if (!valid) return std::unique_ptr<PrewarmRecord>{};
+        return record;
+      }, [&](size_t, std::unique_ptr<PrewarmRecord> record) {
+        ++prewarm_read;
+        if (!record) { ++skipped; ++g_precompile_done; return; }
         std::unique_lock lk{prewarm_mutex};
         prewarm_cv.wait(lk, stop, [this] { return prewarm_records.size() < 32; });
-        if (stop.stop_requested()) {
-            return;
-        }
+        if (stop.stop_requested()) return;
         prewarm_records.push_back(std::move(record));
         ++prewarm_queued;
-    }
+      }, [] {
+        Common::SetCurrentThreadName("shadGT:PrewarmLoad");
+        Common::AllowAllCores();
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Normal);
+      });
+    if (!complete || stop.stop_requested()) return;
+    LOG_INFO(Render_Vulkan, "PRECOMPILE-READ: {} records prepared in {:.3f} s", keys.size(),
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - read_start).count());
     LOG_WARNING(Render_Vulkan,
                 "PERF-038: reader done: {} stored pipelines read, {} skipped (other key version, "
                 "missing stages or files)",
@@ -5141,7 +5174,13 @@ void PipelineCache::TrimUnusedPipelines() {
     if (!instance.CanReportMemoryUsage()) return;
     vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget{};
     vk::PhysicalDeviceMemoryProperties2 memory{.pNext = &budget};
+    const auto budget_query_start = steady_clock::now();
     instance.GetPhysicalDevice().getMemoryProperties2(&memory);
+    const auto budget_query_end = steady_clock::now();
+    if (budget_query_end - budget_query_start >= milliseconds{1}) {
+        LOG_WARNING(Render_Vulkan, "BUDGET-QUERY: pipeline retention {:.3f} ms",
+                    duration<double, std::milli>(budget_query_end - budget_query_start).count());
+    }
     u64 usage_bytes = 0;
     u64 budget_bytes = 0;
     for (u32 i = 0; i < memory.memoryProperties.memoryHeapCount; ++i) {

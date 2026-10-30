@@ -42,6 +42,9 @@
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
 #include "core/debug_state.h"
 #include "imgui.h"
+#if defined(RYTY_GPU) && !defined(ENABLE_DISCORD_RPC)
+#error "RyGT renderer builds must include Discord RPC support"
+#endif
 #ifdef ENABLE_DISCORD_RPC
 #include "common/discord_rpc_handler.h"
 #endif
@@ -536,6 +539,9 @@ void Ryty::RytyLibraryInitialize() {
         auto* rpc = Common::Singleton<DiscordRPCHandler::RPC>::Instance();
         rpc->init();
         rpc->setStatusPlaying("Gran Turismo Sport", "CUSA03220");
+        LOG_INFO(Render_Vulkan, "DISCORD-RPC: compiled in; Gran Turismo Sport presence initialized");
+    } else {
+        LOG_INFO(Render_Vulkan, "DISCORD-RPC: compiled in; disabled by saved game setting");
     }
 #endif
     {

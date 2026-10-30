@@ -4,6 +4,7 @@
 
 #include "ryty_gpu/ryty_diag.h"
 #include "ryty_gpu/ryty_pro_mode.h"
+#include "ryty_gpu/ryty_alias_cache.h"
 #include <windows.h>
 #include <intrin.h>
 #include <algorithm>
@@ -87,7 +88,7 @@ bool IsExecutable(DWORD protect) {
 // over it.
 struct AliasCache {
     std::mutex mutex;
-    std::unordered_map<VAddr, void*> views;
+    Ryty::AliasEntries<> views;
 };
 
 AliasCache& GetAliasCache() {
@@ -96,39 +97,25 @@ AliasCache& GetAliasCache() {
 }
 
 void DropAliases(VAddr address, u64 size) {
+    Native::SlowCallTrace<2> trace{true, "drop-cpu-aliases", {"cache-extract", "host-unmaps"}};
+    trace.Next(0, address, size);
     static const auto unmap_alias = RytyFunction<UnmapAliasFn>("libc.prx", "674-w6lwWXI");
     if (unmap_alias == nullptr) {
         return;
     }
     auto& cache = GetAliasCache();
-    std::scoped_lock lk{cache.mutex};
-    if (cache.views.empty()) {
-        return;
-    }
     constexpr VAddr AliasPage = 0x4000;
     const VAddr first = address & ~(AliasPage - 1);
     const VAddr end = address + std::max<u64>(size, 1);
-    if ((end - first) / AliasPage > cache.views.size()) {
-        for (auto it = cache.views.begin(); it != cache.views.end();) {
-            if (it->first >= first && it->first < end) {
-                if (it->second) {
-                    unmap_alias(it->second);
-                }
-                it = cache.views.erase(it);
-            } else {
-                ++it;
-            }
-        }
-        return;
+    std::vector<void*> retired;
+    {
+        std::scoped_lock lk{cache.mutex};
+        cache.views.RemoveRange(first, end, retired);
     }
-    for (VAddr page = first; page < end; page += AliasPage) {
-        if (const auto it = cache.views.find(page); it != cache.views.end()) {
-            if (it->second) {
-                unmap_alias(it->second);
-            }
-            cache.views.erase(it);
-        }
-    }
+    // No writer can use an extracted pointer. Host unmaps must not hold up a
+    // fence/label writer operating on an unrelated cached alias.
+    trace.Next(1, address, retired.size());
+    for (void* alias : retired) unmap_alias(alias);
 }
 
 // Copies through an alias view of the same pages, so protections set for write tracking do not
@@ -153,24 +140,24 @@ bool WriteThroughCachedAlias(VAddr address, const void* source, u64 size) {
         return false;
     }
     auto& cache = GetAliasCache();
-    std::scoped_lock lk{cache.mutex};
-    auto it = cache.views.find(first);
-    if (it == cache.views.end()) {
-        if (cache.views.size() >= 4096) {
-            for (const auto& [page, view] : cache.views) {
-                if (view) {
-                    unmap_alias(view);
-                }
-            }
-            cache.views.clear();
+    void* retired = nullptr;
+    bool written = false;
+    {
+        std::scoped_lock lk{cache.mutex};
+        auto found = cache.views.Find(first);
+        if (!found) {
+            void* alias = map_alias(first, AliasPage);
+            retired = cache.views.Insert(first, alias);
+            found = alias;
         }
-        it = cache.views.emplace(first, map_alias(first, AliasPage)).first;
+        if (*found) {
+            std::memcpy(static_cast<u8*>(*found) + (address - first), source, size);
+            written = true;
+        }
     }
-    if (it->second == nullptr) {
-        return false;
-    }
-    std::memcpy(static_cast<u8*>(it->second) + (address - first), source, size);
-    return true;
+    // Capacity pressure retires one cold alias, never all 4096 at once.
+    if (retired) unmap_alias(retired);
+    return written;
 }
 
 bool CopyThroughAlias(VAddr address, void* dest, const void* source, u64 size) {
@@ -189,28 +176,10 @@ bool CopyThroughAlias(VAddr address, void* dest, const void* source, u64 size) {
         const char* env = std::getenv("SHADGT_ALIAS_CACHE");
         return !(env && env[0] == '0');
     }();
-    if (cache_views && dest == nullptr && last - first == AliasPage) {
-        // Writes only: reads come in bulk for uploads and would fill the cache.
-        auto& cache = GetAliasCache();
-        std::scoped_lock lk{cache.mutex};
-        auto it = cache.views.find(first);
-        if (it == cache.views.end()) {
-            if (cache.views.size() >= 4096) {
-                for (const auto& [page, view] : cache.views) {
-                    if (view) {
-                        unmap_alias(view);
-                    }
-                }
-                cache.views.clear();
-            }
-            if (void* view = map_alias(first, AliasPage)) {
-                it = cache.views.emplace(first, view).first;
-            }
-        }
-        if (it != cache.views.end() && it->second != nullptr) {
-            std::memcpy(static_cast<u8*>(it->second) + (address - first), source, size);
-            return true;
-        }
+    if (cache_views && dest == nullptr && last - first == AliasPage &&
+        WriteThroughCachedAlias(address, source, size)) {
+        // Share the bounded writer; bulk reads never populate this cache.
+        return true;
     }
     void* alias = map_alias(first, last - first);
     if (alias == nullptr) {

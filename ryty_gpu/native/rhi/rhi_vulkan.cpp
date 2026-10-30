@@ -1,3 +1,6 @@
+#include "ryty_gpu/native/descriptor_update_batch.h"
+#include "ryty_gpu/native/rhi/descriptor_batch_test_spv.h"
+#include "ryty_gpu/native/rhi/gpu_timing_lease.h"
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -361,6 +364,15 @@ public:
     bool owned;
 };
 
+struct GpuListTiming {
+    GpuTimingLease lease;
+    vk::QueryPool queries;
+    vk::Semaphore completion;
+    u64 tick{}, sequence{}, command{}, cpu_started_ns{}, cpu_ended_ns{};
+    u64 buffer_bytes{}, largest_image{}, largest_source_capacity{}, dispatch_groups{};
+    u32 buffer_copies{}, image_uploads{}, image_readbacks{}, dispatches{}, width{}, height{};
+};
+
 struct ThreadPool;
 
 class VulkanCommandList final : public CommandList {
@@ -412,6 +424,7 @@ public:
     /// Whether the GPU is done with the list (its retire fence reached the value).
     bool Retired() const;
 
+    GpuListTiming* timing = nullptr;
     VulkanDevice& device;
     ThreadPool* pool;
     vk::CommandBuffer cmd;
@@ -525,6 +538,17 @@ public:
     void InitImageLayout(vk::Image image, vk::ImageAspectFlags aspect);
     std::unique_ptr<Image> CreateImageFrom(const VkImageCreateInfo& image_ci, const ImageDesc& desc);
     void RecordImageInit(vk::CommandBuffer cmd, std::vector<std::pair<vk::Image, vk::ImageAspectFlags>>& images);
+
+    GpuListTiming* BeginGpuTiming(vk::CommandBuffer cmd);
+    void EndGpuTiming(GpuListTiming* timing, vk::CommandBuffer cmd);
+    void PublishGpuTiming(GpuListTiming* timing, vk::Semaphore completion, u64 tick);
+    void ReadGpuTimings();
+    std::array<GpuListTiming, 64> gpu_timings;
+    u32 gpu_timing_count = 0, timestamp_bits = 0;
+    float timestamp_period = 0;
+    std::atomic<u64> gpu_timing_sequence{}, gpu_timing_completed{}, gpu_timing_skipped{};
+    std::atomic<bool> stop_gpu_timings{};
+    std::thread gpu_timing_reader;
 
     VulkanContext ctx;
     vk::Device device;
@@ -642,9 +666,26 @@ VulkanDevice::VulkanDevice(VulkanContext context)
     });
     ASSERT_MSG(pool_result == vk::Result::eSuccess, "NAT-011: command pool failed");
     init_pool = pool;
+    const auto queues = ctx.physical_device.getQueueFamilyProperties();
+    timestamp_bits = ctx.queue_family < queues.size() ? queues[ctx.queue_family].timestampValidBits : 0;
+    timestamp_period = properties.get<vk::PhysicalDeviceProperties2>().properties.limits.timestampPeriod;
+    if (timestamp_bits != 0 && timestamp_period > 0) {
+        for (auto& sample : gpu_timings) {
+            const auto [query_result, queries] = device.createQueryPool(
+                vk::QueryPoolCreateInfo{.queryType = vk::QueryType::eTimestamp, .queryCount = 2});
+            if (query_result != vk::Result::eSuccess) break;
+            sample.queries = queries;
+            ++gpu_timing_count;
+        }
+    }
+    if (gpu_timing_count != 0) {
+        gpu_timing_reader = std::thread([this] { ReadGpuTimings(); });
+    }
 }
 
 VulkanDevice::~VulkanDevice() {
+    stop_gpu_timings.store(true, std::memory_order_release);
+    if (gpu_timing_reader.joinable()) gpu_timing_reader.join();
     std::ignore = device.waitIdle();
     Collect();
     completed_resources.DrainAndStop();
@@ -659,10 +700,101 @@ VulkanDevice::~VulkanDevice() {
         }
         device.destroyCommandPool(pool->pool);
     }
+    for (u32 i = 0; i < gpu_timing_count; ++i) device.destroyQueryPool(gpu_timings[i].queries);
     device.destroyCommandPool(init_pool);
     device.destroySemaphore(timeline);
     if (ctx.destroy) {
         ctx.destroy();
+    }
+}
+
+namespace {
+u64 GpuTimingCpuNow() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+}
+GpuListTiming* VulkanDevice::BeginGpuTiming(vk::CommandBuffer cmd) {
+    for (u32 i = 0; i < gpu_timing_count; ++i) {
+        auto& sample = gpu_timings[i];
+        if (!sample.lease.TryBegin()) continue;
+        sample.sequence = gpu_timing_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+        sample.command = reinterpret_cast<u64>(static_cast<VkCommandBuffer>(cmd));
+        sample.cpu_started_ns = GpuTimingCpuNow();
+        sample.buffer_bytes = sample.largest_image = sample.largest_source_capacity = 0;
+        sample.dispatch_groups = 0;
+        sample.buffer_copies = sample.image_uploads = sample.image_readbacks = sample.dispatches = 0;
+        sample.width = sample.height = 0;
+        cmd.resetQueryPool(sample.queries, 0, 2);
+        cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, sample.queries, 0);
+        return &sample;
+    }
+    gpu_timing_skipped.fetch_add(1, std::memory_order_relaxed);
+    return nullptr; // Exhausted diagnostics must never delay recording.
+}
+void VulkanDevice::EndGpuTiming(GpuListTiming* sample, vk::CommandBuffer cmd) {
+    if (!sample) return;
+    cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, sample->queries, 1);
+    sample->cpu_ended_ns = GpuTimingCpuNow();
+    sample->lease.End();
+}
+void VulkanDevice::PublishGpuTiming(GpuListTiming* sample, vk::Semaphore completion, u64 tick) {
+    if (!sample) return;
+    sample->completion = completion;
+    sample->tick = tick;
+    sample->lease.Publish(); // Only after submission/MarkExecuted supplies its real fence.
+}
+void VulkanDevice::ReadGpuTimings() {
+    Common::SetCurrentThreadName("shadGT:GpuTimingReader");
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+    auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!stop_gpu_timings.load(std::memory_order_acquire)) {
+        std::array<vk::Semaphore, 64> seen{};
+        std::array<u64, 64> counters{};
+        u32 seen_count = 0;
+        for (u32 i = 0; i < gpu_timing_count; ++i) {
+            auto& sample = gpu_timings[i];
+            if (!sample.lease.IsPending()) continue;
+            u32 index = 0;
+            while (index < seen_count && seen[index] != sample.completion) ++index;
+            if (index == seen_count) {
+                const auto [counter_result, value] = device.getSemaphoreCounterValue(sample.completion);
+                if (counter_result != vk::Result::eSuccess) continue;
+                seen[index] = sample.completion; counters[index] = value; ++seen_count;
+            }
+            if (!sample.lease.Readable(counters[index], sample.tick)) continue;
+            // Availability from an old generation can remain set until the GPU
+            // executes resetQueryPool. The real completion fence above is mandatory.
+            std::array<u64, 4> result{};
+            const VkResult query_result = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueryPoolResults(
+                static_cast<VkDevice>(device), static_cast<VkQueryPool>(sample.queries), 0, 2,
+                sizeof(result), result.data(), 2 * sizeof(u64),
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+            if (query_result != VK_SUCCESS || result[1] == 0 || result[3] == 0) continue;
+            const double gpu_ms = double(GpuTimestampDelta(result[0], result[2], timestamp_bits)) *
+                                  timestamp_period / 1e6;
+            const double cpu_ms = double(sample.cpu_ended_ns - sample.cpu_started_ns) / 1e6;
+            const double age_ms = double(GpuTimingCpuNow() - sample.cpu_ended_ns) / 1e6;
+            if (gpu_ms >= 2.0) {
+                LOG_WARNING(Render_Vulkan,
+                    "GPU-LIST: id={} cmd={:#x} tick={} gpu-span={:.3f}ms cpu-record={:.3f}ms read-age={:.3f}ms "
+                    "rhi-buffer-copies={} bytes={} image-uploads={} readbacks={} dispatches={} groups={} "
+                    "largest-image={:#x} {}x{} source-capacity={}",
+                    sample.sequence, sample.command, sample.tick, gpu_ms, cpu_ms, age_ms,
+                    sample.buffer_copies, sample.buffer_bytes, sample.image_uploads, sample.image_readbacks,
+                    sample.dispatches, sample.dispatch_groups, sample.largest_image,
+                    sample.width, sample.height, sample.largest_source_capacity);
+            }
+            gpu_timing_completed.fetch_add(1, std::memory_order_relaxed);
+            sample.lease.Release(); // No reset/reuse until the old results have been read.
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_report) {
+            LOG_INFO(Render_Vulkan, "GPU-LIST: coverage {} started, {} completed, {} skipped; {} bounded query pairs",
+                gpu_timing_sequence.load(), gpu_timing_completed.load(), gpu_timing_skipped.load(), gpu_timing_count);
+            next_report = now + std::chrono::seconds(10);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(8));
     }
 }
 
@@ -1371,7 +1503,10 @@ std::unique_ptr<CommandList> VulkanDevice::WrapCommandBuffer(u64 native_cmdbuf) 
 
 void VulkanDevice::ReleaseUnsubmitted(CommandList* list) {
     if (!list) return;
-    static_cast<VulkanCommandList*>(list)->retire_value.store(0, std::memory_order_release);
+    auto* vk_list = static_cast<VulkanCommandList*>(list);
+    if (vk_list->timing) vk_list->timing->lease.Cancel();
+    vk_list->timing = nullptr;
+    vk_list->retire_value.store(0, std::memory_order_release);
 }
 
 void VulkanDevice::MarkExecuted(CommandList* list, FenceValue retire) {
@@ -1379,6 +1514,8 @@ void VulkanDevice::MarkExecuted(CommandList* list, FenceValue retire) {
     auto* vulkan_list = static_cast<VulkanCommandList*>(list);
     vulkan_list->retire_fence.store(retire.fence, std::memory_order_relaxed);
     vulkan_list->retire_value.store(retire.value, std::memory_order_release);
+    PublishGpuTiming(vulkan_list->timing, static_cast<const VulkanFence*>(retire.fence)->semaphore, retire.value);
+    vulkan_list->timing = nullptr;
 }
 
 void VulkanDevice::Collect() {
@@ -1398,8 +1535,15 @@ void VulkanDevice::Collect() {
             oldest = retired.empty() ? 0 : retired.front().tick;
         }
         VmaBudget budgets[VK_MAX_MEMORY_HEAPS]{};
+        const auto budget_query_start = std::chrono::steady_clock::now();
         vmaGetHeapBudgets(allocator, budgets);
         const auto properties = ctx.physical_device.getMemoryProperties();
+        const auto budget_query_end = std::chrono::steady_clock::now();
+        if (budget_query_end - budget_query_start >= std::chrono::milliseconds{1}) {
+            LOG_WARNING(Render_Vulkan, "BUDGET-QUERY: Native ownership {:.3f} ms",
+                        std::chrono::duration<double, std::milli>(
+                            budget_query_end - budget_query_start).count());
+        }
         for (u32 heap = 0; heap < properties.memoryHeapCount; ++heap) {
             const auto& budget = budgets[heap];
             LOG_INFO(Render_Vulkan,
@@ -1518,6 +1662,8 @@ void VulkanQueue::Submit(std::span<CommandList* const> lists, std::span<const Fe
         auto* vulkan_list = static_cast<VulkanCommandList*>(list);
         vulkan_list->retire_fence.store(device.timeline_fence.get(), std::memory_order_relaxed);
         vulkan_list->retire_value.store(tick, std::memory_order_release);
+        device.PublishGpuTiming(vulkan_list->timing, device.timeline, tick);
+        vulkan_list->timing = nullptr;
     }
 }
 
@@ -1526,6 +1672,7 @@ void VulkanQueue::Submit(std::span<CommandList* const> lists, std::span<const Fe
 void VulkanCommandList::Begin() {
     graphics = nullptr;
     compute = nullptr;
+    timing = nullptr;
     if (!pool) {
         return; // Externally begun
     }
@@ -1536,12 +1683,14 @@ void VulkanCommandList::Begin() {
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
         .pInheritanceInfo = level == CommandListLevel::Secondary ? &inheritance : nullptr,
     });
+    timing = device.BeginGpuTiming(cmd);
 }
 
 void VulkanCommandList::End() {
     if (!pool) {
         return; // Externally ended
     }
+    device.EndGpuTiming(timing, cmd);
     std::ignore = cmd.end();
 }
 
@@ -1814,6 +1963,7 @@ void VulkanCommandList::DrawIndexed(u32 indices, u32 instances, u32 first_index,
 }
 
 void VulkanCommandList::Dispatch(u32 x, u32 y, u32 z) {
+    if (timing) { ++timing->dispatches; timing->dispatch_groups += u64{x} * y * z; }
     cmd.dispatch(x, y, z);
 }
 
@@ -1829,6 +1979,7 @@ void VulkanCommandList::Barrier(u32 wait_for, u32 hold_back) {
 
 void VulkanCommandList::CopyBuffer(const Buffer* src, u64 src_offset, const Buffer* dst,
                                    u64 dst_offset, u64 size) {
+    if (timing) { ++timing->buffer_copies; timing->buffer_bytes += size; }
     const vk::BufferCopy region{.srcOffset = src_offset, .dstOffset = dst_offset, .size = size};
     cmd.copyBuffer(static_cast<const VulkanBuffer*>(src)->buffer,
                    static_cast<const VulkanBuffer*>(dst)->buffer, region);
@@ -1859,6 +2010,14 @@ std::vector<vk::BufferImageCopy> ToVkRegions(std::span<const BufferImageCopy> re
 
 void VulkanCommandList::CopyBufferToImage(const Buffer* src, const Image* dst,
                                           std::span<const BufferImageCopy> regions) {
+    if (timing) {
+        ++timing->image_uploads;
+        if (src->Size() >= timing->largest_source_capacity) {
+            timing->largest_source_capacity = src->Size();
+            timing->largest_image = dst->NativeHandle();
+            timing->width = dst->Desc().width; timing->height = dst->Desc().height;
+        }
+    }
     const auto out = ToVkRegions(regions);
     cmd.copyBufferToImage(static_cast<const VulkanBuffer*>(src)->buffer,
                           static_cast<const VulkanImage*>(dst)->image, vk::ImageLayout::eGeneral,
@@ -1867,6 +2026,7 @@ void VulkanCommandList::CopyBufferToImage(const Buffer* src, const Image* dst,
 
 void VulkanCommandList::CopyImageToBuffer(const Image* src, const Buffer* dst,
                                           std::span<const BufferImageCopy> regions) {
+    if (timing) ++timing->image_readbacks;
     const auto out = ToVkRegions(regions);
     cmd.copyImageToBuffer(static_cast<const VulkanImage*>(src)->image, vk::ImageLayout::eGeneral,
                           static_cast<const VulkanBuffer*>(dst)->buffer,
@@ -2038,6 +2198,7 @@ std::unique_ptr<Device> CreateStandaloneVulkanDevice(std::string* error) {
             .depthBounds = features.depthBounds,
             .wideLines = features.wideLines,
             .samplerAnisotropy = features.samplerAnisotropy,
+            .textureCompressionBC = features.textureCompressionBC,
             .shaderInt64 = features.shaderInt64,
             .shaderInt16 = features.shaderInt16,
         },
@@ -2105,6 +2266,167 @@ std::unique_ptr<Device> CreateStandaloneVulkanDevice(std::string* error) {
             },
     };
     return std::make_unique<VulkanDevice>(std::move(context));
+}
+
+// Diagnostic harness uses the same backend, lease protocol and reader as gameplay.
+extern "C" __declspec(dllexport) int RytyNativeGpuTimingSelfTest(char* report, int report_size) {
+    std::string error;
+    auto base = CreateStandaloneVulkanDevice(&error);
+    if (!base) return 1;
+    auto& device = static_cast<VulkanDevice&>(*base);
+    bool ok = device.gpu_timing_count == 64;
+    // Exhaustion skips diagnostics, never recording or ownership. None of these
+    // buffers execute: cancel must release their slots without reading stale queries.
+    std::vector<CommandList*> unsubmitted;
+    for (u32 i = 0; i < 96; ++i) {
+        auto* list = device.AcquireCommandList(CommandListLevel::Primary); list->Begin(); list->End();
+        unsubmitted.push_back(list);
+    }
+    ok = ok && device.gpu_timing_sequence.load() == 64 && device.gpu_timing_skipped.load() == 32;
+    for (auto* list : unsubmitted) device.ReleaseUnsubmitted(list);
+    auto source = device.CreateBuffer({.size = 65536, .usage = BufferUsageTransferSrc,
+                                      .memory = MemoryKind::Upload});
+    auto read = device.CreateBuffer({.size = 65536, .usage = BufferUsageTransferDst,
+                                    .memory = MemoryKind::Readback});
+    auto fence = device.CreateFence(0);
+    if (!source || !read || !fence) return 2;
+    for (u32 pass = 1; pass <= 160; ++pass) {
+        std::memset(source->Mapped(), int(pass), 65536);
+        const bool secondary = (pass & 1) == 0;
+        auto* list = device.AcquireCommandList(secondary ? CommandListLevel::Secondary : CommandListLevel::Primary);
+        list->Begin();
+        list->Barrier(ScopeHost, ScopeTransfer);
+        list->CopyBuffer(source.get(), 0, read.get(), 0, 65536);
+        list->Barrier(ScopeTransfer, ScopeHost); list->End();
+        auto* submit_list = list;
+        if (secondary) {
+            submit_list = device.AcquireCommandList(CommandListLevel::Primary);
+            submit_list->Begin();
+            CommandList* secondaries[] = {list};
+            submit_list->ExecuteSecondary(secondaries);
+            submit_list->End();
+        }
+        CommandList* lists[] = {submit_list};
+        device.GraphicsQueue().Submit(lists, {}, {fence.get(), pass});
+        if (secondary) device.MarkExecuted(list, {fence.get(), pass});
+        if (!fence->Wait(pass, 5'000'000'000ULL)) return 3;
+        read->Invalidate();
+        if (std::memcmp(source->Mapped(), read->Mapped(), 65536) != 0) return 4;
+        // Let each generation's completion-gated query read finish before the
+        // next cycle. This wait is in the standalone test, never the recorder.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        const u64 expected = pass + pass / 2;
+        while (device.gpu_timing_completed.load() < expected && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (device.gpu_timing_completed.load() != expected) {
+            const auto detail = fmt::format("pass={} expected={} completed={} started={} skipped={} pools={} bits={}\n",
+                pass, expected, device.gpu_timing_completed.load(), device.gpu_timing_sequence.load(),
+                device.gpu_timing_skipped.load(), device.gpu_timing_count, device.timestamp_bits);
+            if (report && report_size > 0) {
+                const auto n = std::min<size_t>(detail.size(), size_t(report_size - 1));
+                std::memcpy(report, detail.data(), n); report[n] = 0;
+            }
+            return 5;
+        }
+    }
+    const auto text = fmt::format("GPU timing: 64 bounded query pairs, 96 unsubmitted lists, 32 nonblocking skips, "
+        "cancellation, 240 reused query generations in primary/secondary lists and 10485760 GPU copy bytes verified: {}\n", ok ? "passed" : "FAILED");
+    if (report && report_size > 0) {
+        const auto size = std::min<size_t>(text.size(), size_t(report_size - 1));
+        std::memcpy(report, text.data(), size); report[size] = 0;
+    }
+    return ok ? 0 : 6;
+}
+
+extern "C" __declspec(dllexport) int RytyNativeDescriptorBatchSelfTest(char* report,int report_size) {
+    std::string error;
+    auto base=CreateStandaloneVulkanDevice(&error);if(!base)return 1;
+    auto& owner=static_cast<VulkanDevice&>(*base);const auto device=owner.device;
+    constexpr u64 stride=1024, blocks=64, passes=128;
+    std::array<std::unique_ptr<Buffer>,3> inputs;
+    for(u32 i=0;i<3;++i)inputs[i]=owner.CreateBuffer({.size=blocks*stride,
+        .usage=BufferUsageStorage,.memory=MemoryKind::Upload});
+    auto output=owner.CreateBuffer({.size=passes*stride,.usage=BufferUsageStorage,
+        .memory=MemoryKind::Readback});
+    if(!inputs[0]||!inputs[1]||!inputs[2]||!output)return 2;
+    for(u32 block=0;block<blocks;++block)for(u32 i=0;i<8;++i){
+        const std::array<u32,3> values{block*101+i,block*17+i*3,block*29+i*7};
+        for(u32 n=0;n<3;++n)std::memcpy(inputs[n]->Mapped()+block*stride+i*4,&values[n],4);
+    }
+    const vk::DescriptorSetLayoutBinding binding{.binding=0,.descriptorType=vk::DescriptorType::eStorageBuffer,
+        .descriptorCount=1,.stageFlags=vk::ShaderStageFlagBits::eCompute};
+    std::array<vk::DescriptorSetLayout,4> layouts;
+    for(u32 i=0;i<4;++i){
+        const auto [result,layout]=device.createDescriptorSetLayout(vk::DescriptorSetLayoutCreateInfo{
+            .flags=i==1?vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR:vk::DescriptorSetLayoutCreateFlags{},
+            .bindingCount=1,.pBindings=&binding});
+        if(result!=vk::Result::eSuccess)return 3;layouts[i]=layout;
+    }
+    const auto [lr,layout]=device.createPipelineLayout(vk::PipelineLayoutCreateInfo{
+        .setLayoutCount=4,.pSetLayouts=layouts.data()});if(lr!=vk::Result::eSuccess)return 4;
+    const auto [mr,module]=device.createShaderModule(vk::ShaderModuleCreateInfo{
+        .codeSize=sizeof(kDescriptorBatchTestSpv),.pCode=kDescriptorBatchTestSpv});if(mr!=vk::Result::eSuccess)return 5;
+    const auto [pr,pipeline]=device.createComputePipeline({},vk::ComputePipelineCreateInfo{
+        .stage={.stage=vk::ShaderStageFlagBits::eCompute,.module=module,.pName="main"},.layout=layout});
+    if(pr!=vk::Result::eSuccess)return 6;
+    const vk::DescriptorPoolSize pool_size{vk::DescriptorType::eStorageBuffer,384};
+    const auto [dr,pool]=device.createDescriptorPool(vk::DescriptorPoolCreateInfo{
+        .maxSets=384,.poolSizeCount=1,.pPoolSizes=&pool_size});if(dr!=vk::Result::eSuccess)return 7;
+    auto fence=owner.CreateFence(0);auto* list=owner.AcquireCommandList(CommandListLevel::Primary);list->Begin();
+    const vk::CommandBuffer cmd{reinterpret_cast<VkCommandBuffer>(list->NativeHandle())};
+    list->Barrier(ScopeHost,ScopeCompute);cmd.bindPipeline(vk::PipelineBindPoint::eCompute,pipeline);
+    std::array<vk::DescriptorSet,2> cached_a{};u32 old_calls=0,batch_calls=0;
+    for(u32 pass=0;pass<passes;++pass){
+        const u32 block=pass/2,mode=pass%2;const bool hit=(block%2)!=0;
+        std::array<vk::DescriptorBufferInfo,4> infos;
+        for(u32 i=0;i<3;++i)infos[i]={vk::Buffer{reinterpret_cast<VkBuffer>(inputs[i]->NativeHandle())},block*stride,32};
+        infos[3]={vk::Buffer{reinterpret_cast<VkBuffer>(output->NativeHandle())},pass*stride,32};
+        std::array<std::vector<vk::WriteDescriptorSet>,4> groups;
+        std::array<vk::DescriptorSet,4> sets{};
+        for(u32 i=0;i<4;++i){
+            groups[i].push_back(vk::WriteDescriptorSet{.dstBinding=0,.descriptorCount=1,
+                .descriptorType=vk::DescriptorType::eStorageBuffer,.pBufferInfo=&infos[i]});
+            if(i==1)continue;
+            if(i==0&&hit){sets[i]=cached_a[mode];continue;}
+            const auto [ar,allocated]=device.allocateDescriptorSets(vk::DescriptorSetAllocateInfo{
+                .descriptorPool=pool,.descriptorSetCount=1,.pSetLayouts=&layouts[i]});
+            if(ar!=vk::Result::eSuccess)return 8;sets[i]=allocated[0];
+            if(i==0)cached_a[mode]=sets[i];
+        }
+        const auto push=[&](u32 i,const auto& writes){cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,layout,i,writes);};
+        const auto bind=[&](u32 i,vk::DescriptorSet set){cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute,layout,i,set,{});};
+        std::vector<vk::WriteDescriptorSet> updates;
+        if(mode==0){
+            for(u32 i=0;i<4;++i){
+                if(i==1){push(i,groups[i]);continue;}
+                if(!(i==0&&hit)){
+                    updates.clear();Native::AppendDescriptorUpdates(groups[i],sets[i],updates);
+                    device.updateDescriptorSets(updates,{});++old_calls;
+                }
+                bind(i,sets[i]);
+            }
+        }else{
+            for(u32 i=0;i<4;++i)if(i!=1&&!(i==0&&hit))Native::AppendDescriptorUpdates(groups[i],sets[i],updates);
+            Native::CommitDescriptorBatch(updates,sets,1,groups,
+                [&](const auto& writes){device.updateDescriptorSets(writes,{});++batch_calls;},push,bind);
+        }
+        // Original write destinations and info-array addresses must remain untouched.
+        for(u32 i=0;i<4;++i)if(groups[i][0].dstSet||groups[i][0].pBufferInfo!=&infos[i])return 9;
+        cmd.dispatch(1,1,1);
+    }
+    list->Barrier(ScopeCompute,ScopeHost);list->End();CommandList* lists[]={list};
+    owner.GraphicsQueue().Submit(lists,{}, {fence.get(),1});if(!fence->Wait(1,5'000'000'000ULL))return 10;
+    output->Invalidate();u32 checked=0,wrong=0;
+    for(u32 pass=0;pass<passes;++pass)for(u32 i=0;i<8;++i){
+        const u32 block=pass/2,a_block=(block%2)?block-1:block;
+        const u32 expected=(a_block*101+i)^((block*17+i*3)*1664525u+(block*29+i*7));u32 actual;
+        std::memcpy(&actual,output->Mapped()+pass*stride+i*4,4);wrong+=actual!=expected;++checked;
+    }
+    device.destroyDescriptorPool(pool);device.destroyPipeline(pipeline);device.destroyShaderModule(module);
+    device.destroyPipelineLayout(layout);for(auto set_layout:layouts)device.destroyDescriptorSetLayout(set_layout);
+    const auto text=fmt::format("descriptor update batching: {} NVIDIA values checked, {} wrong; {} baseline calls vs {} batched calls; cached sets and middle push set verified\n",checked,wrong,old_calls,batch_calls);
+    if(report&&report_size>0){const auto n=std::min(text.size(),size_t(report_size-1));std::memcpy(report,text.data(),n);report[n]=0;}
+    return wrong==0&&old_calls==160&&batch_calls==64?0:11;
 }
 
 } // namespace Native::Rhi

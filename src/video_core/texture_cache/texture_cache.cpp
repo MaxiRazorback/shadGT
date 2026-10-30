@@ -1709,11 +1709,12 @@ void TextureCache::GarbageCollectUnusedImages() {
     }
     if (now - idle_gc_last_scan < seconds{1}) return;
     idle_gc_last_scan = now;
-    TrimUnusedRecycledImages(instance.GetAllocator());
-    if (empty_block_trim_after != steady_clock::time_point{} && now >= empty_block_trim_after) {
-        Vulkan::TrimEmptyVmaBlocks(instance.GetAllocator());
-        empty_block_trim_after = {};
-    }
+    // Keep the byte-bounded completed-image pool reusable during play. Expiring
+    // the whole pool and trimming VMA blocks on a timer makes the recorder enter
+    // driver destruction and then allocate the same resources again. Capacity
+    // eviction, explicit unmaps, pressure GC and allocation-failure recovery
+    // still reclaim memory; live/GPU-modified images follow their existing rules.
+    empty_block_trim_after = {};
     if (idle_gc_cutoff_tick == 0) return;
 
     u32 freed = 0;

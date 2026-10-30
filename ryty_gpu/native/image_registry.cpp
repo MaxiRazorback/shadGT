@@ -1,3 +1,5 @@
+#include "ryty_gpu/native/unique_upload_batch.h"
+#include "ryty_gpu/native/upload_cause.h"
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -718,10 +720,19 @@ u64 ImageRegistry::Count() {
 }
 
 u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_evict,
-                         const std::function<bool(ImageEntry&)>& keep) {
+                         const std::function<bool(ImageEntry&)>& keep, u32 max_retired) {
+    if (max_retired == 0) return 0;
     std::unordered_set<const ImageEntry*> gone;
     std::vector<ImageEntry*> candidates;
-    for (Shard& shard : shards) {
+    const bool bounded = max_retired != ~u32{0};
+    const u32 first = bounded ? eviction_shard_cursor : 0;
+    // Scan metadata in every shard: a heavily populated single shard must still
+    // be able to retire a full budget every frame, rather than once per rotation.
+    // Rotate the selection order so a busy shard cannot starve the others.
+    const u32 visits = NumShards;
+    if (bounded) eviction_shard_cursor = (first + 1) % NumShards;
+    for (u32 i = 0; i < visits; ++i) {
+        Shard& shard = shards[(first + i) % NumShards];
         std::shared_lock lock{shard.mutex};
         for (const auto& [base, entry] : shard.images) {
             if (entry->last_use.load(std::memory_order_relaxed) < before) {
@@ -731,6 +742,7 @@ u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_
     }
     // FIX-157: pictures the caller keeps stay (asked with no lock held: it looks around).
     for (ImageEntry* entry : candidates) {
+        if (gone.size() >= max_retired) break;
         if (!keep || !keep(*entry)) {
             gone.insert(entry);
         }
@@ -741,7 +753,8 @@ u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_
     // Out of the shards first: from then on nothing finds them (a CPU write fault on another
     // thread queues the textures it finds for upload while holding a shard's lock).
     std::vector<std::unique_ptr<ImageEntry>> taken;
-    for (Shard& shard : shards) {
+    for (u32 i = 0; i < visits; ++i) {
+        Shard& shard = shards[(first + i) % NumShards];
         std::unique_lock lock{shard.mutex};
         for (auto it = shard.images.begin(); it != shard.images.end();) {
             // OPT-010: one a job thread found since the scan stays.
@@ -812,10 +825,31 @@ void ImageRegistry::MarkStale(ImageEntry& entry, Stale why) {
                     why == Stale::CpuWrite ? "CPU write" : why == Stale::Unmap ? "unmap" : "GPU write",
                     entry.needs_upload.load(), WatchedBytes(entry.info.guest_address));
     }
+    if (why == Stale::GpuWrite) {
+        entry.gpu_backing_written.store(true, std::memory_order_release);
+    }
     if (why != Stale::CpuWrite) {
         entry.force_upload.store(true, std::memory_order_relaxed);
     }
-    if (!entry.needs_upload.exchange(true)) {
+    const bool already_dirty = entry.needs_upload.exchange(true);
+    const u32 prior_uploads = entry.total_uploads.load(std::memory_order_relaxed);
+    if (!already_dirty && entry.from_cpu && entry.info.guest_size >= (4ull << 20) &&
+        entry.info.size.width >= 2048 && (prior_uploads <= 3 || prior_uploads % 16 == 0)) {
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1,std::memory_order_relaxed) < 4096) {
+            LOG_WARNING(Render_Vulkan,
+                "UPLOAD-CAUSE: dirty image={:#x} guest={:#x} bytes={} prior={} reason={} forced={}",
+                entry.image->NativeHandle(),entry.info.guest_address,entry.info.guest_size,
+                prior_uploads,static_cast<u32>(why),entry.force_upload.load());
+        }
+    }
+    // All large CPU-texture invalidations wait for actual image use. In particular,
+    // OnUnmap runs before guest memory is released: eagerly queuing here re-imports
+    // and uploads a discarded texture while the unmapping thread waits for us.
+    // Preserve dirty/force flags so a later use after remapping still refreshes it.
+    // Explicit RequestUpload separately admits its required rewrite immediately.
+    const bool defer = entry.from_cpu && entry.info.guest_size >= (4ull << 20);
+    if (!already_dirty && !defer) {
         std::scoped_lock upload_lock{upload_mutex};
         pending_uploads.push_back(&entry);
     }
@@ -894,6 +928,8 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
             if (!exact && size > 2 * std::max<u64>(entry.info.guest_size, 1)) {
                 return;
             }
+            // Retain ownership even after clears/source links/force flags are consumed.
+            entry.gpu_backing_written.store(true, std::memory_order_release);
             // NAT-133: a fill that covers the whole texture fills it on the GPU at its next use
             // (GT Sport clears its environment cube and motion targets with fills, and textures
             // over that memory were uploaded again 60 times a second).
@@ -911,6 +947,24 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
                 made_of_targets = !entry.sources.empty();
             }
             if (!made_of_targets && entry.info.num_samples == 1) {
+                const u32 prior = entry.total_uploads.load(std::memory_order_relaxed);
+                if (!entry.needs_upload.load() && entry.info.guest_size >= (4ull << 20) &&
+                    entry.info.size.width >= 2048 && (prior <= 3 || prior % 16 == 0)) {
+                    static std::atomic<u32> logged{};
+                    if (logged.fetch_add(1,std::memory_order_relaxed) < 4096) {
+                        const u64 sequence = GpuCheckpoints::sequence.load(std::memory_order_acquire);
+                        const auto& slot = GpuCheckpoints::slots[sequence % GpuCheckpoints::slots.size()];
+                        const u64 before = slot.stamp.load(std::memory_order_acquire);
+                        const u64 kind = slot.kind.load(std::memory_order_relaxed);
+                        const u64 program = slot.program.load(std::memory_order_relaxed);
+                        const bool stable = before == sequence && sequence != 0 &&
+                            slot.stamp.load(std::memory_order_acquire) == before;
+                        LOG_WARNING(Render_Vulkan,
+                            "UPLOAD-CAUSE: gpu-write image={:#x} guest={:#x} prior={} write={:#x}+{:#x} exact={} fill={} clock={} preceding-checkpoint={} preceding-kind={} preceding-program={:#x} stable={}",
+                            entry.image->NativeHandle(),entry.info.guest_address,prior,address,size,
+                            exact,pattern != nullptr,clock,sequence,kind,program,stable);
+                    }
+                }
                 MarkStale(entry, Stale::GpuWrite);
                 static std::atomic<u32> logged{};
                 if (const u32 n = logged++; n < 40 || n % 2000 == 0) {
@@ -993,6 +1047,18 @@ void ImageRegistry::CpuWrite(VAddr address, u64 size, u64 exact) {
         // A small texture is checked by hash at its next use (its page is no longer watched,
         // so later writes there go unseen); a large one is uploaded again only when written.
         if (hit || entry.info.guest_size <= HashedSize) {
+            const auto fault = UploadCause::cpu_fault;
+            const u32 prior = entry.total_uploads.load(std::memory_order_relaxed);
+            if (!entry.needs_upload.load() && entry.info.guest_size >= (4ull << 20) &&
+                entry.info.size.width >= 2048 && (prior <= 3 || prior % 16 == 0)) {
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1,std::memory_order_relaxed) < 4096) {
+                    LOG_WARNING(Render_Vulkan,
+                        "UPLOAD-CAUSE: cpu-fault image={:#x} guest={:#x} bytes={} prior={} fault={:#x} reported-size={} exact-size={} page={:#x}+{:#x} context={}",
+                        entry.image->NativeHandle(),entry.info.guest_address,entry.info.guest_size,
+                        prior,fault.address,fault.size,fault.exact,address,size,fault.active);
+                }
+            }
             MarkStale(entry, Stale::CpuWrite);
         }
     });
@@ -1071,6 +1137,23 @@ const Rhi::Pipeline* ImageRegistry::TilingPipeline(const VideoCore::ImageInfo& i
     return result;
 }
 
+Rhi::Buffer* ImageRegistry::AcquireUploadGatherScratch(Rhi::CommandList& list, u64 size) {
+    const u64 capacity = UploadScratchCapacity(size);
+    if (!capacity) return nullptr;
+    if (!upload_gather_scratch || upload_gather_scratch->Size() < size) {
+        auto larger = device.CreateBuffer({.size = capacity,
+            .usage = Rhi::BufferUsageStorage | Rhi::BufferUsageTransferSrc |
+                     Rhi::BufferUsageTransferDst,
+            .memory = Rhi::MemoryKind::DeviceLocal, .name = "shared native upload gather"});
+        if (!larger) return nullptr;
+        // Buffer destruction uses the device's pending-submission retirement tick.
+        upload_gather_scratch = std::move(larger);
+    }
+    // Finish the previous upload's reads before overwriting the gathered bytes.
+    list.Barrier(Rhi::ScopeCompute | Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+    return upload_gather_scratch.get();
+}
+
 u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) {
     SampleGuestHashCalls hash_sampling{trace_slow_calls};
     SlowCallTrace<16> trace{trace_slow_calls, "image-uploads",
@@ -1082,6 +1165,10 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
         std::scoped_lock lock{upload_mutex};
         pending.swap(pending_uploads);
     }
+    // Duplicates may observe needs_upload becoming true again while an earlier
+    // snapshot is copied. Consume each image only once, preserving that new dirty
+    // state for the next actual use rather than uploading it repeatedly now.
+    UniqueUploadBatch(pending);
     u32 uploaded = 0;
     std::vector<std::unique_ptr<Rhi::Buffer>> staging; // freed after the GPU used them
     for (ImageEntry* entry : pending) {
@@ -1200,7 +1287,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
             trace.Next(7);
             const Rhi::Pipeline* untile = TilingPipeline(info, false);
             // Immutable per-image parameters are shared by uploads and downloads.
-            // Keep only the small uniform buffer; the large linear scratch remains transient.
+            // Untiling scratch is shared across uploads, including the observed 147 MiB path.
             trace.Next(8);
             if (!entry->download_params) {
                 entry->download_params = TilingParamsBuffer(info);
@@ -1212,7 +1299,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
             if (capacity && (!upload_scratch || upload_scratch->Size() < size)) {
                 auto larger = device.CreateBuffer({.size = capacity,
                     .usage = Rhi::BufferUsageStorage | Rhi::BufferUsageTransferSrc,
-                    .memory = Rhi::MemoryKind::DeviceLocal});
+                    .memory = Rhi::MemoryKind::DeviceLocal, .name = "shared upload untile scratch"});
                 if (larger) {
                     upload_scratch = std::move(larger);
                     ++upload_stats.scratch_created;
@@ -1272,6 +1359,18 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
                         forced, entry->content_hash, WatchedBytes(info.guest_address));
         }
         entry->upload_kind = kind;
+        const u32 prior = entry->total_uploads.load(std::memory_order_relaxed);
+        if (entry->from_cpu && size >= (4ull << 20) && info.size.width >= 2048 &&
+            (prior <= 3 || prior % 16 == 0)) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1,std::memory_order_relaxed) < 4096) {
+                LOG_WARNING(Render_Vulkan,
+                    "UPLOAD-CAUSE: upload image={:#x} guest={:#x} bytes={} prior={} forced={} source-kind={} hash={:016x} frame={} total-mips={} width={} height={}",
+                    entry->image->NativeHandle(),info.guest_address,size,prior,forced,kind,
+                    entry->content_hash,entry->last_use.load(),info.resources.levels,
+                    info.size.width,info.size.height);
+            }
+        }
         ++entry->total_uploads;
         ++entry->upload_count;
         ++uploaded;

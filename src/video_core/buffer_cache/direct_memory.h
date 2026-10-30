@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "common/types.h"
+#include "video_core/buffer_cache/imported_page_coverage.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
 namespace Vulkan {
@@ -23,6 +24,7 @@ class Scheduler;
 namespace VideoCore {
 
 struct Buffer;
+class ImportCleanupWorker;
 
 /// D1 (direct memory model, SHADGT_DIRECT=1): the GPU reads guest memory itself.
 ///
@@ -70,6 +72,12 @@ public:
     bool ForEachPart(VAddr address, u64 size,
                      const std::function<void(const Buffer&, u64, u64, u64)>& fn) const;
 
+    // Optional copies: never wait for an importer. Validate the entire range
+    // before acquiring the destination or recording any copy. Callbacks must
+    // not reenter DirectMemory; views stay protected through all copies.
+    bool TryForEachPart(VAddr address, u64 size, const std::function<bool()>& ready,
+                        const std::function<void(const Buffer&, u64, u64, u64)>& fn) const;
+
     /// Whether every page of the range is mapped for the GPU (no import attempted).
     bool Covered(VAddr address, u64 size) const;
 
@@ -114,6 +122,7 @@ private:
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
     mutable std::mutex mutex;
+    ImportedPageCoverage<> imported_coverage;
     std::map<VAddr, View> views; // by begin
     std::map<VAddr, VAddr> failed; // failed view base -> committed end; invalidated on unmap
     u64 failed_generation{};
@@ -126,6 +135,7 @@ private:
     std::atomic<u64> imported_bytes{};
     std::atomic<u64> failed_count{};
     std::atomic<u64> volatile_pages{};
+    std::shared_ptr<ImportCleanupWorker> import_cleanup;
 };
 
 } // namespace VideoCore

@@ -1,3 +1,9 @@
+#include "ryty_gpu/native/descriptor_update_batch.h"
+#include "ryty_gpu/native/upload_phase_trace.h"
+#include "ryty_gpu/native/region_init_gaps.h"
+#include "ryty_gpu/native/upload_cause.h"
+#include "ryty_gpu/native/local_tiled_source.h"
+#include "video_core/renderer_vulkan/async_mirror_buffer.h"
 #include "video_core/renderer_vulkan/descriptor_write_groups.h"
 #include "video_core/renderer_vulkan/upload_bytes_equal.h"
 #include "video_core/renderer_vulkan/immutable_upload_memo.h"
@@ -648,9 +654,10 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
     });
     registry->SetUploadSource([this](const Native::ImageEntry& entry,
                                      Native::Rhi::CommandList& list) {
-        Native::SlowCallTrace<9> trace{t_timed, "image-gpu-source",
+        Native::UploadPhaseTrace<10> trace{t_timed || entry.info.guest_size >= 4_MB,
+            "image-gpu-source-detail",
             {"region-lookup", "region-refresh", "wrap-region", "import-guest", "find-import",
-             "gather-allocate", "gather-copies", "refresh-overlaps", "copy-overlaps"}};
+             "gather-allocate", "gather-copies", "refresh-overlaps", "copy-overlaps", "cpu-stage-policy"}};
         // NAT-107: textures are uploaded from guest memory as the GPU sees it, in GPU order.
         Native::ImageRegistry::UploadSource source;
         auto* direct = r.buffer_cache.GetDirectMemory();
@@ -659,24 +666,36 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
         const auto cpu_source = [&]() {
             Native::ImageRegistry::UploadSource staged;
             if (size == 0 || size > 64_MB) return staged;
+            Native::UploadPhaseTrace<8> detail{size >= 4_MB,"cpu-texture-source",
+                {"allocate", "mapping", "readable-prefix", "zero-tail", "guarded-copy",
+                 "sparse-copy", "wrap-buffer", "local-stage"}};
+            detail.Next(0,address,size);
             const auto [buffer, offset, destination] = Allocate(size, r.instance.StorageMinAlignment());
+            detail.Next(1);
             u64 readable = 0;
             if (r.memory->IsValidMapping(address)) {
                 const u64 mapped = r.memory->ClampRangeSize(address, size);
+                detail.Next(2);
                 readable = Native::ReadablePrefix(reinterpret_cast<const void*>(address), mapped);
             }
+            detail.Next(3);
             if (readable < size) std::memset(destination + readable, 0, size - readable);
+            detail.Next(4);
             if (readable && !Core::RytyMemory::GuardedCopy(destination,
                     reinterpret_cast<const void*>(address), readable)) {
+                detail.Next(5);
                 r.memory->CopySparseMemory(address, destination, readable);
             }
+            detail.Next(6);
             auto wrapped = device->WrapBuffer(reinterpret_cast<u64>(static_cast<VkBuffer>(buffer)),
                                                stream.chunks.back().buffer->Size());
             staged.buffer = wrapped.get();
             staged.offset = offset;
             staged.kind = 4;
             staged.keep.push_back(std::move(wrapped));
-            return staged;
+            detail.Next(7);
+            return Native::LocalTiledSource(*registry,list,std::move(staged),size,
+                                            entry.info.props.is_tiled,r.instance.GetVendorID());
         };
         trace.Next(0, address, size);
         if (!direct || size == 0) {
@@ -705,29 +724,38 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
             return source;
         }
         // Many large streamed textures span over a thousand 16 KiB host views.
-        // Importing all of them synchronously cost 20+ ms before the first upload.
+        // Repeated import attempts cost 17-35 ms even after the first upload.
         // A never-GPU-written CPU texture can use RecordUploads' guarded staging
         // copy instead. Existing imports and every authoritative GPU source keep
         // the original path, including partial region overlays.
         if (entry.from_cpu && size > 4_MB && size <= 64_MB &&
-            entry.total_uploads.load(std::memory_order_relaxed) == 0 && !overlap &&
+            !entry.gpu_backing_written.load(std::memory_order_acquire) && !overlap &&
             r.instance.GetVendorID() == 0x10de) {
+            trace.Next(9);
+            Native::UploadPhaseTrace<5> policy_trace{true,"cpu-staging-eligibility",
+                {"sources-lock", "gpu-history", "find-import", "readable-check", "cpu-source"}};
+            policy_trace.Next(0,address,size);
             bool has_sources;
             {
                 std::scoped_lock lock{const_cast<Native::ImageEntry&>(entry).sources_mutex};
                 has_sources = !entry.sources.empty();
             }
+            policy_trace.Next(1);
             const bool gpu_written = entry.write_version.load(std::memory_order_relaxed) != 0 ||
                                      entry.foreign_clock.load(std::memory_order_relaxed) != 0 ||
                                      entry.rewrite_clock != 0;
+            policy_trace.Next(2);
+            const bool single_import=direct->FindBuffer(address,size).has_value();
+            policy_trace.Next(3);
+            const bool cpu_readable=Native::Readable(reinterpret_cast<const void*>(address),size);
             if (Native::PreferCpuTextureStaging(size, true, true, true, gpu_written,
-                    has_sources, false, direct->FindBuffer(address, size).has_value(),
-                    Native::Readable(reinterpret_cast<const void*>(address), size))) {
+                    has_sources, false, single_import,cpu_readable)) {
+                policy_trace.Next(4);
                 static std::atomic<u64> staged{};
                 const u64 count = ++staged;
                 if (count <= 8 || count % 128 == 0) {
                     LOG_INFO(Render_Vulkan,
-                             "UPLOAD-STAGING: initial CPU texture {:#x}+{:#x} avoids host import ({} total)",
+                             "UPLOAD-STAGING: CPU-only texture {:#x}+{:#x} avoids host import ({} total)",
                              address, size, count);
                 }
                 return cpu_source();
@@ -747,15 +775,21 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
             source.offset = found->second;
             source.kind = 2;
             source.keep.push_back(std::move(wrapped));
-            return source;
+            return Native::LocalTiledSource(*registry,list,std::move(source),size,
+                                            entry.info.props.is_tiled,r.instance.GetVendorID());
         }
         trace.Next(5);
-        auto gathered = device->CreateBuffer({.size = size,
+        std::unique_ptr<Native::Rhi::Buffer> temporary_gather;
+        auto* gathered = registry->AcquireUploadGatherScratch(list, size);
+        if (!gathered) {
+            temporary_gather = device->CreateBuffer({.size = size,
                                               .usage = Native::Rhi::BufferUsageStorage |
                                                        Native::Rhi::BufferUsageTransferSrc |
                                                        Native::Rhi::BufferUsageTransferDst,
                                               .memory = Native::Rhi::MemoryKind::DeviceLocal,
                                               .name = "native upload gather"});
+            gathered = temporary_gather.get();
+        }
         if (!gathered) {
             return source;
         }
@@ -799,10 +833,10 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
             }
             list.Barrier(Native::Rhi::ScopeTransfer,
                          Native::Rhi::ScopeCompute | Native::Rhi::ScopeTransfer);
-            source.buffer = gathered.get();
+            source.buffer = gathered;
             source.kind = 3;
         }
-        source.keep.push_back(std::move(gathered));
+        if (temporary_gather) source.keep.push_back(std::move(temporary_gather));
         return source;
     });
     registry->SetUploadHook([this](Native::ImageEntry& entry) {
@@ -818,11 +852,32 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
                                 .name = "native gds"});
     ASSERT_MSG(gds && gds->Mapped(), "NAT-100: no GDS buffer");
     std::memset(gds->Mapped(), 0, gds->Size());
+    mirror_preparation = std::make_unique<AsyncMirrorBuffer<Native::Rhi::Buffer>>(
+        [this](auto request) -> std::unique_ptr<Native::Rhi::Buffer> {
+            if (request.generation != unmap_generation.load()) return {};
+            if (auto* direct = r.buffer_cache.GetDirectMemory()) {
+                direct->WarmImported(request.begin, request.end - request.begin);
+            }
+            if (request.generation != unmap_generation.load()) return {};
+            return device->CreateBuffer({.size = request.end - request.begin,
+                .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageVertex |
+                         Native::Rhi::BufferUsageIndex | Native::Rhi::BufferUsageTransferSrc |
+                         Native::Rhi::BufferUsageTransferDst,
+                .memory = Native::Rhi::MemoryKind::DeviceLocal,
+                .name = "native mirror"});
+        }, [] {
+#ifdef _WIN32
+            SetThreadDescription(GetCurrentThread(), L"shadGT:GeometryPrepare");
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+            SetThreadPriorityBoost(GetCurrentThread(), TRUE);
+#endif
+        });
     LOG_INFO(Render_Vulkan, "NAT-100: native mode: draws, dispatches and copies are recorded with "
                             "native images and guest memory read in place");
 }
 
 NativeRenderer::~NativeRenderer() {
+    mirror_preparation.reset(); // Join before any device or direct-memory teardown.
     std::scoped_lock lock{mutex};
     const vk::Device vk_device = r.instance.GetDevice();
     for (const auto pool : free_pools) {
@@ -1475,7 +1530,12 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
     }
     // GPU-only guest allocations need not have CPU-importable backing. They still need
     // storage for shader writes (including the terrain's persistent shadow map).
-    const bool imported = direct->EnsureImported(begin, end - begin);
+    std::vector<Native::RegionInitRange> covered;
+    covered.reserve(merged.size());
+    for (const auto& old : merged) covered.push_back({old.begin,old.end});
+    const auto gaps = Native::RegionInitGaps(begin,end,covered);
+    u64 guest_init_bytes = 0;
+    for (const auto gap : gaps) guest_init_bytes += gap.end-gap.begin;
     Region region;
     region.begin = begin;
     region.end = end;
@@ -1494,31 +1554,34 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
     Stream& s = Begin();
     GlobalBarrier();
     const vk::Buffer dst{Handle<VkBuffer_T>(region.buffer->NativeHandle())};
-    // Guest memory first, then what the GPU wrote into the regions taken in.
-    if (imported) {
-        direct->ForEachPart(begin, end - begin,
-                        [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset, u64 bytes) {
-                            s.cmd.copyBuffer(view.Handle(), dst,
-                                             vk::BufferCopy{.srcOffset = view_offset,
-                                                            .dstOffset = offset,
-                                                            .size = bytes});
-                        });
-    } else {
-        // Preserve readable CPU contents and initialize holes consistently with sparse guest
-        // reads. Bound the staging allocation rather than snapshotting a whole large region.
-        for (u64 offset = 0; offset < end - begin;) {
-            const u64 bytes = std::min<u64>(4_MB, end - begin - offset);
-            const auto [upload, upload_offset, data] = Allocate(bytes, 4);
-            r.memory->CopySparseMemory(begin + offset, data, bytes);
-            s.cmd.copyBuffer(upload, dst, vk::BufferCopy{.srcOffset = upload_offset,
-                                                        .dstOffset = offset,
-                                                        .size = bytes});
-            offset += bytes;
+    // Initialize only uncovered guest spans. The covered bytes come from the
+    // authoritative old GPU buffers below, including their pending CPU dirty pages.
+    for (const auto gap : gaps) {
+        const u64 gap_size = gap.end-gap.begin;
+        bool imported = direct->EnsureImported(gap.begin,gap_size);
+        if (imported) {
+            imported = direct->ForEachPart(gap.begin,gap_size,
+                [&](const VideoCore::Buffer& view,u64 view_offset,u64 offset,u64 bytes) {
+                    s.cmd.copyBuffer(view.Handle(),dst,vk::BufferCopy{
+                        .srcOffset=view_offset,.dstOffset=gap.begin-begin+offset,.size=bytes});
+                });
+        }
+        if (!imported) {
+            // A mapping can disappear after EnsureImported. Order any partial copies
+            // before the complete sparse fallback for this gap.
+            s.list->Barrier(Native::Rhi::ScopeTransfer,Native::Rhi::ScopeTransfer);
+            for (u64 offset=0;offset<gap_size;) {
+                const u64 bytes=std::min<u64>(4_MB,gap_size-offset);
+                const auto [upload,upload_offset,data]=Allocate(bytes,4);
+                r.memory->CopySparseMemory(gap.begin+offset,data,bytes);
+                s.cmd.copyBuffer(upload,dst,vk::BufferCopy{
+                    .srcOffset=upload_offset,.dstOffset=gap.begin-begin+offset,.size=bytes});
+                offset+=bytes;
+            }
         }
     }
-    // The guest initialization and retained GPU regions write overlapping bytes
-    // of dst. Command order alone does not establish a transfer-write dependency.
-    // Finish initialization before restoring the authoritative GPU-written ranges.
+    // Retain the existing transfer dependency before restoring authoritative data.
+    // Planned guest gaps and old GPU ranges are disjoint.
     if (!merged.empty()) {
         s.list->Barrier(Native::Rhi::ScopeTransfer, Native::Rhi::ScopeTransfer);
     }
@@ -1538,6 +1601,11 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
     WatchPages(begin, end - begin);
     DropMirrors(begin, end - begin); // NAT-150: reads there use the region from now on
     ++stats.regions_made;
+    if (end-begin >= 4_MB && !merged.empty()) {
+        LOG_INFO(Render_Vulkan,
+            "NAT-REGION-INIT: begin={:#x} bytes={} guest-init={} gpu-retained={} gaps={} old-regions={}",
+            begin,end-begin,guest_init_bytes,end-begin-guest_init_bytes,gaps.size(),merged.size());
+    }
     LOG_INFO(Render_Vulkan, "NAT-114: region {:#x}+{:#x} on the GPU ({} taken in)", begin,
              end - begin, merged.size());
     std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
@@ -1757,9 +1825,12 @@ void NativeRenderer::MakePendingMirrors() {
     if (pending_mirrors.empty() || !stream.list) {
         return;
     }
+    mirror_promotion_budget.BeginFrame(frame);
+    if (!mirror_promotion_budget.Available()) {
+        return; // Later draws still bind the original imported guest ranges.
+    }
     std::vector<std::pair<VAddr, VAddr>> pending;
     pending.swap(pending_mirrors);
-    ++buffer_generation; // OPT-003: mirrors are made, taken in or evicted
     std::ranges::sort(pending);
     std::vector<std::pair<VAddr, VAddr>> ranges; // overlapping or touching ranges joined
     for (const auto& [begin, end] : pending) {
@@ -1777,7 +1848,8 @@ void NativeRenderer::MakePendingMirrors() {
     Stream& s = stream;
     bool copied = false;
     bool evicted = false;
-    for (auto [begin, end] : ranges) {
+    for (size_t range_index = 0; range_index < ranges.size(); ++range_index) {
+        auto [begin, end] = ranges[range_index];
         // FIX-185 (diagnosis, RYGT_NATIVE_MIRROR_REGION_GAP=<KB>): no mirror within that distance
         // of a region.
         static const u64 region_gap = [] {
@@ -1799,6 +1871,23 @@ void NativeRenderer::MakePendingMirrors() {
         if (end - begin > 256_MB) {
             continue;
         }
+        if (!mirror_promotion_budget.TryStart(end - begin)) {
+            // Preserve the original ranges, not pointers into mutable mirror
+            // storage. Mapping, CPU/GPU writes and overlaps are checked again
+            // when a later frame has budget. Nothing incomplete is published.
+            pending_mirrors.insert(pending_mirrors.end(), ranges.begin() + range_index,
+                                   ranges.end());
+            break;
+        }
+        const auto promotion_start = std::chrono::steady_clock::now();
+        struct AccountPromotion {
+            OptionalMirrorBudget& budget;
+            std::chrono::steady_clock::time_point start;
+            ~AccountPromotion() { budget.Account(std::chrono::steady_clock::now() - start); }
+        } account_promotion{mirror_promotion_budget, promotion_start};
+        Native::SlowCallTrace<7> promotion_trace{true, "geometry-promotion",
+            {"evict", "try-ready-copy", "unused", "retire-overlaps", "unused", "watch", "publish"}};
+        promotion_trace.Next(0, begin, end - begin);
         if (mirror_bytes - taken + (end - begin) > budget && !evicted) {
             // Mirrors unused for two seconds go first.
             evicted = true;
@@ -1808,6 +1897,7 @@ void NativeRenderer::MakePendingMirrors() {
                     !(it->second.begin < end && it->second.end > begin)) {
                     mirror_bytes -= it->second.end - it->second.begin;
                     ++stats.mirrors_evicted;
+                    ++buffer_generation;
                     buffer_log.Note(it->second.begin, it->second.end);
                     retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
                     it = mirrors.erase(it);
@@ -1820,20 +1910,25 @@ void NativeRenderer::MakePendingMirrors() {
             ++stats.mirror_over_budget;
             continue;
         }
-        if (!direct->EnsureImported(begin, end - begin)) {
+        promotion_trace.Next(1);
+        std::unique_ptr<Native::Rhi::Buffer> buffer;
+        // Source views and destination must both be ready. Neither mutex may
+        // make the recorder wait; a miss preserves the imported-buffer path.
+        const bool ready = direct->TryForEachPart(begin, end - begin, [&] {
+            buffer = mirror_preparation->TryAcquire(
+                {begin, end, unmap_generation.load()});
+            return bool(buffer);
+        }, [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset, u64 bytes) {
+            const vk::Buffer dst{Handle<VkBuffer_T>(buffer->NativeHandle())};
+            s.cmd.copyBuffer(view.Handle(), dst, vk::BufferCopy{
+                .srcOffset = view_offset, .dstOffset = offset, .size = bytes});
+        });
+        if (!ready) {
+            pending_mirrors.emplace_back(ranges[range_index]);
             continue;
         }
-        auto buffer = device->CreateBuffer({.size = end - begin,
-                                            .usage = Native::Rhi::BufferUsageStorage |
-                                                     Native::Rhi::BufferUsageVertex |
-                                                     Native::Rhi::BufferUsageIndex |
-                                                     Native::Rhi::BufferUsageTransferSrc |
-                                                     Native::Rhi::BufferUsageTransferDst,
-                                            .memory = Native::Rhi::MemoryKind::DeviceLocal,
-                                            .name = "native mirror"});
-        if (!buffer) {
-            continue;
-        }
+        promotion_trace.Next(3);
+        ++buffer_generation; // Only actual map changes invalidate prepared draws.
         {
             std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
             for (auto it = FirstMirror(begin); it != mirrors.end() && it->second.begin < end;) {
@@ -1843,20 +1938,15 @@ void NativeRenderer::MakePendingMirrors() {
             }
         }
         buffer_log.Note(begin, end); // OPT-010
-        const vk::Buffer dst{Handle<VkBuffer_T>(buffer->NativeHandle())};
-        direct->ForEachPart(begin, end - begin,
-                            [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset,
-                                u64 bytes) {
-                                s.cmd.copyBuffer(view.Handle(), dst,
-                                                 vk::BufferCopy{.srcOffset = view_offset,
-                                                                .dstOffset = offset,
-                                                                .size = bytes});
-                            });
+        // Copy commands were recorded under the source-view guard above;
+        // allocation and bounded import warming happened on the worker.
         // CPU writes to it from now on are copied in before its next use.
+        promotion_trace.Next(5);
         WatchPages(begin, end - begin);
         mirror_bytes += end - begin;
         ++stats.mirrors_made;
         stats.mirror_made_bytes += end - begin;
+        promotion_trace.Next(6);
         std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
         mirrors.emplace(begin, Mirror{.begin = begin,
                                       .end = end,
@@ -3187,15 +3277,16 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
     const auto& by_set = b.grouped_writes;
     if (b.key_layout != pipeline.GetLayout()) b.PrepareDescriptorKeys(pipeline);
     const vk::Device vk_device = r.instance.GetDevice();
+    static thread_local boost::container::small_vector<vk::WriteDescriptorSet, 64> updates;
+    updates.clear();
+    std::array<vk::DescriptorSet, Shader::Backend::MaxDescriptorSets> sets{};
     for (u32 index = 0; index < by_set.size(); ++index) {
         auto& writes = by_set[index];
         if (writes.empty()) {
             continue;
         }
         if (index == pipeline.PushSet()) {
-            trace.Next(2);
-            cmdbuf.pushDescriptorSetKHR(bind_point, pipeline.GetLayout(), index, writes);
-            continue;
+            continue; // recorded in the original set order after host updates
         }
         const vk::DescriptorSetLayout layout = pipeline.SetLayout(index);
         trace.Next(3, index, writes.size());
@@ -3217,8 +3308,7 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         const u64 key_hash = cacheable ? prepared_key.hash : 0;
         if (cacheable) {
             if (const auto reused = s.descriptor_sets.Find(key_hash, descriptor_key)) {
-                trace.Next(8);
-                cmdbuf.bindDescriptorSets(bind_point, pipeline.GetLayout(), index, reused, {});
+                sets[index] = reused;
                 ++stats.descriptor_reuses;
                 continue;
             }
@@ -3257,18 +3347,20 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         }
         // A miss needs mutable destinations. Hits and push sets borrow the original
         // writes directly; never leave a destination handle in per-draw storage.
-        static thread_local boost::container::small_vector<vk::WriteDescriptorSet, 32> updates;
         trace.Next(5);
-        updates.assign(writes.begin(), writes.end());
-        for (auto& write : updates) write.dstSet = set;
-        trace.Next(6);
-        vk_device.updateDescriptorSets(updates, {});
-
+        Native::AppendDescriptorUpdates(writes,set,updates);
         trace.Next(7);
         if (cacheable) s.descriptor_sets.Store(key_hash, descriptor_key, set);
-        trace.Next(8);
-        cmdbuf.bindDescriptorSets(bind_point, pipeline.GetLayout(), index, set, {});
+        sets[index] = set;
     }
+    Native::CommitDescriptorBatch(updates,sets,pipeline.PushSet(),by_set,
+        [&](const auto& all) {trace.Next(6);vk_device.updateDescriptorSets(all,{});},
+        [&](u32 index,const auto& writes) {
+            trace.Next(2);cmdbuf.pushDescriptorSetKHR(bind_point,pipeline.GetLayout(),index,writes);
+        },
+        [&](u32 index,vk::DescriptorSet set) {
+            trace.Next(8);cmdbuf.bindDescriptorSets(bind_point,pipeline.GetLayout(),index,set,{});
+        });
 }
 
 bool NativeRenderer::MirrorKind(char kind) {
@@ -5444,6 +5536,7 @@ bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 ro
 }
 
 void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
+    registry->QueueUploadForUse(entry);
     using Rewrite = Native::ImageEntry::Rewrite;
     if (entry.rewrite == Rewrite::None && !entry.stencil_clear_pending) {
         return;
@@ -6229,6 +6322,8 @@ void NativeRenderer::ProbeWatchedPictures() {
 }
 
 void NativeRenderer::EvictImages() {
+    Native::SlowCallTrace<3> trace{true, "frame-retirement",
+        {"completed-views", "cold-mirrors", "cold-images"}};
     ProbeWatchedPictures(); // FIX-156 (diagnosis)
     // NAT-108: images not used for two seconds go (GT Sport's scratch pool holds render
     // targets of ever-changing sizes: the UI's blur panels, effects).
@@ -6240,15 +6335,16 @@ void NativeRenderer::EvictImages() {
             retired_views.pop_front();
         }
     }
-    if (frame <= KeepFrames || frame % 30 != 0) {
+    if (frame <= KeepFrames) {
         return;
     }
+    trace.Next(1);
     // Read-only mirrors are reloadable copies, unlike GPU-written regions and images.
     // Reclaim a scene's cold mirrors even below the capacity budget; waiting until the
     // budget fills otherwise keeps every track's peak resident through later menus.
     constexpr u64 MirrorIdleFrames = 600;
     std::vector<std::pair<VAddr, u64>> cold_mirrors;
-    {
+    if (frame % 30 == 0) {
         std::shared_lock map_lock{buffer_map_mutex};
         for (const auto& [base, mirror] : mirrors) {
             if (frame > mirror.used_frame && frame - mirror.used_frame > MirrorIdleFrames) {
@@ -6256,6 +6352,8 @@ void NativeRenderer::EvictImages() {
             }
         }
     }
+    // Mirror collection keeps its original cadence. Image retirement below is
+    // incremental instead of concentrating 30 frames of retirement in one frame.
     for (const auto& [address, bytes] : cold_mirrors) {
         ++stats.mirrors_evicted;
         DropMirrors(address, bytes); // invalidates bindings; existing GPU-safe destruction
@@ -6326,6 +6424,7 @@ void NativeRenderer::EvictImages() {
         }
         return true;
     };
+    trace.Next(2);
     registry->Evict(frame - KeepFrames, [&](Native::ImageEntry& entry) {
         retired_watch_ranges.emplace_back(
             VideoCore::PageManager::GetPageAddr(entry.info.guest_address),
@@ -6360,7 +6459,7 @@ void NativeRenderer::EvictImages() {
             owners.erase(std::remove(owners.begin(), owners.end(), &entry), owners.end());
             it = owners.empty() ? stencil_owners.erase(it) : std::next(it);
         }
-    }, keep);
+    }, keep, 16);
     if (newly_kept != 0) {
         static std::atomic<u32> logged{};
         if (const u32 n = logged++; n < 20 || n % 100 == 0) {
@@ -6373,50 +6472,23 @@ void NativeRenderer::EvictImages() {
 void NativeRenderer::WatchPages(VAddr address, u64 size) {
     const VAddr begin = VideoCore::PageManager::GetPageAddr(address);
     const VAddr end = VideoCore::PageManager::GetNextPageAddr(address + size - 1);
-    constexpr u64 PageSize = 4096;
-    std::scoped_lock lock{watch_mutex};
-    if (Native::WatchedTexture(begin, end)) {
-        u32 fresh = 0;
-        for (VAddr page = begin; page < end; page += PageSize) {
-            fresh += watched_pages.contains(page) ? 0 : 1;
-        }
-        LOG_WARNING(Render_Vulkan, "FIX-153 watch: watch {:#x}-{:#x}, {} of {} pages not yet",
-                    begin, end, fresh, (end - begin) / PageSize);
-    }
-    VAddr run = 0; // start of a run of pages not watched yet
-    for (VAddr page = begin; page < end; page += PageSize) {
-        const bool fresh = watched_pages.insert(page).second;
-        if (fresh && run == 0) {
-            run = page;
-        } else if (!fresh && run != 0) {
-            r.page_manager.UpdatePageWatchers(run, page - run, VideoCore::PageOp::Track);
-            run = 0;
-        }
-    }
-    if (run != 0) {
-        r.page_manager.UpdatePageWatchers(run, end - run, VideoCore::PageOp::Track);
+    const auto fresh = page_watches.Track(begin,end,[&](VAddr run,u64 bytes) {
+        r.page_manager.UpdatePageWatchers(run,bytes,VideoCore::PageOp::Track);
+    });
+    if (Native::WatchedTexture(begin,end)) {
+        LOG_WARNING(Render_Vulkan, "FIX-153 watch: watch {:#x}-{:#x}, {} pages newly watched",
+                    begin,end,fresh);
     }
 }
 
 void NativeRenderer::UnwatchPages(VAddr begin, VAddr end) {
-    constexpr u64 PageSize = 4096;
-    std::scoped_lock lock{watch_mutex};
-    VAddr run = 0;
-    for (VAddr page = begin; page < end; page += PageSize) {
-        const bool watched = watched_pages.erase(page) != 0;
-        if (watched && run == 0) {
-            run = page;
-        } else if (!watched && run != 0) {
-            r.page_manager.UpdatePageWatchers(run, page - run, VideoCore::PageOp::Untrack);
-            run = 0;
-        }
-    }
-    if (run != 0) {
-        r.page_manager.UpdatePageWatchers(run, end - run, VideoCore::PageOp::Untrack);
-    }
+    page_watches.Untrack(begin,end,[&](VAddr run,u64 bytes) {
+        r.page_manager.UpdatePageWatchers(run,bytes,VideoCore::PageOp::Untrack);
+    });
 }
 
 void NativeRenderer::ReleaseUnusedWatches() {
+    Native::SlowCallTrace<2> trace{true, "retired-page-watches", {"live-ranges", "unwatch"}};
     if (retired_watch_ranges.empty()) {
         return;
     }
@@ -6454,6 +6526,7 @@ void NativeRenderer::ReleaseUnusedWatches() {
             retain(mirror.begin, mirror.end);
         }
         std::ranges::sort(live);
+        trace.Next(1, begin, end - begin);
         VAddr cursor = begin;
         for (const auto& [base, limit] : live) {
             if (base > cursor) {
@@ -6464,6 +6537,7 @@ void NativeRenderer::ReleaseUnusedWatches() {
         if (cursor < end) {
             UnwatchPages(cursor, end);
         }
+        trace.Next(0);
     }
 }
 
@@ -6503,7 +6577,10 @@ void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
         }
     }
     UnwatchPages(begin, end);
-    registry->CpuWrite(begin, end - begin, exact != 0 ? (address - begin) + exact : 0);
+    {
+        Native::UploadCause::ScopedCpuFault cause{address,size,exact};
+        registry->CpuWrite(begin, end - begin, exact != 0 ? (address - begin) + exact : 0);
+    }
     ++stats.cpu_writes;
     // NAT-114: pages of regions written by the CPU (a fault on any thread) are copied in before
     // the region's next use; the recorder sorts them to their regions.
@@ -6573,6 +6650,7 @@ void NativeRenderer::Splice() {
 
 void NativeRenderer::CopyDisplayCrop(const Native::ImageEntry& source, Native::ImageEntry& crop,
                                      vk::Extent2D visible) {
+    registry->QueueUploadForUse(*const_cast<Native::ImageEntry*>(&source));
     Stream& s = Begin();
     PrepareImages();
     GlobalBarrier();
@@ -6631,8 +6709,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     std::scoped_lock lock{mutex};
     if (InPlaceSampled()) {
         for (u32 i = 0; i < in_place.pages.size(); ++i) {
-            in_place.total[i] += in_place.pages[i].size();
-            in_place.pages[i].clear();
+            in_place.total[i] += in_place.pages[i].TakePageCount();
         }
         ++in_place.frames;
     }

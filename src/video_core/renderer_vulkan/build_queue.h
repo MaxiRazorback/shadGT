@@ -70,7 +70,7 @@ public:
             if (stop.stop_requested()) {
                 return false;
             }
-            if (auto next = Runnable(jobs); next != jobs.end() && running_foreground < max_foreground) {
+            if (auto next = Runnable(jobs); next != jobs.end() && HasCapacity(running_foreground, max_foreground)) {
                 const bool heavy = next->heavy;
                 job = std::move(next->job);
                 jobs.erase(next);
@@ -84,7 +84,7 @@ public:
             const bool boosted = boost.load(std::memory_order_relaxed);
             const bool paused = !boosted && now < pause_until;
             const u32 limit = boosted ? max_boost : max_background;
-            if (auto next = Runnable(background); next != background.end() && !paused && running_background < limit) {
+            if (auto next = Runnable(background); next != background.end() && !paused && HasCapacity(running_background, limit)) {
                 const bool heavy = next->heavy;
                 job = std::move(next->job);
                 background.erase(next);
@@ -96,15 +96,15 @@ public:
             }
             if (!background.empty() && paused) {
                 cv.wait_until(lk, stop, pause_until, [&] {
-                    return (Runnable(jobs) != jobs.end() && running_foreground < max_foreground) ||
-                           Clock::now() >= pause_until;
+                    return (Runnable(jobs) != jobs.end() && HasCapacity(running_foreground, max_foreground)) ||
+                           boost.load(std::memory_order_relaxed) || Clock::now() >= pause_until;
                 });
             } else {
                 cv.wait(lk, stop, [&] {
                     const u32 limit = boost.load(std::memory_order_relaxed) ? max_boost
                                                                             : max_background;
-                    return (Runnable(jobs) != jobs.end() && running_foreground < max_foreground) ||
-                           (Runnable(background) != background.end() && running_background < limit);
+                    return (Runnable(jobs) != jobs.end() && HasCapacity(running_foreground, max_foreground)) ||
+                           (Runnable(background) != background.end() && HasCapacity(running_background, limit));
                 });
             }
         }
@@ -163,6 +163,11 @@ private:
     std::atomic<bool> boost{false};
     std::mutex mutex;
     std::condition_variable_any cv;
+    bool HasCapacity(u32 running_kind, u32 kind_limit) const {
+        const u32 total_limit = boost.load(std::memory_order_relaxed)
+                                   ? std::max(max_foreground, max_boost) : max_foreground;
+        return running_kind < kind_limit && running_foreground + running_background < total_limit;
+    }
     struct Entry { Job job; bool heavy; };
     std::deque<Entry> jobs;
     std::deque<Entry> background;

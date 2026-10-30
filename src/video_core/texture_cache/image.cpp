@@ -253,10 +253,27 @@ RecycleKey KeyOf(const vk::ImageCreateInfo& ci) {
             u32(ci.samples), u32(VkImageUsageFlags(ci.usage))};
 }
 
+// Destruction may enter the driver and block. Declare this batch before the pool
+// lock so its destructor always runs after that lock has been released, including
+// early returns. Only GPU-complete images removed from the pool enter this batch.
+struct RetiredRecycleImages {
+    VmaAllocator allocator;
+    std::vector<RecycledImage> images;
+    decltype(g_recycled) buckets;
+    ~RetiredRecycleImages() {
+        for (const auto& image : images)
+            vmaDestroyImage(allocator, image.image, image.allocation);
+        for (const auto& [key, entries] : buckets)
+            for (const auto& image : entries)
+                vmaDestroyImage(allocator, image.image, image.allocation);
+    }
+};
+
 /// Keeps the image for reuse; false when it should be destroyed instead.
 bool Recycle(VmaAllocator allocator, const vk::ImageCreateInfo& ci, VmaAllocation allocation,
              vk::Image image, vk::DeviceSize size_bytes) {
-    if (!RecycleEnabled() || ci.pNext != nullptr || size_bytes > (64ULL << 20) || RecycleBudgetBytes() == 0) {
+    RetiredRecycleImages retired{allocator};
+    if (!RecycleEnabled() || ci.pNext != nullptr || size_bytes > (64ULL << 20) || size_bytes > RecycleBudgetBytes()) {
         return false;
     }
     std::scoped_lock lk{g_recycle_mutex};
@@ -273,7 +290,7 @@ bool Recycle(VmaAllocator allocator, const vk::ImageCreateInfo& ci, VmaAllocatio
         auto& old_list = g_recycled[old_key];
         const auto it = std::ranges::find(old_list, old_seq, &RecycledImage::seq);
         if (it != old_list.end()) {
-            vmaDestroyImage(allocator, it->image, it->allocation);
+            retired.images.push_back(*it);
             g_recycled_bytes -= it->size_bytes;
             old_list.erase(it);
             ++g_recycle_dropped;
@@ -322,16 +339,15 @@ u64 RecycledImageBytes() {
 }
 
 void ClearRecycledImages(VmaAllocator allocator) {
+    RetiredRecycleImages retired{allocator};
     std::scoped_lock lk{g_recycle_mutex};
-    for (auto& [key, images] : g_recycled) {
-        for (const auto& image : images) vmaDestroyImage(allocator, image.image, image.allocation);
-    }
-    g_recycled.clear();
+    retired.buckets.swap(g_recycled);
     g_recycle_order.clear();
     g_recycled_bytes = 0;
 }
 
 void TrimUnusedRecycledImages(VmaAllocator allocator) {
+    RetiredRecycleImages retired{allocator};
     const auto cutoff = std::chrono::steady_clock::now() - std::chrono::seconds{30};
     std::scoped_lock lk{g_recycle_mutex};
     while (!g_recycle_order.empty()) {
@@ -346,7 +362,7 @@ void TrimUnusedRecycledImages(VmaAllocator allocator) {
         if (it != images.end()) {
             if (it->unused_since > cutoff) break;
             // Images enter this pool only after their GPU completion callback.
-            vmaDestroyImage(allocator, it->image, it->allocation);
+            retired.images.push_back(*it);
             g_recycled_bytes -= it->size_bytes;
             images.erase(it);
             ++g_recycle_dropped;
@@ -357,15 +373,15 @@ void TrimUnusedRecycledImages(VmaAllocator allocator) {
 }
 
 u64 ReleaseRecycledImages(VmaAllocator allocator) {
+    RetiredRecycleImages retired{allocator};
     std::scoped_lock lock{g_recycle_mutex};
     const u64 released = g_recycled_bytes;
     for (const auto& [key, images] : g_recycled) {
         for (const auto& image : images) {
-            vmaDestroyImage(allocator, image.image, image.allocation);
             ++g_recycle_dropped;
         }
     }
-    g_recycled.clear();
+    retired.buckets.swap(g_recycled);
     g_recycle_order.clear();
     g_recycled_bytes = 0;
     return released;

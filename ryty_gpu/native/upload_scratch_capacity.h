@@ -2,15 +2,13 @@
 #include <algorithm>
 #include <bit>
 #include <cstdint>
-
 namespace Native {
-// One registry-wide device-local scratch buffer, not one retained per texture.
+// Two registry-wide buffers (gather and untile), at most 384 MiB combined.
 constexpr uint64_t UploadScratchCapacity(uint64_t required) {
-    // 2048x2048 mip chains observed on track need about 22 MiB. Keep one
-    // 32 MiB buffer for them instead of allocating it on every upload.
-    constexpr uint64_t Limit = 32ull << 20;
-    return required == 0 || required > Limit
-               ? 0
-               : std::bit_ceil(std::max<uint64_t>(required, 4096));
+    constexpr uint64_t Limit = 192ull << 20;
+    constexpr uint64_t Step = 16ull << 20;
+    if (!required || required > Limit) return 0;
+    if (required <= (32ull << 20)) return std::bit_ceil(std::max<uint64_t>(required,4096));
+    return ((required + Step - 1) / Step) * Step;
 }
-} // namespace Native
+}
