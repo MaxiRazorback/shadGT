@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <fmt/format.h>
 #include <magic_enum/magic_enum.hpp>
 #include "common/logging/classes.h"
@@ -8,6 +9,7 @@
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/structured_control_flow.h"
 #include "shader_recompiler/frontend/translate/translate.h"
+#include "shader_recompiler/ir/ir_emitter.h"
 #include "shader_recompiler/ir/passes/ir_passes.h"
 #include "shader_recompiler/ir/post_order.h"
 #include "shader_recompiler/ir/program.h"
@@ -220,6 +222,68 @@ bool HasEmptyScopeBeforeElse(std::span<const u32> code) {
     return false;
 }
 
+// DIAG-209 (RYGT_NAN_TRACE=<hash>): that pixel shader paints the index of the first NaN among the
+// F32 values of the block that writes RenderTarget0, in base 8 over R, G and B (digit + 1) / 8.
+static void NanTracePass(IR::Program& program, const Info& info) {
+    static const u64 hash = [] {
+        const char* env = std::getenv("RYGT_NAN_TRACE");
+        return env && *env ? std::strtoull(env, nullptr, 16) : 0;
+    }();
+    if (hash == 0 || info.pgm_hash != hash) {
+        return;
+    }
+    for (IR::Block* block : program.blocks) {
+        auto write = block->end();
+        for (auto it = block->begin(); it != block->end(); ++it) {
+            if (it->GetOpcode() == IR::Opcode::SetAttribute &&
+                it->Arg(0).Attribute() == IR::Attribute::RenderTarget0) {
+                write = it;
+                break;
+            }
+        }
+        if (write == block->end()) {
+            continue;
+        }
+        std::vector<IR::Inst*> values;
+        for (auto it = block->begin(); it != write; ++it) {
+            if (it->Type() == IR::Type::F32) {
+                LOG_WARNING(Render_Recompiler, "DIAG-209: value {} is {}", values.size(),
+                            magic_enum::enum_name(it->GetOpcode()));
+                values.push_back(&*it);
+            }
+        }
+        if (values.size() > 511) {
+            values.resize(511);
+        }
+        IR::IREmitter ir{*block, write};
+        IR::U32 found = ir.Imm32(~0U);
+        for (size_t i = values.size(); i-- > 0;) {
+            found = IR::U32{ir.Select(ir.FPIsNan(IR::F32{IR::Value{values[i]}}),
+                                      ir.Imm32(u32(i)), found)};
+        }
+        const IR::U1 any = ir.INotEqual(found, ir.Imm32(~0U));
+        const auto digit = [&](u32 shift) {
+            const IR::U32 d = IR::U32{ir.BitwiseAnd(
+                ir.ShiftRightLogical(found, ir.Imm32(shift)), ir.Imm32(7U))};
+            const IR::F32 f = IR::F32{ir.ConvertUToF(32, 32, ir.IAdd(d, ir.Imm32(1U)))};
+            return ir.FPMul(f, ir.Imm32(0.125f));
+        };
+        const std::array<IR::F32, 3> marks{digit(0), digit(3), digit(6)};
+        for (auto it = write; it != block->end(); ++it) {
+            if (it->GetOpcode() != IR::Opcode::SetAttribute ||
+                it->Arg(0).Attribute() != IR::Attribute::RenderTarget0) {
+                continue;
+            }
+            const u32 comp = it->Arg(2).U32();
+            if (comp < 3) {
+                IR::IREmitter at{*block, it};
+                it->SetArg(1, at.Select(any, marks[comp], IR::F32{it->Arg(1)}));
+            }
+        }
+        return;
+    }
+}
+
 IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Info& info,
                              RuntimeInfo& runtime_info, const Profile& device_profile) {
     auto profile = device_profile;
@@ -315,6 +379,7 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Shader::Optimization::LowerHardwareIntrinsics(program);
     Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);
     Shader::Optimization::DeadCodeEliminationPass(program);
+    NanTracePass(program, info);
     Shader::Optimization::CollectShaderInfoPass(program, profile);
     Shader::IR::DumpProgram(program, info);
 
