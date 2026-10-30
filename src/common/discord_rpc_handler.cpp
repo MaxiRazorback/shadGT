@@ -13,7 +13,7 @@ constexpr const char* RunningOn = "Running on shadGT";
 
 void RPC::init() {
     DiscordEventHandlers handlers{};
-    Discord_Initialize("1557422166931275906", &handlers, 1, nullptr);
+    Discord_Initialize("1440140585595047977", &handlers, 1, nullptr);
     rpcEnabled = true;
 }
 
