@@ -19,6 +19,7 @@
 #include "video_core/renderer_vulkan/descriptor_write_groups.h"
 #include "video_core/renderer_vulkan/scene_region_scale.h"
 
+#include <fstream>
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -3883,6 +3884,18 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
     }
 }
 
+// DIAG-208: purple pixels of the garage cockpit view, and what each draw left there.
+namespace {
+constexpr VAddr TracedTarget = 0x1005000000;
+constexpr std::array<std::pair<s32, s32>, 4> TracedPixels{
+    {{266, 190}, {538, 306}, {273, 195}, {571, 322}}};
+constexpr u64 PixelTraceDraws = 8192;
+struct PixelTrace {
+    std::unique_ptr<Native::Rhi::Buffer> buffer;
+    std::vector<std::pair<u64, u64>> hashes;
+} g_pixel_trace;
+} // namespace
+
 void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     std::scoped_lock lock{mutex};
     const auto start = std::chrono::steady_clock::now();
@@ -4332,6 +4345,48 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         feedback_layout(vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT,
                         vk::ImageLayout::eGeneral);
         s.buffers_written = true;
+    }
+
+    // DIAG-208 (RYGT_PIXEL_TRACE=1): while a frame is dumped, the scene target's traced pixels
+    // are copied after each draw into it, to name the draw that first writes a wrong colour.
+    static const bool pixel_trace = [] {
+        const char* env = std::getenv("RYGT_PIXEL_TRACE");
+        return env && env[0] == '1';
+    }();
+    if (pixel_trace && r.FrameDumpCollecting() && targets.colors[0] &&
+        targets.colors[0]->info.guest_address == TracedTarget &&
+        g_pixel_trace.hashes.size() < PixelTraceDraws) {
+        if (!g_pixel_trace.buffer) {
+            g_pixel_trace.buffer = device->CreateBuffer(
+                {.size = PixelTraceDraws * TracedPixels.size() * 4,
+                 .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageTransferDst,
+                 .memory = Native::Rhi::MemoryKind::Readback,
+                 .name = "pixel trace"});
+        }
+        if (g_pixel_trace.buffer && g_pixel_trace.buffer->Mapped()) {
+            EndRendering();
+            GlobalBarrier();
+            const u64 base = g_pixel_trace.hashes.size() * TracedPixels.size() * 4;
+            std::array<vk::BufferImageCopy, TracedPixels.size()> copies;
+            for (size_t i = 0; i < copies.size(); ++i) {
+                copies[i] = vk::BufferImageCopy{
+                    .bufferOffset = base + i * 4,
+                    .imageSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                      .mipLevel = 0,
+                                      .baseArrayLayer = 0,
+                                      .layerCount = 1},
+                    .imageOffset = {TracedPixels[i].first, TracedPixels[i].second, 0},
+                    .imageExtent = {1, 1, 1}};
+            }
+            stream.cmd.copyImageToBuffer(
+                vk::Image{Handle<VkImage_T>(targets.colors[0]->image->NativeHandle())},
+                vk::ImageLayout::eGeneral,
+                vk::Buffer{Handle<VkBuffer_T>(g_pixel_trace.buffer->NativeHandle())}, copies);
+            GlobalBarrier();
+            const auto* vs = pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
+            const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+            g_pixel_trace.hashes.emplace_back(vs ? vs->pgm_hash : 0, ps ? ps->pgm_hash : 0);
+        }
     }
 
     if (native_fsr_composition) FinishNativeFsr(targets);
@@ -6984,6 +7039,19 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
     }
     Splice();
     r.scheduler.Finish();
+    if (!g_pixel_trace.hashes.empty()) {
+        std::ofstream out{dir / "pixel-trace.txt"};
+        const auto* words = reinterpret_cast<const u32*>(g_pixel_trace.buffer->Mapped());
+        for (size_t i = 0; i < g_pixel_trace.hashes.size(); ++i) {
+            out << fmt::format("{} vs {:#x} ps {:#x}", i, g_pixel_trace.hashes[i].first,
+                               g_pixel_trace.hashes[i].second);
+            for (size_t p = 0; p < TracedPixels.size(); ++p) {
+                out << fmt::format(" {:08x}", words[i * TracedPixels.size() + p]);
+            }
+            out << "\n";
+        }
+        g_pixel_trace.hashes.clear();
+    }
     for (const auto& readback : readbacks) {
         const auto& info = readback.entry->info;
         const auto& desc = readback.entry->image->Desc();
