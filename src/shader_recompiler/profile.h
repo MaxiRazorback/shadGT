@@ -52,6 +52,15 @@ struct Profile {
     u32 amd_vertex_order{};
     /// AMD-313: FIX-215/216's NaN rules for MED3/MIN3/MAX3 on AMD's trinary path (default on).
     bool amd_nan_rules{true};
+    /// AMD-306: pixel shaders keep whole quads and reconverge at the end of branches
+    /// (VK_KHR_shader_quad_control, VK_KHR_shader_maximal_reconvergence), so texture samples in
+    /// branches get their derivatives from all four pixels as on the PS4.
+    bool supports_quad_derivatives{};
+    /// AMD-307: with AMD's explicit vertex parameter extension, per-vertex reads find the vertex
+    /// order matching the barycentrics per triangle. Stages that write the position also write it
+    /// to OrderCheckRefLocation (interpolated) and OrderCheckVertexLocation (per vertex); the
+    /// pixel shader keeps the order whose blend of the per-vertex copy equals the interpolated one.
+    bool vertex_order_check{};
     bool has_broken_spirv_clamp{};
     bool lower_left_origin_mode{};
     bool needs_manual_interpolation{};

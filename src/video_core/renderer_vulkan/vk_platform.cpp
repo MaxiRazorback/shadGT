@@ -306,8 +306,9 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     const auto layers = GetInstanceLayers(enable_validation, enable_crash_diagnostic);
     const auto extensions = GetLayerExtensions(GetInstanceExtensions(window_type, true), layers);
 
+    // AMD-317: the driver and AMD Software see the game; the engine name is unchanged.
     const vk::ApplicationInfo application_info = {
-        .pApplicationName = "shadPS4",
+        .pApplicationName = "Gran Turismo Sport",
         .applicationVersion = VK_MAKE_VERSION(1, 0, 0),
         .pEngineName = "shadPS4 Vulkan",
         .engineVersion = VK_MAKE_VERSION(1, 0, 0),

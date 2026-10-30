@@ -309,6 +309,24 @@ public:
         return shader_clock && shader_clock_features.shaderSubgroupClock;
     }
 
+    /// AMD-306/307: AMD's driver compiling with its older proprietary shader compiler
+    /// (RX 6000 and older); RX 7000 and newer name LLPC in driverInfo.
+    bool IsAmdLegacyShaderCompiler() const {
+        return driver_id == vk::DriverId::eAmdProprietary &&
+               driver_info.find("LLPC") == std::string::npos;
+    }
+
+    /// AMD-306: pixel shaders can ask for whole quads and maximal reconvergence
+    /// (VK_KHR_shader_quad_control with VK_KHR_shader_maximal_reconvergence).
+    bool IsQuadDerivativesSupported() const {
+        return quad_control;
+    }
+
+    /// AMD-307: per-vertex fragment inputs find their vertex order per triangle.
+    bool IsVertexOrderCheckEnabled() const {
+        return vertex_order_check;
+    }
+
     /// Returns the vendor ID of the physical device
     u32 GetVendorID() const {
         return properties.vendorID;
@@ -557,6 +575,7 @@ private:
     vk::DriverIdKHR driver_id;
     vk::UniqueDebugUtilsMessengerEXT debug_callback{};
     std::string vendor_name;
+    std::string driver_info; ///< AMD-306: driverInfo, e.g. "26.8.1 (LLPC)"
     VmaAllocator allocator{};
     vk::Queue present_queue;
     vk::Queue graphics_queue;
@@ -595,6 +614,8 @@ private:
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
     bool shader_clock{};
+    bool quad_control{};       ///< AMD-306
+    bool vertex_order_check{}; ///< AMD-307
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
     u64 total_memory_budget{};
@@ -602,7 +623,7 @@ private:
 };
 
 /// AMD-312: which shader store version the selected GPU uses (see cache_storage.cpp).
-enum class StoreGpuFamily { Other, AmdRdna3, AmdRdna4 };
+enum class StoreGpuFamily { Other, AmdRdna3, AmdRdna4, AmdLegacy };
 StoreGpuFamily GetStoreGpuFamily();
 
 } // namespace Vulkan

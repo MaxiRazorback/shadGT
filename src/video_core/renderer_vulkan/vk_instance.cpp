@@ -300,7 +300,9 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR,
         vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT,
         vk::PhysicalDeviceMemoryPriorityFeaturesEXT,
-        vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>();
+        vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT,
+        vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR,
+        vk::PhysicalDeviceShaderQuadControlFeaturesKHR>();
     features = feature_chain.get().features;
     // AMD-300: the features an older Radeon's driver turns off.
     if (const auto simulated = GetSimulatedGpu(); simulated != SimulatedGpu::None) {
@@ -452,13 +454,31 @@ bool Instance::CreateDevice() {
     amd_shader_explicit_vertex_parameter =
         add_extension(VK_AMD_SHADER_EXPLICIT_VERTEX_PARAMETER_EXTENSION_NAME);
     const char* direct_barycentric_env = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC");
-    const bool direct_barycentric_candidate = properties.vendorID == 0x1002 &&
-        (!direct_barycentric_env || std::strcmp(direct_barycentric_env, "0") != 0);
+    // AMD-314: AMD's older shader compiler (RX 6000 and older) smeared textures with KHR
+    // barycentrics (AMD-305), and AMD-307 already finds its vertex order, so there the
+    // single-sample path is opt-in (=1); RX 7000 and newer keep it by default.
+    const bool direct_barycentric_candidate =
+        properties.vendorID == 0x1002 &&
+        (direct_barycentric_env ? std::strcmp(direct_barycentric_env, "0") != 0
+                                : !IsAmdLegacyShaderCompiler());
     if (!amd_shader_explicit_vertex_parameter || direct_barycentric_candidate) {
         // Keep AMD explicit-vertex support for multisampled shaders; the AMD default path
         // additionally enables KHR for separately specialized one-sample fragments.
         fragment_shader_barycentric =
             add_extension(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
+    }
+    {
+        // AMD-307: with AMD's barycentric extension and its older shader compiler (RX 6000 and
+        // older), per-vertex reads find the driver's vertex order per triangle.
+        // SHADGT_VERTEX_ORDER=0 turns it off, =1 turns it on with AMD's extension on any driver.
+        const char* order_env = std::getenv("SHADGT_VERTEX_ORDER");
+        vertex_order_check = amd_shader_explicit_vertex_parameter &&
+                             (order_env ? order_env[0] == '1' : IsAmdLegacyShaderCompiler());
+        LOG_INFO(Render_Vulkan, "AMD-307: barycentrics from {}, vertex order check {}",
+                 amd_shader_explicit_vertex_parameter ? "VK_AMD_shader_explicit_vertex_parameter"
+                 : fragment_shader_barycentric        ? "VK_KHR_fragment_shader_barycentric"
+                                                      : "none",
+                 vertex_order_check);
     }
     provoking_vertex = add_extension(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
     shader_stencil_export = add_extension(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
@@ -477,6 +497,16 @@ bool Instance::CreateDevice() {
     if (shader_atomic_float2) {
         shader_atomic_float2_features =
             feature_chain.get<vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT>();
+        // AMD-308: of the features the shader translator uses, the only one an RX 6000 (RDNA2)
+        // has and an RX 7600 (RDNA3) lacks is float min/max on images; the format arrays of the
+        // two are the same. With AMD's older shader compiler, image float min/max is made from
+        // integer atomics as on the RX 7600, so both run the same translated shaders there.
+        // SHADGT_FP32_IMAGE_ATOMICS=1 keeps the native atomics.
+        if (const char* env = std::getenv("SHADGT_FP32_IMAGE_ATOMICS");
+            env ? env[0] == '0' : IsAmdLegacyShaderCompiler()) {
+            shader_atomic_float2_features.shaderImageFloat32AtomicMinMax = false;
+            LOG_INFO(Render_Vulkan, "AMD-308: image float min/max from integer atomics");
+        }
         LOG_INFO(Render_Vulkan, "- shaderBufferFloat32AtomicMinMax: {}",
                  shader_atomic_float2_features.shaderBufferFloat32AtomicMinMax);
         LOG_INFO(Render_Vulkan, "- shaderImageFloat32AtomicMinMax: {}",
@@ -525,6 +555,53 @@ bool Instance::CreateDevice() {
         shader_clock_features = feature_chain.get<vk::PhysicalDeviceShaderClockFeaturesKHR>();
         LOG_INFO(Render_Vulkan, "- shaderSubgroupClock: {}",
                  shader_clock_features.shaderSubgroupClock);
+    }
+    // AMD-306: with AMD's older shader compiler (RX 6000 and older) pixel shaders keep whole
+    // quads in branches (see emit_spirv.cpp). RX 7000 and newer compile with LLPC, which drew
+    // these textures right without it, and an RX 7600's driver crashed compiling GT Sport's
+    // garage shaders with it. SHADGT_QUAD_CONTROL=0 turns it off, =1 turns it on for any GPU.
+    {
+        const char* quad_env = std::getenv("SHADGT_QUAD_CONTROL");
+        const bool wanted = quad_env ? quad_env[0] == '1' : IsAmdLegacyShaderCompiler();
+        quad_control =
+            wanted &&
+            feature_chain.get<vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>()
+                .shaderMaximalReconvergence &&
+            feature_chain.get<vk::PhysicalDeviceShaderQuadControlFeaturesKHR>().shaderQuadControl &&
+            !Simulates(VK_KHR_SHADER_QUAD_CONTROL_EXTENSION_NAME) &&
+            add_extension(VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME) &&
+            add_extension(VK_KHR_SHADER_QUAD_CONTROL_EXTENSION_NAME);
+        LOG_INFO(Render_Vulkan, "AMD-306: whole quads in pixel shader branches: {} (driver {})",
+                 quad_control, driver_info);
+    }
+    // AMD-316: one line naming the Radeon generation, the shader compiler and the AMD fixes this
+    // device runs with, so a log shows at once which path a card took.
+    if (driver_id == vk::DriverId::eAmdProprietary) {
+        const std::string model{GetModelName()};
+        const auto has = [&](std::string_view text) {
+            return model.find(text) != std::string::npos;
+        };
+        const char* generation = has("Radeon RX 9")   ? "RDNA4 (RX 9000)"
+                                 : has("Radeon RX 7") ? "RDNA3 (RX 7000)"
+                                 : has("Radeon RX 6") ? "RDNA2 (RX 6000)"
+                                 : has("Radeon RX 55") || has("Radeon RX 56") || has("Radeon RX 57")
+                                     ? "RDNA1 (RX 5000)"
+                                 : has("Vega")                              ? "GCN 5 (Vega)"
+                                 : has("Radeon RX 4") || has("Radeon RX 5") ? "GCN 4 (RX 400/500)"
+                                                                            : "other Radeon";
+        const bool legacy = IsAmdLegacyShaderCompiler();
+        LOG_INFO(Render_Vulkan,
+                 "AMD-316: {} on driver {} ({}), shader compiler {}; quad control {}, vertex "
+                 "order check {}, KHR barycentrics {}",
+                 generation, GetDriverVersionName(), driver_info,
+                 legacy ? "older (non-LLPC)" : "LLPC", quad_control, vertex_order_check,
+                 fragment_shader_barycentric);
+        if (legacy && !quad_control && !std::getenv("SHADGT_QUAD_CONTROL")) {
+            LOG_WARNING(Render_Vulkan,
+                        "AMD-316: this driver has no VK_KHR_shader_quad_control; textures in "
+                        "shader branches may pick wrong mip levels. Updating the AMD driver may "
+                        "help.");
+        }
     }
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
@@ -655,8 +732,7 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceVulkan13Features{
             .robustImageAccess = vk13_features.robustImageAccess,
             // FIX-188: Intel Arc (#65).
-            .pipelineCreationCacheControl =
-                IsIntel() && vk13_features.pipelineCreationCacheControl,
+            .pipelineCreationCacheControl = IsIntel() && vk13_features.pipelineCreationCacheControl,
             .shaderDemoteToHelperInvocation = vk13_features.shaderDemoteToHelperInvocation,
             .subgroupSizeControl = vk13_features.subgroupSizeControl,
             .computeFullSubgroups = IsIntel() && vk13_features.computeFullSubgroups,
@@ -754,7 +830,17 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceFaultFeaturesEXT{
             .deviceFault = true, // DIAG-206
         },
+        vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR{
+            .shaderMaximalReconvergence = true, // AMD-306
+        },
+        vk::PhysicalDeviceShaderQuadControlFeaturesKHR{
+            .shaderQuadControl = true, // AMD-306
+        },
     };
+    if (!quad_control) {
+        device_chain.unlink<vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>();
+        device_chain.unlink<vk::PhysicalDeviceShaderQuadControlFeaturesKHR>();
+    }
     if (!device_fault) {
         device_chain.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
     }
@@ -933,6 +1019,7 @@ void Instance::CollectDeviceParameters() {
 
     driver_id = driver.driverID;
     vendor_name = driver.driverName.data();
+    driver_info = driver.driverInfo.data(); // AMD-306/307
 
     const std::string model_name{GetModelName()};
     const std::string driver_version = GetDriverVersionName();
@@ -949,6 +1036,10 @@ void Instance::CollectDeviceParameters() {
             g_store_gpu_family = StoreGpuFamily::AmdRdna4;
         } else if (model_name.find("Radeon RX 7") != std::string::npos) {
             g_store_gpu_family = StoreGpuFamily::AmdRdna3;
+        } else if (IsAmdLegacyShaderCompiler()) {
+            // AMD's older shader compiler (RX 6000, RX 5000, RX 400/500): AMD-306/307/308 change
+            // its translations, so these cards keep a store of their own.
+            g_store_gpu_family = StoreGpuFamily::AmdLegacy;
         }
     }
     LOG_INFO(Render_Vulkan, "GPU_Integrated: {}", IsIntegrated() ? "Yes" : "No");

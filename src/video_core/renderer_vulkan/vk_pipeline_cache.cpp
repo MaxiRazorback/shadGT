@@ -794,6 +794,13 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
               !regs.stage_enable.IsStageEnabled(static_cast<u32>(HwStage::Local))) ||
              lowers_user_clip_planes) &&
             profile.needs_clip_distance_emulation;
+        // AMD-307: the vertex order check takes locations 30/31. The stage feeding the
+        // rasterizer exports NumExports() parameters, at most two locations further on (clip
+        // distances, layer), so the pixel shader reads the check only when those stay below 30;
+        // the vertex side checks its own outputs the same way and then always writes it.
+        info.hw.fs.vertex_order_check =
+            profile.vertex_order_check &&
+            regs.vs_output_config.NumExports() + 2 <= 30; // OrderCheckRefLocation
         break;
     }
     case HwStage::Compute: {
@@ -899,14 +906,30 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .amd_vertex_order = instance_.GetAmdVertexOrder(), // AMD-311
         // AMD-313: FIX-215/216 drew the purple car again on an RX 7600 (fresh store), so RX 7000
         // cards leave them out; SHADGT_AMD_NAN_RULES=0/1 overrides for any GPU.
-        .amd_nan_rules = [] {
-            if (const char* env = std::getenv("SHADGT_AMD_NAN_RULES"); env && *env) {
-                return env[0] != '0';
-            }
-            return GetStoreGpuFamily() != StoreGpuFamily::AmdRdna3;
-        }(),
-        .needs_manual_interpolation = instance.IsFragmentShaderBarycentricSupported() &&
-                                      instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
+        .amd_nan_rules =
+            [] {
+                if (const char* env = std::getenv("SHADGT_AMD_NAN_RULES"); env && *env) {
+                    return env[0] != '0';
+                }
+                return GetStoreGpuFamily() != StoreGpuFamily::AmdRdna3;
+            }(),
+        .supports_quad_derivatives = instance_.IsQuadDerivativesSupported(), // AMD-306
+        .vertex_order_check = instance_.IsVertexOrderCheckEnabled(),         // AMD-307
+        // AMD-315: on AMD's explicit vertex path a V_INTERP_MOV makes the whole attribute
+        // per-vertex, and the other components' V_INTERP_P2 reads then return vertex 0: flat,
+        // single-colour triangles (hills at Fuji on an RX 6600 XT). AMD's older compiler keeps
+        // that path (AMD-314), so it does GCN's P1/P2 arithmetic by hand, as 217d4011 does for
+        // the KHR path. SHADGT_MANUAL_INTERP=0/1 overrides.
+        .needs_manual_interpolation =
+            [&] {
+                if (const char* env = std::getenv("SHADGT_MANUAL_INTERP"); env && *env) {
+                    return env[0] != '0';
+                }
+                return (instance.IsFragmentShaderBarycentricSupported() &&
+                        instance.GetDriverID() == vk::DriverId::eNvidiaProprietary) ||
+                       (instance.IsAmdShaderExplicitVertexParameterSupported() &&
+                        instance.IsAmdLegacyShaderCompiler());
+            }(),
         .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
                               instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         .intel_arc_workarounds = instance.IsIntel(),
@@ -927,6 +950,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     profile.native_cube_sampling = NativeModeRequested() && instance.IsImageCubeArraySupported();
 #endif
     const char* barycentric_env = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC");
+    SetVertexOrderCheckCacheEnabled(profile.vertex_order_check); // AMD-307
     SetSingleSampleBarycentricCacheEnabled(UseSingleSampleBarycentric(
         instance.GetVendorID(), profile.supports_fragment_shader_barycentric, 1,
         !barycentric_env || std::strcmp(barycentric_env, "0") != 0));
