@@ -2879,7 +2879,23 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
 
 void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs& regs,
                                   Shader::Backend::Bindings& binding, DrawBindings& b) {
+    // DIAG-207 (RYGT_NULL_TEXTURES=<hash>:<hex slot mask>): that program's chosen texture slots
+    // are bound empty, to see which one carries a wrong colour. Recorder-side draws only.
+    static const std::pair<u64, u64> null_textures = [] {
+        const char* env = std::getenv("RYGT_NULL_TEXTURES");
+        if (!env || !*env) {
+            return std::pair<u64, u64>{0, 0};
+        }
+        char* end{};
+        const u64 hash = std::strtoull(env, &end, 16);
+        const u64 mask = end && *end == ':' ? std::strtoull(end + 1, nullptr, 16) : ~u64{0};
+        return std::pair<u64, u64>{hash, mask};
+    }();
+    u32 slot = 0;
     for (const auto& image_desc : stage.images) {
+        const bool null_slot = null_textures.first != 0 && stage.pgm_hash == null_textures.first &&
+                               slot < 64 && ((null_textures.second >> slot) & 1);
+        ++slot;
         auto tsharp = image_desc.GetSharp(stage);
         MatchExperimentalCompositionTexture(tsharp, stage, image_desc, *registry);
         const bool cube_sampling = image_desc.post_op == Shader::SharpFetchPostOp::NativeCubeSampling;
@@ -2907,6 +2923,10 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             ++stats.null_reasons[reason];
             add_write();
         };
+        if (null_slot) {
+            bind_null(0);
+            continue;
+        }
         // OPT-002: the picture and views this T# resolved to last time.
         ++stats.texture_lookups;
         TextureMemo* memo = nullptr;
