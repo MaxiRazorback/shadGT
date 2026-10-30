@@ -120,7 +120,13 @@ bool LoadApi() {
     std::wstring dir{exe};
     dir = dir.substr(0, dir.find_last_of(L"\\/"));
     const std::wstring path = dir + L"\\amd_fidelityfx_vk.dll";
-    HMODULE module = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    // FSR-210: SDK 2.x splits the effects; its loader finds amd_fidelityfx_upscaler_vk.dll beside
+    // it. Older builds keep the single amd_fidelityfx_vk.dll.
+    const std::wstring loader = dir + L"\\amd_fidelityfx_loader_vk.dll";
+    HMODULE module = LoadLibraryExW(loader.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!module) {
+        module = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    }
     if (!module) {
         LOG_WARNING(Render_Vulkan,
                     "FSR 3.1: fsr3_enabled is on but amd_fidelityfx_vk.dll could not be loaded "
