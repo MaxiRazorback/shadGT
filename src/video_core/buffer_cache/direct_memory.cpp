@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -17,6 +18,7 @@
 #include "core/memory.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/direct_memory.h"
+#include "ryty_gpu/native/slow_call_trace.h"
 #include "video_core/buffer_cache/proto_import.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -216,6 +218,10 @@ std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindBuffer(VAddr addr
 }
 
 bool DirectMemory::ImportView(VAddr address) {
+    Native::SlowCallTrace<8> trace{Native::trace_guest_hash_calls, "import-guest-view",
+        {"guest-view", "map-alias", "host-properties", "allocate-memory", "create-bind-buffer",
+         "device-address", "map-pages", "store-view"}};
+    trace.Next(0, address, 0);
 #ifdef _WIN32
     const VAddr base = GuestViewBase(address);
     if (base == 0) {
@@ -245,6 +251,7 @@ bool DirectMemory::ImportView(VAddr address) {
     if (!map_alias) {
         return fail("no GuestArenaMapAlias");
     }
+    trace.Next(1, base, end - base);
     void* alias = map_alias(base, end - base);
     if (!alias) {
         return fail("no alias (not shared memory)");
@@ -253,6 +260,7 @@ bool DirectMemory::ImportView(VAddr address) {
     const VkDevice device = instance.GetDevice();
     VkMemoryHostPointerPropertiesEXT ptr_props{
         VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    trace.Next(2);
     if (d.vkGetMemoryHostPointerPropertiesEXT(device,
                                               VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
                                               alias, &ptr_props) != VK_SUCCESS ||
@@ -279,6 +287,7 @@ bool DirectMemory::ImportView(VAddr address) {
     VkMemoryAllocateInfo info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &import, end - base,
                               memory_type_index};
     VkDeviceMemory memory{};
+    trace.Next(3);
     if (const VkResult r = d.vkAllocateMemory(device, &info, nullptr, &memory); r != VK_SUCCESS) {
         UnmapAlias()(alias);
         return fail("import refused");
@@ -294,16 +303,23 @@ bool DirectMemory::ImportView(VAddr address) {
                         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                         VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT; // NAT-100: dispatch arguments
     VkBuffer buffer{};
+    trace.Next(4);
     if (d.vkCreateBuffer(device, &buffer_info, nullptr, &buffer) != VK_SUCCESS ||
         d.vkBindBufferMemory(device, buffer, memory, 0) != VK_SUCCESS) {
+        if (buffer) {
+            d.vkDestroyBuffer(device, buffer, nullptr);
+        }
         d.vkFreeMemory(device, memory, nullptr);
         UnmapAlias()(alias);
         return fail("buffer over the import failed");
     }
     VkBufferDeviceAddressInfo address_info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr,
                                            buffer};
+    trace.Next(5);
     const vk::DeviceAddress device_address = d.vkGetBufferDeviceAddress(device, &address_info);
+    trace.Next(6);
     MapPages(base, end, device_address);
+    trace.Next(7);
     auto wrapper = std::make_shared<Buffer>(instance, base, end - base, vk::Buffer{buffer});
     views.emplace(base, View{base, end, alias, memory, buffer, device_address, std::move(wrapper)});
     imported_bytes += end - base;
@@ -337,39 +353,104 @@ bool DirectMemory::ForEachPart(VAddr address, u64 size,
     return true;
 }
 
-bool DirectMemory::EnsureImported(VAddr address, u64 size) {
-    if (g_has_pending.load(std::memory_order_relaxed)) {
-        // Aliases of unmapped views the GPU no longer uses.
-        std::scoped_lock lk{g_pending_mutex};
-        const auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;
-        std::erase_if(g_pending, [&](PendingRelease& p) {
-            if (!scheduler.IsFree(p.tick)) {
-                return false;
-            }
-            p.wrapper.reset();
-            d.vkFreeMemory(instance.GetDevice(), p.memory, nullptr);
-            UnmapAlias()(p.alias);
-            return true;
-        });
-        g_has_pending.store(!g_pending.empty(), std::memory_order_relaxed);
+void DirectMemory::WarmImported(VAddr address, u64 size) {
+    // Speculative preparation must not wait behind another worker or the recorder.
+    // Bound both driver calls and time spent holding the shared view mutex. Large
+    // Windows allocations stay on the normal path: warming a tiny texture must
+    // not eagerly pin hundreds of MiB of unrelated backing.
+    constexpr u64 MaxWarmViewBytes = 4ull << 20;
+    constexpr u32 MaxWarmImports = 8;
+    if (size == 0 || size > (64ull << 20) || address > ~VAddr{0} - size) {
+        return;
     }
-    const VAddr end = address + size;
-    const u64 generation = g_unmap_generation.load(std::memory_order_acquire);
-    for (const RecentView& recent : t_recent_views) {
-        if (recent.generation == generation && address >= recent.begin && end <= recent.end) {
-            return true;
-        }
+    std::unique_lock lock{mutex, std::try_to_lock};
+    if (!lock.owns_lock()) {
+        return;
     }
-    std::scoped_lock lk{mutex};
 #ifdef RYTY_GPU
-    // OnUnmap is reported before the host remap. A lookup during that window can
-    // fail, so discard negative results after the completed mapping is reported too.
     const u64 mapping_generation = Core::RytyMemory::MappingGeneration();
     if (failed_generation != mapping_generation) {
         failed.clear();
         failed_generation = mapping_generation;
     }
 #endif
+    const VAddr end = address + size;
+    const auto started = std::chrono::steady_clock::now();
+    u32 imported = 0;
+    for (VAddr page = address & ~(PageSize - 1); page < end;) {
+        const auto failure = failed.upper_bound(page);
+        if (failure != failed.begin() && page < std::prev(failure)->second) {
+            return;
+        }
+        auto it = views.upper_bound(page);
+        if (it != views.begin()) {
+            const auto& view = std::prev(it)->second;
+            if (page >= view.begin && page < view.end) {
+                page = view.end;
+                continue;
+            }
+        }
+        if (imported >= MaxWarmImports ||
+            std::chrono::steady_clock::now() - started >= std::chrono::milliseconds(1)) {
+            return;
+        }
+        const VAddr base = GuestViewBase(page);
+        const VAddr view_end = base ? GuestViewEnd(base, MaxWarmViewBytes) : 0;
+        if (!base || view_end <= page || view_end - base > MaxWarmViewBytes) {
+            return;
+        }
+        if (!ImportView(page)) {
+            return;
+        }
+        ++imported;
+    }
+}
+
+bool DirectMemory::EnsureImported(VAddr address, u64 size) {
+    Native::SlowCallTrace<9> trace{Native::trace_guest_hash_calls, "ensure-imported",
+        {"pending-lock", "completion-query", "destroy-wrapper", "free-memory", "unmap-alias",
+         "recent-cache", "view-mutex", "mapping-generation", "lookup-import"}};
+    trace.Next(0, address, size);
+    if (g_has_pending.load(std::memory_order_relaxed)) {
+        // Aliases of unmapped views the GPU no longer uses.
+        std::scoped_lock lk{g_pending_mutex};
+        const auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;
+        std::erase_if(g_pending, [&](PendingRelease& p) {
+            trace.Next(1);
+            if (!scheduler.IsFree(p.tick)) {
+                return false;
+            }
+            trace.Next(2);
+            p.wrapper.reset();
+            trace.Next(3);
+            d.vkFreeMemory(instance.GetDevice(), p.memory, nullptr);
+            trace.Next(4);
+            UnmapAlias()(p.alias);
+            return true;
+        });
+        g_has_pending.store(!g_pending.empty(), std::memory_order_relaxed);
+    }
+    const VAddr end = address + size;
+    trace.Next(5);
+    const u64 generation = g_unmap_generation.load(std::memory_order_acquire);
+    for (const RecentView& recent : t_recent_views) {
+        if (recent.generation == generation && address >= recent.begin && end <= recent.end) {
+            return true;
+        }
+    }
+    trace.Next(6);
+    std::scoped_lock lk{mutex};
+#ifdef RYTY_GPU
+    // OnUnmap is reported before the host remap. A lookup during that window can
+    // fail, so discard negative results after the completed mapping is reported too.
+    trace.Next(7);
+    const u64 mapping_generation = Core::RytyMemory::MappingGeneration();
+    if (failed_generation != mapping_generation) {
+        failed.clear();
+        failed_generation = mapping_generation;
+    }
+#endif
+    trace.Next(8);
     for (VAddr page = address & ~(PageSize - 1); page < end;) {
         // A failed view is retried by many draws (and again by the gather fallback).
         // Its bounds are already known: avoid querying Windows for its base each time.
@@ -393,6 +474,10 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
             return false;
         }
     }
+    // The complete range was verified under the view mutex. Remember that union,
+    // not just ranges fitting one view: large textures otherwise repeat hundreds
+    // of ordered-map lookups at every upload. Any unmap expires it via generation.
+    t_recent_views[t_recent_next++ % t_recent_views.size()] = {generation, address, end};
     return true;
 }
 

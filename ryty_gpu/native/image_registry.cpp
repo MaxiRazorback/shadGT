@@ -9,6 +9,9 @@
 #include "core/guest_hash.h"
 #include "core/memory.h"
 #include "ryty_gpu/native/image_registry.h"
+#include "ryty_gpu/native/upload_scratch_capacity.h"
+#include "ryty_gpu/native/gpu_checkpoints.h"
+#include "ryty_gpu/native/slow_call_trace.h"
 #include "video_core/amdgpu/tiling.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/texture_cache/tiling_specialization.h"
@@ -1068,7 +1071,12 @@ const Rhi::Pipeline* ImageRegistry::TilingPipeline(const VideoCore::ImageInfo& i
     return result;
 }
 
-u32 ImageRegistry::RecordUploads(Rhi::CommandList& list) {
+u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) {
+    SampleGuestHashCalls hash_sampling{trace_slow_calls};
+    SlowCallTrace<16> trace{trace_slow_calls, "image-uploads",
+        {"queue-lock", "validate", "watch-pages", "hash", "gpu-source", "cpu-allocate",
+         "cpu-copy", "tiling-pipeline", "tiling-params", "scratch", "barrier-bindings",
+         "dispatch", "mip-copies", "copy-image", "final-barrier", "retire"}};
     std::vector<ImageEntry*> pending;
     {
         std::scoped_lock lock{upload_mutex};
@@ -1082,6 +1090,10 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list) {
         }
         const VideoCore::ImageInfo& info = entry->info;
         const u64 size = info.guest_size;
+        GpuCheckpoints::Record(reinterpret_cast<VkCommandBuffer>(list.NativeHandle()),
+                               3, entry->last_use.load(std::memory_order_relaxed),
+                               info.guest_address, size, u64(info.size.width) << 32 | info.size.height);
+        trace.Next(1, info.guest_address, size);
         if (size == 0) {
             continue;
         }
@@ -1100,11 +1112,13 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list) {
             }
             continue;
         }
+        trace.Next(2);
         if (upload_hook && entry->from_cpu) {
             upload_hook(*entry); // NAT-105: CPU writes from here on are seen
         }
         // NAT-109: a small texture whose bytes did not change (a write elsewhere on its page)
         // is not uploaded again; GPU writes to its memory always upload.
+        trace.Next(3);
         constexpr u64 HashedSize = 4ull << 20;
         const bool forced = entry->force_upload.exchange(false);
         // FIX-157: render targets of any size (what their memory held when made).
@@ -1126,6 +1140,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list) {
         }
         // NAT-107: the bytes as the GPU sees guest memory, in GPU order (textures the game's
         // GPU work filled, in memory the CPU may not even read), else a copy the CPU makes now.
+        trace.Next(4);
         UploadSource gpu_source;
         if (upload_source) {
             gpu_source = upload_source(*entry, list);
@@ -1140,9 +1155,11 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list) {
             staging.push_back(std::move(keep));
         }
         if (bytes) {
-            ++upload_stats.gpu;
+            if (gpu_source.kind == 4) ++upload_stats.cpu;
+            else ++upload_stats.gpu;
         } else {
             ++upload_stats.cpu;
+            trace.Next(5);
             source = device.CreateBuffer({.size = size,
                                           .usage = Rhi::BufferUsageStorage |
                                                    Rhi::BufferUsageTransferSrc,
@@ -1152,6 +1169,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list) {
             }
             // Only what is mapped is read (a T# can reach past the end of a mapping); the rest of
             // the picture is zeros.
+            trace.Next(6);
             const u64 readable = memory_clamp ? memory_clamp(info.guest_address, size) : size;
             if (readable < size) {
                 std::memset(source->Mapped() + readable, 0, size - readable);
@@ -1179,35 +1197,69 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list) {
         const Rhi::Buffer* linear = bytes;
         u64 linear_offset = bytes_offset;
         if (info.props.is_tiled) {
+            trace.Next(7);
             const Rhi::Pipeline* untile = TilingPipeline(info, false);
-            auto params_buffer = TilingParamsBuffer(info);
-            auto out = device.CreateBuffer({.size = size,
-                                            .usage = Rhi::BufferUsageStorage |
-                                                     Rhi::BufferUsageTransferSrc,
-                                            .memory = Rhi::MemoryKind::DeviceLocal});
+            // Immutable per-image parameters are shared by uploads and downloads.
+            // Keep only the small uniform buffer; the large linear scratch remains transient.
+            trace.Next(8);
+            if (!entry->download_params) {
+                entry->download_params = TilingParamsBuffer(info);
+            }
+            const Rhi::Buffer* params_buffer = entry->download_params.get();
+            std::unique_ptr<Rhi::Buffer> temporary;
+            trace.Next(9);
+            const u64 capacity = UploadScratchCapacity(size);
+            if (capacity && (!upload_scratch || upload_scratch->Size() < size)) {
+                auto larger = device.CreateBuffer({.size = capacity,
+                    .usage = Rhi::BufferUsageStorage | Rhi::BufferUsageTransferSrc,
+                    .memory = Rhi::MemoryKind::DeviceLocal});
+                if (larger) {
+                    upload_scratch = std::move(larger);
+                    ++upload_stats.scratch_created;
+                }
+            }
+            Rhi::Buffer* out = nullptr;
+            if (capacity && upload_scratch && upload_scratch->Size() >= size) {
+                out = upload_scratch.get();
+                ++upload_stats.scratch_reused;
+            } else {
+                temporary = device.CreateBuffer({.size = size,
+                    .usage = Rhi::BufferUsageStorage | Rhi::BufferUsageTransferSrc,
+                    .memory = Rhi::MemoryKind::DeviceLocal});
+                out = temporary.get();
+                ++upload_stats.scratch_transient;
+            }
             if (!untile || !params_buffer || !out) {
                 continue;
+            }
+            // WAR dependency: the preceding copy must finish reading shared scratch
+            // before this dispatch overwrites it. All uses are on the recording queue.
+            trace.Next(10);
+            if (!temporary) {
+                list.Barrier(Rhi::ScopeTransfer | Rhi::ScopeCompute, Rhi::ScopeCompute);
             }
             list.BindPipeline(untile);
             const std::array<Rhi::Binding, 3> bindings{{
                 {.slot = 0, .type = Rhi::BindingType::StorageBuffer, .buffer = bytes,
                  .offset = bytes_offset, .size = size},
-                {.slot = 1, .type = Rhi::BindingType::StorageBuffer, .buffer = out.get(), .size = size},
-                {.slot = 2, .type = Rhi::BindingType::UniformBuffer, .buffer = params_buffer.get(),
+                {.slot = 1, .type = Rhi::BindingType::StorageBuffer, .buffer = out, .size = size},
+                {.slot = 2, .type = Rhi::BindingType::UniformBuffer, .buffer = params_buffer,
                  .size = sizeof(TilingParams)},
             }};
             list.PushBindings(bindings);
+            trace.Next(11);
             list.Dispatch(static_cast<u32>((size / (info.num_bits / 8)) / 64), 1, 1);
             list.Barrier(Rhi::ScopeCompute, Rhi::ScopeTransfer);
-            linear = out.get();
+            linear = out;
             linear_offset = 0;
-            staging.push_back(std::move(params_buffer));
-            staging.push_back(std::move(out));
+            if (temporary) staging.push_back(std::move(temporary));
         }
+        trace.Next(12);
         auto copies = MipCopies(info);
         for (auto& copy : copies) {
             copy.buffer_offset += linear_offset;
         }
+        trace.Next(13);
         list.CopyBufferToImage(linear, entry->image.get(), copies);
         const u8 kind = source ? 4 : gpu_source.kind; // FIX-153 (diagnosis)
         if (source) {
@@ -1224,11 +1276,13 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list) {
         ++entry->upload_count;
         ++uploaded;
     }
+    trace.Next(14, 0, pending.size());
     if (uploaded) {
         list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeDraw | Rhi::ScopeCompute);
         stats.uploads += uploaded;
     }
     // The device frees these once the submission that runs this list has finished.
+    trace.Next(15);
     staging.clear();
     return uploaded;
 }

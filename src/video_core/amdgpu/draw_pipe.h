@@ -203,7 +203,6 @@ private:
     std::atomic<u64> finished_jobs{};
     bool recorder_waiting{};
     const size_t max_pending;
-    size_t max_stage_pending{}; // Native register snapshots: bound producer + worker + recorder backlog.
     std::atomic<std::thread::id> recorder_id{};
     std::function<void()> thread_init;
     std::function<void()> idle_hook; // D5

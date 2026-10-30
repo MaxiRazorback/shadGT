@@ -1,4 +1,7 @@
 #include "video_core/renderer_vulkan/driver_cache_snapshot.h"
+#include "video_core/renderer_vulkan/pipeline_retention_budget.h"
+#include "video_core/renderer_vulkan/draw_preparation_options.h"
+#include "video_core/renderer_vulkan/compile_cpu_batch.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -140,6 +143,39 @@ static void KeepCompiledTessellationLayout(Shader::StageSpecialization& spec,
     }
 }
 
+extern "C" __declspec(dllexport) int RytyTestTessLayoutKeys() {
+    unsigned cases=0;
+    for (u32 stride : {0u, 24u, 128u, 160u, 65536u}) {
+        Shader::StageSpecialization key{};
+        Shader::RuntimeInfo compiled{};
+        compiled.Initialize(Shader::HwStage::Vertex, Shader::SwStage::TessellationEval);
+        compiled.sw.tes.hs_output_cp_stride=stride;
+        key.runtime_info=compiled;
+        key.runtime_info.sw.tes.hs_output_cp_stride=0x3f800000;
+        KeepCompiledTessellationLayout(key,compiled);
+        if(key.runtime_info.sw.tes.hs_output_cp_stride!=stride)return -1;
+        ++cases;
+        compiled.Initialize(Shader::HwStage::Hull, Shader::SwStage::TessellationControl);
+        compiled.sw.tcs.hs_output_cp_stride=stride;
+        compiled.sw.tcs.ls_stride=24;
+        compiled.sw.tcs.hs_output_base=0x700;
+        key.runtime_info=compiled;
+        key.runtime_info.sw.tcs.hs_output_cp_stride=0xbf800000;
+        key.runtime_info.sw.tcs.ls_stride=0x3f800000;
+        key.runtime_info.sw.tcs.hs_output_base=0x3f800000;
+        key.runtime_info.sw.tcs.num_threads=4;
+        KeepCompiledTessellationLayout(key,compiled);
+        if(key.runtime_info.sw.tcs.hs_output_cp_stride!=stride || key.runtime_info.sw.tcs.ls_stride!=24 || key.runtime_info.sw.tcs.hs_output_base!=0x700 || key.runtime_info.sw.tcs.num_threads!=4)return -2;
+        ++cases;
+    }
+    Shader::StageSpecialization key{};Shader::RuntimeInfo compiled{};
+    compiled.Initialize(Shader::HwStage::Vertex,Shader::SwStage::Vertex);
+    key.runtime_info=compiled;key.runtime_info.sw.vs.step_rate_0=19;
+    KeepCompiledTessellationLayout(key,compiled);
+    if(key.runtime_info.sw.vs.step_rate_0!=19)return -3;
+    return cases+1;
+}
+
 // Frontend resolution runs under the caller's captured draw state. Workers must
 // never follow guest descriptor-table pointers after the handoff.
 struct OwnedTranslation {
@@ -148,6 +184,44 @@ struct OwnedTranslation {
     std::optional<Shader::IR::Program> program;
     explicit OwnedTranslation(const Shader::RuntimeInfo& runtime) : compiled_runtime{runtime} {}
 };
+
+extern "C" __declspec(dllexport) int RytyTestOwnedTranslationInputs() {
+    unsigned cases{};
+    for (auto stage : {Shader::SwStage::TessellationControl, Shader::SwStage::TessellationEval}) {
+        for (u32 stride : {24u, 128u, 160u, 65536u}) {
+            Shader::Info info{};
+            info.sw_stage = stage;
+            Shader::RuntimeInfo runtime{};
+            runtime.Initialize(stage == Shader::SwStage::TessellationControl ? Shader::HwStage::Hull
+                                                                           : Shader::HwStage::Vertex,
+                               stage);
+            auto owned = std::make_shared<OwnedTranslation>(runtime);
+            if (stage == Shader::SwStage::TessellationControl) {
+                owned->compiled_runtime.sw.tcs.ls_stride = 24;
+                owned->compiled_runtime.sw.tcs.hs_output_cp_stride = stride;
+                owned->compiled_runtime.sw.tcs.hs_output_base = 0x700;
+            } else {
+                owned->compiled_runtime.sw.tes.hs_output_cp_stride = stride;
+            }
+            // A default Info has no usable tessellation V# or user-data table.
+            // Construction must consume the owned layout without accessing either.
+            Shader::Profile profile{};
+            bool passed{};
+            std::thread worker([owned, &info, &profile, runtime, stage, stride, &passed] {
+                Shader::StageSpecialization key(info, runtime, profile, {}, nullptr,
+                                                &owned->compiled_runtime);
+                passed = stage == Shader::SwStage::TessellationControl
+                    ? key.runtime_info.sw.tcs.hs_output_cp_stride == stride &&
+                      key.runtime_info.sw.tcs.ls_stride == 24 && key.runtime_info.sw.tcs.hs_output_base == 0x700
+                    : key.runtime_info.sw.tes.hs_output_cp_stride == stride;
+            });
+            worker.join();
+            if (!passed) return -1;
+            ++cases;
+        }
+    }
+    return cases;
+}
 
 class PipelineCache::TranslateWorkers {
 public:
@@ -3931,7 +4005,40 @@ static bool SaneTessConstants(const Shader::Info& hull, const AmdGpu::Liverpool*
     };
     Common::CopyGuest(&c, reinterpret_cast<const void*>(base), sizeof(c));
     const bool sane = is_sane();
-    {
+    if (DrawPreparationEnabled(4)) {
+        // DIAG-060: sane and garbage constants per hull program, every 5 s.
+        static thread_local std::unordered_map<u64, std::pair<u32, u32>> per_hull;
+        static thread_local u32 garbage_drawn{};
+        static thread_local u32 garbage_read_ahead{};
+        if (!sane) {
+            ++(read_ahead ? garbage_read_ahead : garbage_drawn);
+        }
+        static thread_local auto last = std::chrono::steady_clock::now();
+        auto& [good, bad] = per_hull[hull.pgm_hash];
+        ++(sane ? good : bad);
+        if (PollPreparationDiagnostics())
+        if (const auto now = std::chrono::steady_clock::now(); now - last >= std::chrono::seconds{5}) {
+            last = now;
+            std::string line;
+            for (const auto& [hash, counts] : per_hull) {
+                if (counts.second != 0) {
+                    line += fmt::format(" {:#x}={}/{}", hash, counts.first, counts.second);
+                }
+            }
+            if (!line.empty()) {
+                LOG_WARNING(Render_Vulkan,
+                            "DIAG-060: hulls with garbage constants (sane/garbage):{}; decoding "
+                            "submission {} of {}; garbage in {} draws, {} read-ahead states",
+                            line, liverpool ? liverpool->DecodingSubmit() : 0,
+                            liverpool ? liverpool->SubmittedCount() : 0, garbage_drawn,
+                            garbage_read_ahead);
+                garbage_drawn = 0;
+                garbage_read_ahead = 0;
+            }
+            per_hull.clear();
+        }
+    }
+    else {
         // DIAG-060: sane and garbage constants per hull program, every 5 s.
         static std::mutex stats_mutex;
         static std::unordered_map<u64, std::pair<u32, u32>> per_hull;
@@ -3944,6 +4051,7 @@ static bool SaneTessConstants(const Shader::Info& hull, const AmdGpu::Liverpool*
         std::scoped_lock lk{stats_mutex};
         auto& [good, bad] = per_hull[hull.pgm_hash];
         ++(sane ? good : bad);
+        if (PollPreparationDiagnostics())
         if (const auto now = std::chrono::steady_clock::now(); now - last >= std::chrono::seconds{5}) {
             last = now;
             std::string line;
@@ -3986,7 +4094,9 @@ static bool SaneTessConstants(const Shader::Info& hull, const AmdGpu::Liverpool*
     if (sane) {
         // DIAG-059: what sane constants and their V#s look like, to compare with garbage ones.
         static std::atomic<u32> sane_logged{};
-        if (const u32 n = ++sane_logged; n <= 40 || n % 5000 == 0) {
+        static thread_local u32 thread_sane_logged{};
+        const u32 n = DrawPreparationEnabled(8) ? ++thread_sane_logged : ++sane_logged;
+        if (n <= (DrawPreparationEnabled(8) ? 4u : 40u) || n % 5000 == 0) {
             if (n % 5000 == 0 && std::getenv("SHADGT_TESS_SUBMIT_CHECK")) {
                 WatchIbAfterDecode(n, true, base);
             }
@@ -4128,12 +4238,14 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
                                      const Shader::ShaderParams& params,
                                      const Shader::RuntimeInfo& runtime_info,
                                      const Shader::Backend::Bindings& start, bool speculative) {
+    static const bool reported=[] { LOG_INFO(Render_Vulkan, "CPU/compiler diagnostic batch mask {} (1 priority, 2 retry, 4 library futures, 8 descriptor hash)", CompileCpuBatchMask()); return true; }();
+    (void)reported;
     auto& jobs = translate_jobs[params.hash];
     const auto now = std::chrono::steady_clock::now();
     std::erase_if(jobs, [&](const auto& job) {
         if (!job->done || job->module) return false;
         const bool same_inputs = std::ranges::equal(job->user_data, params.user_data);
-        return !DelayFailedTranslationRetry(job->retry_after, now, speculative, same_inputs);
+        return !CompileCpuBatchEnabled(2) || !DelayFailedTranslationRetry(job->retry_after, now, speculative, same_inputs);
     });
     for (const auto& job : jobs) {
         if (MatchesTranslationRequest(*job, hw_stage, sw_stage, runtime_info, start)) {
@@ -4295,7 +4407,7 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
                 Common::GuestClock::CompilePause hold;
                 RYDIAG_SCOPE(ShaderCompile, hash);
                 // The draw needs this shader now; don't wait behind speculative work.
-                translate_workers->Prioritize(job);
+                if (CompileCpuBatchEnabled(1)) translate_workers->Prioritize(job);
                 std::unique_lock lk{job->mutex};
                 job->cv.wait(lk, [&] { return job->done.load(); });
                 waited = true;
@@ -4321,12 +4433,12 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
             }
             // Keep a brief negative result only for optional draws. Required
             // dependencies still retry/fall back, and changed user data bypasses it.
-            return !DelayFailedTranslationRetry(job->retry_after, now, !wait, true);
+            return !CompileCpuBatchEnabled(2) || !DelayFailedTranslationRetry(job->retry_after, now, !wait, true);
         }
         translate_stats.translate_ms += job->translate_ms;
         // Tessellation keys were captured on the translating worker, not from
         // whatever the guest wrote to the constant buffer before harvesting.
-        // The worker captured every stage key from the owned compilation inputs.
+        // Every stage key was captured from the owned compilation inputs on the worker.
         job->ready_since = now;
         ready.push_back(job);
         return true;
@@ -5051,14 +5163,29 @@ void PipelineCache::TrimUnusedPipelines() {
     using namespace std::chrono;
     const auto now = steady_clock::now();
     if (now - retention_last_scan < seconds{1}) return;
+    retention_last_scan = now;
+    // Retain reusable pipelines until the live device-local budget needs headroom.
+    // VMA allocation totals omit driver-owned pipeline memory; query the driver.
+    // Without budget reporting we cannot establish pressure, so retain pipelines.
+    if (!instance.CanReportMemoryUsage()) return;
+    vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    vk::PhysicalDeviceMemoryProperties2 memory{.pNext = &budget};
+    instance.GetPhysicalDevice().getMemoryProperties2(&memory);
+    u64 usage_bytes = 0;
+    u64 budget_bytes = 0;
+    for (u32 i = 0; i < memory.memoryProperties.memoryHeapCount; ++i) {
+        const auto& heap = memory.memoryProperties.memoryHeaps[i];
+        if (!(heap.flags & vk::MemoryHeapFlagBits::eDeviceLocal)) continue;
+        usage_bytes += budget.heapUsage[i];
+        budget_bytes += std::min<u64>(budget.heapBudget[i], heap.size);
+    }
+    const bool under_pressure = PipelineRetentionUnderPressure(usage_bytes, budget_bytes);
     std::unique_lock lock{lookup_mutex, std::try_to_lock};
     if (!lock.owns_lock()) return;
-    retention_last_scan = now;
     retention_now = now;
-    // Keep the active working set even if a scene needs more than the soft limit.
+    if (!under_pressure) return;
     // Queued selections hold a shared reference; retirement cannot invalidate them.
-    constexpr size_t soft_limit = 1024;
-    constexpr size_t retire_batch = 64;
+    constexpr size_t retire_batch = 8;
     const auto cutoff = now - seconds{60};
     std::vector<std::shared_ptr<const void>> retired;
     const auto trim = [&](auto& cache) {
@@ -5078,7 +5205,7 @@ void PipelineCache::TrimUnusedPipelines() {
         }
         std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
         for (const auto& [used, key] : candidates) {
-            if (retired.size() >= retire_batch || graphics_pipelines.size() + compute_pipelines.size() <= soft_limit) break;
+            if (retired.size() >= retire_batch) break;
             auto it = cache.find(key);
             pipeline_last_use.erase(it->second.get());
             retired.emplace_back(std::move(it.value()));
@@ -5091,7 +5218,9 @@ void PipelineCache::TrimUnusedPipelines() {
     const auto count = retired.size();
     // Includes commands already recorded in the current, not-yet-submitted batch.
     scheduler.DeferOperation([retired = std::move(retired)] {});
-    LOG_DEBUG(Render_Vulkan, "Retired {} unused pipelines; {} cached", count,
-              graphics_pipelines.size() + compute_pipelines.size());
+    LOG_INFO(Render_Vulkan, "Pipeline memory pressure: {} MiB used / {} MiB budget, "
+             "1024 MiB reserve; retired {} unused pipelines, {} cached",
+             usage_bytes >> 20, budget_bytes >> 20, count,
+             graphics_pipelines.size() + compute_pipelines.size());
 }
 }

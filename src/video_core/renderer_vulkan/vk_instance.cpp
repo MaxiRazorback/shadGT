@@ -21,6 +21,7 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 #ifdef RYTY_GPU
 #include "ryty_gpu/ryty_dlss.h"
+#include "ryty_gpu/native/gpu_checkpoints.h"
 #include "ryty_gpu/ryty_xess.h"
 #endif
 
@@ -620,6 +621,13 @@ bool Instance::CreateDevice() {
 #endif
     // DIAG-206: the driver's report of what faulted when the device is lost.
     device_fault = add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+#ifdef RYTY_GPU
+    if (Native::GpuCheckpoints::Requested()) {
+        const bool enabled = add_extension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+        Native::GpuCheckpoints::supported.store(enabled, std::memory_order_relaxed);
+        LOG_INFO(Render_Vulkan, "GPU-CHECKPOINT: diagnostic requested, supported={}", enabled);
+    }
+#endif
     // XESS-200: Intel XeSS's device extensions and features, only when it is the upscaler.
     bool xess = false;
     bool xess_mutable_descriptor = false;
@@ -1218,9 +1226,13 @@ vk::Format Instance::GetSupportedFormat(const vk::Format format,
 void Instance::LogDeviceFault() const {
     // DIAG-206: once, after the device was lost.
     static std::atomic_flag logged = ATOMIC_FLAG_INIT;
-    if (!device_fault || logged.test_and_set()) {
+    if (logged.test_and_set()) {
         return;
     }
+#ifdef RYTY_GPU
+    Native::GpuCheckpoints::Log(static_cast<VkQueue>(graphics_queue));
+#endif
+    if (!device_fault) return;
     const auto get_fault = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(
         VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr(static_cast<VkDevice>(*device),
                                                           "vkGetDeviceFaultInfoEXT"));

@@ -1,10 +1,11 @@
+#include "video_core/renderer_vulkan/descriptor_set_reserve.h"
+#include "video_core/renderer_vulkan/prepared_descriptor_key.h"
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 // NAT-100: native mode (RYGT_NATIVE=1, ryGT builds); see vk_rasterizer_native.cpp.
 
 #pragma once
-#include "video_core/renderer_vulkan/prepared_descriptor_key.h"
 
 #include <array>
 #include <atomic>
@@ -25,8 +26,8 @@
 #include <boost/container/static_vector.hpp>
 
 #include "common/types.h"
+#include "video_core/renderer_vulkan/pipeline_binding_state.h"
 #include "video_core/renderer_vulkan/descriptor_set_memo.h"
-#include "video_core/renderer_vulkan/descriptor_set_reserve.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/amdgpu/regs_texture.h"
@@ -183,7 +184,7 @@ private:
         bool rendering = false;
         RenderState render{};
         DynamicState dynamic{};
-        vk::Pipeline pipeline{};
+        PipelineBindingState<vk::Pipeline> pipelines;
         /// OPT-005: the vertex input layout, vertex buffers and index buffer last recorded in
         /// this list (the same ones are not recorded again).
         bool vertex_state_known = false;
@@ -245,8 +246,8 @@ private:
 
     /// Upload memory of the stream's list: (buffer, offset, CPU pointer).
     std::tuple<vk::Buffer, u64, u8*> Allocate(u64 size, u64 align);
-    vk::DescriptorBufferInfo UploadFlatData(u32 stage, const u8* source, u32 size);
     Chunk TakeChunk(u64 size);
+    vk::DescriptorBufferInfo UploadFlatData(u32 stage, const u8* source, u32 size);
     vk::DescriptorPool TakeDescriptorPool();
 
     /// NAT-114: a range shaders write that no single imported view holds lives in a buffer of
@@ -421,7 +422,6 @@ private:
         u64 index_offset = 0;
         vk::IndexType index_type = vk::IndexType::eUint32;
         u32 index_count = 0;
-
     };
     void ResolveVertexBuffers(const GraphicsPipeline& pipeline, const AmdGpu::Regs& regs,
                               VertexIndexState& v);
@@ -524,6 +524,7 @@ private:
             Region* region;
             VAddr address;
             u64 size;
+            bool operator==(const RegionUse& other) const { return region == other.region && address == other.address && size == other.size; }
         };
         boost::container::small_vector<RegionUse, 4> regions;
         std::vector<std::pair<VAddr, VAddr>> image_ranges;
@@ -732,6 +733,8 @@ private:
         u64 vertex_skipped = 0;  ///< OPT-005
         /// OPT-010: draws bound from a prepared draw, without one, and prepared draws not used:
         /// another pipeline, other user data, memory unmapped, pictures or buffers changed.
+        u64 flat_upload_hits = 0, flat_upload_bytes_saved = 0, flat_upload_misses = 0;
+        u64 descriptor_allocate_calls = 0, descriptor_reserve_hits = 0;
         u64 prepared_used = 0, prepared_missing = 0;
         std::array<u64, 5> prepared_rejected{};
         u64 prepared_vertices = 0, prepared_vertices_rejected = 0; ///< OPT-011
@@ -740,10 +743,6 @@ private:
         /// and index binds, pipeline bind, descriptors and push constants, the draw, write notes.
         std::array<u64, 8> record_ns{};
         u64 descriptor_reuses = 0, descriptor_allocations = 0;
-        u64 descriptor_allocate_calls = 0, descriptor_update_calls = 0;
-        u64 descriptor_reserve_hits = 0;
-        u64 flat_upload_hits = 0, flat_upload_bytes_saved = 0, flat_upload_misses = 0;
-        u64 descriptor_bind_calls = 0, descriptor_bound_sets = 0;
         u64 texture_memo_hits = 0, texture_lookups = 0; ///< OPT-002
         u64 buffer_memo_hits = 0;                        ///< OPT-003
         u64 mirror_binds = 0, mirrors_made = 0, mirror_made_bytes = 0, mirrors_dropped = 0,

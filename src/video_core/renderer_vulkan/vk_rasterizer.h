@@ -181,9 +181,6 @@ public:
         bool index{};        // MT-005: then the index buffer
         u64 seq{};           // MT-007: the stage's number for the job
     };
-    /// Native recorder helpers work from immutable selection/register snapshots only.
-    bool PrepareNativeDrawAhead(const SelectedPipeline& selected, const AmdGpu::Regs& regs,
-                                const void* packet, u32 epoch, bool indexed, u32 index_offset);
     /// PERF-067 (buffer stage thread): obtains what it can of the selected draw's shader
     /// buffers. False when it stopped early (the recorder obtains the rest, and must have
     /// recorded this draw before the stage goes on).

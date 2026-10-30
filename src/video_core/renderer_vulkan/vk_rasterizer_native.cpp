@@ -1,4 +1,8 @@
+#include "video_core/renderer_vulkan/descriptor_write_groups.h"
+#include "video_core/renderer_vulkan/upload_bytes_equal.h"
+#include "video_core/renderer_vulkan/immutable_upload_memo.h"
 #include "video_core/renderer_vulkan/freshness_range_search.h"
+#include "video_core/renderer_vulkan/draw_preparation_options.h"
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -14,10 +18,9 @@
 // own threads with this code (ryty_gpu/native/DESIGN.md, N4).
 
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
-#include "video_core/renderer_vulkan/upload_bytes_equal.h"
-#include "video_core/renderer_vulkan/vertex_input_equal.h"
-#include "video_core/renderer_vulkan/descriptor_write_groups.h"
 #include "video_core/renderer_vulkan/scene_region_scale.h"
+#include "video_core/renderer_vulkan/upload_chunk_tail.h"
+#include "video_core/renderer_vulkan/upload_chunk_cache.h"
 
 #include <fstream>
 #include <algorithm>
@@ -44,6 +47,9 @@
 #include "core/guest_hash.h"
 #include "core/memory.h"
 #include "ryty_gpu/native/image_registry.h"
+#include "ryty_gpu/native/cpu_texture_staging.h"
+#include "ryty_gpu/native/gpu_checkpoints.h"
+#include "ryty_gpu/native/slow_call_trace.h"
 #include "ryty_gpu/native/job_walker.h"
 #include "ryty_gpu/native/rhi/rhi_vulkan.h"
 #include "ryty_gpu/ryty_ghost.h"
@@ -72,6 +78,17 @@ bool RytyGtsInRace();
 extern std::atomic<u64> g_prepared_frames;
 bool RytyGtsMenuSnapshotsAllowed();
 namespace {
+thread_local u64 descriptor_hash_reused = 0;
+thread_local u64 descriptor_hash_refreshed = 0;
+
+using FlatUploadMemo = ImmutableUploadMemo<vk::DescriptorBufferInfo, Shader::MaxStageTypes>;
+FlatUploadMemo& UploadMemoFor(const NativeRenderer* renderer) {
+    struct Local { const NativeRenderer* owner{}; FlatUploadMemo memo; };
+    static thread_local Local local;
+    if (local.owner != renderer) { local.memo.Clear(); local.owner = renderer; }
+    return local.memo;
+}
+
 
 constexpr bool IsSceneCompositionShader(u64 hash) {
     // Race composition and the transmission-selection menu variant, captured at 540p.
@@ -386,6 +403,8 @@ void NativeRenderer::DrawBindings::PrepareDescriptorKeys(const Pipeline& pipelin
     for (u32 set = 0; set < grouped_writes.size(); ++set) {
         if (grouped_writes[set].empty() || set == pipeline.PushSet()) continue;
         descriptor_keys[set].Build(pipeline.SetLayout(set), grouped_writes[set]);
+        auto& key = descriptor_keys[set];
+        if (key.cacheable) key.hash = XXH3_64bits(key.words.data(), key.words.size() * sizeof(u64));
     }
     key_layout = pipeline.GetLayout();
 }
@@ -607,6 +626,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
     const VkSemaphore semaphore = r.scheduler.GetWorkSemaphore()->Handle();
     timeline = device->ImportFence(reinterpret_cast<u64>(semaphore));
     device->UseExternalTimeline(timeline.get(), [this] { return r.scheduler.CurrentTick(); });
+    LOG_INFO(Render_Vulkan, "DRAW-PREP: mask {} (1 range union, 2 region dedup, 4 thread-local stats, 8 batched diagnostic polling)", DrawPreparationMask());
     registry = std::make_unique<Native::ImageRegistry>(*device);
     registry->SetImageFactory([this](const VideoCore::ImageInfo& info, bool render_target) {
         return MakeImage(info, render_target);
@@ -615,20 +635,51 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
         return HasImageBacking(address, size);
     });
     registry->SetMemoryClamp([this](VAddr address, u64 size) -> u64 {
+        Native::SlowCallTrace<3> trace{Native::trace_guest_hash_calls, "image-readable-prefix",
+            {"valid-mapping", "clamp-area", "readable-prefix"}};
+        trace.Next(0, address, size);
         // Mapped, and readable by the CPU (GPU-only memory is not: NAT-106).
         if (!r.memory->IsValidMapping(address)) {
             return 0;
         }
+        trace.Next(1);
         const u64 mapped = r.memory->ClampRangeSize(address, size);
+        trace.Next(2);
         return Native::ReadablePrefix(reinterpret_cast<const void*>(address), mapped);
     });
     registry->SetUploadSource([this](const Native::ImageEntry& entry,
                                      Native::Rhi::CommandList& list) {
+        Native::SlowCallTrace<9> trace{t_timed, "image-gpu-source",
+            {"region-lookup", "region-refresh", "wrap-region", "import-guest", "find-import",
+             "gather-allocate", "gather-copies", "refresh-overlaps", "copy-overlaps"}};
         // NAT-107: textures are uploaded from guest memory as the GPU sees it, in GPU order.
         Native::ImageRegistry::UploadSource source;
         auto* direct = r.buffer_cache.GetDirectMemory();
         const VAddr address = entry.info.guest_address;
         const u64 size = entry.info.guest_size;
+        const auto cpu_source = [&]() {
+            Native::ImageRegistry::UploadSource staged;
+            if (size == 0 || size > 64_MB) return staged;
+            const auto [buffer, offset, destination] = Allocate(size, r.instance.StorageMinAlignment());
+            u64 readable = 0;
+            if (r.memory->IsValidMapping(address)) {
+                const u64 mapped = r.memory->ClampRangeSize(address, size);
+                readable = Native::ReadablePrefix(reinterpret_cast<const void*>(address), mapped);
+            }
+            if (readable < size) std::memset(destination + readable, 0, size - readable);
+            if (readable && !Core::RytyMemory::GuardedCopy(destination,
+                    reinterpret_cast<const void*>(address), readable)) {
+                r.memory->CopySparseMemory(address, destination, readable);
+            }
+            auto wrapped = device->WrapBuffer(reinterpret_cast<u64>(static_cast<VkBuffer>(buffer)),
+                                               stream.chunks.back().buffer->Size());
+            staged.buffer = wrapped.get();
+            staged.offset = offset;
+            staged.kind = 4;
+            staged.keep.push_back(std::move(wrapped));
+            return staged;
+        };
+        trace.Next(0, address, size);
         if (!direct || size == 0) {
             return source;
         }
@@ -638,11 +689,13 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
         if (Region* region = overlap;
             region && address >= region->begin && address + size <= region->end &&
             (address - region->begin) % r.instance.StorageMinAlignment() == 0) {
+            trace.Next(1);
             RefreshRegion(*region, address, size);
             // RefreshRegion may record transfer writes after FlushUploads' initial barrier.
             // The upload or untiling dispatch must read those refreshed bytes.
             list.Barrier(Native::Rhi::ScopeTransfer,
                          Native::Rhi::ScopeTransfer | Native::Rhi::ScopeCompute);
+            trace.Next(2);
             auto wrapped = device->WrapBuffer(region->buffer->NativeHandle(), region->buffer->Size());
             source.buffer = wrapped.get();
             source.offset = address - region->begin;
@@ -652,9 +705,40 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
             source.keep.push_back(std::move(wrapped));
             return source;
         }
-        if (!direct->EnsureImported(address, size)) {
-            return source;
+        // Many large streamed textures span over a thousand 16 KiB host views.
+        // Importing all of them synchronously cost 20+ ms before the first upload.
+        // A never-GPU-written CPU texture can use RecordUploads' guarded staging
+        // copy instead. Existing imports and every authoritative GPU source keep
+        // the original path, including partial region overlays.
+        if (entry.from_cpu && size > 4_MB && size <= 64_MB &&
+            entry.total_uploads.load(std::memory_order_relaxed) == 0 && !overlap &&
+            r.instance.GetVendorID() == 0x10de) {
+            bool has_sources;
+            {
+                std::scoped_lock lock{const_cast<Native::ImageEntry&>(entry).sources_mutex};
+                has_sources = !entry.sources.empty();
+            }
+            const bool gpu_written = entry.write_version.load(std::memory_order_relaxed) != 0 ||
+                                     entry.foreign_clock.load(std::memory_order_relaxed) != 0 ||
+                                     entry.rewrite_clock != 0;
+            if (Native::PreferCpuTextureStaging(size, true, true, true, gpu_written,
+                    has_sources, false, direct->FindBuffer(address, size).has_value(),
+                    Native::Readable(reinterpret_cast<const void*>(address), size))) {
+                static std::atomic<u64> staged{};
+                const u64 count = ++staged;
+                if (count <= 8 || count % 128 == 0) {
+                    LOG_INFO(Render_Vulkan,
+                             "UPLOAD-STAGING: initial CPU texture {:#x}+{:#x} avoids host import ({} total)",
+                             address, size, count);
+                }
+                return cpu_source();
+            }
         }
+        trace.Next(3);
+        if (!direct->EnsureImported(address, size)) {
+            return cpu_source();
+        }
+        trace.Next(4);
         if (const auto found = direct->FindBuffer(address, size);
             !overlap && found && found->second % r.instance.StorageMinAlignment() == 0) {
             auto wrapped = device->WrapBuffer(
@@ -666,6 +750,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
             source.keep.push_back(std::move(wrapped));
             return source;
         }
+        trace.Next(5);
         auto gathered = device->CreateBuffer({.size = size,
                                               .usage = Native::Rhi::BufferUsageStorage |
                                                        Native::Rhi::BufferUsageTransferSrc |
@@ -677,6 +762,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
         }
         const vk::CommandBuffer cmd{Handle<VkCommandBuffer_T>(list.NativeHandle())};
         const vk::Buffer dst{Handle<VkBuffer_T>(gathered->NativeHandle())};
+        trace.Next(6);
         const bool all = direct->ForEachPart(
             address, size, [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset, u64 bytes) {
                 cmd.copyBuffer(view.Handle(), dst,
@@ -685,6 +771,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
             });
         if (all) {
             if (overlap) {
+                trace.Next(7);
                 // The texture can straddle several GPU-written regions and imported guest
                 // memory. Keep guest bytes in the gaps, but use the GPU's current bytes for
                 // every overlap. Reading the whole range from the import loses those writes.
@@ -698,6 +785,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
                 list.Barrier(Native::Rhi::ScopeDraw | Native::Rhi::ScopeCompute |
                                  Native::Rhi::ScopeTransfer,
                              Native::Rhi::ScopeTransfer);
+                trace.Next(8);
                 for (auto& [base, region] : regions) {
                     const VAddr begin = std::max(address, region.begin);
                     const VAddr end = std::min(address + size, region.end);
@@ -962,6 +1050,7 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     if (s.list) {
         return s;
     }
+    UploadMemoFor(this).Clear(); // new list: old upload-buffer bindings cannot be reused
     if (r.instance.IsIntel()) {
         // FIX-188: Intel Arc (#65) records into the scheduler's own command buffer.
         r.scheduler.EndRendering();
@@ -976,7 +1065,7 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     }
     s.rendering = false;
     s.dynamic.Invalidate();
-    s.pipeline = vk::Pipeline{};
+    s.pipelines.Invalidate();
     s.vertex_state_known = false; // OPT-005
     s.commands = 0;
     // What was recorded before this list (earlier lists, the presenter) is finished first.
@@ -1158,7 +1247,7 @@ void NativeRenderer::FlushWritebacks() {
         s.keep.push_back(std::move(out));
     }
     writebacks.clear();
-    s.pipeline = vk::Pipeline{}; // the re-tiling binds its own pipeline
+    s.pipelines.Invalidate(); // the re-tiling binds its own pipeline
     // What reads guest memory next (shaders, the CPU after the GPU) sees the pictures.
     const vk::MemoryBarrier2 barrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -1173,20 +1262,27 @@ void NativeRenderer::FlushWritebacks() {
 }
 
 void NativeRenderer::PrepareImages() {
+    Native::SlowCallTrace<6> trace{t_timed, "prepare-images",
+        {"pending-init-lock", "pending-upload-lock", "end-rendering", "initialize", "global-barrier", "uploads"}};
     const bool init = device->PendingImageInit();
+    trace.Next(1);
     const bool uploads = registry->HasPendingUploads();
     if (!init && !uploads) {
         return;
     }
     Stream& s = stream;
+    trace.Next(2);
     EndRendering();
     if (init) {
+        trace.Next(3);
         device->RecordPendingImageInit(*s.list);
     }
     if (uploads) {
+        trace.Next(4);
         GlobalBarrier(); // NAT-107: uploads read guest memory as earlier GPU work left it
-        registry->RecordUploads(*s.list);
-        s.pipeline = vk::Pipeline{}; // the uploads bind their own pipelines
+        trace.Next(5);
+        registry->RecordUploads(*s.list, t_timed);
+        s.pipelines.Invalidate(); // the uploads bind their own pipelines
     }
 }
 
@@ -1200,33 +1296,41 @@ void NativeRenderer::ChunkFlushCheck() {
 }
 
 NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
+    Native::SlowCallTrace<6> trace{t_timed, "take-upload-chunk",
+        {"mutex", "timeline-query", "trim-free", "reclaim-retired", "take-free", "create-buffer"}};
+    trace.Next(0, 0, size);
     auto* semaphore = r.scheduler.GetWorkSemaphore();
     std::scoped_lock lock{chunk_mutex};
-    if (free_chunks.empty() && !retiring_chunks.empty()) {
+    trace.Next(1);
+    const auto has_available = [&] {
+        return std::ranges::any_of(free_chunks, [&](const Chunk& chunk) {
+            return chunk.buffer->Size() >= size;
+        });
+    };
+    if (!has_available() && !retiring_chunks.empty()) {
         semaphore->Refresh();
     }
     const u64 known = semaphore->KnownGpuTick();
     // Loading can briefly need hundreds of MiB of upload chunks. Keep a bounded
     // reserve once their GPU work finishes instead of retaining that peak forever.
-    constexpr size_t MaxCachedChunks = 128_MB / ChunkSize;
-    while (free_chunks.size() > MaxCachedChunks) {
-        free_chunks.pop_back();
+    trace.Next(2);
+    trace.Next(3);
+    CacheCompletedUploadChunks(free_chunks, retiring_chunks, known);
+    trace.Next(4);
+    auto fit = free_chunks.end();
+    for (auto it = free_chunks.begin(); it != free_chunks.end(); ++it) {
+        if (it->buffer->Size() >= size &&
+            (fit == free_chunks.end() || it->buffer->Size() < fit->buffer->Size())) fit = it;
     }
-    while (!retiring_chunks.empty() && retiring_chunks.front().retire_tick <= known) {
-        if (retiring_chunks.front().buffer->Size() == ChunkSize &&
-            free_chunks.size() < MaxCachedChunks) {
-            free_chunks.push_back(std::move(retiring_chunks.front()));
-        }
-        retiring_chunks.pop_front(); // larger ones are freed (after the GPU, by the device)
-    }
-    if (size <= ChunkSize && !free_chunks.empty()) {
-        Chunk chunk = std::move(free_chunks.back());
-        free_chunks.pop_back();
+    if (fit != free_chunks.end()) {
+        Chunk chunk = std::move(*fit);
+        free_chunks.erase(fit);
         return chunk;
     }
     Chunk chunk;
+    trace.Next(5);
     chunk.buffer = device->CreateBuffer({
-        .size = std::max(size, ChunkSize),
+        .size = UploadChunkCapacity(size, ChunkSize),
         .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageUniform |
                  Native::Rhi::BufferUsageIndex | Native::Rhi::BufferUsageVertex |
                  Native::Rhi::BufferUsageIndirect | Native::Rhi::BufferUsageTransferSrc,
@@ -1253,26 +1357,28 @@ std::tuple<vk::Buffer, u64, u8*> NativeRenderer::Allocate(u64 size, u64 align) {
 }
 
 vk::DescriptorBufferInfo NativeRenderer::UploadFlatData(u32 stage, const u8* source, u32 size) {
-    auto& previous = stream.flat_uploads[stage];
-    if (previous.binding.buffer && previous.bytes.size() == size &&
-        UploadBytesEqual(previous.bytes.data(), source, size)) {
+    Native::SlowCallTrace<5> trace{t_timed, "upload-flat-data",
+        {"compare", "allocate", "copy-upload", "copy-reference", "finish"}};
+    trace.Next(0, reinterpret_cast<u64>(source), size);
+    auto& memo = UploadMemoFor(this);
+    const std::span<const u8> bytes{source, size};
+    const auto lookup = memo.Find(stage, bytes, [](const void* data, size_t length) {
+        return XXH3_64bits(data, length);
+    });
+    if (lookup.binding) {
         ++stats.flat_upload_hits;
         stats.flat_upload_bytes_saved += size;
-        return previous.binding;
+        return *lookup.binding;
     }
     ++stats.flat_upload_misses;
+    trace.Next(1);
     const auto [buffer, offset, data] = Allocate(size, r.instance.StorageMinAlignment());
+    trace.Next(2);
     std::memcpy(data, source, size);
     const vk::DescriptorBufferInfo binding{buffer, offset, size};
-    // Upload heaps are sequential-write memory and can be uncached/write-combined.
-    // Keep comparisons in normal CPU memory; bound retained capacity per stage.
-    if (size <= 64 * 1024) {
-        previous.bytes.assign(source, source + size);
-        previous.binding = binding;
-    } else {
-        previous.bytes.clear();
-        previous.binding = {};
-    }
+    trace.Next(3);
+    memo.Store(lookup, stage, bytes, binding);
+    trace.Next(4);
     return binding;
 }
 
@@ -1410,6 +1516,12 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
                                                         .size = bytes});
             offset += bytes;
         }
+    }
+    // The guest initialization and retained GPU regions write overlapping bytes
+    // of dst. Command order alone does not establish a transfer-write dependency.
+    // Finish initialization before restoring the authoritative GPU-written ranges.
+    if (!merged.empty()) {
+        s.list->Barrier(Native::Rhi::ScopeTransfer, Native::Rhi::ScopeTransfer);
     }
     for (auto& old : merged) {
         s.cmd.copyBuffer(vk::Buffer{Handle<VkBuffer_T>(old.buffer->NativeHandle())}, dst,
@@ -2616,9 +2728,9 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
             case Shader::BufferType::Flatbuf: {
                 const u32 size = static_cast<u32>(stage.flattened_ud_buf.size() * sizeof(u32));
                 if (size != 0) {
-                    info = UploadFlatData(static_cast<u32>(stage.sw_stage),
-                                          reinterpret_cast<const u8*>(stage.flattened_ud_buf.data()),
-                                          size);
+                    const auto [buffer, offset, data] = Allocate(size, alignment);
+                    std::memcpy(data, stage.flattened_ud_buf.data(), size);
+                    info = {buffer, offset, size};
                 }
                 break;
             }
@@ -3106,6 +3218,9 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
 
 void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoint bind_point,
                                   DrawBindings& b) {
+    Native::SlowCallTrace<9> trace{t_timed, "descriptor-bindings",
+        {"push-constants", "groups-keys", "push-descriptor", "hash-lookup", "allocate",
+         "copy-writes", "update-descriptors", "store-key", "bind-set"}};
     Stream& s = stream;
     const CmdBuf cmdbuf{s.cmd};
     const auto stage_flags =
@@ -3115,38 +3230,10 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         return;
     }
     // SHD-002: each stage's writes go to its own set; one set may be pushed.
-    // Prepared draws group on their preparation thread. Fallback/compute draws
-    // prepare once here; every span still references this draw's own storage.
+    trace.Next(1);
     if (!b.groups_ready) b.PrepareWriteGroups();
     const auto& by_set = b.grouped_writes;
     if (b.key_layout != pipeline.GetLayout()) b.PrepareDescriptorKeys(pipeline);
-    std::array<vk::DescriptorSet, Shader::Backend::MaxDescriptorSets> sets{};
-    // Preserve ascending set order: a lower incompatible bind can disturb
-    // a higher push set. Flush lower ordinary sets before every push.
-    u32 first_unbound = 0;
-    const auto bind_before = [&](u32 limit) {
-        for (u32 first = first_unbound; first < limit;) {
-            if (!sets[first]) {
-                ++first;
-                continue;
-            }
-            u32 end = first + 1;
-            while (end < limit && sets[end]) {
-                ++end;
-            }
-            cmdbuf.bindDescriptorSets(bind_point, pipeline.GetLayout(), first,
-                                     std::span<const vk::DescriptorSet>{sets.data() + first, end - first}, {});
-            ++stats.descriptor_bind_calls;
-            stats.descriptor_bound_sets += end - first;
-            first = end;
-        }
-        first_unbound = limit;
-    };
-    std::array<u64, Shader::Backend::MaxDescriptorSets> hashes{};
-    std::array<bool, Shader::Backend::MaxDescriptorSets> cacheable_sets{};
-    std::array<vk::DescriptorSetLayout, Shader::Backend::MaxDescriptorSets> missing_layouts{};
-    std::array<u32, Shader::Backend::MaxDescriptorSets> missing_indices{};
-    u32 missing_count = 0;
     const vk::Device vk_device = r.instance.GetDevice();
     for (u32 index = 0; index < by_set.size(); ++index) {
         auto& writes = by_set[index];
@@ -3154,129 +3241,82 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
             continue;
         }
         if (index == pipeline.PushSet()) {
-            continue; // Recorded in set order after ordinary sets are ready.
+            trace.Next(2);
+            cmdbuf.pushDescriptorSetKHR(bind_point, pipeline.GetLayout(), index, writes);
+            continue;
         }
         const vk::DescriptorSetLayout layout = pipeline.SetLayout(index);
-        // Worker-prepared metadata and image keys stay fixed; ordered commit
-        // updates buffer slots, which must be refreshed before exact-key lookup.
+        trace.Next(3, index, writes.size());
+        // Cache values, never pointers into per-draw binding storage. Rebind even
+        // on a hit so pipeline-layout switches and intervening passes remain safe.
         auto& prepared_key = b.descriptor_keys[index];
-        // Sparse keys benefit from hashing just the changing words. Dense
-        // buffer-only keys retain vectorized full hashing (measured faster).
-        const bool sparse_key = prepared_key.buffers.size() <= 3;
-        if (sparse_key) prepared_key.RefreshBuffers();
-        else prepared_key.RefreshBuffers<false>();
+        // Preparation hashed the complete key. Commit changes only buffer slots;
+        // recompute the same XXH3 hash only when those values actually changed.
+        const bool key_changed = prepared_key.RefreshBuffers<false>();
         const auto& key = prepared_key.words;
         const bool cacheable = prepared_key.cacheable;
         const std::span<const u64> descriptor_key{key.data(), key.size()};
-        const u64 key_hash = cacheable ? (sparse_key ? prepared_key.hash
-            : XXH3_64bits(key.data(), key.size() * sizeof(u64))) : 0;
+        if (cacheable && key_changed) {
+            prepared_key.hash = XXH3_64bits(key.data(), key.size() * sizeof(u64));
+            ++descriptor_hash_refreshed;
+        } else if (cacheable) {
+            ++descriptor_hash_reused;
+        }
+        const u64 key_hash = cacheable ? prepared_key.hash : 0;
         if (cacheable) {
             if (const auto reused = s.descriptor_sets.Find(key_hash, descriptor_key)) {
-                sets[index] = reused;
+                trace.Next(8);
+                cmdbuf.bindDescriptorSets(bind_point, pipeline.GetLayout(), index, reused, {});
                 ++stats.descriptor_reuses;
                 continue;
             }
         }
-        hashes[index] = key_hash;
-        cacheable_sets[index] = cacheable;
-        missing_layouts[missing_count] = layout;
-        missing_indices[missing_count++] = index;
-    }
-    if (missing_count) {
-        // At most the spare budget plus one required set per descriptor set.
-        constexpr u32 MaxReserved = decltype(s.descriptor_reserve)::SpareLimit +
-                                    Shader::Backend::MaxDescriptorSets;
-        std::array<vk::DescriptorSet, MaxReserved> allocated{};
-        std::array<vk::DescriptorSetLayout, MaxReserved> layouts{};
-        std::array<u32, Shader::Backend::MaxDescriptorSets> starts{}, counts{};
-        u32 allocate_count = 0;
-        u32 pending_extra = 0;
-        for (u32 i = 0; i < missing_count; ++i) {
-            const u64 layout_key = u64(VkDescriptorSetLayout(missing_layouts[i]));
-            const u32 index = missing_indices[i];
-            if (const auto spare = s.descriptor_reserve.Take(layout_key)) {
-                sets[index] = spare;
-                ++stats.descriptor_reserve_hits;
-                continue;
-            }
-            const u32 count = u32(s.descriptor_reserve.BatchSize(layout_key, pending_extra));
-            starts[i] = allocate_count;
-            counts[i] = count;
-            pending_extra += count - 1;
-            for (u32 j = 0; j < count; ++j) layouts[allocate_count++] = missing_layouts[i];
-        }
-        const auto allocate = [&] {
-            if (!allocate_count) return true;
-            if (s.pools.empty()) s.pools.push_back(TakeDescriptorPool());
+        trace.Next(4);
+        const u64 layout_key = u64(VkDescriptorSetLayout(layout));
+        vk::DescriptorSet set = s.descriptor_reserve.Take(layout_key);
+        if (set) ++stats.descriptor_reserve_hits;
+        std::array<vk::DescriptorSetLayout, 32> layouts;
+        layouts.fill(layout);
+        std::array<vk::DescriptorSet, 32> allocated{};
+        u32 allocate_count = set ? 0 : u32(s.descriptor_reserve.BatchSize(layout_key));
+        for (u32 attempt = 0; attempt < 3 && !set; ++attempt) {
+            if (s.pools.empty() || attempt == 2) s.pools.push_back(TakeDescriptorPool());
+            // A block may not fit: try one in the same pool, then one in a new pool.
+            if (attempt != 0) allocate_count = 1;
             const vk::DescriptorSetAllocateInfo alloc{
                 .descriptorPool = s.pools.back(),
                 .descriptorSetCount = allocate_count,
                 .pSetLayouts = layouts.data(),
             };
             ++stats.descriptor_allocate_calls;
-            if (vk_device.allocateDescriptorSets(&alloc, allocated.data()) != vk::Result::eSuccess)
-                return false;
-            stats.descriptor_allocations += allocate_count;
-            return true;
-        };
-        bool success = allocate();
-        if (!success) {
-            // If a reserve block will not fit, try only the required sets in
-            // the current pool, then a fresh pool. Failed outputs are unused.
-            allocate_count = 0;
-            for (u32 i = 0; i < missing_count; ++i) {
-                if (!counts[i]) continue;
-                starts[i] = allocate_count;
-                counts[i] = 1;
-                layouts[allocate_count++] = missing_layouts[i];
-            }
-            success = allocate();
-            if (!success) {
-                s.pools.push_back(TakeDescriptorPool());
-                success = allocate();
+            if (vk_device.allocateDescriptorSets(&alloc, allocated.data()) == vk::Result::eSuccess) {
+                set = allocated[0];
+                stats.descriptor_allocations += allocate_count;
+                if (allocate_count > 1) s.descriptor_reserve.Store(layout_key,
+                    std::span<const vk::DescriptorSet>{allocated.data() + 1, allocate_count - 1});
             }
         }
-        if (success) {
-            static thread_local boost::container::small_vector<vk::WriteDescriptorSet, 64> updates;
-            updates.clear();
-            for (u32 i = 0; i < missing_count; ++i) {
-                const u32 index = missing_indices[i];
-                if (counts[i]) {
-                    sets[index] = allocated[starts[i]];
-                    if (counts[i] > 1) {
-                        s.descriptor_reserve.Store(u64(VkDescriptorSetLayout(missing_layouts[i])),
-                            std::span<const vk::DescriptorSet>{allocated.data() + starts[i] + 1, counts[i] - 1});
-                    }
-                }
-                for (auto write : by_set[index]) {
-                    write.dstSet = sets[index];
-                    updates.push_back(write);
-                }
-            }
-            // Each set remains immutable and list-scoped, as before. Only the
-            // host allocation/update calls are combined; descriptor values are unchanged.
-            vk_device.updateDescriptorSets(updates, {});
-            ++stats.descriptor_update_calls;
-            for (u32 i = 0; i < missing_count; ++i) {
-                const u32 index = missing_indices[i];
-                if (cacheable_sets[index]) {
-                    s.descriptor_sets.Store(hashes[index], b.descriptor_keys[index].words, sets[index]);
-                }
-            }
-        } else {
+        if (!set) {
             static std::atomic<u32> logged{};
             if (Sample(logged)) {
-                LOG_ERROR(Render_Vulkan, "NAT-100: no descriptor sets for a draw");
+                LOG_ERROR(Render_Vulkan, "NAT-100: no descriptor set for a draw");
             }
+            continue;
         }
+        // A miss needs mutable destinations. Hits and push sets borrow the original
+        // writes directly; never leave a destination handle in per-draw storage.
+        static thread_local boost::container::small_vector<vk::WriteDescriptorSet, 32> updates;
+        trace.Next(5);
+        updates.assign(writes.begin(), writes.end());
+        for (auto& write : updates) write.dstSet = set;
+        trace.Next(6);
+        vk_device.updateDescriptorSets(updates, {});
+
+        trace.Next(7);
+        if (cacheable) s.descriptor_sets.Store(key_hash, descriptor_key, set);
+        trace.Next(8);
+        cmdbuf.bindDescriptorSets(bind_point, pipeline.GetLayout(), index, set, {});
     }
-    for (u32 index = 0; index < by_set.size(); ++index) {
-        if (index == pipeline.PushSet() && !by_set[index].empty()) {
-            bind_before(index);
-            cmdbuf.pushDescriptorSetKHR(bind_point, pipeline.GetLayout(), index, by_set[index]);
-        }
-    }
-    bind_before(u32(sets.size()));
 }
 
 bool NativeRenderer::MirrorKind(char kind) {
@@ -3596,8 +3636,8 @@ void NativeRenderer::RecordVertexIndex(const VertexIndexState& v) {
     const bool known = s.vertex_state_known;
     s.vertex_state_known = true;
     if (dynamic_input) {
-        if (!known || !VertexInputBytesEqual(s.input_bindings, v.input_bindings) ||
-            !VertexInputBytesEqual(s.attributes, v.attributes)) {
+        if (!known || !std::ranges::equal(s.input_bindings, v.input_bindings) ||
+            !std::ranges::equal(s.attributes, v.attributes)) {
             cmdbuf.setVertexInputEXT(v.input_bindings, v.attributes);
             s.input_bindings.assign(v.input_bindings.begin(), v.input_bindings.end());
             s.attributes.assign(v.attributes.begin(), v.attributes.end());
@@ -3619,12 +3659,8 @@ void NativeRenderer::RecordVertexIndex(const VertexIndexState& v) {
             }
             s.vertex_buffers.assign(v.buffers.begin(), v.buffers.end());
             s.vertex_offsets.assign(v.offsets.begin(), v.offsets.end());
-            if (!dynamic_input) {
-                // Dynamic vertex input binds only buffers/offsets; its sizes and
-                // strides are not read by this device's recording path.
-                s.vertex_sizes.assign(v.sizes.begin(), v.sizes.end());
-                s.vertex_strides.assign(v.strides.begin(), v.strides.end());
-            }
+            s.vertex_sizes.assign(v.sizes.begin(), v.sizes.end());
+            s.vertex_strides.assign(v.strides.begin(), v.strides.end());
         }
     }
     if (v.index_buffer) {
@@ -3899,17 +3935,56 @@ struct PixelTrace {
 void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     std::scoped_lock lock{mutex};
     const auto start = std::chrono::steady_clock::now();
-    struct Timed {
-        std::chrono::steady_clock::time_point start;
-        u64& total;
-        ~Timed() {
-            total += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                         std::chrono::steady_clock::now() - start)
-                         .count();
-        }
-    } timed{start, stats.draw_ns};
     t_timed = (++timing_tick & 15) == 0; // OPT-001
     stats.timed_draws += t_timed ? 1 : 0;
+    struct Timed {
+        std::chrono::steady_clock::time_point start;
+        Stats& stats;
+        bool sampled;
+        std::array<u64, 8> phase_before{};
+        std::array<u64, 8> record_before{};
+        Timed(std::chrono::steady_clock::time_point start_, Stats& stats_)
+            : start{start_}, stats{stats_}, sampled{t_timed} {
+            if (sampled) {
+                phase_before = stats.phase_ns;
+                record_before = stats.record_ns;
+            }
+        }
+        ~Timed() {
+            const u64 elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            stats.draw_ns += elapsed;
+            if (!sampled || elapsed < 1'000'000) {
+                return;
+            }
+            static thread_local auto next_report = std::chrono::steady_clock::time_point{};
+            const auto now = std::chrono::steady_clock::now();
+            if (now < next_report) {
+                return;
+            }
+            next_report = now + std::chrono::milliseconds{100};
+            // Report() may reset the interval counters at the end of this draw.
+            for (size_t i = 0; i < phase_before.size(); ++i) {
+                if (stats.phase_ns[i] < phase_before[i] ||
+                    stats.record_ns[i] < record_before[i]) {
+                    return;
+                }
+            }
+            std::array<double, 8> phases{}, parts{};
+            for (size_t i = 0; i < phases.size(); ++i) {
+                phases[i] = (stats.phase_ns[i] - phase_before[i]) / 1e6;
+                parts[i] = (stats.record_ns[i] - record_before[i]) / 1e6;
+            }
+            LOG_WARNING(Render_Vulkan,
+                "NAT: slow sampled draw {:.2f} ms; pipeline/targets/buffers/textures/sources/vertices/prepare/record "
+                "{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}; "
+                "record barrier/begin/dynamic/vertex/pipeline/bindings/draw/notes "
+                "{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}",
+                elapsed / 1e6, phases[0], phases[1], phases[2], phases[3], phases[4],
+                phases[5], phases[6], phases[7], parts[0], parts[1], parts[2], parts[3],
+                parts[4], parts[5], parts[6], parts[7]);
+        }
+    } timed{start, stats};
     r.scheduler.PopPendingOperations();
     const auto& regs = r.liverpool->DrawRegs();
     switch (Classify(regs)) {
@@ -4308,10 +4383,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     const CmdBuf cmdbuf{s.cmd};
     {
         PhaseClock part{stats.record_ns[4]};
-        if (s.pipeline != pipeline->Handle()) {
+        s.pipelines.Graphics(pipeline->Handle(), [&] {
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
-            s.pipeline = pipeline->Handle();
-        }
+        });
     }
     {
         PhaseClock part{stats.record_ns[5]};
@@ -4324,6 +4398,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             DrawOffsets(regs, vs_info, pipeline->GetFetchShader());
         const u32 instances = regs.num_instances.NumInstances();
         const auto* fs = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        Native::GpuCheckpoints::Record(static_cast<VkCommandBuffer>(s.cmd), 1, frame,
+            vs_info.pgm_hash, fs ? fs->pgm_hash : 0, regs.num_indices);
         if (quad_triangles) {
             if (index_count != 0) {
                 cmdbuf.drawIndexed(index_count, instances, 0, s32(vertex_offset),
@@ -4655,16 +4731,21 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
         FreePrepared(p);
         return;
     }
-    // Records reference this pooled draw's stable buffer/image slots. Commit
-    // updates buffer values before the recorder hashes and consumes the groups.
-    p->bindings.PrepareWriteGroups();
-    p->bindings.PrepareDescriptorKeys(pipeline);
     // OPT-011: the vertex and index buffers too, when they need nothing ordered.
     constexpr u32 VertexStage = static_cast<u32>(Shader::SwStage::Vertex);
     if (VertexStage < count && stages[VertexStage]) {
         p->has_vertices =
             PrepareVertices(*p, regs, pipeline, *stages[VertexStage], is_indexed, index_offset);
     }
+    // Finish lookup work on the preparing thread. The recorder checks the same
+    // memory union and refreshes each exact Region pointer only once.
+    if (DrawPreparationEnabled(1)) {
+        CompactPreparedRanges(p->image_ranges);
+        CompactPreparedRanges(p->buffer_ranges);
+    }
+    if (DrawPreparationEnabled(2)) StableUniquePrepared(p->regions);
+    p->bindings.PrepareWriteGroups(); // binding-owned spans, published with this draw
+    p->bindings.PrepareDescriptorKeys(pipeline);
     std::vector<PreparedDraw*> dropped;
     {
         PreparedShard& shard = ShardFor(packet);
@@ -4744,7 +4825,7 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
         return env && *env ? env[0] == '1' : r.instance.GetVendorID() == 0x1002;
     }();
     const bool descriptor_composition = composition_descriptors &&
-        stage.sw_stage == Shader::SwStage::Fragment && IsSceneCompositionShader(stage.pgm_hash);
+        stage.sw_stage == Shader::SwStage::Fragment && stage.pgm_hash == 0xb33ec4df;
     static const bool postprocess_descriptors = [&] {
         const char* env = std::getenv("RYGT_POSTPROCESS_BUFFER_DESCRIPTORS");
         return env && *env ? env[0] == '1' : r.instance.GetVendorID() == 0x1002;
@@ -4896,6 +4977,28 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
     // As BindTextures, without its side effects: pictures that exist only, no rewrites or
     // copies of sources (the recorder does them).
     DrawBindings& b = p.bindings;
+    const auto warm_upload = [&](VAddr address, u64 size) {
+        // Only establish aliases/imports here; never refresh, copy, upload or
+        // alter image state on the worker. The recorder still validates freshness
+        // and orders every actual upload. Keep this bounded to real texture data.
+        if (size == 0 || size > 64_MB) {
+            return;
+        }
+        auto* direct = r.buffer_cache.GetDirectMemory();
+        if (!direct) {
+            return;
+        }
+        {
+            std::shared_lock lock{buffer_map_mutex};
+            if (const Region* region = RegionOver(address, size);
+                region && address >= region->begin && size <= region->end - address) {
+                return; // already has a GPU source; no guest import needed
+            }
+        }
+        Native::SlowCallTrace<1> trace{true, "prefetch-image-import", {"import"}};
+        trace.Next(0, address, size);
+        direct->WarmImported(address, size);
+    };
     const u64 now_frame = shared_frame.load(std::memory_order_relaxed);
     static thread_local std::array<TextureMemo, 4096> memos{};
     for (const auto& image_desc : stage.images) {
@@ -4946,6 +5049,9 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
         if (memo.entry && memo.flags == memo_flags && memo.sharp == raw_sharp &&
             memo.generation == memo_generation) {
             Native::ImageEntry* entry = memo.entry;
+            if (!storage && entry->needs_upload.load(std::memory_order_relaxed)) {
+                warm_upload(entry->info.guest_address, entry->info.guest_size);
+            }
             entry->last_use.store(now_frame, std::memory_order_relaxed);
             for (u32 i = 0; i < num_bindings; ++i) {
                 b.images.push_back({VK_NULL_HANDLE, memo.views[i], vk::ImageLayout::eGeneral});
@@ -4991,6 +5097,9 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
             continue;
         }
         Native::ImageEntry* entry = registry->Find(desc.info, storage, now_frame, false);
+        if (!storage && (!entry || entry->needs_upload.load(std::memory_order_relaxed))) {
+            warm_upload(desc.info.guest_address, desc.info.guest_size);
+        }
         if (!entry) {
             return false; // made by the recorder, in GPU order
         }
@@ -5079,7 +5188,6 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobVertexBuffer(VAddr 
             if (address < region->begin || address + size > region->end) {
                 return std::nullopt;
             }
-            // Different vertex/index ranges can share one backing region.
             p.regions.push_back({region, address, size});
             return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
                              u64{address - region->begin}};
@@ -5226,6 +5334,9 @@ bool NativeRenderer::CommitPreparedVertices(PreparedDraw& p, const GraphicsPipel
 
 bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pipeline,
                                     const AmdGpu::Regs& regs, bool trusted) {
+    Native::SlowCallTrace<8> trace{t_timed, "commit-prepared",
+        {"stage-validation", "image-freshness", "sort-cpu-writes", "buffer-freshness",
+         "refresh-regions", "upload-data", "image-rewrite-sources", "push-data"}};
     const auto reject = [&](u32 why) {
         ++stats.prepared_rejected[why];
         return false;
@@ -5251,20 +5362,24 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     if (p.unmap_gen != unmap_generation.load(std::memory_order_acquire)) {
         return reject(2);
     }
+    trace.Next(1);
     if (!registry->Untouched(p.image_generation, p.image_ranges)) {
         return reject(3);
     }
+    trace.Next(2);
     SortRegionWrites(); // CPU writes since (may drop mirrors)
+    trace.Next(3);
     if (!buffer_log.Untouched(p.buffer_seq, p.buffer_ranges)) {
         return reject(4);
     }
     // The ordered part, as BindBuffers and BindTextures do it.
+    trace.Next(4);
     for (const auto& use : p.regions) {
-        // Match the non-prepared path: unrelated dirty allocations remain pending.
         RefreshRegion(*use.region, use.address, use.size);
         ++stats.region_binds;
     }
     const u64 alignment = r.instance.StorageMinAlignment();
+    trace.Next(5);
     for (const auto& upload : p.uploads) {
         const u8* source = p.upload_bytes.data() + upload.offset;
         u32 size = upload.size;
@@ -5280,6 +5395,7 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
             p.bindings.buffers[upload.info] = vk::DescriptorBufferInfo{buffer, offset, size};
         }
     }
+    trace.Next(6);
     for (const auto* stored : p.bindings.stored) {
         auto& entry = *const_cast<Native::ImageEntry*>(stored);
         entry.last_use.store(frame, std::memory_order_relaxed);
@@ -5294,6 +5410,7 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
         }
     }
     // The viewport transform the shaders get, from the registers as recorded.
+    trace.Next(7);
     const Shader::PushData fresh = UserData(regs);
     p.bindings.push.xoffset = fresh.xoffset;
     p.bindings.push.xscale = fresh.xscale;
@@ -5703,11 +5820,12 @@ void NativeRenderer::DispatchDirect() {
     }
     if (!transferred) {
         // FIX-188: Intel Arc (#65) binds the pipeline every time (tile work runs between).
-        if (r.instance.IsIntel() || s.pipeline != pipeline->Handle()) {
+        s.pipelines.Compute(pipeline->Handle(), r.instance.IsIntel(), [&] {
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
-            s.pipeline = pipeline->Handle();
-        }
+        });
         PushBindings(*pipeline, vk::PipelineBindPoint::eCompute, b);
+        Native::GpuCheckpoints::Record(static_cast<VkCommandBuffer>(s.cmd), 2, frame,
+            cs.pgm_hash, cs_program.dim_x, u64(cs_program.dim_y) << 32 | cs_program.dim_z);
         cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     }
     NoteWrites(nullptr, b);
@@ -5751,10 +5869,9 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     GlobalBarrier();
     const CmdBuf cmdbuf{s.cmd};
     // FIX-188: Intel Arc (#65) binds the pipeline every time (tile work runs between).
-    if (r.instance.IsIntel() || s.pipeline != pipeline->Handle()) {
+    s.pipelines.Compute(pipeline->Handle(), r.instance.IsIntel(), [&] {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
-        s.pipeline = pipeline->Handle();
-    }
+    });
     PushBindings(*pipeline, vk::PipelineBindPoint::eCompute, b);
     cmdbuf.dispatchIndirect(args->first, args->second);
     NoteWrites(nullptr, b);
@@ -6239,7 +6356,7 @@ void NativeRenderer::ProbeWatchedPictures() {
                 auto copies = Native::MipCopies(entry.info);
                 stream.list->CopyImageToBuffer(entry.image.get(), buffer.get(), copies);
                 stream.list->Barrier(Native::Rhi::ScopeTransfer, Native::Rhi::ScopeHost);
-                stream.pipeline = vk::Pipeline{};
+                stream.pipelines.Invalidate();
                 probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, size, frame,
                                   entry.write_version.load(), entry.info.size.width,
                                   entry.info.size.height, !entry.from_cpu, watched, false});
@@ -6567,21 +6684,19 @@ void NativeRenderer::Splice() {
     }
     {
         std::scoped_lock chunk_lock{chunk_mutex};
-        for (auto& chunk : s.chunks) {
-            chunk.retire_tick = tick;
-            retiring_chunks.push_back(std::move(chunk));
-        }
+        RetireUploadChunks(s.chunks, retiring_chunks, s.chunk_used, tick, ChunkSize);
         for (const auto pool : s.pools) {
             retiring_pools.emplace_back(tick, pool);
         }
     }
+    UploadMemoFor(this).Clear(); // bindings expire before upload chunks can be recycled
     for (auto& upload : s.flat_uploads) {
-        upload.bytes.clear(); // retain bounded CPU capacity, discard every retired binding
+        upload.bytes.clear();
         upload.binding = {};
     }
-    s.chunks.clear();
-    s.chunk_used = 0;
-    s.descriptor_reserve.Clear(); // unused handles retire with the same pools
+    // The last partial standard chunk remains append-only across lists. The
+    // immutable binding memo is still cleared above: only unused bytes survive.
+    s.descriptor_reserve.Clear(); // never-written spares retire with their pools
     s.descriptor_sets.Clear(); // descriptor pools retire with this list
     s.pools.clear();
     s.keep.clear(); // freed by the device once the GPU ran this list (NAT-107)
@@ -7207,19 +7322,35 @@ void NativeRenderer::Report() {
         in_place.total = {};
         in_place.frames = 0;
     }
+    LOG_INFO(Render_Vulkan,
+        "OPT-PIPELINE-BINDS: graphics emitted={} reused={}, compute emitted={} reused={} in 10 s",
+        stream.pipelines.emitted[0], stream.pipelines.reused[0],
+        stream.pipelines.emitted[1], stream.pipelines.reused[1]);
+    stream.pipelines.ResetCounts();
     LOG_INFO(Render_Vulkan, "OPT-DESCRIPTORS: {} identical sets reused, {} sets allocated in 10 s",
              stats.descriptor_reuses, stats.descriptor_allocations);
-    LOG_INFO(Render_Vulkan,
-             "OPT-DESCRIPTOR-CALLS: {} sets in {} bind calls, {} allocation calls, {} update calls, {} unused reserve sets issued in 10 s",
-             stats.descriptor_bound_sets, stats.descriptor_bind_calls,
-             stats.descriptor_allocate_calls, stats.descriptor_update_calls, stats.descriptor_reserve_hits);
+    {
+        std::scoped_lock lock{chunk_mutex};
+        u64 upload_free_bytes = 0;
+        for (const auto& chunk : free_chunks) upload_free_bytes += chunk.buffer->Size();
+        LOG_INFO(Render_Vulkan,
+                 "VRAM-OWNERS: native descriptor_pools active={} free={} retiring={} "
+                 "upload_chunks active={} free={} retiring={} images_live={} images_evicted={} "
+                 "views_retiring={} upload_free_bytes={}",
+                 stream.pools.size(), free_pools.size(), retiring_pools.size(),
+                 stream.chunks.size(), free_chunks.size(), retiring_chunks.size(),
+                 registry->Count(), registry_stats.evicted.load(), retired_views.size(), upload_free_bytes);
+    }
     LOG_INFO(Render_Vulkan, "NAT: flat uploads reused={} uploaded={} bytes_saved={}",
              stats.flat_upload_hits, stats.flat_upload_misses, stats.flat_upload_bytes_saved);
     stats.flat_upload_hits = stats.flat_upload_misses = stats.flat_upload_bytes_saved = 0;
-    stats.descriptor_reserve_hits = 0;
-    stats.descriptor_allocate_calls = stats.descriptor_update_calls = 0;
-    stats.descriptor_bind_calls = stats.descriptor_bound_sets = 0;
+    LOG_INFO(Render_Vulkan, "NAT: descriptor allocation calls={} reserve hits={} unused={}",
+             stats.descriptor_allocate_calls, stats.descriptor_reserve_hits, stream.descriptor_reserve.SpareCount());
+    stats.descriptor_allocate_calls = stats.descriptor_reserve_hits = 0;
     stats.descriptor_reuses = stats.descriptor_allocations = 0;
+    LOG_INFO(Render_Vulkan, "DESC-HASH: {} prepared hashes reused, {} refreshed after buffer changes",
+             descriptor_hash_reused, descriptor_hash_refreshed);
+    descriptor_hash_reused = descriptor_hash_refreshed = 0;
     const u64 cpu_writes = stats.cpu_writes.load();
     stats.draws = stats.dispatches = stats.skipped = stats.no_pipeline = stats.passes = 0;
     stats.barriers = stats.splices = stats.copied_reads = stats.copied_bytes = stats.unbound = 0;

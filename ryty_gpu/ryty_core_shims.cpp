@@ -31,6 +31,7 @@
 #include "core/libraries/kernel/threads.h"
 #include "core/libraries/kernel/time.h"
 #include "core/guest_hash.h"
+#include "ryty_gpu/native/slow_call_trace.h"
 #include "core/memory.h"
 #include "imgui/friends_layer.h"
 #include "imgui/invitation_prompt_layer.h"
@@ -742,11 +743,15 @@ bool GuardedCopy(void* dest, const void* source, size_t size) {
 }
 
 u64 HashGuestMemory(VAddr address, u64 size) {
+    Native::SlowCallTrace<4> trace{Native::trace_guest_hash_calls, "guest-hash",
+        {"lookup-area", "direct-xxh3", "fallback-copy", "fallback-xxh3"}};
+    trace.Next(0, address, size);
     // Pages page tracking made unreadable are read as in shadGT (the fault is handled); only
     // memory the game itself released or protected is read through the safe copy.
     const VAddr end = address + std::max<u64>(size, 1);
     if (const AreaAnswer answer = LookupArea(address, end); answer.end >= end && answer.readable) {
         u64 hash;
+        trace.Next(1);
         ++g_guarded_reads;
         const bool ok = GuardedHashRaw(reinterpret_cast<const void*>(address), size, &hash);
         --g_guarded_reads;
@@ -757,8 +762,10 @@ u64 HashGuestMemory(VAddr address, u64 size) {
     // Released pool memory and pages the game or page tracking made unreadable: through the
     // copy that reads them without faulting (zeros where nothing is mapped).
     thread_local std::vector<u8> bytes;
+    trace.Next(2);
     bytes.resize(size);
     Core::Memory::Instance()->CopySparseMemory(address, bytes.data(), size);
+    trace.Next(3);
     return XXH3_64bits(bytes.data(), size);
 }
 

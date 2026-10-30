@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <array>
+#include <chrono>
 #include <bit>
 #include <deque>
 #include <functional>
@@ -14,8 +16,10 @@
 
 #include "common/allocation_pressure_retry.h"
 #include "common/assert.h"
+#include "common/thread.h"
 #include "common/logging/log.h"
 #include "ryty_gpu/native/rhi/rhi_vulkan.h"
+#include "ryty_gpu/native/rhi/completed_resource_worker.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -23,9 +27,35 @@
 #include "video_core/renderer_vulkan/image_allocation.h"
 
 #include <vk_mem_alloc.h>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#undef near
+#undef far
+#endif
 
 namespace Native::Rhi {
 namespace {
+
+std::atomic<u64> diagnostic_command_lists_created{};
+
+// Pair large/slow allocation and destruction events by native handle. This is
+// diagnostic only: ownership, retirement ticks and allocation policy are unchanged.
+void TraceResourceChurn(const char* operation, const char* kind, u64 handle, u64 bytes,
+                        std::chrono::steady_clock::time_point start,
+                        std::string_view name = {}) {
+    const auto end = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(end - start).count();
+    if (bytes < (64ull << 20) && ms < 2.0) return;
+    LOG_WARNING(Render_Vulkan,
+                "RESOURCE-CHURN: {} {} handle={:#x} bytes={} name='{}' took {:.3f} ms "
+                "start_ns={} end_ns={}", operation, kind, handle, bytes, name, ms,
+                std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count(),
+                std::chrono::duration_cast<std::chrono::nanoseconds>(end.time_since_epoch()).count());
+}
+
 
 vk::Format ToVk(Format format) {
     return static_cast<vk::Format>(static_cast<u32>(format));
@@ -506,6 +536,7 @@ public:
     std::atomic<u64> submitted{0};    // ticks handed out
     std::mutex retire_mutex;
     std::deque<Retired> retired;
+    CompletedResourceWorker completed_resources;
     std::mutex pools_mutex;
     std::unordered_map<std::thread::id, std::unique_ptr<ThreadPool>> pools;
     // New images go from UNDEFINED to GENERAL in a command buffer submitted before the next list.
@@ -530,17 +561,27 @@ VulkanBuffer::~VulkanBuffer() {
     }
     device.Retire([dev = device.device, alloc = device.allocator, buffer = buffer,
                    allocation = allocation, memory = memory] {
+        const auto destroy_start = std::chrono::steady_clock::now();
+        VmaAllocationInfo allocation_info{};
         if (allocation) {
+            vmaGetAllocationInfo(alloc, allocation, &allocation_info);
             vmaDestroyBuffer(alloc, static_cast<VkBuffer>(buffer), allocation);
         } else {
             dev.destroyBuffer(buffer);
             dev.freeMemory(memory);
         }
+        TraceResourceChurn("destroy", "buffer", reinterpret_cast<u64>(static_cast<VkBuffer>(buffer)),
+                           allocation_info.size, destroy_start);
     });
 }
 VulkanImage::~VulkanImage() {
     device.Retire([alloc = device.allocator, image = image, allocation = allocation] {
+        const auto destroy_start = std::chrono::steady_clock::now();
+        VmaAllocationInfo allocation_info{};
+        vmaGetAllocationInfo(alloc, allocation, &allocation_info);
         vmaDestroyImage(alloc, static_cast<VkImage>(image), allocation);
+        TraceResourceChurn("destroy", "image", reinterpret_cast<u64>(static_cast<VkImage>(image)),
+                           allocation_info.size, destroy_start);
     });
 }
 VulkanImageView::~VulkanImageView() {
@@ -560,7 +601,14 @@ VulkanPipeline::~VulkanPipeline() {
 }
 
 VulkanDevice::VulkanDevice(VulkanContext context)
-    : ctx{std::move(context)}, device{ctx.device}, allocator{ctx.allocator} {
+    : ctx{std::move(context)}, device{ctx.device}, allocator{ctx.allocator},
+      completed_resources{[] {
+          Common::SetCurrentThreadName("shadGT:ResourceCleanup");
+          Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+#ifdef _WIN32
+          SetThreadPriorityBoost(GetCurrentThread(), TRUE);
+#endif
+      }} {
     caps.backend = BackendKind::Vulkan;
     caps.import_host_memory = ctx.external_memory_host;
     caps.geometry_shaders = ctx.geometry;
@@ -599,6 +647,7 @@ VulkanDevice::VulkanDevice(VulkanContext context)
 VulkanDevice::~VulkanDevice() {
     std::ignore = device.waitIdle();
     Collect();
+    completed_resources.DrainAndStop();
     for (auto& retired_object : retired) {
         retired_object.destroy();
     }
@@ -618,6 +667,7 @@ VulkanDevice::~VulkanDevice() {
 }
 
 std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
+    const auto allocation_start = std::chrono::steady_clock::now();
     vk::BufferUsageFlags usage{};
     if (desc.usage & BufferUsageVertex) usage |= vk::BufferUsageFlagBits::eVertexBuffer;
     if (desc.usage & BufferUsageIndex) usage |= vk::BufferUsageFlagBits::eIndexBuffer;
@@ -679,6 +729,8 @@ std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
                 desc.size, vk::to_string(vk::Result{result.result}));
       return nullptr;
     }
+    TraceResourceChurn("allocate", "buffer", reinterpret_cast<u64>(buffer), info.size,
+                       allocation_start, desc.name);
     u64 address = 0;
     if (desc.usage & BufferUsageDeviceAddress) {
         address = device.getBufferAddress(vk::BufferDeviceAddressInfo{.buffer = buffer});
@@ -846,6 +898,7 @@ std::unique_ptr<Image> VulkanDevice::CreateImage(const ImageDesc& desc) {
 
 std::unique_ptr<Image> VulkanDevice::CreateImageFrom(const VkImageCreateInfo& image_ci,
                                                     const ImageDesc& desc) {
+    const auto allocation_start = std::chrono::steady_clock::now();
     VmaAllocationCreateInfo alloc_ci{.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     alloc_ci.pool = Vulkan::SmallImageAllocationPool(allocator, image_ci, alloc_ci);
     VkImage image{};
@@ -881,6 +934,10 @@ std::unique_ptr<Image> VulkanDevice::CreateImageFrom(const VkImageCreateInfo& im
                 vk::to_string(vk::Result{result.result}));
       return nullptr;
     }
+    VmaAllocationInfo allocation_info{};
+    vmaGetAllocationInfo(allocator, allocation, &allocation_info);
+    TraceResourceChurn("allocate", "image", reinterpret_cast<u64>(image), allocation_info.size,
+                       allocation_start, desc.name);
     InitImageLayout(image, AspectOf(static_cast<vk::Format>(image_ci.format)));
     return std::make_unique<VulkanImage>(*this, desc, image, allocation);
 }
@@ -1268,8 +1325,11 @@ CommandList* VulkanDevice::AcquireCommandList(CommandListLevel level) {
         }
         pool = slot.get();
     }
-    // Lists retire in roughly the order they were used; one still running stops the scan.
-    for (size_t scanned = 0; !pool->used.empty() && scanned < 64; ++scanned) {
+    auto& free = level == CommandListLevel::Secondary ? pool->free_secondary : pool->free;
+    // Reclaim only on demand. Draining up to 64 lists here queried the driver and
+    // reset buffers/pools in a burst even when a reusable list already existed.
+    // Keep FIFO completion checks and the scan cap for mixed primary/secondary pools.
+    for (size_t scanned = 0; free.empty() && !pool->used.empty() && scanned < 64; ++scanned) {
         VulkanCommandList* list = pool->used.front();
         if (!list->Retired()) {
             break;
@@ -1282,7 +1342,6 @@ CommandList* VulkanDevice::AcquireCommandList(CommandListLevel level) {
         (list->level == CommandListLevel::Secondary ? pool->free_secondary : pool->free)
             .push_back(list);
     }
-    auto& free = level == CommandListLevel::Secondary ? pool->free_secondary : pool->free;
     VulkanCommandList* list;
     if (!free.empty()) {
         list = free.back();
@@ -1296,6 +1355,7 @@ CommandList* VulkanDevice::AcquireCommandList(CommandListLevel level) {
         });
         ASSERT_MSG(result == vk::Result::eSuccess, "NAT-011: command buffer failed");
         pool->all.push_back(std::make_unique<VulkanCommandList>(*this, pool, buffers[0], level));
+        diagnostic_command_lists_created.fetch_add(1, std::memory_order_relaxed);
         list = pool->all.back().get();
     }
     list->retire_fence.store(nullptr, std::memory_order_relaxed);
@@ -1322,17 +1382,62 @@ void VulkanDevice::MarkExecuted(CommandList* list, FenceValue retire) {
 }
 
 void VulkanDevice::Collect() {
-    const u64 completed = CompletedTick();
-    std::vector<std::function<void()>> ready;
-    {
-        std::scoped_lock lock{retire_mutex};
-        while (!retired.empty() && retired.front().tick <= completed) {
-            ready.push_back(std::move(retired.front().destroy));
-            retired.pop_front();
+    // Sample ownership independently of whether deferred destruction is pending.
+    // VMA allocation bytes exclude the driver's own descriptor/command storage.
+    static std::atomic<s64> next_report_ms{};
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto next = next_report_ms.load(std::memory_order_relaxed);
+    if (now_ms >= next && next_report_ms.compare_exchange_strong(
+            next, now_ms + 10000, std::memory_order_relaxed)) {
+        size_t pending;
+        u64 oldest;
+        {
+            std::scoped_lock lock{retire_mutex};
+            pending = retired.size();
+            oldest = retired.empty() ? 0 : retired.front().tick;
+        }
+        VmaBudget budgets[VK_MAX_MEMORY_HEAPS]{};
+        vmaGetHeapBudgets(allocator, budgets);
+        const auto properties = ctx.physical_device.getMemoryProperties();
+        for (u32 heap = 0; heap < properties.memoryHeapCount; ++heap) {
+            const auto& budget = budgets[heap];
+            LOG_INFO(Render_Vulkan,
+                     "VRAM-OWNERS: heap={} device_local={} allocations={} allocation_bytes={} "
+                     "blocks={} block_bytes={} usage={} budget={} retired={} oldest_tick={} "
+                     "completed_tick={} command_lists_created={}",
+                     heap, bool(properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal),
+                     budget.statistics.allocationCount, budget.statistics.allocationBytes,
+                     budget.statistics.blockCount, budget.statistics.blockBytes,
+                     budget.usage, budget.budget, pending, oldest, CompletedTick(),
+                     diagnostic_command_lists_created.load(std::memory_order_relaxed));
         }
     }
-    for (auto& destroy : ready) {
-        destroy();
+    {
+        std::scoped_lock lock{retire_mutex};
+        if (retired.empty()) {
+            return;
+        }
+    }
+    const auto start = std::chrono::steady_clock::now();
+    const u64 completed = CompletedTick();
+    size_t count = 0;
+    {
+        std::scoped_lock lock{retire_mutex};
+        while (count < 64 && !retired.empty() && retired.front().tick <= completed) {
+            if (!completed_resources.TryEnqueue(retired.front().destroy)) {
+                break; // Bounded backlog: retain ownership and retry at the next splice.
+            }
+            retired.pop_front();
+            ++count;
+        }
+    }
+    const double elapsed = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+    if (elapsed >= 4.0) {
+        LOG_WARNING(Render_Vulkan,
+                    "NAT: slow resource handoff {:.2f} ms; {} completed objects queued, no inline destruction",
+                    elapsed, count);
     }
 }
 

@@ -780,7 +780,6 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     // recorder checks the selection against the memory it sees before using it.
     std::optional<Vulkan::Rasterizer::SelectedPipeline> selected;
     bool prepared_draw = false;
-    const void* native_prepare_packet = decode_draw_packet;
 #ifdef RYTY_GPU
     // OPT-012: a draw a game job thread prepared is selected there (the recorder installs
     // that selection).
@@ -847,7 +846,6 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     struct StagedDraw {
         std::optional<Vulkan::Rasterizer::SelectedPipeline> selected;
         Vulkan::Rasterizer::BufferPlan plan;
-        std::unique_ptr<Regs> native_regs;
     };
     std::shared_ptr<StagedDraw> staged;
     DrawPipe::Prepare prepare;
@@ -860,29 +858,15 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
                                u64(*staged_index_offset) * index_size;
         staged_index_bytes = regs.num_indices * index_size;
     }
-    const bool native_indexed = staged_index_offset.has_value();
-    const u32 native_index_offset = staged_index_offset.value_or(0);
     staged_index_offset.reset();
     if (draw_pipe->HasStage() && selected) {
         staged = std::make_shared<StagedDraw>();
         staged->selected = std::move(selected);
         selected.reset();
-#ifdef RYTY_GPU
-        if (rasterizer->Native() && !compute && direct_draw && native_prepare_packet) {
-            // Bounded by the dispatcher's in-flight window; do not hand workers live registers.
-            staged->native_regs = std::make_unique<Regs>(regs);
-            prepare = [this, staged, native_prepare_packet, decode_epoch, native_indexed, native_index_offset] {
-                return rasterizer->PrepareNativeDrawAhead(*staged->selected, *staged->native_regs,
-                    native_prepare_packet, decode_epoch, native_indexed, native_index_offset);
-            };
-        } else if (!rasterizer->Native())
-#endif
-        {
-            prepare = [this, staged, staged_index_address, staged_index_bytes] {
-                return rasterizer->PrepareBuffersAhead(*staged->selected, staged->plan,
-                                                       staged_index_address, staged_index_bytes);
-            };
-        }
+        prepare = [this, staged, staged_index_address, staged_index_bytes] {
+            return rasterizer->PrepareBuffersAhead(*staged->selected, staged->plan,
+                                                   staged_index_address, staged_index_bytes);
+        };
     }
     // A draw whose buffers the stage does not obtain is obtained by the recorder: the stage
     // must not run past it.
@@ -894,18 +878,15 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     }();
     const bool neutral_filtered =
         filtered_neutral && !staged && direct_draw && !compute && FilteredDraw(regs);
-    // Native job-thread snapshots have already done the preparation. They need no
-    // stage-side plan and are validated again by CommitPrepared on the recorder.
-    // Keep recording order, but do not stop later preparation behind every such draw.
-    const auto kind = prepared_draw || (staged && bool(prepare)) || neutral_filtered
-                          ? DrawPipe::JobKind::Neutral : DrawPipe::JobKind::Barrier;
+    const auto kind = staged || neutral_filtered ? DrawPipe::JobKind::Neutral
+                                                 : DrawPipe::JobKind::Barrier;
     if (!staged) {
         // DIAG-069
         DrawPipe::SetPushTag(compute ? (direct_draw ? "dispatch not selected" : "indirect dispatch")
                                      : (direct_draw ? "draw not selected" : "indirect draw"));
     }
     DrawPipe::Work order;
-    if (staged && !staged->native_regs && bool(prepare)) {
+    if (staged) {
         order = [this, staged] { rasterizer->OrderBuffersAhead(*staged->selected, staged->plan); };
     }
     draw_pipe->Push([this, delta = std::move(delta), cs, cb_extent = last_cb_extent,
@@ -1513,8 +1494,30 @@ void Liverpool::Process(std::stop_token stoken) {
                             submit_stats.max_gpu_us = std::max(submit_stats.max_gpu_us, gpu);
                         });
                     }
-                    std::scoped_lock lock2{submit_mutex};
+                    // Isolate the completion wake-up: ETW repeatedly sampled its internal
+                    // condition-variable mutex during recorder stalls. Time each boundary
+                    // directly so scheduler tracing overhead cannot be mistaken for this call.
+                    const auto wake_start = std::chrono::steady_clock::now();
+                    std::unique_lock completion_lock{submit_mutex};
+                    const auto wake_locked = std::chrono::steady_clock::now();
                     submit_cv.notify_all();
+                    const auto wake_notified = std::chrono::steady_clock::now();
+                    completion_lock.unlock();
+                    const auto wake_released = std::chrono::steady_clock::now();
+                    if (wake_released - wake_start >= std::chrono::milliseconds{1}) {
+                        static thread_local std::chrono::steady_clock::time_point next_wake_report{};
+                        if (wake_released >= next_wake_report) {
+                            next_wake_report = wake_released + std::chrono::seconds{1};
+                            const auto ms = [](auto elapsed) {
+                                return std::chrono::duration<double, std::milli>(elapsed).count();
+                            };
+                            LOG_WARNING(Render,
+                                "SUBMIT-WAKE: total {:.3f} ms; submit-mutex {:.3f}, notify {:.3f}, unlock {:.3f}; remaining {}",
+                                ms(wake_released - wake_start), ms(wake_locked - wake_start),
+                                ms(wake_notified - wake_locked), ms(wake_released - wake_notified),
+                                num_submits.load());
+                        }
+                    }
                 });
             }
         }

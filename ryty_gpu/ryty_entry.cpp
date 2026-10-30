@@ -25,6 +25,7 @@
 #include "core/libraries/ime/ime_dialog.h"
 #include "core/libraries/videoout/video_out.h"
 #include "core/memory.h"
+#include "ryty_gpu/native/job_walker.h"
 #include "core/signals.h"
 #include "core/loader/symbols_resolver.h"
 #include "input/controller.h"
@@ -565,12 +566,14 @@ extern "C" __declspec(dllexport) void RytyGpuUnmapMemory(u64 address, u64 size) 
 // Ryty calls this after any change to guest mappings or protections (after an unmap completes,
 // for example), so lookups cached in between are not kept.
 extern "C" __declspec(dllexport) void RytyGpuMappingChanged(u64 address, u64 size) {
+    Native::ForgetReadable(address, size);
     Core::RytyMemory::NoteMappingChange(address, size);
 }
 
 // Ryty calls this after the game changed the protection of guest memory (sceKernelMprotect),
 // which replaced the protections the renderer's page tracking had set there.
 extern "C" __declspec(dllexport) void RytyGpuProtectionChanged(u64 address, u64 size) {
+    Native::ForgetReadable(address, size);
     if (Native::WatchedTexture(address, address + size)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: game protection change {:#x}+{:#x}", address,
                     size);
@@ -582,6 +585,7 @@ extern "C" __declspec(dllexport) void RytyGpuProtectionChanged(u64 address, u64 
 }
 
 extern "C" __declspec(dllexport) void RytyGpuMapMemory(u64 address, u64 size) {
+    Native::ForgetReadable(address, size);
     if (Native::WatchedTexture(address, address + size)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: map {:#x}+{:#x}", address, size);
     }

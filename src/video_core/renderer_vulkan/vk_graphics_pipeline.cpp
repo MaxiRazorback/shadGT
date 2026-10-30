@@ -1,3 +1,5 @@
+#include "video_core/renderer_vulkan/compile_cpu_batch.h"
+#include "video_core/renderer_vulkan/fragment_descriptor_policy.h"
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -39,6 +41,9 @@
 #endif
 
 namespace Vulkan {
+#ifdef RYTY_GPU
+bool NativeModeRequested();
+#endif
 
 #ifdef _WIN32
 // DIAG-100: every thread's stack to user\log\<file_name> (tools\stackdump.exe next to
@@ -810,8 +815,9 @@ GraphicsPipeline::GraphicsPipeline(
     };
 
     const auto create_start = std::chrono::steady_clock::now();
-    // Warm-up can reuse the same stage libraries as live draws when LTO is off.
-    // With LTO enabled, retain whole background builds instead of scheduling another link.
+    // Stored ordinary pipelines use the same shared stage libraries and fast link as draws.
+    // Whole-pipeline prewarm recompiles both stages for every target/blend permutation and
+    // does not populate the stage-library cache used when new runtime permutations appear.
     // FIX-057: tessellated pipelines are compiled whole, not from libraries: on GT Sport's race
     // summary their library compiles (with link-time optimization info kept) took the process
     // from 11 GB to over 50 GB with only two running. -DisablePerf 80 builds them from libraries.
@@ -822,7 +828,12 @@ GraphicsPipeline::GraphicsPipeline(
         const char* env = std::getenv("SHADGT_NO_LIBRARIES");
         return env && env[0] == '1';
     }();
-    if ((!preloading || !LinkTimeOptimization()) && !no_libraries &&
+    // Comparison control; the default prewarm path shares exactly the runtime libraries.
+    static const bool whole_prewarm = [] {
+        const char* env = std::getenv("RYGT_PREWARM_WHOLE_PIPELINES");
+        return env && env[0] == '1';
+    }();
+    if (!(preloading && whole_prewarm) && !no_libraries &&
         instance.IsGraphicsPipelineLibrarySupported() &&
         !(tessellated && whole_tessellated)) {
         // PERF-017: a pipeline first needed during play is built from four separately compiled
@@ -830,12 +841,6 @@ GraphicsPipeline::GraphicsPipeline(
         // fraction of a full compile. A worker then links the same libraries with link-time
         // optimization, and draws switch to that pipeline once it exists. Both pipelines come
         // from the same create info, so they render the same.
-        if (preloading) {
-            static const bool logged = [] {
-                LOG_INFO(Render_Vulkan, "SHADER-WARMUP: using shared stage libraries; LTO off, heavy limit unchanged");
-                return true;
-            }();
-        }
         library_link = std::make_unique<LibraryLink>();
         boost::container::static_vector<vk::PipelineShaderStageCreateInfo, MaxShaderStages>
             pre_raster_stages;
@@ -972,17 +977,10 @@ GraphicsPipeline::GraphicsPipeline(
         vk::Pipeline fragment_library = fragment_owner ? **fragment_owner : vk::Pipeline{};
         const bool pre_raster_reused = bool(pre_raster_library);
         const bool fragment_reused = bool(fragment_library);
-        // PERF-018: the two shader libraries are compiled at the same time, the fragment one
-        // on another thread.
-        std::future<StageLibraryCache::Owner> fragment_future;
-        const auto pending_fragment = !fragment_library && share_libraries
-            ? library_cache.Pending(device, fragment_hash)
-            : std::shared_future<StageLibraryCache::Owner>{};
-        if (!fragment_library && share_libraries && !pending_fragment.valid()) {
-            fragment_future = std::async(std::launch::async, [&] {
-                return library_cache.Acquire(device, fragment_hash, true, [&] { return create_library(2); });
-            });
-        }
+        // Pipeline workers already provide parallelism across pipelines. A nested
+        // std::async per fragment bypasses that budget and starts default-priority
+        // compilers alongside the low-priority workers. Build both stages on this
+        // worker; Acquire still shares in-flight and completed libraries.
         std::array<vk::Pipeline, 4> library_handles{};
         library_handles[0] = create_library(0);
         if (!pre_raster_library) {
@@ -991,13 +989,7 @@ GraphicsPipeline::GraphicsPipeline(
             pre_raster_library = **pre_raster_owner;
         }
         library_handles[3] = create_library(3);
-        if (pending_fragment.valid()) {
-            fragment_owner = pending_fragment.get();
-            fragment_library = **fragment_owner;
-        } else if (fragment_future.valid()) {
-            fragment_owner = fragment_future.get();
-            fragment_library = **fragment_owner;
-        } else if (!fragment_library) {
+        if (!fragment_library) {
             fragment_owner = library_cache.Acquire(device, fragment_hash, share_libraries,
                 [&] { return create_library(2); });
             fragment_library = **fragment_owner;
@@ -1022,16 +1014,20 @@ GraphicsPipeline::GraphicsPipeline(
                    vk::to_string(link_result));
         pipeline = std::move(linked);
         SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
-        LOG_WARNING(
-            Render_Vulkan,
-            "Graphics pipeline {}: libraries {:.1f} ms (pre-raster {}, fragment {}), fast "
-            "link {:.1f} ms",
-            debug_str,
-            std::chrono::duration<double, std::milli>(libraries_done - create_start).count(),
-            pre_raster_reused ? "reused" : "compiled", fragment_reused ? "reused" : "compiled",
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-                                                      libraries_done)
-                .count());
+        const double library_ms =
+            std::chrono::duration<double, std::milli>(libraries_done - create_start).count();
+        if (!preloading || library_ms >= 20.0) {
+            LOG_WARNING(
+                Render_Vulkan,
+                "Graphics pipeline {}: libraries {:.1f} ms (pre-raster {}, fragment {}), fast "
+                "link {:.1f} ms",
+                debug_str,
+                library_ms,
+                pre_raster_reused ? "reused" : "compiled", fragment_reused ? "reused" : "compiled",
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                          libraries_done)
+                    .count());
+        }
 
         if (!LinkTimeOptimization()) {
             return; // SHD-001: the fast-linked pipeline is the one drawn with
@@ -1235,9 +1231,24 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
         }
         set_descriptors[set] = binding;
     }
-    // The fragment set is pushed when it fits, else the vertex set; the others are allocated.
+    // Repeated material pushes dominate NVIDIA command recording. Fragment sets
+    // can instead use the Native recorder's immutable, full-key descriptor cache.
+    // Vertex pushes remain available; other backends retain their previous policy.
+    bool cached_fragment = false;
+#ifdef RYTY_GPU
+    static const char* const descriptor_override = std::getenv("RYGT_NVIDIA_CACHED_FRAGMENT_SETS");
+    cached_fragment = CacheFragmentDescriptors(instance.GetVendorID(), NativeModeRequested(),
+                                                descriptor_override);
+    if (cached_fragment) {
+        static std::once_flag logged;
+        std::call_once(logged, [] {
+            LOG_INFO(Render_Vulkan, "DESC-POLICY: NVIDIA fragment sets use immutable descriptor caching; vertex push descriptors retained when supported");
+        });
+    }
+#endif
     push_set = NoPushSet;
     for (const auto sw : {Shader::SwStage::Fragment, Shader::SwStage::Vertex}) {
+        if (cached_fragment && sw == Shader::SwStage::Fragment) continue;
         const u32 set = Shader::Backend::StageSet(u32(sw));
         if (!set_bindings[set].empty() && set_descriptors[set] < instance.MaxPushDescriptors()) {
             push_set = set;

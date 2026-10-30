@@ -192,6 +192,7 @@ public:
     }
     struct UploadStats {
         std::atomic<u64> gpu, cpu, unchanged;
+        std::atomic<u64> scratch_created, scratch_reused, scratch_transient;
     };
     UploadStats& GetUploadStats() {
         return upload_stats;
@@ -273,7 +274,7 @@ public:
 
     /// Records the uploads queued since the last call (copy from guest memory, untile, copy
     /// into the images). Returns how many images were uploaded.
-    u32 RecordUploads(Rhi::CommandList& list);
+    u32 RecordUploads(Rhi::CommandList& list, bool trace_slow_calls = false);
 
     /// Records copying an image back into a buffer in its guest layout (tiled again), for
     /// guest memory the CPU reads after the GPU wrote it.
@@ -342,6 +343,8 @@ private:
     u64 change_count = 0;
     /// Logs the ranges, then moves the generation on.
     void NoteChanges(std::span<const std::pair<VAddr, VAddr>> ranges);
+    // Recorder-only scratch shared by sequential untile dispatch/copy pairs.
+    std::unique_ptr<Rhi::Buffer> upload_scratch;
     std::unique_ptr<Rhi::PipelineLayout> untile_layout;
     std::mutex untile_mutex;
     std::unordered_map<u64, std::unique_ptr<Rhi::Pipeline>> untile_pipelines;

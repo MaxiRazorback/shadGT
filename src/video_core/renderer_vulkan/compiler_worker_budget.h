@@ -9,8 +9,10 @@ struct CompilerWorkerBudget {
     unsigned translation;
     unsigned pipeline;
     static constexpr CompilerWorkerBudget ForLogicalThreads(unsigned logical) {
-        // Unknown topology and tiny CPUs use one compiler, without unsigned underflow.
-        const unsigned total = logical > 2 ? logical - 2 : 1;
+        // Logical CPUs share execution and cache resources. Reserve half for game,
+        // recording and the driver; do not start an almost machine-wide compile storm.
+        // Bound large machines too: each driver compile can hold substantial memory.
+        const unsigned total = logical > 2 ? std::min(8u, logical / 2) : 1;
         const unsigned translation = total > 1 ? std::max(1u, total / 4) : 0;
         return {translation, total - translation};
     }

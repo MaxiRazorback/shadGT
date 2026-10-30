@@ -725,38 +725,6 @@ void Rasterizer::OrderBuffersAhead(const SelectedPipeline& selected, BufferPlan&
 // FIX-111: set while PrepareBuffersAhead only asks IsComputeImageCopy/MetaClear/ImageClear.
 static thread_local bool t_special_dry_run = false;
 
-bool Rasterizer::PrepareNativeDrawAhead(const SelectedPipeline& selected, const AmdGpu::Regs& regs,
-                                         const void* packet, u32 epoch, bool indexed, u32 index_offset) {
-#ifdef RYTY_GPU
-    auto* native = Native();
-    if (!native || !packet || selected.is_compute || selected.is_quad_list || !selected.pipeline)
-        return false;
-    std::array<std::unique_ptr<Shader::Info>, Shader::MaxStageTypes> copies;
-    std::array<const Shader::Info*, Shader::MaxStageTypes> infos{};
-    for (u32 i = 0; i < selected.stages.size(); ++i) {
-        const auto& stage = selected.stages[i];
-        if (!stage.present) continue;
-        if (!stage.seed) return false;
-        auto info = std::make_unique<Shader::Info>(*stage.seed);
-        // Never speculate across shader side effects; the dispatcher waits for this draw.
-        if (info->has_storage_images ||
-            std::ranges::any_of(info->buffers, [](const auto& b) { return b.is_written; }) ||
-            std::ranges::any_of(info->images, [](const auto& image) { return image.is_written; }))
-            return false;
-        info->pgm_base = stage.pgm_base;
-        info->user_data = std::span<const u32>{stage.user_data.data(), stage.num_user_data};
-        info->flattened_ud_buf = stage.flattened;
-        infos[i] = info.get();
-        copies[i] = std::move(info);
-    }
-    native->PrepareJobDraw(packet, epoch, regs, *selected.pipeline, selected.keepalive[0],
-                          infos, indexed, index_offset);
-    return native->HasPrepared(packet);
-#else
-    return false;
-#endif
-}
-
 bool Rasterizer::PrepareBuffersAhead(const SelectedPipeline& selected, BufferPlan& plan,
                                      VAddr index_address, u32 index_bytes, bool order_only) {
     const Pipeline* pipeline = selected.is_compute
@@ -3999,7 +3967,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         // FIX-016: record the vertex fetch as a read of the range, so a later upload into it
         // (GT Sport rewrites grass vertex buffers between draws) waits for this draw. Without
         // it the copy can overwrite the vertices while this draw still reads them, mixing
-        // old and new data (the suspected cause of stretched NÃƒÂ¼rburgring grass and terrain).
+        // old and new data (the suspected cause of stretched NÃ¼rburgring grass and terrain).
         ctx->bound_buffers.emplace_back(range.buffer, range.offset, size, false);
     }
 
