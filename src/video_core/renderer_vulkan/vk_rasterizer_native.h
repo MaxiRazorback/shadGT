@@ -99,6 +99,7 @@ public:
     /// NAT-105: the CPU wrote watched memory (a page fault on any thread): the textures there
     /// are uploaded again before their next use, and their pages are no longer watched.
     void OnCpuWrite(VAddr address, u64 size, u64 exact);
+    void OnCpuStack(VAddr address, u64 size);
     u32 ReadGds(u32 gds_offset);
 
     /// Ends the command list recorded so far and runs it in the scheduler's current command
@@ -268,6 +269,7 @@ private:
     std::map<VAddr, Region> regions; ///< by begin; guarded by mutex
     std::mutex region_dirty_mutex;   ///< pending_region_writes (CPU write faults: any thread)
     std::vector<std::pair<VAddr, VAddr>> pending_region_writes;
+    std::vector<std::pair<VAddr, VAddr>> pending_stack_retirements;
     std::atomic<bool> has_pending_region_writes{false};
     /// FIX-173: region pages as guest memory held them before the CPU's first write since they
     /// were last copied in (taken at the write fault; guarded by region_dirty_mutex).
@@ -333,7 +335,7 @@ private:
     Mirror* MirrorHolding(VAddr address, u64 size);
     bool IsDynamic(VAddr begin, VAddr end);
     std::optional<std::pair<vk::Buffer, u64>> MirrorBuffer(VAddr address, u64 size);
-    void RefreshMirror(Mirror& mirror);
+    bool RefreshMirror(Mirror& mirror);
     void MakePendingMirrors();
     void DropMirrors(VAddr address, u64 size);
     /// NAT-150: what the last GuestBuffer bound (for the NAT-142 counters).
