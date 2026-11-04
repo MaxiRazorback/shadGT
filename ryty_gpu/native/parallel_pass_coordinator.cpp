@@ -28,10 +28,11 @@ bool ThreadCpu100ns(u64& out) noexcept {
 }
 }
 PassCoordinator::PassCoordinator(Rhi::Device& device,const Vulkan::Instance& instance,Rhi::Fence& timeline,
-    std::size_t worker_count,std::size_t count_cap,std::size_t byte_cap,std::size_t node_cap)
+    std::size_t worker_count,std::size_t count_cap,std::size_t byte_cap,std::size_t node_cap,
+    const std::vector<AffinityMask>& worker_affinity_masks)
     // Prefixes and pass jobs each retain a credit; bound those credits by the
     // existing node limit while keeping the worker queue's separate limit.
-    :device_(device),instance_(instance),timeline_(timeline),budget_(node_cap,byte_cap),workers_(worker_count,count_cap),node_cap_(node_cap),in_flight_(node_cap) {
+    :device_(device),instance_(instance),timeline_(timeline),budget_(node_cap,byte_cap),workers_(worker_count,count_cap,worker_affinity_masks),node_cap_(node_cap),in_flight_(node_cap) {
     if(TransferPasses())try {draw_pool_=std::make_shared<DrawPool>();} catch(...) {}
 }
 PassCoordinator::~PassCoordinator() {
@@ -134,7 +135,16 @@ bool PassCoordinator::ResolveGroup(const GroupPtr& group,bool record_missing) {
 #ifndef NDEBUG
             if(group->is_small && BatchDiag()) {auto ns=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-group->submit_time).count();if(ns>=0){++group_stats_.lead_samples;group_stats_.lead_ns+=u64(ns);group_stats_.lead_max_ns=(std::max)(group_stats_.lead_max_ns,u64(ns));}}
 #endif
-            try {auto result=workers_.Take();if(!result || *result!=group){failed_=true;return false;}}
+            try {
+#if !defined(NDEBUG)
+                TimingProbe wait_timing{*this,TimingPhase::DrainWait};
+#endif
+                auto result=workers_.Take();
+#if !defined(NDEBUG)
+                wait_timing.Success();
+#endif
+                if(!result || *result!=group){failed_=true;return false;}
+            }
             catch(...) { /* completed task failed; recover each unfinished pass below */ }
         }
         group->resolved=true;

@@ -17,10 +17,19 @@
 namespace Native::Parallel {
 // One coordinator thread only. Worker callbacks record Vulkan commands only;
 // they do not touch the renderer, registry, guest memory, or scheduler.
+
+#ifdef _WIN32
+using AffinityMask = DWORD_PTR;
+#else
+using AffinityMask = uintptr_t;
+#endif
+
+// One coordinator thread only. Worker callbacks record Vulkan commands only;
+// they do not touch the renderer, registry, guest memory, or scheduler.
 class PassCoordinator {
 public:
 #if !defined(NDEBUG)
-    enum class TimingPhase : std::size_t { Rotation, Admission, QueueSubmit, Drain, Collect, Count };
+    enum class TimingPhase : std::size_t { Rotation, Admission, QueueSubmit, Drain, DrainWait, Collect, Count };
     struct PhaseTiming { u64 ns{},count{},failed{}; };
     struct CoordinatorTimingProbes {
         std::array<PhaseTiming,static_cast<std::size_t>(TimingPhase::Count)> phases{};
@@ -97,9 +106,16 @@ private:
     bool ResolveGroup(const GroupPtr& group, bool record_missing);
     RejectReason PrefixStateRejection(u64 epoch,Rhi::CommandList* list,bool has_resources) const noexcept;
     static void DropGroupJob(const GroupPtr& group,const JobPtr& job) noexcept;
+#ifdef _WIN32
+using AffinityMask = DWORD_PTR;
+#else
+using AffinityMask = uintptr_t;
+#endif
+
 public:
     PassCoordinator(Rhi::Device& device,const Vulkan::Instance& instance,Rhi::Fence& timeline,
-                    std::size_t worker_count,std::size_t count_cap,std::size_t byte_cap,std::size_t node_cap);
+                    std::size_t worker_count,std::size_t count_cap,std::size_t byte_cap,std::size_t node_cap,
+                    const std::vector<AffinityMask>& worker_affinity_masks = {});
     ~PassCoordinator();
     // Owner only: do not call concurrently with shutdown or retain the handles.
     template<class F> void ForEachWorkerHandle(F&& callback) {

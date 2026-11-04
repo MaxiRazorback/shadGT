@@ -399,7 +399,7 @@ bool ParallelRecordingRequested() {
 bool ParallelReadonlyDescriptorEnabled() {static const bool yes=[] {const char* p=std::getenv("RYGT_PARALLEL_READONLY_DESCRIPTOR");return p && p[0]=='1' && p[1]=='\0';}();return yes;}
 bool ParallelDirectVertexEnabled() { static const bool yes=[] {const char* p=std::getenv("RYGT_PARALLEL_DIRECT_VERTEX");return p && p[0]=='1' && p[1]=='\0';}();return yes; }
 bool ParallelVertexEnabled() { static const bool yes=[] {const char* p=std::getenv("RYGT_PARALLEL_VERTEX");return p && p[0]=='1' && p[1]=='\0';}();return yes; }
-bool ParallelSmallPassBatchEnabled() { static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_SMALLPASS_BATCH");return p && p[0]=='1' && p[1]=='\0';}();return enabled; }
+bool ParallelSmallPassBatchEnabled() { static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_SMALLPASS_BATCH");return !(p && p[0]=='0' && p[1]=='\0');}();return enabled; }
 // Experimental indexed/MRT/depth packet. Clear admission remains separately gated.
 bool ParallelExtendedEnabled() {static const bool on=[] {const char* p=std::getenv("RYGT_PARALLEL_EXTENDED");return p && p[0]=='1' && !p[1];}();return on;}
 bool ParallelD2Enabled() { static const bool yes=[] {const char* p=std::getenv("RYGT_PARALLEL_D2"); return p && p[0]=='1' && p[1]=='\0';}();return yes; }
@@ -5089,7 +5089,68 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             if(const char* path=std::getenv("RYGT_PARALLEL_VIEW_MODE_FILE");path && *path)
                 sidecar->view_mode_controller=std::make_unique<Native::Parallel::ModeController>(std::filesystem::path(path),sidecar->view_applied_mode.Enabled());
 #endif
-            sidecar->coordinator=std::make_unique<Native::Parallel::PassCoordinator>(*device,r.instance,*timeline,2,32,64*1024*1024,64);
+            // Worker count configurable via RYGT_PARALLEL_WORKERS (default 2, range 1-8)
+            int worker_count = 2;
+            if (const char* env = std::getenv("RYGT_PARALLEL_WORKERS")) {
+                worker_count = std::clamp(std::atoi(env), 1, 8);
+            }
+            // CPU affinity masks configurable via RYGT_PARALLEL_AFFINITY (comma-separated hex masks, e.g., "0x400,0x1000" for CPUs 10,12)
+            using AffinityMask = Native::Parallel::AffinityMask;
+            std::vector<AffinityMask> worker_affinity_masks;
+            bool affinity_parse_failed = false;
+            if (const char* env = std::getenv("RYGT_PARALLEL_AFFINITY")) {
+                std::string affinity_str(env);
+                // Check for trailing comma (trailing empty entry)
+                if (!affinity_str.empty() && affinity_str.back() == ',') {
+                    LOG_ERROR(Render_Vulkan, "RYGT_PARALLEL_AFFINITY: trailing comma (empty entry); ignoring all affinity settings");
+                    affinity_parse_failed = true;
+                }
+                size_t start = 0;
+                while (start < affinity_str.size() && !affinity_parse_failed) {
+                    size_t end = affinity_str.find(',', start);
+                    if (end == std::string::npos) end = affinity_str.size();
+                    std::string mask_str = affinity_str.substr(start, end - start);
+                    // Trim whitespace
+                    size_t mask_start = mask_str.find_first_not_of(" \t");
+                    size_t mask_end = mask_str.find_last_not_of(" \t");
+                    if (mask_start == std::string::npos || mask_end == std::string::npos) {
+                        LOG_ERROR(Render_Vulkan, "RYGT_PARALLEL_AFFINITY: empty mask entry at position {}", worker_affinity_masks.size());
+                        affinity_parse_failed = true;
+                        break;
+                    }
+                    mask_str = mask_str.substr(mask_start, mask_end - mask_start + 1);
+                    // Reject negative masks (e.g., "-1")
+                    if (!mask_str.empty() && mask_str[0] == '-') {
+                        LOG_ERROR(Render_Vulkan, "RYGT_PARALLEL_AFFINITY: negative mask '{}' not allowed", mask_str);
+                        affinity_parse_failed = true;
+                        break;
+                    }
+                    char* endptr = nullptr;
+                    errno = 0;
+                    unsigned long long mask_val = std::strtoull(mask_str.c_str(), &endptr, 0);
+                    if (endptr != mask_str.c_str() + mask_str.size()) {
+                        LOG_ERROR(Render_Vulkan, "RYGT_PARALLEL_AFFINITY: invalid mask '{}' (trailing characters)", mask_str);
+                        affinity_parse_failed = true;
+                        break;
+                    } else if (errno == ERANGE || mask_val == 0) {
+                        LOG_ERROR(Render_Vulkan, "RYGT_PARALLEL_AFFINITY: invalid mask '{}' (out of range or zero)", mask_str);
+                        affinity_parse_failed = true;
+                        break;
+                    } else {
+                        worker_affinity_masks.push_back(static_cast<AffinityMask>(mask_val));
+                    }
+                    start = end + 1;
+                }
+            }
+            if (affinity_parse_failed) {
+                LOG_ERROR(Render_Vulkan, "RYGT_PARALLEL_AFFINITY: parsing failed; ignoring all affinity settings");
+                worker_affinity_masks.clear();
+            } else if (!worker_affinity_masks.empty() && worker_affinity_masks.size() != static_cast<size_t>(worker_count)) {
+                LOG_WARNING(Render_Vulkan, "RYGT_PARALLEL_AFFINITY mask count ({}) does not match worker count ({}); ignoring affinity",
+                    worker_affinity_masks.size(), worker_count);
+                worker_affinity_masks.clear();
+            }
+            sidecar->coordinator=std::make_unique<Native::Parallel::PassCoordinator>(*device,r.instance,*timeline,worker_count,32,64*1024*1024,64,worker_affinity_masks);
 #if !defined(NDEBUG)
             if(const char* path=std::getenv("RYGT_PARALLEL_TRANSFER_MODE_FILE");path && *path)
                 sidecar->transfer_mode_controller=std::make_unique<Native::Parallel::ModeController>(std::filesystem::path(path),sidecar->transfer_applied_mode.Enabled());
@@ -10631,7 +10692,8 @@ void NativeRenderer::Report() {
         }
         if(ParallelGateDiagEnabled()) {
             const auto timing=sidecar->coordinator->TakeCoordinatorTimingProbes();
-            static constexpr std::array timing_names{"rotation","admission","queue-submit","drain","collect"};
+            static constexpr std::array timing_names{"rotation","admission","queue-submit","drain","drain-wait","collect"};
+static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::PassCoordinator::TimingPhase::Count), "timing_names size mismatch");
             for(std::size_t i=0;i<timing.phases.size();++i) {
                 const auto& t=timing.phases[i];
                 LOG_INFO(Render_Vulkan,"PARALLEL-COORD-TIMING phase={} count={} failed={} wall_ns={} window_s={:.3f} current_worker_mode={} (owner-thread; admission includes queue-submit; nested phases must not be added)",

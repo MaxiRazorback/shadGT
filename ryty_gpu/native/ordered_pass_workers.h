@@ -1,6 +1,7 @@
 #pragma once
 #include <condition_variable>
 #include <cstddef>
+#include <cstdio>
 #include <deque>
 #include <functional>
 #include <future>
@@ -11,6 +12,13 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+using AffinityMask = DWORD_PTR;
+#else
+using AffinityMask = uintptr_t;
+#endif
 
 // Isolated prototype. Single coordinator calls Submit/Take in order. The callback
 // gets a worker index and immutable packet; it must own its worker's recording
@@ -26,7 +34,23 @@ class OrderedPassWorkers {
     std::vector<std::thread> workers_;
     const std::size_t limit_;
     bool stop_=false;
+    std::vector<AffinityMask> worker_affinity_masks_;
     void Worker(std::size_t index) {
+        // Apply CPU affinity if configured for this worker
+        if (index < worker_affinity_masks_.size() && worker_affinity_masks_[index] != 0) {
+#ifdef _WIN32
+            if (!::SetThreadAffinityMask(::GetCurrentThread(), static_cast<DWORD_PTR>(worker_affinity_masks_[index]))) {
+                DWORD error = ::GetLastError();
+                // Self-contained error reporting for standalone test compatibility
+                fprintf(stderr, "Worker %zu: failed to set CPU affinity mask 0x%llx (Windows error %lu)\n",
+                    index, static_cast<unsigned long long>(worker_affinity_masks_[index]), static_cast<unsigned long>(error));
+                fflush(stderr);
+            }
+#else
+            // On non-Windows, AffinityMask is uintptr_t but actual affinity setting
+            // would use pthread_setaffinity_np with cpu_set_t; omitted for brevity
+#endif
+        }
         for (;;) {
             Task task;
             { std::unique_lock lock(mutex_); wake_.wait(lock,[&]{return stop_ || !queue_.empty();});
@@ -37,8 +61,13 @@ class OrderedPassWorkers {
     }
 public:
     using Record=std::function<Result(std::size_t,const Packet&)>;
-    OrderedPassWorkers(std::size_t count,std::size_t limit):limit_(limit) {
+    OrderedPassWorkers(std::size_t count,std::size_t limit, const std::vector<AffinityMask>& worker_affinity_masks = {}):limit_(limit)
+        , worker_affinity_masks_(worker_affinity_masks)
+    {
         if(!count || !limit) throw std::invalid_argument("zero worker count or limit");
+        if (!worker_affinity_masks_.empty() && worker_affinity_masks_.size() != count) {
+            throw std::invalid_argument("worker_affinity_masks size must match worker count");
+        }
         try {for(std::size_t i=0;i<count;++i) workers_.emplace_back([this,i]{Worker(i);});}
         catch(...) {{std::lock_guard lock(mutex_);stop_=true;}wake_.notify_all();for(auto& w:workers_)w.join();throw;}
     }
