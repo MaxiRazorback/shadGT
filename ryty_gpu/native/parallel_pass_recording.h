@@ -79,4 +79,27 @@ bool RecordPass(vk::CommandBuffer cmd,const Vulkan::Instance& instance,const Pas
 // command-buffer state through the supplied recorder-owned cache.
 bool RecordPassInline(vk::CommandBuffer cmd,const Vulkan::Instance& instance,const Pass& pass,
                       Vulkan::DynamicState& dynamic,vk::Pipeline& last_pipeline);
+
+#if !defined(NDEBUG)
+// Debug-only process-wide sums across recording threads, not critical-path time.
+// Descriptor time includes regular binds, push descriptors and descriptor iteration.
+// Residual = total_pass_ns minus the named phase sums; includes dynamic state,
+// push constants, index binding, rendering boundaries, setup and probe overhead.
+struct RecordingCostProbes {
+    u64 validate_ns;
+    u64 pipeline_bind_ns;
+    u64 vertex_bind_ns;
+    u64 descriptor_bind_ns;
+    u64 draw_call_ns;
+    u64 draw_count;
+    u64 pipeline_change_count;
+    u64 vertex_change_count;
+    u64 descriptor_flush_count; // regular descriptor set bind calls
+    u64 total_pass_ns;
+    u64 pass_count;
+    u64 failure_count;
+};
+RecordingCostProbes TakeRecordingCostProbes() noexcept;
+void ResetRecordingCostProbes() noexcept;
+#endif
 }

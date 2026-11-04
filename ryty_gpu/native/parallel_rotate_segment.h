@@ -11,6 +11,9 @@ bool RotateSegment(PassCoordinator& ordered,Rhi::Device& device,u64 epoch,
                    Rhi::CommandList*& list,vk::CommandBuffer& cmd,
                    std::shared_ptr<const void> lease,std::size_t charged_bytes,
                    ResetState&& reset_state,RotationDiag* diag=nullptr) {
+#if !defined(NDEBUG)
+    PassCoordinator::TimingProbe timing{ordered,PassCoordinator::TimingPhase::Rotation};
+#endif
     if(diag)++diag->attempts;
     if(!list || !cmd || !lease){if(diag)++diag->invalid;return false;}
     Rhi::CommandList* replacement=nullptr;bool queued=false;
@@ -30,7 +33,11 @@ bool RotateSegment(PassCoordinator& ordered,Rhi::Device& device,u64 epoch,
         // RHI End and cache invalidation must not throw after the prefix has
         // entered the ordered queue; callers must treat violation as fatal.
         queued=true;
-        list->End();list=replacement;cmd=next;reset_state();if(diag)++diag->success;return true;
+        list->End();list=replacement;cmd=next;reset_state();if(diag)++diag->success;
+#if !defined(NDEBUG)
+        timing.Success();
+#endif
+        return true;
     } catch(...) {
         if(queued) std::terminate(); // no safe rollback after queue publication
         if(diag)++diag->exception;

@@ -10629,6 +10629,20 @@ void NativeRenderer::Report() {
             }
             sidecar->proof_phases={};
         }
+        if(ParallelGateDiagEnabled()) {
+            const auto timing=sidecar->coordinator->TakeCoordinatorTimingProbes();
+            static constexpr std::array timing_names{"rotation","admission","queue-submit","drain","collect"};
+            for(std::size_t i=0;i<timing.phases.size();++i) {
+                const auto& t=timing.phases[i];
+                LOG_INFO(Render_Vulkan,"PARALLEL-COORD-TIMING phase={} count={} failed={} wall_ns={} window_s={:.3f} current_worker_mode={} (owner-thread; admission includes queue-submit; nested phases must not be added)",
+                    timing_names[i],t.count,t.failed,t.ns,seconds,sidecar->applied_mode.Enabled());
+            }
+            const auto cost=Native::Parallel::TakeRecordingCostProbes();
+            const u64 named=cost.validate_ns+cost.pipeline_bind_ns+cost.vertex_bind_ns+cost.descriptor_bind_ns+cost.draw_call_ns;
+            const u64 residual=cost.total_pass_ns>named?cost.total_pass_ns-named:0;
+            LOG_INFO(Render_Vulkan,"PARALLEL-RECORD-COST passes={} failed={} draws={} total_pass_ns_sum={} validate_ns={} pipeline_bind_ns={} vertex_bind_ns={} descriptor_bind_ns={} draw_call_ns={} residual_ns={} pipeline_changes={} vertex_changes={} set_bind_calls={} window_s={:.3f} (process-wide completed-pass wall sums; overlaps across threads; excludes merge lock; not critical-path or GPU time; clocks included)",
+                cost.pass_count,cost.failure_count,cost.draw_count,cost.total_pass_ns,cost.validate_ns,cost.pipeline_bind_ns,cost.vertex_bind_ns,cost.descriptor_bind_ns,cost.draw_call_ns,residual,cost.pipeline_change_count,cost.vertex_change_count,cost.descriptor_flush_count,seconds);
+        }
         const auto admission=sidecar->coordinator->TakeAdmissionDiag();
         const auto report_rejections=[&](const char* kind,const auto& v) {
             LOG_INFO(Render_Vulkan,"PARALLEL-ADMISSION-REJECT kind={} failed={} zero_epoch={} epoch_mismatch={} node_cap={} validation={} invalid={} overflow={} charge={} budget_count={} budget_bytes={}",kind,v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8],v[9]);

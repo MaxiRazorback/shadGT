@@ -19,6 +19,27 @@ namespace Native::Parallel {
 // they do not touch the renderer, registry, guest memory, or scheduler.
 class PassCoordinator {
 public:
+#if !defined(NDEBUG)
+    enum class TimingPhase : std::size_t { Rotation, Admission, QueueSubmit, Drain, Collect, Count };
+    struct PhaseTiming { u64 ns{},count{},failed{}; };
+    struct CoordinatorTimingProbes {
+        std::array<PhaseTiming,static_cast<std::size_t>(TimingPhase::Count)> phases{};
+    };
+    // Coordinator-owner thread only. Includes unsuccessful and exceptional exits.
+    class TimingProbe {
+        PassCoordinator* owner_{};
+        TimingPhase phase_{};
+        std::chrono::steady_clock::time_point start_{};
+        bool sampled_{},success_{};
+    public:
+        TimingProbe(PassCoordinator& owner,TimingPhase phase) noexcept;
+        ~TimingProbe() noexcept;
+        TimingProbe(const TimingProbe&)=delete;
+        TimingProbe& operator=(const TimingProbe&)=delete;
+        bool Complete(bool result) noexcept {success_=result;return result;}
+        void Success() noexcept {success_=true;}
+    };
+#endif
     enum class RejectReason : std::size_t { Failed, ZeroEpoch, EpochMismatch, NodeCap, Validation, Invalid, Overflow, Charge, BudgetCount, BudgetBytes, Count };
     struct AdmissionDiag {
         u64 small_attempts{},small_accepted{},small_submit_failed{},prefix_attempts{},prefix_accepted{},prefix_exceptions{},large_attempts{},large_accepted{},large_submit_failed{},partial_drain{},partial_large{};
@@ -65,6 +86,10 @@ private:
     u64 small_groups_submitted_{},small_groups_synchronous_{},small_passes_{},small_submitted_draws_{};
     u64 transfer_success_{},transfer_fallback_{};
     AdmissionDiag admission_diag_{};
+#if !defined(NDEBUG)
+    CoordinatorTimingProbes timing_probes_{};
+    unsigned admission_timing_depth_{};
+#endif
     JobPtr Record(const JobPtr& job);
     std::function<void()> MakeRelease(const JobPtr& job);
     bool SubmitGroup(const GroupPtr& group);
@@ -92,6 +117,9 @@ public:
     // leases must remain retained through the corresponding GPU fence.
     template<class Accept> bool Drain(u64 signal_tick,Accept&& accept) {
         static_assert(std::is_nothrow_invocable_v<Accept,Rhi::CommandList*,JobPtr,PrefixPtr>, "accept must be noexcept");
+#if !defined(NDEBUG)
+        TimingProbe timing{*this,TimingPhase::Drain};
+#endif
         if(failed_ || !signal_tick || (pending_epoch_ && pending_epoch_!=signal_tick) || nodes_.size()+in_flight_count_>node_cap_)return false;
         CloseSmall(0); // submission/drain boundary
         for(auto& node:nodes_) {
@@ -110,9 +138,15 @@ public:
             nodes_.pop_front();
         }
         pending_epoch_=0;
+#if !defined(NDEBUG)
+        timing.Success();
+#endif
         return true;
     }
     void Collect(u64 completed_tick) noexcept {
+#if !defined(NDEBUG)
+        TimingProbe timing{*this,TimingPhase::Collect};
+#endif
         for(auto& slot:in_flight_) if(slot.tick && slot.tick<=completed_tick) {
             if(slot.release) {
                 // release holds a Job copy before the slot drops its copy. The
@@ -122,6 +156,9 @@ public:
             }
             slot.prefix_lease.reset();slot.tick=0;--in_flight_count_;
         }
+#if !defined(NDEBUG)
+        timing.Success();
+#endif
     }
     struct WorkerStats {u64 jobs,wall_ns,cpu_100ns,cpu_samples,peak,recorded_passes,recorded_draws,small_groups_submitted,small_groups_synchronous,small_passes,small_submitted_draws;};
     struct TransferStats {u64 success,fallback;};
@@ -138,5 +175,11 @@ public:
         const auto used=nodes_.size()+in_flight_count_;
         return used<=node_cap_ && node_cap_-used>=2;
     }
+
+#if !defined(NDEBUG)
+    // Owner only; recording workers never update this snapshot.
+    CoordinatorTimingProbes TakeCoordinatorTimingProbes() noexcept;
+    void ResetCoordinatorTimingProbes() noexcept;
+#endif
 };
 }

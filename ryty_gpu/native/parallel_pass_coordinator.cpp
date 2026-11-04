@@ -5,8 +5,10 @@
 #endif
 #ifndef NDEBUG
 #define COORD_DIAG(...) __VA_ARGS__
+#define COORD_RETURN(value) return timing.Complete(value)
 #else
 #define COORD_DIAG(...)
+#define COORD_RETURN(value) return (value)
 #endif
 
 namespace Native::Parallel {
@@ -142,6 +144,9 @@ bool PassCoordinator::ResolveGroup(const GroupPtr& group,bool record_missing) {
     return true;
 }
 bool PassCoordinator::SubmitGroup(const GroupPtr& group) {
+#if !defined(NDEBUG)
+    TimingProbe timing{*this,TimingPhase::QueueSubmit};
+#endif
     try {
 #ifndef NDEBUG
         if(group->is_small && BatchDiag())group->submit_time=std::chrono::steady_clock::now();
@@ -163,10 +168,14 @@ bool PassCoordinator::SubmitGroup(const GroupPtr& group) {
 #endif
             return task;
         });
-        group->submitted=ok;return ok;
+        group->submitted=ok;
+        COORD_RETURN(ok);
     } catch(...) {return false;}
 }
 bool PassCoordinator::TryPass(u64 epoch,const Pass& pass,std::size_t total_owned_bytes) {
+#if !defined(NDEBUG)
+    TimingProbe timing{*this,TimingPhase::Admission};
+#endif
     COORD_DIAG(++admission_diag_.large_attempts);
     const auto reject=[&](RejectReason why){COORD_DIAG(++admission_diag_.large_rejected[static_cast<std::size_t>(why)]);return false;};
     // A later task must not overtake an earlier, incomplete group in the future queue.
@@ -188,16 +197,19 @@ bool PassCoordinator::TryPass(u64 epoch,const Pass& pass,std::size_t total_owned
     std::function<void()> release=MakeRelease(job);
     nodes_.push_back({nullptr,job,{},group,false,std::move(release)});
     if(!SubmitGroup(group)){nodes_.pop_back();COORD_DIAG(++admission_diag_.large_submit_failed);return false;}
-    pending_epoch_=epoch;COORD_DIAG(++admission_diag_.large_accepted);return true;
+    pending_epoch_=epoch;COORD_DIAG(++admission_diag_.large_accepted);COORD_RETURN(true);
 }
 bool PassCoordinator::TryPassTransfer(u64 epoch,Pass& pass,std::size_t total_owned_bytes) {
-    if(!draw_pool_)return TryPass(epoch,pass,total_owned_bytes);
+#if !defined(NDEBUG)
+    TimingProbe timing{*this,TimingPhase::Admission};
+#endif
+    if(!draw_pool_){COORD_RETURN(TryPass(epoch,pass,total_owned_bytes));}
     struct Loan {
         DrawPool* pool;std::size_t index;std::vector<Draw> spare;
         ~Loan(){if(index!=DrawPool::Invalid && !pool->ReturnLoan(index,spare))std::terminate();}
     } loan{draw_pool_.get(),DrawPool::Invalid,{}};
     loan.index=draw_pool_->TryTake(loan.spare,pass.draws.capacity());
-    if(loan.index==DrawPool::Invalid){COORD_DIAG(++transfer_fallback_);return TryPass(epoch,pass,total_owned_bytes);}
+    if(loan.index==DrawPool::Invalid){COORD_DIAG(++transfer_fallback_);COORD_RETURN(TryPass(epoch,pass,total_owned_bytes));}
     COORD_DIAG(++admission_diag_.large_attempts);
     const auto reject=[&](RejectReason why){COORD_DIAG(++admission_diag_.large_rejected[static_cast<std::size_t>(why)]);return false;};
     CloseSmall(1);
@@ -224,9 +236,12 @@ bool PassCoordinator::TryPassTransfer(u64 epoch,Pass& pass,std::size_t total_own
         pass.draws.swap(loan.spare);job->pass.draws.swap(pass.draws);job->loan=DrawPool::Invalid;
         nodes_.pop_back();COORD_DIAG(++admission_diag_.large_submit_failed);return false; // loan destructor restores the spare
     }
-    loan.index=DrawPool::Invalid;COORD_DIAG(++transfer_success_);pending_epoch_=epoch;COORD_DIAG(++admission_diag_.large_accepted);return true;
+    loan.index=DrawPool::Invalid;COORD_DIAG(++transfer_success_);pending_epoch_=epoch;COORD_DIAG(++admission_diag_.large_accepted);COORD_RETURN(true);
 }
 bool PassCoordinator::TrySmallPass(u64 epoch,const Pass& pass,std::size_t total_owned_bytes) {
+#if !defined(NDEBUG)
+    TimingProbe timing{*this,TimingPhase::Admission};
+#endif
     COORD_DIAG(++admission_diag_.small_attempts);
     const auto reject=[&](RejectReason why){COORD_DIAG(++admission_diag_.small_rejected[static_cast<std::size_t>(why)]);return false;};
     if(failed_)return reject(RejectReason::Failed);
@@ -257,8 +272,34 @@ bool PassCoordinator::TrySmallPass(u64 epoch,const Pass& pass,std::size_t total_
         // Once published, a failed submission remains an ordered synchronous group.
         if(SubmitGroup(group)){COORD_DIAG(++small_groups_submitted_);COORD_DIAG(small_submitted_draws_+=group->draws);}else COORD_DIAG(++admission_diag_.small_submit_failed);CloseSmall(2);
     }
-    COORD_DIAG(++admission_diag_.small_accepted);return true;
+    COORD_DIAG(++admission_diag_.small_accepted);COORD_RETURN(true);
 }
+
+#if !defined(NDEBUG)
+PassCoordinator::TimingProbe::TimingProbe(PassCoordinator& owner,TimingPhase phase) noexcept :phase_(phase) {
+    if(!GateDiag() || phase==TimingPhase::Count)return;
+    owner_=&owner;
+    // Transfer fallback can call TryPass; count only the complete outer attempt.
+    if(phase==TimingPhase::Admission && owner.admission_timing_depth_++!=0)return;
+    sampled_=true;start_=std::chrono::steady_clock::now();
+}
+PassCoordinator::TimingProbe::~TimingProbe() noexcept {
+    if(!owner_)return;
+    if(phase_==TimingPhase::Admission)--owner_->admission_timing_depth_;
+    if(!sampled_)return;
+    auto& total=owner_->timing_probes_.phases[static_cast<std::size_t>(phase_)];
+    total.ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start_).count();
+    ++total.count;if(!success_)++total.failed;
+}
+PassCoordinator::CoordinatorTimingProbes PassCoordinator::TakeCoordinatorTimingProbes() noexcept {
+    return std::exchange(timing_probes_,{});
+}
+
+void PassCoordinator::ResetCoordinatorTimingProbes() noexcept {
+    timing_probes_={};
+}
+#endif
 }
 
 #undef COORD_DIAG
+#undef COORD_RETURN
