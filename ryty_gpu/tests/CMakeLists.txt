@@ -548,3 +548,24 @@ else()
     target_compile_options(ordered_pass_worker_handles_test PRIVATE -UNDEBUG)
 endif()
 add_test(NAME ordered_pass_worker_handles COMMAND ordered_pass_worker_handles_test)
+
+add_executable(parallel_chunk_submission_test parallel_chunk_submission_test.cpp)
+target_compile_features(parallel_chunk_submission_test PRIVATE cxx_std_23)
+target_include_directories(parallel_chunk_submission_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+if(MSVC)
+    target_compile_options(parallel_chunk_submission_test PRIVATE /UNDEBUG /EHsc)
+else()
+    target_compile_options(parallel_chunk_submission_test PRIVATE -UNDEBUG)
+endif()
+set(chunk_fragments chunk-closure-types.inc chunk-end-rendering.inc chunk-close-before-draw.inc chunk-rotate-segment.inc)
+list(TRANSFORM chunk_fragments PREPEND "${CMAKE_CURRENT_BINARY_DIR}/")
+add_custom_command(OUTPUT ${chunk_fragments}
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_parallel_chunk_submission.py"
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
+        "${SHADGT_ROOT}/ryty_gpu/native/parallel_rotate_segment.h"
+        "${CMAKE_CURRENT_BINARY_DIR}"
+    DEPENDS extract_parallel_chunk_submission.py
+        "${SHADGT_ROOT}/src/video_core/renderer_vulkan/vk_rasterizer_native.cpp"
+        "${SHADGT_ROOT}/ryty_gpu/native/parallel_rotate_segment.h" VERBATIM)
+target_sources(parallel_chunk_submission_test PRIVATE ${chunk_fragments})
+add_test(NAME parallel_chunk_submission COMMAND parallel_chunk_submission_test)

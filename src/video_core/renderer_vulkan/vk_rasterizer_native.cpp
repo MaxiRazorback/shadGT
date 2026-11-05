@@ -6536,11 +6536,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         if(eligible && same_serial_scope)
             parallel->NoteSerialEligible();
         else parallel->FinishSerialEligibleRun();
+        // Hand long scopes to workers in bounded draw batches. Keep the full
+        // admission proof and EndRendering's ordered prefix, owner retention
+        // and synchronous fallback for every batch.
         u32 close_reason=0;
         if(parallel->active && ((!eligible && (close_reason|=CloseIneligible,true)) ||
            (!s.rendering && (close_reason|=CloseNotRendering,true)) ||
            (!(s.render==targets.state) && (close_reason|=CloseTarget,true)) ||
-           (parallel->active->draws.size()>=256 && (close_reason|=CloseFull,true)))) {
+           (parallel->active->draws.size()>=64 && (close_reason|=CloseFull,true)))) {
             if(close_reason!=CloseIneligible || !ContinueSmallParallelPass(targets.state,close_reason,inline_safe)) {
                 EndRendering(close_reason);PassBarrier(); // continuation uses LOAD, with an attachment dependency
             }
