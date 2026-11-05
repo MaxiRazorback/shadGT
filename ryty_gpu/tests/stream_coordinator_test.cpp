@@ -95,9 +95,9 @@ public:
 }
 using namespace Native::Parallel;
 using namespace std::chrono_literals;
-static std::shared_ptr<Pass> Source(std::size_t capacity=64){
+static std::shared_ptr<Pass> Source(std::size_t capacity=64,std::size_t initial=8){
     auto pass=std::make_shared<Pass>();pass->resource_lease=std::make_shared<int>(7);pass->draws.reserve(capacity);
-    auto owner=std::make_shared<int>(42);for(int i=1;i<=8;++i)pass->draws.push_back({i,16,owner});return pass;
+    auto owner=std::make_shared<int>(42);for(std::size_t i=1;i<=initial;++i)pass->draws.push_back({int(i),16,owner});return pass;
 }
 static void WaitFor(const std::atomic<std::size_t>& value,std::size_t target){
     const auto deadline=std::chrono::steady_clock::now()+2s;
@@ -107,6 +107,24 @@ static auto Accept(std::vector<Native::Rhi::CommandList*>& lists){
     return [&lists](Native::Rhi::CommandList* list,PassCoordinator::JobPtr,PassCoordinator::PrefixPtr)noexcept{lists.push_back(list);};
 }
 int main(){
+    // Starting with fewer than eight draws still runs the worker while the
+    // producer is open. Each subsequent slot is published individually.
+    for(std::size_t initial:{1,2,7}){Native::Rhi::Device device;Vulkan::Instance instance;Native::Rhi::Fence fence;Native::Rhi::CommandList prefix{1};
+     PassCoordinator coordinator(device,instance,fence);auto source=Source(64,initial);const Draw* storage=source->draws.data();
+     std::weak_ptr<int> owner=source->draws[0].owner;
+     auto ticket=coordinator.BeginStream(7,source,&prefix,source->resource_lease);CHECK(ticket && coordinator.PendingNodes()==2);
+     WaitFor(instance.emitted,initial);std::vector<Native::Rhi::CommandList*> accepted;accepted.reserve(2);
+     CHECK(!coordinator.Drain(7,Accept(accepted)) && accepted.empty() && !prefix.ended);
+     for(std::size_t count=initial+1;count<=64;++count){
+        source->draws.push_back({int(count),16,source->draws[0].owner});CHECK(source->draws.data()==storage);
+        CHECK(coordinator.PublishStream(ticket,count));WaitFor(instance.emitted,count);
+        CHECK(!coordinator.Drain(7,Accept(accepted)) && accepted.empty() && !prefix.ended);
+     }
+     coordinator.FinishStream(ticket);CHECK(prefix.ended && source->draws.empty() && ticket->pass.draws.data()==storage);
+     auto* replacement=coordinator.StreamReplacement(ticket);source.reset();
+     CHECK(coordinator.Drain(7,Accept(accepted)) && accepted.size()==2 && accepted[0]==&prefix && accepted[1]==ticket->list);ticket.reset();
+     CHECK(instance.emitted==64 && instance.fallbacks==0 && !owner.expired());
+     coordinator.Collect(6);CHECK(!owner.expired());coordinator.Collect(7);CHECK(owner.expired());device.ReleaseUnsubmitted(replacement);}
     // Open streams cannot consume futures or reach the primary. The worker has
     // nevertheless consumed immutable draw slots before FinishStream.
     {Native::Rhi::Device device;Vulkan::Instance instance;Native::Rhi::Fence fence;Native::Rhi::CommandList prefix{1};
@@ -146,9 +164,9 @@ int main(){
      CHECK(std::count_if(device.lists.begin(),device.lists.end(),[](const auto& list){return list->released==1;})==1);
      coordinator.FinishStream(x);std::vector<Native::Rhi::CommandList*> accepted;accepted.reserve(2);CHECK(coordinator.Drain(7,Accept(accepted)));coordinator.Collect(7);}
     // Budget and replacement acquisition failures leave no accepted work.
-    for(bool fail_acquire:{false,true}){Native::Rhi::Device device;Vulkan::Instance instance;Native::Rhi::Fence fence;Native::Rhi::CommandList prefix{1};
-     device.fail_acquire=fail_acquire;PassCoordinator coordinator(device,instance,fence,32,fail_acquire?64*1024*1024:1024);auto source=Source();
-     CHECK(!coordinator.BeginStream(7,source,&prefix,source->resource_lease));CHECK(coordinator.PendingNodes()==0 && coordinator.Budget().count==0 && source->draws.size()==8 && !prefix.ended);}
+    for(std::size_t initial:{1,2,7,8})for(bool fail_acquire:{false,true}){Native::Rhi::Device device;Vulkan::Instance instance;Native::Rhi::Fence fence;Native::Rhi::CommandList prefix{1};
+     device.fail_acquire=fail_acquire;PassCoordinator coordinator(device,instance,fence,32,fail_acquire?64*1024*1024:1024);auto source=Source(64,initial);
+     CHECK(!coordinator.BeginStream(7,source,&prefix,source->resource_lease));CHECK(coordinator.PendingNodes()==0 && coordinator.Budget().count==0 && source->draws.size()==initial && !prefix.ended && instance.emitted==0 && instance.fallbacks==0);}
     // Initial and incremental descriptor charges must stay within the reserved
     // per-draw cap; rejected unpublished tail slots cannot reach the worker.
     {Native::Rhi::Device device;Vulkan::Instance instance;Native::Rhi::Fence fence;Native::Rhi::CommandList prefix{1};
@@ -165,10 +183,11 @@ int main(){
         bytes[i]=coordinator.Budget().bytes;coordinator.FinishStream(ticket);std::vector<Native::Rhi::CommandList*> accepted;accepted.reserve(2);CHECK(coordinator.Drain(7,Accept(accepted)));coordinator.Collect(7);}
      CHECK(bytes[1]-bytes[0]==192*sizeof(Draw));}
     // Failed worker recording is discarded and replayed once after sealing.
-    {Native::Rhi::Device device;Vulkan::Instance instance;Native::Rhi::Fence fence;Native::Rhi::CommandList prefix{1};
-     instance.fail_record=true;PassCoordinator coordinator(device,instance,fence);auto source=Source();auto ticket=coordinator.BeginStream(7,source,&prefix,source->resource_lease);CHECK(ticket);
+    for(std::size_t initial:{1,2,7,8}){Native::Rhi::Device device;Vulkan::Instance instance;Native::Rhi::Fence fence;Native::Rhi::CommandList prefix{1};
+     instance.fail_record=true;PassCoordinator coordinator(device,instance,fence);auto source=Source(64,initial);auto ticket=coordinator.BeginStream(7,source,&prefix,source->resource_lease);CHECK(ticket);
+     for(std::size_t count=initial+1;count<=64;++count){source->draws.push_back({int(count),16,source->draws[0].owner});CHECK(coordinator.PublishStream(ticket,count));}
      coordinator.FinishStream(ticket);std::vector<Native::Rhi::CommandList*> accepted;accepted.reserve(2);CHECK(coordinator.Drain(7,Accept(accepted)));
-     CHECK(instance.failed==1 && instance.fallbacks==1 && instance.emitted==8);coordinator.Collect(7);}
+     CHECK(accepted.size()==2 && accepted[0]==&prefix && instance.failed==1 && instance.fallbacks==1 && instance.emitted==64);coordinator.Collect(7);}
     // Accepted storage and owners survive source/ticket release and GPU drain.
     {Native::Rhi::Device device;Vulkan::Instance instance;Native::Rhi::Fence fence;Native::Rhi::CommandList prefix{1};
      PassCoordinator coordinator(device,instance,fence);auto source=Source();std::weak_ptr<int> owner=source->draws[0].owner;

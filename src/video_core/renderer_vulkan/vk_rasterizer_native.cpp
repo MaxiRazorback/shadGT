@@ -6852,9 +6852,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             if(serial_split_started)NATIVE_DIAGNOSTIC(++parallel->serial_split_first_draws);
             if(preclosed_serial_scope)NATIVE_DIAGNOSTIC(++parallel->natural_captured);
             // Use one worker invocation and command list for the whole scope.
-            // The first eight draws retain the existing large-pass policy;
-            // subsequent immutable packets are published individually.
-            if(parallel->draw_stream || (!parallel->stream_attempted && draws.size()>=8)) {
+            // Publish from the first fully admitted draw. Later packets share
+            // this worker/list and retain the ordered prefix until pass closure.
+            if(parallel->draw_stream || !parallel->stream_attempted) {
                 parallel->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::EndPass);
                 if(parallel->draw_stream) {
                     ASSERT_MSG(parallel->coordinator->PublishStream(parallel->draw_stream,draws.size()),

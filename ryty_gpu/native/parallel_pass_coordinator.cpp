@@ -222,7 +222,7 @@ PassCoordinator::StreamTicket PassCoordinator::BeginStream(u64 epoch,const std::
     CloseSmall(1);
     if(failed_ || !epoch || (pending_epoch_ && pending_epoch_!=epoch) ||
        !current_prefix || !prefix_resources || !HasRoomForPass() || !source ||
-       source->draws.size()<8 || source->draws.size()>StreamDrawLimit ||
+       source->draws.empty() || source->draws.size()>StreamDrawLimit ||
        source->draws.capacity()<StreamDrawLimit || source->draws.capacity()>256 ||
        !ValidatePass(*source))return reject();
     for(const auto& draw:source->draws)

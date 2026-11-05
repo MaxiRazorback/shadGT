@@ -146,7 +146,7 @@ public:
     bool TryPass(u64 epoch,const Pass& pass,std::size_t total_owned_bytes);
     bool TryPassTransfer(u64 epoch,Pass& pass,std::size_t total_owned_bytes);
     bool TrySmallPass(u64 epoch,const Pass& pass,std::size_t total_owned_bytes);
-    // Start only after at least eight complete admitted packets. The producer
+    // Start after the first complete admitted packet. The producer
     // keeps recording into current_prefix until FinishStream; workers only see
     // published immutable slots, never the changing source vector metadata.
     StreamTicket BeginStream(u64 epoch,const std::shared_ptr<Pass>& source,
