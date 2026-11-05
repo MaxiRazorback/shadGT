@@ -644,6 +644,11 @@ private:
     bool frame_dump_collecting{};
     bool frame_dump_done{};
     bool frame_dump_write_old{}; // written at the next draw (not at the flip)
+#ifndef NDEBUG
+    bool debug_frame_dump_active{};
+    bool debug_frame_dump_previous_done{};
+    std::filesystem::path debug_frame_dump_dir;
+#endif
     std::filesystem::path frame_dump_dir;
     /// FIX-153 (diagnosis): render targets of the dumped frame the CPU reads back (from
     /// 0xf000000000 up), and how many flips to wait before their guest memory is saved.

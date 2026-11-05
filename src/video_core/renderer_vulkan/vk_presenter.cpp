@@ -1149,6 +1149,60 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
         .baseArrayLayer = 0,
         .layerCount = 1,
     };
+#ifndef NDEBUG
+    std::optional<ScreenshotReadback> pending_screenshot;
+    const u32 screenshot_count = VideoCore::ConsumeGameOnlyScreenshotRequests();
+    if (screenshot_count) {
+        const auto paths = BuildScreenshotPaths(ScreenshotKind::GameOnly, screenshot_count);
+        const auto format = display->capture_format;
+        const bool supported = format == vk::Format::eR8G8B8A8Unorm ||
+                               format == vk::Format::eR8G8B8A8Srgb ||
+                               format == vk::Format::eB8G8R8A8Unorm ||
+                               format == vk::Format::eB8G8R8A8Srgb ||
+                               format == vk::Format::eA2R10G10B10UnormPack32 ||
+                               format == vk::Format::eA2B10G10R10UnormPack32;
+        if (!display->capture_transfer_src || !supported || !display->width || !display->height) {
+            LOG_ERROR(Render_Vulkan, "Native screenshot unavailable: format {}, transfer source {}, size {}x{}",
+                      vk::to_string(format), display->capture_transfer_src, display->width,
+                      display->height);
+        } else {
+            const bool hdr_encoded = attribute.attrib.pixel_format ==
+                                     Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq;
+            auto& readback = pending_screenshot.emplace(instance, ScreenshotKind::GameOnly, paths,
+                                                        display->width, display->height, format,
+                                                        hdr_encoded);
+            draw_scheduler.EndRendering();
+            const auto cmdbuf = draw_scheduler.DirectCommandBuffer();
+            const vk::ImageMemoryBarrier2 to_copy{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+                .oldLayout = vk::ImageLayout::eGeneral,
+                .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+                .image = display->image,
+                .subresourceRange = single,
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_copy});
+            CopyImageToReadback(cmdbuf, display->image, vk::ImageLayout::eTransferSrcOptimal,
+                                readback);
+            const vk::BufferMemoryBarrier2 to_host{
+                .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+                .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .buffer = readback.buffer.Handle(),
+                .offset = 0,
+                .size = static_cast<u64>(readback.width) * readback.height * 4,
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &to_host});
+        }
+    }
+#endif
     // The display picture is read in the shader-read layout, then goes back to the general
     // layout native mode keeps its images in.
     const std::array<vk::ImageMemoryBarrier2, 2> barriers{{
@@ -1169,12 +1223,24 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
             },
         },
         {
+#ifndef NDEBUG
+            .srcStageMask = pending_screenshot ? vk::PipelineStageFlagBits2::eCopy
+                                               : vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = pending_screenshot ? vk::AccessFlagBits2::eTransferRead
+                                                : vk::AccessFlagBits2::eMemoryWrite,
+#else
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
             .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+#endif
             .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader |
                             vk::PipelineStageFlagBits2::eComputeShader,
             .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+#ifndef NDEBUG
+            .oldLayout = pending_screenshot ? vk::ImageLayout::eTransferSrcOptimal
+                                            : vk::ImageLayout::eGeneral,
+#else
             .oldLayout = vk::ImageLayout::eGeneral,
+#endif
             .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
             .image = display->image,
             .subresourceRange = single,
@@ -1258,6 +1324,16 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
     });
     DebugState.game_resolution = {image_size.width, image_size.height};
     DebugState.output_resolution = {frame->width, frame->height};
+#ifndef NDEBUG
+    if (pending_screenshot) {
+        draw_scheduler.DeferPriorityOperation(
+            [deferred_screenshot = std::move(pending_screenshot)]() mutable {
+                auto& readback = deferred_screenshot.value();
+                readback.buffer.Invalidate(0, readback.buffer.mapped_data.size());
+                SavePendingScreenshot(readback);
+            });
+    }
+#endif
     frame->ready_semaphore = draw_scheduler.GetWorkSemaphore()->Handle();
     frame->ready_tick = draw_scheduler.CurrentTick();
     frame->ready_scheduler = &draw_scheduler;

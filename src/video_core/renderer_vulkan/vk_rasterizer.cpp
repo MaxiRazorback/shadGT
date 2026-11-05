@@ -24,6 +24,7 @@
 #include "core/memory.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/renderdoc.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
@@ -3299,7 +3300,8 @@ void Rasterizer::FrameDumpFlip() {
         }
         return times;
     }();
-    if (frame_dump_done && frame_dump_mem.empty() && frame_dump_index + 1 < dump_times.size()) {
+    if (!debug_frame_dump_active && frame_dump_done && frame_dump_mem.empty() &&
+        frame_dump_index + 1 < dump_times.size()) {
         ++frame_dump_index;
         frame_dump_done = false;
     }
@@ -3335,7 +3337,7 @@ void Rasterizer::FrameDumpFlip() {
     {
         static auto last_check = std::chrono::steady_clock::now();
         const auto check_now = std::chrono::steady_clock::now();
-        if (!frame_dump_collecting && frame_dump_mem.empty() &&
+        if (!debug_frame_dump_active && !frame_dump_collecting && frame_dump_mem.empty() &&
             check_now - last_check > std::chrono::milliseconds(500)) {
             last_check = check_now;
             static const auto trigger =
@@ -3349,10 +3351,57 @@ void Rasterizer::FrameDumpFlip() {
             }
         }
     }
-    if ((dump_at < 0 && !exposure_dump_requested && !frame_dump_collecting) || frame_dump_done) {
-        return;
+    if (debug_frame_dump_active && frame_dump_done && frame_dump_mem.empty() &&
+        !frame_dump_write_old) {
+        debug_frame_dump_active = false;
+        frame_dump_done = debug_frame_dump_previous_done;
+        VideoCore::FinishDebugFrameDump();
     }
     const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    if (!debug_frame_dump_active && !frame_dump_collecting && frame_dump_mem.empty() &&
+        !frame_dump_write_old && (frame_dump_done || !exposure_dump_requested) &&
+        (dump_at < 0 || now < dump_at || frame_dump_done) && VideoCore::BeginDebugFrameDump()) {
+        const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        const auto parent = Common::FS::GetUserPath(Common::FS::PathType::LogDir);
+        std::error_code ec;
+        const auto space = std::filesystem::space(parent, ec);
+        bool created = false;
+        if (ec) {
+            LOG_ERROR(Render_Vulkan, "F8 capture: cannot check free disk space: {}", ec.message());
+        } else if (space.available < (2ull << 30)) {
+            LOG_ERROR(Render_Vulkan, "F8 capture: at least 2 GiB of free disk space is required");
+        } else {
+            for (unsigned suffix = 0; suffix < 1000; ++suffix) {
+                debug_frame_dump_dir = parent / fmt::format("dump-f8-{}-{}", stamp, suffix);
+                if ((created = std::filesystem::create_directory(debug_frame_dump_dir, ec))) {
+                    break;
+                }
+                if (ec) {
+                    break;
+                }
+            }
+            if (!created) {
+                LOG_ERROR(Render_Vulkan, "F8 capture: cannot create output directory: {}",
+                          ec ? ec.message() : "all names are already in use");
+            }
+        }
+        if (!created) {
+            VideoCore::FinishDebugFrameDump();
+        } else {
+            debug_frame_dump_active = true;
+            debug_frame_dump_previous_done = frame_dump_done;
+            frame_dump_done = false;
+            VideoCore::RequestScreenshotToPath(debug_frame_dump_dir / "screenshot.png");
+            LOG_WARNING(Render_Vulkan, "F8 capture: {} (screenshot at next present)",
+                        debug_frame_dump_dir.string());
+        }
+    }
+    if ((dump_at < 0 && !exposure_dump_requested && !frame_dump_collecting &&
+         !debug_frame_dump_active) ||
+        frame_dump_done) {
+        return;
+    }
     // NAT-128 (RYGT_FRAME_DUMP_FRAMES=n): n frames are collected (events of each, the targets and
     // textures as the last one left them), for work the game does every few frames only.
     static const u32 dump_frames = [] {
@@ -3361,7 +3410,7 @@ void Rasterizer::FrameDumpFlip() {
     }();
     static u32 frames_seen = 0;
     if (!frame_dump_collecting) {
-        if ((dump_at >= 0 && now >= dump_at) || exposure_dump_requested) {
+        if ((dump_at >= 0 && now >= dump_at) || exposure_dump_requested || debug_frame_dump_active) {
             frame_dump_collecting = true; // the next frame's targets are noted
             frame_dump_old.clear();
             frames_seen = 0;
@@ -3371,7 +3420,7 @@ void Rasterizer::FrameDumpFlip() {
         }
         return;
     }
-    if (++frames_seen < dump_frames) {
+    if (++frames_seen < (debug_frame_dump_active ? 1u : dump_frames)) {
         FrameDumpEvent(fmt::format("---- flip {} ----", frames_seen));
         return;
     }
@@ -3380,10 +3429,12 @@ void Rasterizer::FrameDumpFlip() {
 #ifdef RYTY_GPU
     Native::g_watch_window = false;
 #endif
-    const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir) /
-                     fmt::format("dump-{}-{}", native ? "native" : "old",
-                                 dump_at >= 0 ? fmt::format("{:g}", dump_at)
-                                              : std::string{"exp"});
+    const auto dir = debug_frame_dump_active
+                         ? debug_frame_dump_dir
+                         : Common::FS::GetUserPath(Common::FS::PathType::LogDir) /
+                               fmt::format("dump-{}-{}", native ? "native" : "old",
+                                           dump_at >= 0 ? fmt::format("{:g}", dump_at)
+                                                        : std::string{"exp"});
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     FrameDumpWriteEvents(dir);

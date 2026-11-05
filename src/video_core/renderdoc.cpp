@@ -28,6 +28,22 @@ enum class CaptureState {
     InProgress,
 };
 static CaptureState capture_state{CaptureState::Idle};
+enum class DebugFrameDumpState { Idle, Pending, Active };
+static std::atomic<DebugFrameDumpState> debug_frame_dump{DebugFrameDumpState::Idle};
+
+bool RequestDebugFrameDump() {
+    auto expected = DebugFrameDumpState::Idle;
+    return debug_frame_dump.compare_exchange_strong(expected, DebugFrameDumpState::Pending);
+}
+
+bool BeginDebugFrameDump() {
+    auto expected = DebugFrameDumpState::Pending;
+    return debug_frame_dump.compare_exchange_strong(expected, DebugFrameDumpState::Active);
+}
+
+void FinishDebugFrameDump() {
+    debug_frame_dump.store(DebugFrameDumpState::Idle);
+}
 #endif
 static std::atomic<u32> screenshot_game_only_count{0};
 static std::atomic<u32> screenshot_with_overlays_count{0};
