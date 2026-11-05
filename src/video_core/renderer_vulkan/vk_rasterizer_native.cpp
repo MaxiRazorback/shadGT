@@ -10422,6 +10422,100 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
     }
     u64 extra_bytes=0, total_readback_bytes=0;
     constexpr u64 TraceReadbackBudget=128ull<<20;
+    struct RegionReadback {
+        std::unique_ptr<Native::Rhi::Buffer> buffer;
+        std::vector<u8> guest;
+        std::string stem;
+        bool guest_readable;
+        u64 size;
+    };
+    std::vector<RegionReadback> region_readbacks;
+    std::string region_manifest;
+    // Prioritize small CPU-backed sampled textures before the image readback budget is spent.
+    // These guest bytes are observed during this dump, not at texture upload time.
+    for (const auto& [key, entry] : dump_textures) {
+        const u64 address = entry->info.guest_address;
+        const u64 size = entry->info.guest_size;
+        if (!entry->from_cpu || !entry->image || !size || size > (4ull << 20) ||
+            size > std::numeric_limits<u64>::max() - address) {
+            continue;
+        }
+        const u64 end = address + size;
+        auto it = regions.upper_bound(address);
+        if (it != regions.begin()) --it;
+        for (; it != regions.end() && it->second.begin < end; ++it) {
+            const Region& region = it->second;
+            const u64 begin = std::max(address, region.begin);
+            const u64 limit = std::min(end, region.end);
+            if (begin >= limit || !region.buffer) continue;
+            const u64 offset = begin - region.begin;
+            const u64 bytes = limit - begin;
+            const std::string stem = fmt::format("region-{}-{:x}", key, begin);
+            region_manifest += fmt::format("{} texture={:#x}+{:#x} region={:#x}..{:#x} "
+                                           "slice={:#x}+{:#x}",
+                                           stem, address, size, region.begin, region.end,
+                                           offset, bytes);
+            region_manifest += " dirty_pages=";
+            bool has_dirty = false;
+            for (const VAddr page : region.dirty_pages) {
+                if (page < limit && page + 4096 > begin) {
+                    region_manifest += fmt::format("{:#x},", page);
+                    has_dirty = true;
+                }
+            }
+            if (!has_dirty) region_manifest += "none";
+            {
+                std::scoped_lock dirty_lock{region_dirty_mutex};
+                region_manifest += " snapshots=";
+                bool has_snapshot = false;
+                for (const auto& [page, snapshot] : page_snapshots) {
+                    if (snapshot && page < limit && page + 4096 > begin) {
+                        region_manifest += fmt::format("{:#x},", page);
+                        has_snapshot = true;
+                    }
+                }
+                if (!has_snapshot) region_manifest += "none";
+                region_manifest += " pending_writes=";
+                bool has_pending = false;
+                for (const auto& [first, last] : pending_region_writes) {
+                    if (first < limit && last > begin) {
+                        region_manifest += fmt::format("{:#x}..{:#x},", first, last);
+                        has_pending = true;
+                    }
+                }
+                if (!has_pending) region_manifest += "none";
+            }
+            if ((offset | bytes) & 3) {
+                region_manifest += " status=unaligned\n";
+                continue;
+            }
+            if (bytes > TraceReadbackBudget - total_readback_bytes) {
+                region_manifest += " status=budget\n";
+                continue;
+            }
+            auto buffer = device->CreateBuffer({.size = bytes,
+                .usage = Native::Rhi::BufferUsageTransferDst,
+                .memory = Native::Rhi::MemoryKind::Readback, .name = "scene trace region"});
+            if (!buffer || !buffer->Mapped()) {
+                region_manifest += " status=allocation_failed\n";
+                continue;
+            }
+            std::vector<u8> guest(bytes);
+            const bool readable = Core::RytyMemory::GuardedCopy(
+                guest.data(), reinterpret_cast<const void*>(begin), bytes);
+            s.cmd.copyBuffer(vk::Buffer{Handle<VkBuffer_T>(region.buffer->NativeHandle())},
+                             vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
+                             vk::BufferCopy{.srcOffset = offset, .dstOffset = 0, .size = bytes});
+            total_readback_bytes += bytes;
+            region_manifest += fmt::format(" status=queued guest={}\n",
+                                           readable ? "read" : "unreadable");
+            region_readbacks.push_back({std::move(buffer), std::move(guest), stem, readable, bytes});
+        }
+    }
+    if (auto* file = std::fopen((dir / "region-manifest.txt").string().c_str(), "w")) {
+        std::fwrite(region_manifest.data(), 1, region_manifest.size(), file);
+        std::fclose(file);
+    }
     std::string mip_manifest="file,address,mip,width,height,depth,layers,unit_bytes,compressed,bytes,status,version,format,depth_aspect\n";
     u32 index=0;
     for(const auto& [entry,name]:jobs){
@@ -10462,6 +10556,19 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
     s.cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount=1,.pMemoryBarriers=&trace_to_host});
     Splice();
     r.scheduler.Finish();
+    for (const auto& readback : region_readbacks) {
+        readback.buffer->Invalidate();
+        if (auto* file = std::fopen((dir / (readback.stem + "-gpu.bin")).string().c_str(), "wb")) {
+            std::fwrite(readback.buffer->Mapped(), 1, readback.size, file);
+            std::fclose(file);
+        }
+        if (readback.guest_readable) {
+            if (auto* file = std::fopen((dir / (readback.stem + "-guest.bin")).string().c_str(), "wb")) {
+                std::fwrite(readback.guest.data(), 1, readback.size, file);
+                std::fclose(file);
+            }
+        }
+    }
     if (!g_pixel_trace.hashes.empty()) {
         std::ofstream out{dir / "pixel-trace.txt"};
         const auto* words = reinterpret_cast<const u32*>(g_pixel_trace.buffer->Mapped());
