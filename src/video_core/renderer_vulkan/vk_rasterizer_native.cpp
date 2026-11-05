@@ -1,3 +1,4 @@
+#include <exception>
 #include "ryty_gpu/native/cpu_stack_registry.h"
 #include "ryty_gpu/native/ahead_descriptor_pools.h"
 #include "ryty_gpu/native/per_draw_view_proof.h"
@@ -332,7 +333,9 @@ struct ParallelRuntime {
     Native::Parallel::AppliedMode view_applied_mode{BatchViewWalkRequested()};bool view_mode_initial_logged{};
     u64 whole_seq{},whole_samples{},whole_wall_ns{},whole_cpu_samples{},whole_cpu_100ns{},whole_max_ns{};
     ParallelGateHistogram gates;
-    std::optional<Native::Parallel::Pass> active;
+    std::shared_ptr<Native::Parallel::Pass> active;
+    Native::Parallel::PassCoordinator::StreamTicket draw_stream;
+    bool stream_attempted{};
     Native::Parallel::SyncOwnerPins<> sync_pins;
     std::size_t pin_slot=Native::Parallel::SyncOwnerPins<>::Invalid;
     std::vector<Native::Parallel::Draw> scratch_draws;
@@ -1671,6 +1674,27 @@ void NativeRenderer::EndRendering(u32 reason) {
         NATIVE_DIAGNOSTIC(++sidecar->pass_size_hist[std::min<std::size_t>(8,pass.draws.size())]);
         u64 coordinator_start=0,coordinator_end=0;const bool cpu_started=ParallelGateDiagEnabled() && DescriptorThreadCpu100ns(coordinator_start);
         stream.rendering=false; // the captured pass has not begun on stream.cmd
+        if(sidecar->draw_stream) {
+            // CPU recording may already be underway, but all draw preparation
+            // stays in this prefix until the complete rendering scope is sealed.
+            auto ticket=std::move(sidecar->draw_stream);
+            sidecar->coordinator->FinishStream(ticket);
+            stream.list=sidecar->coordinator->StreamReplacement(ticket);
+            ASSERT_MSG(stream.list,"stream replacement command list missing");
+            stream.cmd=vk::CommandBuffer{reinterpret_cast<VkCommandBuffer>(stream.list->NativeHandle())};
+            stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;
+            sidecar->sync_pins.Queued(sidecar->pin_slot);
+            NATIVE_DIAGNOSTIC(++sidecar->queued);
+            sidecar->pass_closure.Close(captured_draws,true,reason);
+            sidecar->pin_slot=Native::Parallel::SyncOwnerPins<>::Invalid;
+            // FinishStream transferred the stable Draw backing to its Job.
+            // It must remain untouched until the corresponding GPU fence.
+            sidecar->active.reset();sidecar->lease.reset();sidecar->stream_attempted=false;
+            if(cpu_started && DescriptorThreadCpu100ns(coordinator_end) && coordinator_end>=coordinator_start) {
+                NATIVE_DIAGNOSTIC(sidecar->coordinator_cpu_100ns+=coordinator_end-coordinator_start);NATIVE_DIAGNOSTIC(++sidecar->coordinator_cpu_samples);
+            }
+            return;
+        }
         bool queued=false;
         if((pass.draws.size()>=8 || ParallelSmallPassBatchEnabled()) && !sidecar->closing) {
             const auto reset=[&]() noexcept {stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;};
@@ -1711,7 +1735,7 @@ void NativeRenderer::EndRendering(u32 reason) {
 
 bool NativeRenderer::ContinueSmallParallelPass(const RenderState& target,u32 reason,bool safe) {
     auto* sidecar=FindParallelRuntime(this);
-    if(!sidecar || !sidecar->active)return false;
+    if(!sidecar || !sidecar->active || sidecar->draw_stream)return false;
     auto& pass=*sidecar->active;
     if(!CanInlineContinuation(pass.draws.size(),ParallelSmallPassBatchEnabled(),sidecar->closing,
             stream.rendering,stream.render==target && pass.target==target,
@@ -5072,6 +5096,16 @@ struct PixelTrace {
 
 void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     std::scoped_lock lock{mutex};
+    struct StreamUnwindGuard {
+        NativeRenderer& renderer;
+        int exceptions=std::uncaught_exceptions();
+        ~StreamUnwindGuard() noexcept {
+            if(std::uncaught_exceptions()>exceptions) {
+                if(auto* runtime=FindParallelRuntime(&renderer);runtime && runtime->draw_stream)
+                    renderer.EndRendering();
+            }
+        }
+    } stream_unwind_guard{*this};
     if (ParallelRecordingRequested() && !parallel_sidecar_init_failed.load(std::memory_order_relaxed) && RytyGtsInRace() && !r.instance.IsIntel() && !FindParallelRuntime(this)) {
         try {
             auto sidecar=std::make_unique<ParallelRuntime>();
@@ -6527,7 +6561,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             fail(24,cheap_eligible && !descriptor_safe && !b.writes_buffers && b.gpu_writes.empty() && b.stored.empty());
             parallel->gates.Add(mask,stable);
         }
-        const bool eligible=descriptor_safe;
+        // A streaming reservation covers each descriptor snapshot before its
+        // immutable slot becomes visible to the recording worker.
+        const bool eligible=descriptor_safe && parallel_descriptor_bytes<=
+            Native::Parallel::PassCoordinator::StreamDescriptorBytesPerDraw;
         if(eligible) {NATIVE_DIAGNOSTIC(++parallel->eligible);
             if(parallel->active)NATIVE_DIAGNOSTIC(++parallel->eligible_in_active_scope);
             else if(s.rendering)NATIVE_DIAGNOSTIC(++parallel->eligible_in_serial_scope);
@@ -6536,14 +6573,13 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         if(eligible && same_serial_scope)
             parallel->NoteSerialEligible();
         else parallel->FinishSerialEligibleRun();
-        // Hand long scopes to workers in bounded draw batches. Keep the full
-        // admission proof and EndRendering's ordered prefix, owner retention
-        // and synchronous fallback for every batch.
+        // Bound stable storage for incremental publication. Every draw still
+        // passes the existing admission proof before worker visibility.
         u32 close_reason=0;
         if(parallel->active && ((!eligible && (close_reason|=CloseIneligible,true)) ||
            (!s.rendering && (close_reason|=CloseNotRendering,true)) ||
            (!(s.render==targets.state) && (close_reason|=CloseTarget,true)) ||
-           (parallel->active->draws.size()>=64 && (close_reason|=CloseFull,true)))) {
+           (parallel->active->draws.size()>=Native::Parallel::PassCoordinator::StreamDrawLimit && (close_reason|=CloseFull,true)))) {
             if(close_reason!=CloseIneligible || !ContinueSmallParallelPass(targets.state,close_reason,inline_safe)) {
                 EndRendering(close_reason);PassBarrier(); // continuation uses LOAD, with an attachment dependency
             }
@@ -6568,7 +6604,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                             }
                         }
                     } reserved_pin{parallel};
-                    parallel->scratch_draws.reserve(256);
+                    parallel->scratch_draws.reserve(Native::Parallel::PassCoordinator::StreamDrawLimit);
                     const u64 epoch=r.scheduler.CurrentTick();
                     auto lease=std::make_shared<const u64>(epoch);
                     Native::Parallel::Pass pass{};pass.target=targets.state;pass.resource_lease=lease;pass.extended_verified=extended;
@@ -6591,8 +6627,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                     if(prebind_ok) {
                         static_assert(std::is_nothrow_move_constructible_v<Native::Parallel::Pass>);
                         pass.draws.swap(parallel->scratch_draws);
+                        auto active=std::make_shared<Native::Parallel::Pass>(std::move(pass));
                         if(split_now) {EndRendering();PassBarrier();serial_split_started=true;NATIVE_DIAGNOSTIC(++parallel->serial_split_success);serial_split_prebound=true;}
-                        parallel->epoch=epoch;parallel->lease=std::move(lease);parallel->active.emplace(std::move(pass));
+                        parallel->epoch=epoch;parallel->lease=std::move(lease);parallel->active=std::move(active);
+                        parallel->stream_attempted=false;
                         parallel->active_list=s.list;parallel->active_cmd=s.cmd;
                         NATIVE_DIAGNOSTIC(parallel->pass_closure.origin=split_now?0:preclosed_serial_scope?1:2);
                         reserved_pin.committed=true;
@@ -6813,6 +6851,20 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             unfinished_draw_guard.committed=true;pending_draw_guard.committed=true;NATIVE_DIAGNOSTIC(++parallel->draws);
             if(serial_split_started)NATIVE_DIAGNOSTIC(++parallel->serial_split_first_draws);
             if(preclosed_serial_scope)NATIVE_DIAGNOSTIC(++parallel->natural_captured);
+            // Use one worker invocation and command list for the whole scope.
+            // The first eight draws retain the existing large-pass policy;
+            // subsequent immutable packets are published individually.
+            if(parallel->draw_stream || (!parallel->stream_attempted && draws.size()>=8)) {
+                parallel->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::EndPass);
+                if(parallel->draw_stream) {
+                    ASSERT_MSG(parallel->coordinator->PublishStream(parallel->draw_stream,draws.size()),
+                               "parallel draw publication failed");
+                } else {
+                    parallel->stream_attempted=true;
+                    parallel->draw_stream=parallel->coordinator->BeginStream(parallel->epoch,parallel->active,
+                        s.list,parallel->lease);
+                }
+            }
         } else {
         SceneTrace::GpuBegin(s.cmd);
         Native::GpuCheckpoints::Record(static_cast<VkCommandBuffer>(s.cmd), 1, frame,
@@ -10656,6 +10708,11 @@ void NativeRenderer::Report() {
                 LOG_INFO(Render_Vulkan,"PARALLEL-PREPARED-VIEW-STATE mode={} generation={} active={}",bool(state&1),state>>1,sidecar->prepared_proof_context->active.load(std::memory_order_seq_cst));}
         }
         if(ParallelGateDiagEnabled()) {
+#if !defined(NDEBUG)
+            const auto streaming=sidecar->coordinator->TakeStreamStats();
+            LOG_INFO(Render_Vulkan,"PARALLEL-DRAW-STREAM started={} published={} worker_started={} passes_with_early_work={} early_draws={} start_rejected={} (early work completed before stream seal)",
+                streaming.started,streaming.published,streaming.worker_started,streaming.passes_with_early_work,streaming.early_draws,streaming.start_rejected);
+#endif
             const auto top=sidecar->gates.Top();u64 shown=0;
             for(const auto& slot:top) if(slot.count) {shown+=slot.count;LOG_INFO(Render_Vulkan,"PARALLEL-GATE-DIAG mask={:#x} count={}",slot.mask,slot.count);}
             const auto& gates=sidecar->gates;

@@ -5,6 +5,7 @@
 #include "shader_recompiler/resource.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "ryty_gpu/native/descriptor_snapshot.h"
+#include "ryty_gpu/native/draw_publication.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Native::Parallel {
@@ -75,6 +76,15 @@ void EmitWholePass(const Pass& pass,Begin&& begin,Emit&& emit,End&& end) {
 // This routine neither resolves registry/guest state nor schedules GPU work.
 bool ValidatePass(const Pass& pass);
 bool RecordPass(vk::CommandBuffer cmd,const Vulkan::Instance& instance,const Pass& pass);
+// Header is immutable; storage contains publication.count completed slots. The
+// callback never reads the producer's changing vector metadata. One worker owns
+// the command buffer and its binding caches for the entire stream.
+bool RecordPublishedPass(vk::CommandBuffer cmd,const Vulkan::Instance& instance,
+                         const Pass& header,const Draw* storage,DrawPublication& publication
+#if !defined(NDEBUG)
+                         ,std::size_t* early_draws=nullptr
+#endif
+                         );
 // Validates first, then leaves the rendering scope open and returns the final
 // command-buffer state through the supplied recorder-owned cache.
 bool RecordPassInline(vk::CommandBuffer cmd,const Vulkan::Instance& instance,const Pass& pass,

@@ -50,6 +50,11 @@ struct Pass {RenderState target;std::vector<Draw> draws;};
 template<int=0> struct SyncOwnerPins {static constexpr std::size_t Invalid=~std::size_t{0};};
 struct RotationDiag {u64 attempts{},success{},invalid{},preflight{},acquire{},command{},prefix{},exception{};};
 struct PassCoordinator {
+    static constexpr std::size_t StreamDrawLimit=64;
+    using StreamTicket=std::shared_ptr<Pass>;
+    Native::Rhi::CommandList stream_replacement{2};
+    void FinishStream(const StreamTicket& ticket) { assert(ticket && ticket->draws.size()==64); events.push_back("finish-stream"); }
+    Native::Rhi::CommandList* StreamReplacement(const StreamTicket&) { events.push_back("replacement"); return &stream_replacement; }
     enum class TimingPhase {Rotation};
     struct TimingProbe {TimingProbe(PassCoordinator&,TimingPhase){} void Success(){}};
     bool allow_rotation=true,allow_prefix=true,allow_admission=true,throw_admission=false;
@@ -83,7 +88,9 @@ struct ParallelRuntime {
     } sync_pins;
     Native::Parallel::PassCoordinator actual_coordinator;
     Native::Parallel::PassCoordinator* coordinator=&actual_coordinator;
-    std::optional<Native::Parallel::Pass> active;
+    std::shared_ptr<Native::Parallel::Pass> active;
+    Native::Parallel::PassCoordinator::StreamTicket draw_stream;
+    bool stream_attempted{};
     std::shared_ptr<const void> lease=std::make_shared<int>(42);
     std::vector<Native::Parallel::Draw> scratch_draws;
     bool closing=false;
@@ -104,7 +111,7 @@ struct NativeRenderer {
     struct {struct {int GetDevice(){return 0;}} instance;} r;
     Native::Rhi::Device actual_device;Native::Rhi::Device* device=&actual_device;
     ParallelRuntime runtime;
-    explicit NativeRenderer(std::size_t draws){runtime.active.emplace();runtime.active->draws.resize(draws);}
+    explicit NativeRenderer(std::size_t draws){runtime.active=std::make_shared<Native::Parallel::Pass>();runtime.active->draws.resize(draws);}
     void EndRendering(u32 reason=0);
     bool ContinueSmallParallelPass(const RenderState&,u32,bool){return false;}
     void PassBarrier(){EndRendering();events.push_back("barrier");}
@@ -148,4 +155,9 @@ int main(){
     {events.clear();NativeRenderer r(7);test_small_batch=false;r.EndRendering(CloseTarget);
      assert(Count("replay-1")==1 && Count("tag-pin")==1 && !Count("prefix") && !Count("try-small"));
      assert(!r.runtime.active && !r.runtime.lease && r.runtime.synchronous==1);}
+    {events.clear();NativeRenderer r(64);auto retained=r.runtime.active;r.runtime.draw_stream=retained;r.EndRendering(CloseFull);
+     assert(At("finish-stream")<At("replacement") && At("replacement")<At("queued-pin"));
+     assert(r.stream.list==&r.runtime.actual_coordinator.stream_replacement && r.stream.cmd.id==2);
+     assert(retained->draws.size()==64 && !r.runtime.active && !r.runtime.lease);
+     assert(!Count("prefix") && !Count("try-pass") && !Count("try-small") && !Count("replay-1") && !Count("replay-2") && !Count("tag-pin"));}
 }

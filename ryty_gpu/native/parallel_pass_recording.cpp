@@ -40,17 +40,19 @@ struct PassProbe {
 };
 }
 #endif
-bool ValidatePass(const Pass& pass) {
+static bool ValidatePassHeader(const Pass& pass) {
     const auto& target=pass.target;
     if(target.num_color_attachments>8 || !target.width || !target.height || !target.num_layers ||
-       !pass.resource_lease || pass.draws.empty() || pass.draws.size()>256) return false;
+       !pass.resource_lease) return false;
     if(!pass.extended_verified && (target.num_color_attachments!=1 || !target.color_attachments[0].image_view ||
        target.color_attachments[0].is_clear || target.depth_stencil_attachment.has_depth || target.depth_stencil_attachment.has_stencil))return false;
     if(pass.extended_verified && (target.depth_stencil_attachment.has_depth || target.depth_stencil_attachment.has_stencil) && !target.depth_stencil_attachment.image_view)return false;
-    for(const auto& draw:pass.draws) {
+    return true;
+}
+static bool ValidateDraw(const Draw& draw,bool extended_verified) {
         if(!draw.pipeline || !draw.layout || !draw.pipeline_owner || draw.push_set>draw.sets.size())return false;
         if(draw.indexed) {
-            if(!pass.extended_verified || !draw.index_backing_verified || !draw.index_buffer ||
+            if(!extended_verified || !draw.index_backing_verified || !draw.index_buffer ||
                (draw.index_type!=vk::IndexType::eUint16 && draw.index_type!=vk::IndexType::eUint32))return false;
             const u64 element=draw.index_type==vk::IndexType::eUint16?2:4;
             if(draw.index_offset%element || !draw.index_size || draw.index_offset>~vk::DeviceSize{0}-draw.index_size || u64(draw.vertices)>draw.index_size/element)return false;
@@ -73,16 +75,58 @@ bool ValidatePass(const Pass& pass) {
             if(draw.push_set>=draw.sets.size() || draw.sets[draw.push_set])return false;
             if(!draw.push_writes->ParallelReplaySafe(draw.immutable_upload_buffers_verified))return false;
         }
-    }
     return true;
 }
+bool ValidatePass(const Pass& pass) {
+    if(!ValidatePassHeader(pass) || pass.draws.empty() || pass.draws.size()>256)return false;
+    for(const auto& draw:pass.draws)if(!ValidateDraw(draw,pass.extended_verified))return false;
+    return true;
+}
+struct PassTraversal {
+    const Pass& pass;
+    DrawPublication* publication;
+    const Draw* storage;
+#if !defined(NDEBUG)
+    std::size_t* early_draws;
+#endif
+    bool valid=true;
+};
+template<class Begin,class Emit,class End>
+static void EmitWholePass(PassTraversal& traversal,Begin&& begin,Emit&& emit,End&& end) {
+    if(!traversal.publication) {
+        EmitWholePass(traversal.pass,begin,emit,end);
+        return;
+    }
+    begin(traversal.pass.target);
+    std::size_t consumed=0;
+    for(;;) {
+        const auto available=traversal.publication->Wait(consumed);
+        for(;consumed<available.count;++consumed) {
+            const auto& draw=traversal.storage[consumed];
+            if(!ValidateDraw(draw,traversal.pass.extended_verified)) {
+                traversal.valid=false;end();return;
+            }
+            emit(draw);
+#if !defined(NDEBUG)
+            if(traversal.early_draws && !traversal.publication->Load().sealed)++*traversal.early_draws;
+#endif
+        }
+        if(available.sealed)break;
+    }
+    end();
+}
 static bool RecordPassImpl(vk::CommandBuffer cmd,const Vulkan::Instance& instance,const Pass& pass,
-                           Vulkan::DynamicState* inline_dynamic,vk::Pipeline* inline_pipeline) {
+                           Vulkan::DynamicState* inline_dynamic,vk::Pipeline* inline_pipeline,
+                           DrawPublication* publication=nullptr,const Draw* storage=nullptr
+#if !defined(NDEBUG)
+                           ,std::size_t* early_draws=nullptr
+#endif
+                           ) {
 #if !defined(NDEBUG)
     PassProbe probe;
     const auto t_validate_start = probe.Start();
 #endif
-    const bool valid=cmd && ValidatePass(pass);
+    const bool valid=cmd && (publication ? storage && ValidatePassHeader(pass) : ValidatePass(pass));
 #if !defined(NDEBUG)
     probe.Add(probe.local.validate_ns,t_validate_start);
 #endif
@@ -107,6 +151,11 @@ static bool RecordPassImpl(vk::CommandBuffer cmd,const Vulkan::Instance& instanc
     dynamic.Invalidate();
     vk::Pipeline bound_pipeline{};
     const Draw* bound_vertex = nullptr;
+    PassTraversal traversal{pass,publication,storage
+#if !defined(NDEBUG)
+        ,early_draws
+#endif
+        };
     const auto same_vertex = [](const Draw& a, const Draw& b) {
         return a.pipeline == b.pipeline &&
                Vulkan::VertexInputBytesEqual(a.vertex_attributes, b.vertex_attributes) &&
@@ -116,7 +165,7 @@ static bool RecordPassImpl(vk::CommandBuffer cmd,const Vulkan::Instance& instanc
                Vulkan::VertexInputBytesEqual(a.vertex_sizes, b.vertex_sizes) &&
                Vulkan::VertexInputBytesEqual(a.vertex_strides, b.vertex_strides);
     };
-    EmitWholePass(pass,
+    EmitWholePass(traversal,
         [&](const auto&) {cmd.beginRendering(vk::RenderingInfo{.renderArea{.offset={0,0},.extent={target.width,target.height}},
             .layerCount=target.num_layers,.colorAttachmentCount=target.num_color_attachments,.pColorAttachments=colors.data(),
             .pDepthAttachment=db.has_depth?&depth:nullptr,.pStencilAttachment=db.has_stencil?&stencil:nullptr});},
@@ -192,6 +241,7 @@ static bool RecordPassImpl(vk::CommandBuffer cmd,const Vulkan::Instance& instanc
             }
         },
         [&] {if(!inline_dynamic)cmd.endRendering();});
+    if(!traversal.valid)return false;
     if(inline_pipeline)*inline_pipeline=bound_pipeline;
 #if !defined(NDEBUG)
     probe.failed=false;
@@ -200,6 +250,18 @@ static bool RecordPassImpl(vk::CommandBuffer cmd,const Vulkan::Instance& instanc
 }
 bool RecordPass(vk::CommandBuffer cmd,const Vulkan::Instance& instance,const Pass& pass) {
     return RecordPassImpl(cmd,instance,pass,nullptr,nullptr);
+}
+bool RecordPublishedPass(vk::CommandBuffer cmd,const Vulkan::Instance& instance,
+                         const Pass& header,const Draw* storage,DrawPublication& publication
+#if !defined(NDEBUG)
+                         ,std::size_t* early_draws
+#endif
+                         ) {
+    return RecordPassImpl(cmd,instance,header,nullptr,nullptr,&publication,storage
+#if !defined(NDEBUG)
+                          ,early_draws
+#endif
+                          );
 }
 bool RecordPassInline(vk::CommandBuffer cmd,const Vulkan::Instance& instance,const Pass& pass,
                       Vulkan::DynamicState& dynamic,vk::Pipeline& last_pipeline) {

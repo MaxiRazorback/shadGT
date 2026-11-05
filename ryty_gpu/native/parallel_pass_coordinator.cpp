@@ -40,11 +40,18 @@ PassCoordinator::~PassCoordinator() {
     // been submitted; transfer/retirement of accepted nodes belongs to Drain.
     // Join every submitted task even after a future mismatch or failed drain.
     // No worker may still mutate a Job when its unsubmitted list is released.
+    // A producer can be abandoned during teardown. Wake its recording callback
+    // while the source and immutable slots are still retained, then join before
+    // releasing any command list or packet storage.
+    for(auto& node:nodes_)if(node.pass && node.pass->stream && !node.pass->stream->finished)
+        node.pass->stream->publication.Seal();
     workers_.Shutdown();
     pending_small_.reset();
     while(!nodes_.empty()) {
         Node node=std::move(nodes_.front());nodes_.pop_front();
         if(node.prefix) {device_.ReleaseUnsubmitted(node.prefix);continue;}
+        if(node.pass && node.pass->stream && !node.pass->stream->finished)
+            device_.ReleaseUnsubmitted(node.pass->stream->replacement);
         if(node.pass && node.pass->list){device_.ReleaseUnsubmitted(node.pass->list);node.pass->list=nullptr;}
         DropGroupJob(node.group,node.pass);
         if(node.release) {
@@ -58,14 +65,32 @@ PassCoordinator::~PassCoordinator() {
     if(last && (!timeline_.Wait(last,~u64{0}) || timeline_.Completed()<last))std::terminate();
     while(in_flight_count_) {Collect(timeline_.Completed());if(in_flight_count_)std::this_thread::yield();}
 }
-PassCoordinator::JobPtr PassCoordinator::Record(const JobPtr& job) {
+PassCoordinator::JobPtr PassCoordinator::Record(const JobPtr& job,bool on_worker) {
     Rhi::CommandList* list=nullptr;
     try {
         list=device_.AcquireCommandList(Rhi::CommandListLevel::Secondary);
         if(!list) return job;
         list->Begin();
         const auto cmd=vk::CommandBuffer{reinterpret_cast<VkCommandBuffer>(list->NativeHandle())};
-        if(!RecordPass(cmd,instance_,job->pass)) {device_.ReleaseUnsubmitted(list);return job;}
+        bool recorded=false;
+        if(on_worker && job->stream) {
+#if !defined(NDEBUG)
+            std::size_t early_draws=0;
+            if(job->stream->probe)stream_workers_started_.fetch_add(1,std::memory_order_relaxed);
+#endif
+            recorded=RecordPublishedPass(cmd,instance_,job->pass,job->stream->storage,job->stream->publication
+#if !defined(NDEBUG)
+                ,job->stream->probe?&early_draws:nullptr
+#endif
+                );
+#if !defined(NDEBUG)
+            if(job->stream->probe && early_draws) {
+                streams_with_early_work_.fetch_add(1,std::memory_order_relaxed);
+                stream_early_draws_.fetch_add(early_draws,std::memory_order_relaxed);
+            }
+#endif
+        } else recorded=RecordPass(cmd,instance_,job->pass);
+        if(!recorded) {device_.ReleaseUnsubmitted(list);return job;}
         list->End();job->list=list;job->recorded=true;
     } catch(...) {if(list)device_.ReleaseUnsubmitted(list);}
     return job;
@@ -168,19 +193,119 @@ bool PassCoordinator::SubmitGroup(const GroupPtr& group) {
             u64 cpu_start=0,cpu_end=0;const bool cpu_started=GateDiag() && ThreadCpu100ns(cpu_start);
             const auto start=std::chrono::steady_clock::now();
             u64 recorded_passes=0,recorded_draws=0;
-            for(const auto& job:task->jobs) { Record(job); if(job->recorded){++recorded_passes;recorded_draws+=job->pass.draws.size();} }
+            for(const auto& job:task->jobs) { Record(job,true); if(job->recorded){++recorded_passes;recorded_draws+=job->stream?job->stream->publication.Load().count:job->pass.draws.size();} }
             worker_recorded_passes_.fetch_add(recorded_passes);worker_recorded_draws_.fetch_add(recorded_draws);
             if(cpu_started && ThreadCpu100ns(cpu_end) && cpu_end>=cpu_start){worker_cpu_100ns_.fetch_add(cpu_end-cpu_start);worker_cpu_samples_.fetch_add(1);}
             worker_wall_ns_.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count());
             worker_jobs_.fetch_add(1);worker_active_.fetch_sub(1);
 #else
-            for(const auto& job:task->jobs) Record(job);
+            for(const auto& job:task->jobs) Record(job,true);
 #endif
             return task;
         });
         group->submitted=ok;
         COORD_RETURN(ok);
     } catch(...) {return false;}
+}
+PassCoordinator::StreamTicket PassCoordinator::BeginStream(u64 epoch,const std::shared_ptr<Pass>& source,
+    Rhi::CommandList* current_prefix,std::shared_ptr<const void> prefix_resources) {
+#if !defined(NDEBUG)
+    const bool probe=GateDiag();
+#endif
+    const auto reject=[&]() -> StreamTicket {
+#if !defined(NDEBUG)
+        if(probe)++stream_start_rejected_;
+#endif
+        return {};
+    };
+    // Preserve the future order when an earlier small group remains unsubmitted.
+    CloseSmall(1);
+    if(failed_ || !epoch || (pending_epoch_ && pending_epoch_!=epoch) ||
+       !current_prefix || !prefix_resources || !HasRoomForPass() || !source ||
+       source->draws.size()<8 || source->draws.size()>StreamDrawLimit ||
+       source->draws.capacity()<StreamDrawLimit || source->draws.capacity()>256 ||
+       !ValidatePass(*source))return reject();
+    for(const auto& draw:source->draws)
+        if(draw.descriptor_bytes>StreamDescriptorBytesPerDraw)return reject();
+    Rhi::CommandList* replacement=nullptr;
+    const auto previous_nodes=nodes_.size();
+    try {
+        auto group=std::make_shared<Group>();
+        // Charge the actual backing allocation: completed-vector reuse can
+        // return capacity 256 even though only 64 slots may be published.
+        const std::size_t bytes=sizeof(Job)+sizeof(Pass)+source->draws.capacity()*sizeof(Draw)+
+            StreamDrawLimit*StreamDescriptorBytesPerDraw+sizeof(StreamState)+sizeof(Group)+
+            group->jobs.capacity()*sizeof(JobPtr)+4*128;
+        auto prefix_credit=budget_.TryAcquire(64*1024);
+        if(!prefix_credit)return reject();
+        auto pass_credit=budget_.TryAcquire(bytes);
+        if(!pass_credit)return reject();
+        auto stream=std::make_shared<StreamState>();
+        stream->source=source;stream->storage=source->draws.data();stream->prefix=current_prefix;
+#if !defined(NDEBUG)
+        stream->probe=probe;
+#endif
+        auto job=std::make_shared<Job>(std::move(*pass_credit));
+        job->pass.target=source->target;job->pass.extended_verified=source->extended_verified;
+        job->pass.resource_lease=source->resource_lease;job->stream=stream;
+        group->jobs.push_back(job);group->draws=source->draws.size();
+        auto prefix_lease=std::make_shared<PrefixLease>(std::move(prefix_resources),std::move(*prefix_credit));
+        auto release=MakeRelease(job);
+        replacement=device_.AcquireCommandList(Rhi::CommandListLevel::Secondary);
+        if(!replacement)return reject();
+        replacement->Begin();stream->replacement=replacement;
+        if(!stream->publication.Publish(source->draws.size()))std::terminate();
+        nodes_.push_back({current_prefix,{},std::move(prefix_lease),{},true});
+        nodes_.push_back({nullptr,job,{},group,false,std::move(release)});
+        if(!SubmitGroup(group)) {
+            nodes_.pop_back();nodes_.pop_back();
+            device_.ReleaseUnsubmitted(replacement);return reject();
+        }
+        // No fallible operation remains after the worker can see its packet.
+        pending_epoch_=epoch;
+#if !defined(NDEBUG)
+        if(probe){++streams_started_;stream_draws_published_+=source->draws.size();}
+#endif
+        return job;
+    } catch(...) {
+        while(nodes_.size()>previous_nodes)nodes_.pop_back();
+        if(replacement)device_.ReleaseUnsubmitted(replacement);
+        return reject();
+    }
+}
+bool PassCoordinator::PublishStream(const StreamTicket& ticket,std::size_t count) noexcept {
+    if(!ticket || !ticket->stream)return false;
+    auto& stream=*ticket->stream;
+    const auto previous=stream.publication.Load();
+    if(stream.finished || previous.sealed || !stream.source ||
+       count!=stream.source->draws.size() || count>StreamDrawLimit || count<previous.count ||
+       stream.source->draws.data()!=stream.storage)return false;
+    for(auto i=previous.count;i<count;++i)
+        if(stream.storage[i].descriptor_bytes>StreamDescriptorBytesPerDraw)return false;
+    if(!stream.publication.Publish(count))return false;
+#if !defined(NDEBUG)
+    if(stream.probe)stream_draws_published_+=count-previous.count;
+#endif
+    return true;
+}
+Rhi::CommandList* PassCoordinator::StreamReplacement(const StreamTicket& ticket) const noexcept {
+    return ticket && ticket->stream?ticket->stream->replacement:nullptr;
+}
+void PassCoordinator::FinishStream(const StreamTicket& ticket) noexcept {
+    if(!ticket || !ticket->stream)std::terminate();
+    auto& stream=*ticket->stream;
+    if(stream.finished)return;
+    const auto published=stream.publication.Load();
+    if(published.sealed || !stream.source || stream.source->draws.size()!=published.count ||
+       stream.source->draws.data()!=stream.storage || !stream.prefix || !stream.replacement)
+        std::terminate();
+    // Swap metadata only. The worker's pointers into immutable Draw storage
+    // stay valid, and the accepted job now retains them through its GPU fence.
+    ticket->pass.draws.swap(stream.source->draws);
+    try {stream.prefix->End();} catch(...) {std::terminate();}
+    stream.finished=true;
+    stream.publication.Seal();
+    stream.source.reset();
 }
 bool PassCoordinator::TryPass(u64 epoch,const Pass& pass,std::size_t total_owned_bytes) {
 #if !defined(NDEBUG)

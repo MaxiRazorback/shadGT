@@ -56,16 +56,33 @@ public:
         PassBudget::Snapshot budget{};
     };
     using DrawPool=CompletedDrawVectorPool<Draw>;
+    static constexpr std::size_t StreamDrawLimit=DrawPublication::Capacity;
+    // Snapshot payload is capped at 64 KiB by admission. Include its object,
+    // shared ownership bookkeeping and the existing descriptor charge allowance.
+    static constexpr std::size_t StreamDescriptorBytesPerDraw=64*1024+1024;
+    struct StreamState {
+        DrawPublication publication;
+        std::shared_ptr<Pass> source;
+        const Draw* storage{};
+        Rhi::CommandList* prefix{};
+        Rhi::CommandList* replacement{};
+        bool finished{}; // coordinator owner only; set before the seal release
+#if !defined(NDEBUG)
+        bool probe{};
+#endif
+    };
     struct Job {
         Pass pass;
         std::optional<PassBudget::Token> credit;
         Rhi::CommandList* list{};
         bool recorded{};
         std::size_t loan=DrawPool::Invalid;
+        std::shared_ptr<StreamState> stream;
         Job(Pass p,PassBudget::Token token):pass(std::move(p)),credit(std::move(token)){}
         explicit Job(PassBudget::Token token):credit(std::move(token)){}
     };
     using JobPtr=std::shared_ptr<Job>;
+    using StreamTicket=JobPtr;
     struct Group { std::vector<JobPtr> jobs; std::size_t draws{}; bool submitted{}, resolved{}, is_small{}; std::chrono::steady_clock::time_point submit_time{}; Group(){jobs.reserve(8);} };
     using GroupPtr=std::shared_ptr<Group>;
     struct PrefixLease {
@@ -98,8 +115,10 @@ private:
 #if !defined(NDEBUG)
     CoordinatorTimingProbes timing_probes_{};
     unsigned admission_timing_depth_{};
+    u64 streams_started_{},stream_draws_published_{},stream_start_rejected_{};
+    std::atomic<u64> stream_workers_started_{},streams_with_early_work_{},stream_early_draws_{};
 #endif
-    JobPtr Record(const JobPtr& job);
+    JobPtr Record(const JobPtr& job,bool on_worker=false);
     std::function<void()> MakeRelease(const JobPtr& job);
     bool SubmitGroup(const GroupPtr& group);
     void CloseSmall(unsigned reason) noexcept;
@@ -127,6 +146,17 @@ public:
     bool TryPass(u64 epoch,const Pass& pass,std::size_t total_owned_bytes);
     bool TryPassTransfer(u64 epoch,Pass& pass,std::size_t total_owned_bytes);
     bool TrySmallPass(u64 epoch,const Pass& pass,std::size_t total_owned_bytes);
+    // Start only after at least eight complete admitted packets. The producer
+    // keeps recording into current_prefix until FinishStream; workers only see
+    // published immutable slots, never the changing source vector metadata.
+    StreamTicket BeginStream(u64 epoch,const std::shared_ptr<Pass>& source,
+                             Rhi::CommandList* current_prefix,
+                             std::shared_ptr<const void> prefix_resources);
+    bool PublishStream(const StreamTicket& ticket,std::size_t count) noexcept;
+    // Finish closes the old prefix and transfers its pre-acquired replacement
+    // to the renderer. Caller switches list/cmd and invalidates serial caches.
+    Rhi::CommandList* StreamReplacement(const StreamTicket& ticket) const noexcept;
+    void FinishStream(const StreamTicket& ticket) noexcept;
     // The first phase resolves every worker and fallback before touching the
     // primary. The caller must establish epoch and pre-reserve no-throw GPU
     // retirement storage before the accept phase. Accepted jobs and prefix
@@ -137,6 +167,10 @@ public:
         TimingProbe timing{*this,TimingPhase::Drain};
 #endif
         if(failed_ || !signal_tick || (pending_epoch_ && pending_epoch_!=signal_tick) || nodes_.size()+in_flight_count_>node_cap_)return false;
+        // Never wait for an active producer or submit an open prefix. Owner must
+        // finish each stream before entering the existing drain transaction.
+        for(const auto& node:nodes_)if(node.pass && node.pass->stream &&
+            !node.pass->stream->finished)return false;
         CloseSmall(0); // submission/drain boundary
         for(auto& node:nodes_) {
             if(node.prefix) continue;
@@ -193,6 +227,12 @@ public:
     }
 
 #if !defined(NDEBUG)
+    struct StreamStats {u64 started,published,worker_started,passes_with_early_work,early_draws,start_rejected;};
+    StreamStats TakeStreamStats() noexcept {
+        return {std::exchange(streams_started_,0),std::exchange(stream_draws_published_,0),
+            stream_workers_started_.exchange(0),streams_with_early_work_.exchange(0),
+            stream_early_draws_.exchange(0),std::exchange(stream_start_rejected_,0)};
+    }
     // Owner only; recording workers never update this snapshot.
     CoordinatorTimingProbes TakeCoordinatorTimingProbes() noexcept;
     void ResetCoordinatorTimingProbes() noexcept;
