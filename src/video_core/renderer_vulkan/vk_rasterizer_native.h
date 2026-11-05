@@ -785,6 +785,9 @@ private:
     /// of the metadata can be told from a clear of a picture).
     std::unordered_set<VAddr> known_meta;
 
+#ifndef NDEBUG
+    u64 stats_reset_generation{};
+#endif
     struct Stats {
         u64 rewrite_clears = 0, rewrite_uploads = 0, fill_shaders = 0; ///< NAT-120
         u64 rewrite_partial = 0; ///< NAT-124

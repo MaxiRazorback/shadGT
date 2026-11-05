@@ -5208,7 +5208,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
 #if !defined(NDEBUG)
     const auto start = std::chrono::steady_clock::now();
     t_timed = r.FrameDumpCollecting() || (++timing_tick & 15) == 0; // F8: every draw
-    SceneTrace::CpuScope scene_trace{r.FrameDumpCollecting(),frame,"draw",stats.phase_ns,stats.record_ns};
+    SceneTrace::CpuScope scene_trace{r.FrameDumpCollecting(),frame,"draw",stats.phase_ns,stats.record_ns,
+                                    &stats_reset_generation};
     if (SceneTrace::Id()) r.FrameDumpEvent(fmt::format("scene-pass id={} kind=draw indexed={} index_offset={}", SceneTrace::Id(),is_indexed,index_offset));
     NATIVE_DIAGNOSTIC(stats.timed_draws += t_timed ? 1 : 0);
     struct Timed {
@@ -10985,6 +10986,7 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
     stats.prepared_rejected = {};
     stats.prepared_vertices = stats.prepared_vertices_rejected = 0;
     stats.prepared_installed = 0;
+    ++stats_reset_generation;
     stats.record_ns = {};
     prepare_stats.made = 0;
     prepare_stats.failed = 0;
