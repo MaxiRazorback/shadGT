@@ -248,7 +248,8 @@ void WindowSDL::WaitEvent() {
             VideoCore::RequestDebugFrameDump()) {
             LOG_INFO(Frontend, "F8 capture queued");
 #ifdef _WIN32
-            MessageBeep(MB_OK);
+            // Match the capture helper's acknowledgement on this window-event thread.
+            Beep(1100, 60);
 #endif
         }
         return;

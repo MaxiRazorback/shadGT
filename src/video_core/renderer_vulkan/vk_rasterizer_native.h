@@ -115,6 +115,10 @@ public:
         vk::ImageView view;
         u32 width;
         u32 height;
+#ifndef NDEBUG
+        vk::Format capture_format{};
+        bool capture_transfer_src{};
+#endif
         vk::ImageView output_view{};
         vk::ImageView ui_layer{};
         vk::Extent2D output_size{};

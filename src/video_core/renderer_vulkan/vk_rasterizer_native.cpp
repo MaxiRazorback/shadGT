@@ -10116,6 +10116,11 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     Splice();
     Display display{vk::Image{Handle<VkImage_T>(source->image->NativeHandle())}, view,
                     source->info.size.width, source->info.size.height};
+#ifndef NDEBUG
+    display.capture_format = static_cast<vk::Format>(source->image->Desc().format);
+    display.capture_transfer_src =
+        bool(source->image->Desc().usage & Native::Rhi::ImageUsageTransferSrc);
+#endif
     if (const auto shown =
             UiHires::TakeFrame(r.instance, r.scheduler.DirectCommandBuffer(), info.guest_address,
                                {display.width, display.height}, output_size, view_format)) {
