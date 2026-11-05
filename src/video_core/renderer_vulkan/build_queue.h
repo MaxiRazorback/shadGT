@@ -17,8 +17,9 @@
 
 namespace Vulkan {
 
-/// The pipeline build workers' jobs (PERF-019). Urgent jobs (a draw waits) run first, then
-/// normal ones (read-ahead) in order. PERF-038: background jobs (stored pipelines built while
+/// The pipeline build workers' jobs (PERF-019). Urgent jobs (a draw waits) run last-first,
+/// then Soon jobs (a draw went on) in draw order, then normal read-ahead in order.
+/// PERF-038: background jobs (stored pipelines built while
 /// the game runs) run only when neither waits, on at most `max_background` workers at once,
 /// and not while paused: each pipeline a draw needs pauses them for a while, so they never
 /// compete with the builds the game is waiting for.
@@ -26,7 +27,7 @@ class BuildQueue {
 public:
     using Job = std::function<void()>;
     using Clock = std::chrono::steady_clock;
-    enum class Kind { Urgent, Normal, Background };
+    enum class Kind { Urgent, Soon, Normal, Background };
 
     explicit BuildQueue(u32 max_foreground_, u32 max_background_, u32 max_boost_ = 0)
         : max_foreground{max_foreground_}, max_background{max_background_},
@@ -49,10 +50,13 @@ public:
             std::scoped_lock lk{mutex};
             switch (kind) {
             case Kind::Urgent:
-                jobs.push_front({std::move(job), heavy});
+                urgent.push_front({std::move(job), heavy});
+                break;
+            case Kind::Soon:
+                soon.push_back({std::move(job), heavy});
                 break;
             case Kind::Normal:
-                jobs.push_back({std::move(job), heavy});
+                normal.push_back({std::move(job), heavy});
                 break;
             case Kind::Background:
                 background.push_back({std::move(job), heavy});
@@ -70,10 +74,11 @@ public:
             if (stop.stop_requested()) {
                 return false;
             }
-            if (auto next = Runnable(jobs); next != jobs.end() && HasCapacity(running_foreground, max_foreground)) {
+            if (auto* entries = RunnableForeground(); entries && HasCapacity(running_foreground, max_foreground)) {
+                auto next = Runnable(*entries);
                 const bool heavy = next->heavy;
                 job = std::move(next->job);
-                jobs.erase(next);
+                entries->erase(next);
                 running_heavy += heavy;
                 if (is_heavy) *is_heavy = heavy;
                 is_background = false;
@@ -96,14 +101,14 @@ public:
             }
             if (!background.empty() && paused) {
                 cv.wait_until(lk, stop, pause_until, [&] {
-                    return (Runnable(jobs) != jobs.end() && HasCapacity(running_foreground, max_foreground)) ||
+                    return (RunnableForeground() && HasCapacity(running_foreground, max_foreground)) ||
                            boost.load(std::memory_order_relaxed) || Clock::now() >= pause_until;
                 });
             } else {
                 cv.wait(lk, stop, [&] {
                     const u32 limit = boost.load(std::memory_order_relaxed) ? max_boost
                                                                             : max_background;
-                    return (Runnable(jobs) != jobs.end() && HasCapacity(running_foreground, max_foreground)) ||
+                    return (RunnableForeground() && HasCapacity(running_foreground, max_foreground)) ||
                            (Runnable(background) != background.end() && HasCapacity(running_background, limit));
                 });
             }
@@ -122,7 +127,7 @@ public:
     /// PERF-101: no draw or read-ahead build is queued or running.
     bool ForegroundIdle() {
         std::scoped_lock lk{mutex};
-        return jobs.empty() && running_foreground == 0;
+        return urgent.empty() && soon.empty() && normal.empty() && running_foreground == 0;
     }
 
     void FinishedBackground(bool heavy = false) {
@@ -148,7 +153,7 @@ public:
     /// PERF-160: jobs waiting for a worker, foreground and background.
     size_t Pending() {
         std::scoped_lock lk{mutex};
-        return jobs.size() + background.size();
+        return urgent.size() + soon.size() + normal.size() + background.size();
     }
 
     /// Wakes the workers waiting for jobs or a pause, so they can see a stop request.
@@ -169,13 +174,23 @@ private:
         return running_kind < kind_limit && running_foreground + running_background < total_limit;
     }
     struct Entry { Job job; bool heavy; };
-    std::deque<Entry> jobs;
+    std::deque<Entry> urgent;
+    std::deque<Entry> soon;
+    std::deque<Entry> normal;
     std::deque<Entry> background;
     // Keep queued heavy jobs out of worker threads until memory capacity is available.
     std::deque<Entry>::iterator Runnable(std::deque<Entry>& entries) {
         return std::find_if(entries.begin(), entries.end(), [this](const Entry& entry) {
             return !entry.heavy || running_heavy < CompilerWorkerBudget::HeavyPipelineLimit;
         });
+    }
+    // PERF-109 (WillScarlettOhara, PERF-GT7-025): preserve priority while allowing
+    // runnable lighter jobs to bypass heavy jobs blocked by the shared budget.
+    std::deque<Entry>* RunnableForeground() {
+        for (auto* entries : {&urgent, &soon, &normal}) {
+            if (Runnable(*entries) != entries->end()) return entries;
+        }
+        return nullptr;
     }
     u32 running_heavy{};
     u32 running_background{};

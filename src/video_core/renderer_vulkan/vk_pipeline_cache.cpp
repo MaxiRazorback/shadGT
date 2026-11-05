@@ -449,8 +449,8 @@ public:
         queue.NotifyAll();
     }
 
-    void Push(std::function<void()>&& job, bool urgent, bool heavy = false) {
-        queue.Push(std::move(job), urgent ? BuildQueue::Kind::Urgent : BuildQueue::Kind::Normal, heavy);
+    void Push(std::function<void()>&& job, BuildQueue::Kind kind, bool heavy = false) {
+        queue.Push(std::move(job), kind, heavy);
     }
     void PushBackground(std::function<void()>&& job, bool heavy = false) {
         queue.Push(std::move(job), BuildQueue::Kind::Background, heavy);
@@ -1323,7 +1323,7 @@ void PipelineCache::FinishBuild(PipelineBuild& build) {
     }
 }
 
-void PipelineCache::QueueBuild(const std::shared_ptr<PipelineBuild>& build, bool urgent) {
+void PipelineCache::QueueBuild(const std::shared_ptr<PipelineBuild>& build, BuildQueue::Kind kind) {
     if (!build_workers) {
         build_workers = std::make_unique<PipelineBuildWorkers>();
     }
@@ -1332,15 +1332,16 @@ void PipelineCache::QueueBuild(const std::shared_ptr<PipelineBuild>& build, bool
             FinishBuild(*build);
         }
     };
-    build_workers->Push(std::move(job), urgent,
+    build_workers->Push(std::move(job), kind,
         Common::PerfFeatureEnabled(79) &&
         build->infos[u32(Shader::SwStage::TessellationControl)] != nullptr);
 }
 
-std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::StartPipelineBuild(bool urgent) {
+std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::StartPipelineBuild(bool urgent, bool in_order) {
     auto build = MakePipelineBuild();
-    build->urgent = urgent;
-    QueueBuild(build, urgent);
+    build->urgent = urgent && !in_order;
+    QueueBuild(build, !urgent ? BuildQueue::Kind::Normal
+                            : in_order ? BuildQueue::Kind::Soon : BuildQueue::Kind::Urgent);
     return build;
 }
 
@@ -2610,6 +2611,10 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
         ++Common::GetWorkCounters().pipelines_compiled;
         last_pipeline_miss = std::chrono::steady_clock::now();
         GraphicsPipeline::NotePipelineMiss();
+        // PERF-109 (WillScarlettOhara, PERF-GT7-025): builds for draws that go on
+        // run in draw order, after waiting draws and before read-ahead.
+        const bool goes_on = AsyncPipelines() && !LegacyWaits() && !WritesMemory(S().infos) &&
+                             !NeverSkipped(S().infos) && !MenusWait();
         auto* const queued_states = liverpool->PipeReadAheadStates();
         if (queued_states) {
             queued_states->NoteMiss();
@@ -2628,17 +2633,17 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             }
         } else if (Common::PerfFeatureEnabled(19) && !liverpool->Pipelined()) {
             const auto key = S().graphics_key;
-            build = StartPipelineBuild(true);
+            build = StartPipelineBuild(true, goes_on);
             ReadAhead(params);
             ASSERT_MSG(S().graphics_key == key, "Read-ahead changed the current pipeline key");
         } else if (queued_states) {
             // PERF-034: a worker builds it while this thread starts the builds the command
             // thread's read-ahead queues meanwhile.
-            build = StartPipelineBuild(true);
+            build = StartPipelineBuild(true, goes_on);
         } else {
             // Queue even when read-ahead/draw-pipe helpers are disabled. Retain the job
             // in pending_builds below so a later draw installs its completed pipeline.
-            build = StartPipelineBuild(true);
+            build = StartPipelineBuild(true, goes_on);
         }
         // PERF-076: a draw does not wait for a new pipeline. Its build goes on on a worker, the
         // draws that need it are skipped until it is done (a frame or two of a missing object),
@@ -2667,7 +2672,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             if (!build->urgent && !build->started.load(std::memory_order_acquire) &&
                 build->done.wait_for(std::chrono::microseconds{0}) != std::future_status::ready) {
                 build->urgent = true;
-                QueueBuild(build, true);
+                QueueBuild(build, BuildQueue::Kind::Urgent);
             }
             const auto wait_start = std::chrono::steady_clock::now();
             // Queueing a cosmetic job must not freeze input/audio clocks. Hold
@@ -2782,7 +2787,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             });
         auto completion = job->get_future();
         if (!build_workers) build_workers = std::make_unique<PipelineBuildWorkers>();
-        build_workers->Push([job] { (*job)(); }, true);
+        build_workers->Push([job] { (*job)(); }, BuildQueue::Kind::Urgent);
         it.value() = completion.get();
         it.value()->SetStageInfo(*S().infos[0]);
         sdata = inputs->sdata;

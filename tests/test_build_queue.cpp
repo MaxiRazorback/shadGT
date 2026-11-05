@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <atomic>
+#include <chrono>
+#include <future>
 #include <string>
 #include <thread>
 #include <vector>
@@ -14,99 +15,228 @@ using Vulkan::BuildQueue;
 using namespace std::chrono_literals;
 
 namespace {
-std::string PopName(BuildQueue& queue, std::stop_token stop, bool* background = nullptr) {
-    std::string name;
+struct Popped {
+    bool success{};
+    bool background{};
+    bool heavy{};
     BuildQueue::Job job;
-    bool is_background = false;
-    if (!queue.Pop(job, is_background, stop)) {
-        return "stopped";
-    }
-    job();
-    if (background) {
-        *background = is_background;
-    }
-    return name;
+};
+
+Popped Pop(BuildQueue& queue, std::stop_token stop = {}) {
+    Popped result;
+    result.success = queue.Pop(result.job, result.background, stop, &result.heavy);
+    return result;
 }
+
+void Finish(BuildQueue& queue, const Popped& result) {
+    if (result.background) {
+        queue.FinishedBackground(result.heavy);
+    } else {
+        queue.FinishedForeground(result.heavy);
+    }
+}
+
+// Always stop and join the worker, including when an expectation fails.
+class WaitingPop {
+public:
+    explicit WaitingPop(BuildQueue& queue_) : queue{queue_}, future{promise.get_future()},
+        worker{[this](std::stop_token stop) { promise.set_value(Pop(queue, stop)); }} {}
+    ~WaitingPop() {
+        worker.request_stop();
+        queue.NotifyAll();
+    }
+    bool Ready(std::chrono::milliseconds timeout = 2s) {
+        return future.wait_for(timeout) == std::future_status::ready;
+    }
+    Popped Get() { return future.get(); }
+    void Stop() { worker.request_stop(); queue.NotifyAll(); }
+private:
+    BuildQueue& queue;
+    std::promise<Popped> promise;
+    std::future<Popped> future;
+    std::jthread worker;
+};
 } // namespace
 
-TEST(BuildQueue, UrgentThenNormalThenBackground) {
-    BuildQueue queue{4};
+TEST(BuildQueue, PriorityAndOrdering) {
+    BuildQueue queue{4, 2};
     std::vector<std::string> order;
-    queue.Push([&] { order.push_back("background"); }, BuildQueue::Kind::Background);
-    queue.Push([&] { order.push_back("normal1"); }, BuildQueue::Kind::Normal);
-    queue.Push([&] { order.push_back("normal2"); }, BuildQueue::Kind::Normal);
-    queue.Push([&] { order.push_back("urgent"); }, BuildQueue::Kind::Urgent);
-    std::stop_source stop;
-    for (int i = 0; i < 4; ++i) {
-        bool background = false;
-        PopName(queue, stop.get_token(), &background);
-        if (background) {
-            queue.FinishedBackground();
-        }
+    const auto push = [&](const char* name, BuildQueue::Kind kind) {
+        queue.Push([&, name] { order.emplace_back(name); }, kind);
+    };
+    push("background", BuildQueue::Kind::Background);
+    push("normal1", BuildQueue::Kind::Normal);
+    push("soon1", BuildQueue::Kind::Soon);
+    push("urgent1", BuildQueue::Kind::Urgent);
+    push("normal2", BuildQueue::Kind::Normal);
+    push("soon2", BuildQueue::Kind::Soon);
+    push("urgent2", BuildQueue::Kind::Urgent);
+    for (int i = 0; i < 7; ++i) {
+        auto result = Pop(queue);
+        ASSERT_TRUE(result.success);
+        result.job();
+        Finish(queue, result);
     }
-    EXPECT_EQ(order, (std::vector<std::string>{"urgent", "normal1", "normal2", "background"}));
+    EXPECT_EQ(order, (std::vector<std::string>{"urgent2", "urgent1", "soon1", "soon2",
+                                               "normal1", "normal2", "background"}));
 }
 
-TEST(BuildQueue, BackgroundJobsAreCapped) {
-    BuildQueue queue{1};
-    for (int i = 0; i < 3; ++i) {
-        queue.Push([] {}, BuildQueue::Kind::Background);
+TEST(BuildQueue, SoonCountsAsPendingAndForegroundUntilFinished) {
+    BuildQueue queue{2, 1};
+    EXPECT_TRUE(queue.ForegroundIdle());
+    queue.Push([] {}, BuildQueue::Kind::Soon);
+    EXPECT_EQ(queue.Pending(), 1u);
+    EXPECT_FALSE(queue.ForegroundIdle());
+    auto result = Pop(queue);
+    ASSERT_TRUE(result.success);
+    EXPECT_FALSE(result.background);
+    EXPECT_EQ(queue.Pending(), 0u);
+    EXPECT_FALSE(queue.ForegroundIdle());
+    Finish(queue, result);
+    EXPECT_TRUE(queue.ForegroundIdle());
+}
+
+TEST(BuildQueue, SoonWakesWorkerWhileBackgroundPaused) {
+    BuildQueue queue{2, 1};
+    queue.PauseBackground(BuildQueue::Clock::now() + 1h);
+    queue.Push([] {}, BuildQueue::Kind::Background);
+    WaitingPop waiting{queue};
+    EXPECT_FALSE(waiting.Ready(50ms));
+    queue.Push([] {}, BuildQueue::Kind::Soon);
+    const bool ready = waiting.Ready();
+    EXPECT_TRUE(ready);
+    if (ready) {
+        auto result = waiting.Get();
+        EXPECT_TRUE(result.success);
+        EXPECT_FALSE(result.background);
+        if (result.success) Finish(queue, result);
     }
-    std::stop_source stop;
-    BuildQueue::Job job;
-    bool background = false;
-    ASSERT_TRUE(queue.Pop(job, background, stop.get_token()));
-    EXPECT_TRUE(background);
-    // A second worker waits while the first background job runs, but takes normal work.
-    std::atomic<bool> got{};
-    std::thread second{[&] {
-        BuildQueue::Job next;
-        bool next_background = false;
-        if (queue.Pop(next, next_background, stop.get_token())) {
-            EXPECT_TRUE(next_background);
-            got = true;
-            queue.FinishedBackground();
-        }
-    }};
-    std::this_thread::sleep_for(50ms);
-    EXPECT_FALSE(got.load()) << "only one background job runs at a time";
-    queue.FinishedBackground();
-    second.join();
-    EXPECT_TRUE(got.load());
     EXPECT_EQ(queue.BackgroundQueued(), 1u);
 }
 
-TEST(BuildQueue, PauseHoldsBackgroundButNotNormalJobs) {
-    BuildQueue queue{4};
+TEST(BuildQueue, SoonWaitsForSharedTotalCapacity) {
+    BuildQueue queue{1, 1};
     queue.Push([] {}, BuildQueue::Kind::Background);
-    const auto start = BuildQueue::Clock::now();
-    queue.PauseBackground(start + 100ms);
-    queue.Push([] {}, BuildQueue::Kind::Normal);
-    std::stop_source stop;
-    BuildQueue::Job job;
-    bool background = true;
-    ASSERT_TRUE(queue.Pop(job, background, stop.get_token()));
-    EXPECT_FALSE(background);
-    EXPECT_LT(BuildQueue::Clock::now() - start, 50ms);
-    ASSERT_TRUE(queue.Pop(job, background, stop.get_token()));
-    EXPECT_TRUE(background);
-    EXPECT_GE(BuildQueue::Clock::now() - start, 100ms) << "background waited out the pause";
-    queue.FinishedBackground();
+    auto first = Pop(queue);
+    ASSERT_TRUE(first.success);
+    ASSERT_TRUE(first.background);
+    queue.Push([] {}, BuildQueue::Kind::Soon);
+    WaitingPop waiting{queue};
+    EXPECT_FALSE(waiting.Ready(50ms));
+    Finish(queue, first);
+    const bool ready = waiting.Ready();
+    EXPECT_TRUE(ready);
+    if (ready) {
+        auto result = waiting.Get();
+        EXPECT_TRUE(result.success);
+        EXPECT_FALSE(result.background);
+        if (result.success) Finish(queue, result);
+    }
 }
 
-TEST(BuildQueue, StopWakesAWaitingWorker) {
-    BuildQueue queue{2};
-    std::stop_source stop;
-    std::atomic<bool> returned{};
-    std::thread worker{[&] {
-        BuildQueue::Job job;
-        bool background = false;
-        EXPECT_FALSE(queue.Pop(job, background, stop.get_token()));
-        returned = true;
-    }};
-    std::this_thread::sleep_for(20ms);
-    stop.request_stop();
-    queue.NotifyAll();
-    worker.join();
-    EXPECT_TRUE(returned.load());
+TEST(BuildQueue, HeavyCapacityIsSharedAndReleasedAcrossKinds) {
+    for (auto kind : {BuildQueue::Kind::Urgent, BuildQueue::Kind::Soon,
+                      BuildQueue::Kind::Normal, BuildQueue::Kind::Background}) {
+        BuildQueue queue{3, 2};
+        queue.Push([] {}, kind, true);
+        auto first = Pop(queue);
+        ASSERT_TRUE(first.success);
+        ASSERT_TRUE(first.heavy);
+        queue.Push([] {}, BuildQueue::Kind::Soon, true);
+        WaitingPop waiting{queue};
+        EXPECT_FALSE(waiting.Ready(50ms));
+        Finish(queue, first);
+        const bool ready = waiting.Ready();
+        EXPECT_TRUE(ready);
+        if (ready) {
+            auto result = waiting.Get();
+            EXPECT_TRUE(result.success);
+            EXPECT_TRUE(result.heavy);
+            EXPECT_FALSE(result.background);
+            if (result.success) Finish(queue, result);
+        }
+    }
+}
+
+TEST(BuildQueue, BlockedHeavySoonAllowsLighterWorkToRun) {
+    BuildQueue queue{3, 2};
+    queue.Push([] {}, BuildQueue::Kind::Urgent, true);
+    auto heavy = Pop(queue);
+    ASSERT_TRUE(heavy.success);
+    ASSERT_TRUE(heavy.heavy);
+    queue.Push([] {}, BuildQueue::Kind::Soon, true);
+    queue.Push([] {}, BuildQueue::Kind::Normal);
+    queue.Push([] {}, BuildQueue::Kind::Background);
+
+    WaitingPop normal_wait{queue};
+    const bool normal_ready = normal_wait.Ready();
+    EXPECT_TRUE(normal_ready);
+    if (!normal_ready) {
+        Finish(queue, heavy);
+        return;
+    }
+    auto normal = normal_wait.Get();
+    ASSERT_TRUE(normal.success);
+    EXPECT_FALSE(normal.background);
+    EXPECT_FALSE(normal.heavy);
+    WaitingPop background_wait{queue};
+    const bool background_ready = background_wait.Ready();
+    EXPECT_TRUE(background_ready);
+    if (!background_ready) {
+        Finish(queue, normal);
+        Finish(queue, heavy);
+        return;
+    }
+    auto background = background_wait.Get();
+    ASSERT_TRUE(background.success);
+    EXPECT_TRUE(background.background);
+    EXPECT_FALSE(background.heavy);
+    Finish(queue, normal);
+    Finish(queue, background);
+
+    WaitingPop waiting{queue};
+    EXPECT_FALSE(waiting.Ready(50ms));
+    Finish(queue, heavy);
+    const bool ready = waiting.Ready();
+    EXPECT_TRUE(ready);
+    if (ready) {
+        auto result = waiting.Get();
+        EXPECT_TRUE(result.success);
+        EXPECT_TRUE(result.heavy);
+        EXPECT_FALSE(result.background);
+        if (result.success) Finish(queue, result);
+    }
+}
+TEST(BuildQueue, BoostUsesSharedCapacityForForegroundAndBackground) {
+    BuildQueue queue{1, 1, 2};
+    queue.SetBoost(true);
+    queue.Push([] {}, BuildQueue::Kind::Background);
+    queue.Push([] {}, BuildQueue::Kind::Background);
+    auto first = Pop(queue);
+    auto second = Pop(queue);
+    ASSERT_TRUE(first.success && second.success);
+    EXPECT_TRUE(first.background && second.background);
+    queue.Push([] {}, BuildQueue::Kind::Soon);
+    WaitingPop waiting{queue};
+    EXPECT_FALSE(waiting.Ready(50ms));
+    Finish(queue, first);
+    const bool ready = waiting.Ready();
+    EXPECT_TRUE(ready);
+    if (ready) {
+        auto result = waiting.Get();
+        EXPECT_TRUE(result.success);
+        EXPECT_FALSE(result.background);
+        if (result.success) Finish(queue, result);
+    }
+    Finish(queue, second);
+}
+
+TEST(BuildQueue, StopAndNotifyWakeWaitingWorker) {
+    BuildQueue queue{2, 1};
+    WaitingPop waiting{queue};
+    EXPECT_FALSE(waiting.Ready(50ms));
+    waiting.Stop();
+    const bool ready = waiting.Ready();
+    EXPECT_TRUE(ready);
+    if (ready) EXPECT_FALSE(waiting.Get().success);
 }
