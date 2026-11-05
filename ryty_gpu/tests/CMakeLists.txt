@@ -569,3 +569,26 @@ add_custom_command(OUTPUT ${chunk_fragments}
         "${SHADGT_ROOT}/ryty_gpu/native/parallel_rotate_segment.h" VERBATIM)
 target_sources(parallel_chunk_submission_test PRIVATE ${chunk_fragments})
 add_test(NAME parallel_chunk_submission COMMAND parallel_chunk_submission_test)
+
+# CPU publication/traversal and coordinator ownership/order contracts.
+set(stream_contract_fragments stream-traversal.inc stream-coordinator-types.inc stream-drain-collect.inc stream-coordinator-methods.inc)
+list(TRANSFORM stream_contract_fragments PREPEND "${CMAKE_CURRENT_BINARY_DIR}/")
+add_custom_command(OUTPUT ${stream_contract_fragments}
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/extract_stream_contract.py"
+        "${SHADGT_ROOT}/ryty_gpu/native" "${CMAKE_CURRENT_BINARY_DIR}"
+    DEPENDS extract_stream_contract.py
+        "${SHADGT_ROOT}/ryty_gpu/native/parallel_pass_recording.cpp"
+        "${SHADGT_ROOT}/ryty_gpu/native/parallel_pass_coordinator.h"
+        "${SHADGT_ROOT}/ryty_gpu/native/parallel_pass_coordinator.cpp" VERBATIM)
+foreach(name IN ITEMS draw_publication stream_coordinator)
+    add_executable(${name}_test ${name}_test.cpp)
+    target_compile_features(${name}_test PRIVATE cxx_std_23)
+    target_include_directories(${name}_test PRIVATE "${SHADGT_ROOT}" "${SHADGT_ROOT}/ryty_gpu/native" "${CMAKE_CURRENT_BINARY_DIR}")
+    if(MSVC)
+        target_compile_options(${name}_test PRIVATE /EHsc /UNDEBUG)
+    else()
+        target_compile_options(${name}_test PRIVATE -UNDEBUG)
+    endif()
+    target_sources(${name}_test PRIVATE ${stream_contract_fragments})
+    add_test(NAME ${name} COMMAND ${name}_test)
+endforeach()

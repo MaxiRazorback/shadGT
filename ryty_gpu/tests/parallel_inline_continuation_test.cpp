@@ -28,7 +28,7 @@ struct ParallelRuntime {
  struct Updates {enum {EndPass}; void Flush(int,int){++flushes;}} descriptor_updates;
  struct Pins {static constexpr int Invalid=-1;bool Tag(int,u64){++tags;return true;}} sync_pins;
  struct Closure {void Close(std::size_t,bool,u32){++closes;}} pass_closure;
- std::optional<Pass> active{Pass{}};bool closing=false;int active_list=1,active_cmd=2,pin_slot=3;
+ std::optional<Pass> active{Pass{}};bool draw_stream=false,closing=false;int active_list=1,active_cmd=2,pin_slot=3;
  u64 epoch=4,inline_continuations=0,synchronous=0,coordinator_cpu_100ns=0,coordinator_cpu_samples=0;
  std::array<u64,9> pass_size_hist{};std::vector<int> scratch_draws;std::optional<int> lease=1;
  void FinishSerialEligibleRun(){}
@@ -64,6 +64,7 @@ int main(){
  {ResetFlags();NativeRenderer r;r.runtime.active->draws.resize(8);Reject(r);}
  {ResetFlags();NativeRenderer r;batch=true;Reject(r);}
  {ResetFlags();NativeRenderer r;r.runtime.closing=true;Reject(r);}
+ {ResetFlags();NativeRenderer r;r.runtime.draw_stream=true;Reject(r);}
  {ResetFlags();NativeRenderer r;r.stream.rendering=false;assert(!r.ContinueSmallParallelPass(RenderState{},1,true));assert(!flushes && !replays && !tags && r.runtime.active);}
  {ResetFlags();NativeRenderer r;Reject(r,false);}
  {ResetFlags();NativeRenderer r;assert(r.ContinueSmallParallelPass(RenderState{},1,true));
