@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#if !defined(NDEBUG)
 #include <windows.h>
 #include <tlhelp32.h>
 
@@ -1064,7 +1065,10 @@ void Init(State& s) {
         std::fputs(header.c_str(), s.frames_csv);
     }
     s.samples = std::make_unique<Sample[]>(SampleRingSize);
-    std::thread{SamplerThread}.detach();
+    const char* counters_only = std::getenv("RYGT_DIAG_COUNTERS_ONLY");
+    if (!(counters_only && counters_only[0] == '1')) {
+        std::thread{SamplerThread}.detach();
+    }
     std::thread{WriterThread}.detach();
 }
 
@@ -1239,3 +1243,5 @@ extern "C" __declspec(dllexport) void RyGtDiagRecordNs(u32 zone, u64 nanos, u64 
         RyDiag::RecordElapsed(RyDiag::Zone(zone), std::chrono::nanoseconds{nanos}, arg);
     }
 }
+
+#endif // !defined(NDEBUG)

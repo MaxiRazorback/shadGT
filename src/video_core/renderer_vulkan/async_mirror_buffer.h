@@ -12,6 +12,9 @@ namespace Vulkan {
 // Optional promotion only: a missing result always leaves the original guest
 // buffer usable. One slot bounds queued + executing + prepared storage to 256 MiB.
 // Allocation and abandoned-result destruction never hold the handoff mutex.
+// Prepare must return a blank, fixed-usage allocation whose compatibility is
+// determined solely by exact byte size and generation. Request addresses may
+// be used for speculative warming, never for populating or owning its content.
 template <class Buffer>
 class AsyncMirrorBuffer {
 public:
@@ -19,6 +22,8 @@ public:
         std::uint64_t begin, end, generation;
         bool operator==(const Request&) const = default;
     };
+    enum class Observation { None, Busy, Queued, Pending, Ready, Reused,
+                             DiscardSize, DiscardGeneration };
     using Prepare = std::function<std::unique_ptr<Buffer>(Request)>;
     explicit AsyncMirrorBuffer(Prepare prepare, std::function<void()> setup = {})
         : prepare(std::move(prepare)), worker([this, setup = std::move(setup)] {
@@ -30,29 +35,57 @@ public:
         cv.notify_one();
         worker.join();
     }
+    enum class Snapshot { Busy, Empty, Present };
+    // A copied hint only; TryAcquire still validates the live slot under its lock.
+    Snapshot TrySnapshot(Request& out) {
+        std::unique_lock lock(mutex, std::try_to_lock);
+        if (!lock.owns_lock() || stopping) return Snapshot::Busy;
+        if (state != State::Queued && state != State::Running && state != State::Ready)
+            return Snapshot::Empty;
+        out = request;
+        return Snapshot::Present;
+    }
     // No wait, allocation, driver call or buffer destruction on the caller.
-    std::unique_ptr<Buffer> TryAcquire(Request next) {
+    std::unique_ptr<Buffer> TryAcquire(Request next, Observation* observation = nullptr) {
+        if (observation) *observation = Observation::None;
         if (next.end <= next.begin || next.end - next.begin > (256ull << 20)) return {};
         std::unique_lock lock(mutex, std::try_to_lock);
-        if (!lock.owns_lock() || stopping) return {};
+        if (!lock.owns_lock() || stopping) {if(observation)*observation=Observation::Busy;return {};}
         if (state == State::Idle) {
             request = next;
             state = State::Queued;
+            if(observation)*observation=Observation::Queued;
             lock.unlock();
             cv.notify_one();
             return {};
         }
         if (state == State::Ready) {
-            if (request == next) {
+            if (request.generation == next.generation &&
+                request.end - request.begin == next.end - next.begin) {
                 state = State::Idle;
+                if(observation)*observation=request.begin==next.begin?Observation::Ready:Observation::Reused;
                 return std::move(result);
             }
+            if(observation)*observation=request.generation!=next.generation?Observation::DiscardGeneration:Observation::DiscardSize;
             // Different mapping/range: only the worker may destroy the old result.
             state = State::Discard;
             lock.unlock();
             cv.notify_one();
         }
+        else if(observation)*observation=Observation::Pending;
         return {};
+    }
+    // Queue only an idle slot. Never consume or replace an existing result.
+    // The recorder charges budget only while holding this lock and only for a new request.
+    template <class Start> bool TryPrepare(Request next, Start&& start) {
+        if (next.end <= next.begin || next.end - next.begin > (256ull << 20)) return false;
+        std::unique_lock lock(mutex, std::try_to_lock);
+        if (!lock.owns_lock() || stopping || state != State::Idle || !start()) return false;
+        request = next;
+        state = State::Queued;
+        lock.unlock();
+        cv.notify_one();
+        return true;
     }
     AsyncMirrorBuffer(const AsyncMirrorBuffer&) = delete;
     AsyncMirrorBuffer& operator=(const AsyncMirrorBuffer&) = delete;

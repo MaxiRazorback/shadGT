@@ -23,7 +23,7 @@ struct NativeRenderer {
  bool MirrorDiagnosticEnabled(){return false;} template<class...T>void NoteMirrorDiagnostic(T...){};
  auto FirstMirror(u64 a){auto it=mirrors.upper_bound(a);if(it!=mirrors.begin()&&std::prev(it)->second.end>a)--it;return it;}
  void UnwatchPages(u64 b,u64 e);
- void DropMirrors(u64,u64);void ReleaseUnusedWatches();void OnCpuStack(u64,u64);
+ void DropMirrors(u64,u64,u32=~u32{0});void ReleaseUnusedWatches();void OnCpuStack(u64,u64);
  void OnCpuWrite(u64 a,u64 n,u64){page_watches.Untrack(a&~4095ull,(a+n+4095)&~4095ull,[](u64,u64){});std::lock_guard lock{region_dirty_mutex};pending_region_writes.emplace_back(a,a+n);has_pending_region_writes=true;}
  void SortRegionWrites(){
 #include "cpu-stack-sort.inc"

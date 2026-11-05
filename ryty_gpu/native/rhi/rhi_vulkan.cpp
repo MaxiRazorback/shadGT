@@ -1,3 +1,4 @@
+#include "ryty_gpu/native/rhi/completed_owner_release.h"
 #include "ryty_gpu/native/descriptor_update_batch.h"
 #include "ryty_gpu/native/rhi/descriptor_batch_test_spv.h"
 #include "ryty_gpu/native/rhi/gpu_timing_lease.h"
@@ -8,6 +9,7 @@
 #include <atomic>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <bit>
 #include <deque>
 #include <functional>
@@ -42,14 +44,18 @@
 namespace Native::Rhi {
 namespace {
 
+#ifndef NDEBUG
 std::atomic<u64> diagnostic_command_lists_created{};
 
 // Pair large/slow allocation and destruction events by native handle. This is
 // diagnostic only: ownership, retirement ticks and allocation policy are unchanged.
-void TraceResourceChurn(const char* operation, const char* kind, u64 handle, u64 bytes,
+void
+#ifndef NDEBUG
+ TraceResourceChurn(const char* operation, const char* kind, u64 handle, u64 bytes,
                         std::chrono::steady_clock::time_point start,
                         std::string_view name = {}) {
     const auto end = std::chrono::steady_clock::now();
+#endif
     const double ms = std::chrono::duration<double, std::milli>(end - start).count();
     if (bytes < (64ull << 20) && ms < 2.0) return;
     LOG_WARNING(Render_Vulkan,
@@ -60,6 +66,7 @@ void TraceResourceChurn(const char* operation, const char* kind, u64 handle, u64
 }
 
 
+#endif
 vk::Format ToVk(Format format) {
     return static_cast<vk::Format>(static_cast<u32>(format));
 }
@@ -364,6 +371,7 @@ public:
     bool owned;
 };
 
+#ifndef NDEBUG
 struct GpuListTiming {
     GpuTimingLease lease;
     vk::QueryPool queries;
@@ -373,6 +381,7 @@ struct GpuListTiming {
     u32 buffer_copies{}, image_uploads{}, image_readbacks{}, dispatches{}, width{}, height{};
 };
 
+#endif
 struct ThreadPool;
 
 class VulkanCommandList final : public CommandList {
@@ -424,7 +433,9 @@ public:
     /// Whether the GPU is done with the list (its retire fence reached the value).
     bool Retired() const;
 
+#ifndef NDEBUG
     GpuListTiming* timing = nullptr;
+#endif
     VulkanDevice& device;
     ThreadPool* pool;
     vk::CommandBuffer cmd;
@@ -476,9 +487,15 @@ struct VulkanContext {
     std::function<void()> destroy; // owned objects
 };
 
+#ifndef NDEBUG
+static bool GpuTimingRequested(const char* value) noexcept {
+    return value && value[0] == '1' && value[1] == '\0';
+}
+
+#endif
 class VulkanDevice final : public Device {
 public:
-    explicit VulkanDevice(VulkanContext context);
+    explicit VulkanDevice(VulkanContext context, bool gpu_timing_enabled);
     ~VulkanDevice() override;
 
     const DeviceCaps& Caps() const override {
@@ -539,10 +556,12 @@ public:
     std::unique_ptr<Image> CreateImageFrom(const VkImageCreateInfo& image_ci, const ImageDesc& desc);
     void RecordImageInit(vk::CommandBuffer cmd, std::vector<std::pair<vk::Image, vk::ImageAspectFlags>>& images);
 
+#ifndef NDEBUG
     GpuListTiming* BeginGpuTiming(vk::CommandBuffer cmd);
     void EndGpuTiming(GpuListTiming* timing, vk::CommandBuffer cmd);
     void PublishGpuTiming(GpuListTiming* timing, vk::Semaphore completion, u64 tick);
     void ReadGpuTimings();
+    const bool gpu_timing_enabled;
     std::array<GpuListTiming, 64> gpu_timings;
     u32 gpu_timing_count = 0, timestamp_bits = 0;
     float timestamp_period = 0;
@@ -550,6 +569,7 @@ public:
     std::atomic<bool> stop_gpu_timings{};
     std::thread gpu_timing_reader;
 
+#endif
     VulkanContext ctx;
     vk::Device device;
     VmaAllocator allocator;
@@ -568,6 +588,9 @@ public:
     vk::CommandPool init_pool;
     std::deque<std::pair<u64, vk::CommandBuffer>> init_used; // (tick, buffer)
     std::vector<std::pair<vk::Image, vk::ImageAspectFlags>> pending_init;
+    // Retain a non-owning wrapper for the scheduler's semaphore until this
+    // device finishes its timing thread and deferred-resource collection.
+    std::unique_ptr<VulkanFence> external_fence_owner;
     Fence* external_fence = nullptr;
     std::function<u64()> external_current;
 };
@@ -585,27 +608,43 @@ VulkanBuffer::~VulkanBuffer() {
     }
     device.Retire([dev = device.device, alloc = device.allocator, buffer = buffer,
                    allocation = allocation, memory = memory] {
+#ifndef NDEBUG
         const auto destroy_start = std::chrono::steady_clock::now();
+#endif
+#ifndef NDEBUG
         VmaAllocationInfo allocation_info{};
+#endif
         if (allocation) {
+#ifndef NDEBUG
             vmaGetAllocationInfo(alloc, allocation, &allocation_info);
+#endif
             vmaDestroyBuffer(alloc, static_cast<VkBuffer>(buffer), allocation);
         } else {
             dev.destroyBuffer(buffer);
             dev.freeMemory(memory);
         }
+#ifndef NDEBUG
+
         TraceResourceChurn("destroy", "buffer", reinterpret_cast<u64>(static_cast<VkBuffer>(buffer)),
                            allocation_info.size, destroy_start);
+#endif
     });
 }
 VulkanImage::~VulkanImage() {
     device.Retire([alloc = device.allocator, image = image, allocation = allocation] {
+#ifndef NDEBUG
         const auto destroy_start = std::chrono::steady_clock::now();
+#endif
+#ifndef NDEBUG
         VmaAllocationInfo allocation_info{};
         vmaGetAllocationInfo(alloc, allocation, &allocation_info);
+#endif
         vmaDestroyImage(alloc, static_cast<VkImage>(image), allocation);
+#ifndef NDEBUG
+
         TraceResourceChurn("destroy", "image", reinterpret_cast<u64>(static_cast<VkImage>(image)),
                            allocation_info.size, destroy_start);
+#endif
     });
 }
 VulkanImageView::~VulkanImageView() {
@@ -624,8 +663,12 @@ VulkanPipeline::~VulkanPipeline() {
     device.Retire([dev = device.device, pipeline = pipeline] { dev.destroyPipeline(pipeline); });
 }
 
-VulkanDevice::VulkanDevice(VulkanContext context)
-    : ctx{std::move(context)}, device{ctx.device}, allocator{ctx.allocator},
+VulkanDevice::VulkanDevice(VulkanContext context, bool timing_enabled)
+    :
+#ifndef NDEBUG
+      gpu_timing_enabled{timing_enabled},
+#endif
+      ctx{std::move(context)}, device{ctx.device}, allocator{ctx.allocator},
       completed_resources{[] {
           Common::SetCurrentThreadName("shadGT:ResourceCleanup");
           Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
@@ -666,10 +709,13 @@ VulkanDevice::VulkanDevice(VulkanContext context)
     });
     ASSERT_MSG(pool_result == vk::Result::eSuccess, "NAT-011: command pool failed");
     init_pool = pool;
-    const auto queues = ctx.physical_device.getQueueFamilyProperties();
-    timestamp_bits = ctx.queue_family < queues.size() ? queues[ctx.queue_family].timestampValidBits : 0;
-    timestamp_period = properties.get<vk::PhysicalDeviceProperties2>().properties.limits.timestampPeriod;
-    if (timestamp_bits != 0 && timestamp_period > 0) {
+#ifndef NDEBUG
+    if (gpu_timing_enabled) {
+        const auto queues = ctx.physical_device.getQueueFamilyProperties();
+        timestamp_bits = ctx.queue_family < queues.size() ? queues[ctx.queue_family].timestampValidBits : 0;
+        timestamp_period = properties.get<vk::PhysicalDeviceProperties2>().properties.limits.timestampPeriod;
+    }
+    if (gpu_timing_enabled && timestamp_bits != 0 && timestamp_period > 0) {
         for (auto& sample : gpu_timings) {
             const auto [query_result, queries] = device.createQueryPool(
                 vk::QueryPoolCreateInfo{.queryType = vk::QueryType::eTimestamp, .queryCount = 2});
@@ -681,11 +727,17 @@ VulkanDevice::VulkanDevice(VulkanContext context)
     if (gpu_timing_count != 0) {
         gpu_timing_reader = std::thread([this] { ReadGpuTimings(); });
     }
+#endif
+
 }
 
 VulkanDevice::~VulkanDevice() {
-    stop_gpu_timings.store(true, std::memory_order_release);
-    if (gpu_timing_reader.joinable()) gpu_timing_reader.join();
+#ifndef NDEBUG
+    if (gpu_timing_reader.joinable()) {
+        stop_gpu_timings.store(true, std::memory_order_release);
+        gpu_timing_reader.join();
+    }
+#endif
     std::ignore = device.waitIdle();
     Collect();
     completed_resources.DrainAndStop();
@@ -700,7 +752,9 @@ VulkanDevice::~VulkanDevice() {
         }
         device.destroyCommandPool(pool->pool);
     }
+#ifndef NDEBUG
     for (u32 i = 0; i < gpu_timing_count; ++i) device.destroyQueryPool(gpu_timings[i].queries);
+#endif
     device.destroyCommandPool(init_pool);
     device.destroySemaphore(timeline);
     if (ctx.destroy) {
@@ -708,6 +762,7 @@ VulkanDevice::~VulkanDevice() {
     }
 }
 
+#ifndef NDEBUG
 namespace {
 u64 GpuTimingCpuNow() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -798,8 +853,11 @@ void VulkanDevice::ReadGpuTimings() {
     }
 }
 
+#endif
 std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
+#ifndef NDEBUG
     const auto allocation_start = std::chrono::steady_clock::now();
+#endif
     vk::BufferUsageFlags usage{};
     if (desc.usage & BufferUsageVertex) usage |= vk::BufferUsageFlagBits::eVertexBuffer;
     if (desc.usage & BufferUsageIndex) usage |= vk::BufferUsageFlagBits::eIndexBuffer;
@@ -861,8 +919,11 @@ std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
                 desc.size, vk::to_string(vk::Result{result.result}));
       return nullptr;
     }
+#ifndef NDEBUG
+
     TraceResourceChurn("allocate", "buffer", reinterpret_cast<u64>(buffer), info.size,
                        allocation_start, desc.name);
+#endif
     u64 address = 0;
     if (desc.usage & BufferUsageDeviceAddress) {
         address = device.getBufferAddress(vk::BufferDeviceAddressInfo{.buffer = buffer});
@@ -982,7 +1043,13 @@ void VulkanDevice::RecordPendingImageInit(CommandList& list) {
 }
 
 void VulkanDevice::UseExternalTimeline(Fence* fence, std::function<u64()> current) {
-    external_fence = fence;
+    // The caller's wrapper may die before this device. The scheduler owns the
+    // underlying semaphore and outlives the renderer/device.
+    auto* vulkan_fence = static_cast<VulkanFence*>(fence);
+    external_fence_owner = vulkan_fence
+        ? std::make_unique<VulkanFence>(device, vulkan_fence->semaphore, false)
+        : nullptr;
+    external_fence = external_fence_owner.get();
     external_current = std::move(current);
 }
 
@@ -1030,7 +1097,9 @@ std::unique_ptr<Image> VulkanDevice::CreateImage(const ImageDesc& desc) {
 
 std::unique_ptr<Image> VulkanDevice::CreateImageFrom(const VkImageCreateInfo& image_ci,
                                                     const ImageDesc& desc) {
+#ifndef NDEBUG
     const auto allocation_start = std::chrono::steady_clock::now();
+#endif
     VmaAllocationCreateInfo alloc_ci{.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     alloc_ci.pool = Vulkan::SmallImageAllocationPool(allocator, image_ci, alloc_ci);
     VkImage image{};
@@ -1066,10 +1135,15 @@ std::unique_ptr<Image> VulkanDevice::CreateImageFrom(const VkImageCreateInfo& im
                 vk::to_string(vk::Result{result.result}));
       return nullptr;
     }
+#ifndef NDEBUG
     VmaAllocationInfo allocation_info{};
     vmaGetAllocationInfo(allocator, allocation, &allocation_info);
+#endif
+#ifndef NDEBUG
+
     TraceResourceChurn("allocate", "image", reinterpret_cast<u64>(image), allocation_info.size,
                        allocation_start, desc.name);
+#endif
     InitImageLayout(image, AspectOf(static_cast<vk::Format>(image_ci.format)));
     return std::make_unique<VulkanImage>(*this, desc, image, allocation);
 }
@@ -1487,7 +1561,9 @@ CommandList* VulkanDevice::AcquireCommandList(CommandListLevel level) {
         });
         ASSERT_MSG(result == vk::Result::eSuccess, "NAT-011: command buffer failed");
         pool->all.push_back(std::make_unique<VulkanCommandList>(*this, pool, buffers[0], level));
+#ifndef NDEBUG
         diagnostic_command_lists_created.fetch_add(1, std::memory_order_relaxed);
+#endif
         list = pool->all.back().get();
     }
     list->retire_fence.store(nullptr, std::memory_order_relaxed);
@@ -1504,8 +1580,10 @@ std::unique_ptr<CommandList> VulkanDevice::WrapCommandBuffer(u64 native_cmdbuf) 
 void VulkanDevice::ReleaseUnsubmitted(CommandList* list) {
     if (!list) return;
     auto* vk_list = static_cast<VulkanCommandList*>(list);
+#ifndef NDEBUG
     if (vk_list->timing) vk_list->timing->lease.Cancel();
     vk_list->timing = nullptr;
+#endif
     vk_list->retire_value.store(0, std::memory_order_release);
 }
 
@@ -1513,12 +1591,16 @@ void VulkanDevice::MarkExecuted(CommandList* list, FenceValue retire) {
     if (!list) return;
     auto* vulkan_list = static_cast<VulkanCommandList*>(list);
     vulkan_list->retire_fence.store(retire.fence, std::memory_order_relaxed);
-    vulkan_list->retire_value.store(retire.value, std::memory_order_release);
+#ifndef NDEBUG
     PublishGpuTiming(vulkan_list->timing, static_cast<const VulkanFence*>(retire.fence)->semaphore, retire.value);
     vulkan_list->timing = nullptr;
+#endif
+    // Publish retirement only after every coordinator access to this list ends.
+    vulkan_list->retire_value.store(retire.value, std::memory_order_release);
 }
 
 void VulkanDevice::Collect() {
+#ifndef NDEBUG
     // Sample ownership independently of whether deferred destruction is pending.
     // VMA allocation bytes exclude the driver's own descriptor/command storage.
     static std::atomic<s64> next_report_ms{};
@@ -1557,13 +1639,16 @@ void VulkanDevice::Collect() {
                      diagnostic_command_lists_created.load(std::memory_order_relaxed));
         }
     }
+#endif
     {
         std::scoped_lock lock{retire_mutex};
         if (retired.empty()) {
             return;
         }
     }
+#ifndef NDEBUG
     const auto start = std::chrono::steady_clock::now();
+#endif
     const u64 completed = CompletedTick();
     size_t count = 0;
     {
@@ -1576,6 +1661,7 @@ void VulkanDevice::Collect() {
             ++count;
         }
     }
+#ifndef NDEBUG
     const double elapsed = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - start).count();
     if (elapsed >= 4.0) {
@@ -1583,6 +1669,8 @@ void VulkanDevice::Collect() {
                     "NAT: slow resource handoff {:.2f} ms; {} completed objects queued, no inline destruction",
                     elapsed, count);
     }
+#endif
+
 }
 
 void VulkanQueue::Submit(std::span<CommandList* const> lists, std::span<const FenceValue> waits,
@@ -1661,9 +1749,12 @@ void VulkanQueue::Submit(std::span<CommandList* const> lists, std::span<const Fe
     for (CommandList* list : lists) {
         auto* vulkan_list = static_cast<VulkanCommandList*>(list);
         vulkan_list->retire_fence.store(device.timeline_fence.get(), std::memory_order_relaxed);
-        vulkan_list->retire_value.store(tick, std::memory_order_release);
+#ifndef NDEBUG
         device.PublishGpuTiming(vulkan_list->timing, device.timeline, tick);
         vulkan_list->timing = nullptr;
+#endif
+        // The owning worker may recycle immediately after this release.
+        vulkan_list->retire_value.store(tick, std::memory_order_release);
     }
 }
 
@@ -1672,7 +1763,9 @@ void VulkanQueue::Submit(std::span<CommandList* const> lists, std::span<const Fe
 void VulkanCommandList::Begin() {
     graphics = nullptr;
     compute = nullptr;
+#ifndef NDEBUG
     timing = nullptr;
+#endif
     if (!pool) {
         return; // Externally begun
     }
@@ -1683,14 +1776,18 @@ void VulkanCommandList::Begin() {
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
         .pInheritanceInfo = level == CommandListLevel::Secondary ? &inheritance : nullptr,
     });
-    timing = device.BeginGpuTiming(cmd);
+#ifndef NDEBUG
+    if (device.gpu_timing_enabled) timing = device.BeginGpuTiming(cmd);
+#endif
 }
 
 void VulkanCommandList::End() {
     if (!pool) {
         return; // Externally ended
     }
+#ifndef NDEBUG
     device.EndGpuTiming(timing, cmd);
+#endif
     std::ignore = cmd.end();
 }
 
@@ -1963,7 +2060,9 @@ void VulkanCommandList::DrawIndexed(u32 indices, u32 instances, u32 first_index,
 }
 
 void VulkanCommandList::Dispatch(u32 x, u32 y, u32 z) {
+#ifndef NDEBUG
     if (timing) { ++timing->dispatches; timing->dispatch_groups += u64{x} * y * z; }
+#endif
     cmd.dispatch(x, y, z);
 }
 
@@ -1979,7 +2078,9 @@ void VulkanCommandList::Barrier(u32 wait_for, u32 hold_back) {
 
 void VulkanCommandList::CopyBuffer(const Buffer* src, u64 src_offset, const Buffer* dst,
                                    u64 dst_offset, u64 size) {
+#ifndef NDEBUG
     if (timing) { ++timing->buffer_copies; timing->buffer_bytes += size; }
+#endif
     const vk::BufferCopy region{.srcOffset = src_offset, .dstOffset = dst_offset, .size = size};
     cmd.copyBuffer(static_cast<const VulkanBuffer*>(src)->buffer,
                    static_cast<const VulkanBuffer*>(dst)->buffer, region);
@@ -2010,6 +2111,7 @@ std::vector<vk::BufferImageCopy> ToVkRegions(std::span<const BufferImageCopy> re
 
 void VulkanCommandList::CopyBufferToImage(const Buffer* src, const Image* dst,
                                           std::span<const BufferImageCopy> regions) {
+#ifndef NDEBUG
     if (timing) {
         ++timing->image_uploads;
         if (src->Size() >= timing->largest_source_capacity) {
@@ -2018,6 +2120,7 @@ void VulkanCommandList::CopyBufferToImage(const Buffer* src, const Image* dst,
             timing->width = dst->Desc().width; timing->height = dst->Desc().height;
         }
     }
+#endif
     const auto out = ToVkRegions(regions);
     cmd.copyBufferToImage(static_cast<const VulkanBuffer*>(src)->buffer,
                           static_cast<const VulkanImage*>(dst)->image, vk::ImageLayout::eGeneral,
@@ -2026,7 +2129,9 @@ void VulkanCommandList::CopyBufferToImage(const Buffer* src, const Image* dst,
 
 void VulkanCommandList::CopyImageToBuffer(const Image* src, const Buffer* dst,
                                           std::span<const BufferImageCopy> regions) {
+#ifndef NDEBUG
     if (timing) ++timing->image_readbacks;
+#endif
     const auto out = ToVkRegions(regions);
     cmd.copyImageToBuffer(static_cast<const VulkanImage*>(src)->image, vk::ImageLayout::eGeneral,
                           static_cast<const VulkanBuffer*>(dst)->buffer,
@@ -2080,6 +2185,11 @@ void VulkanCommandList::EndMarker() {
 
 } // namespace
 
+bool TryEnqueueCompleted(Device& device,std::function<void()>& release) noexcept {
+    try {return static_cast<VulkanDevice&>(device).completed_resources.TryEnqueue(release);}
+    catch (...) {return false;}
+}
+
 std::unique_ptr<Image> CreateVulkanImage(Device& device, const VkImageCreateInfo& image_ci,
                                          const ImageDesc& desc) {
     return static_cast<VulkanDevice&>(device).CreateImageFrom(image_ci, desc);
@@ -2101,10 +2211,16 @@ std::unique_ptr<Device> CreateVulkanDevice(const Vulkan::Instance& instance) {
         .depth_clip_control = instance.IsDepthClipControlSupported(),
         .max_push_descriptors = instance.MaxPushDescriptors(),
     };
-    return std::make_unique<VulkanDevice>(std::move(context));
+    return std::make_unique<VulkanDevice>(std::move(context),
+#ifndef NDEBUG
+        GpuTimingRequested(std::getenv("RYGT_GPU_TIMING"))
+#else
+        false
+#endif
+    );
 }
 
-std::unique_ptr<Device> CreateStandaloneVulkanDevice(std::string* error) {
+static std::unique_ptr<Device> CreateStandaloneVulkanDeviceImpl(std::string* error, bool timing_enabled) {
     const auto fail = [error](std::string why) -> std::unique_ptr<Device> {
         if (error) {
             *error = std::move(why);
@@ -2265,16 +2381,49 @@ std::unique_ptr<Device> CreateStandaloneVulkanDevice(std::string* error) {
                 delete kept_instance;
             },
     };
-    return std::make_unique<VulkanDevice>(std::move(context));
+    return std::make_unique<VulkanDevice>(std::move(context), timing_enabled);
 }
 
+std::unique_ptr<Device> CreateStandaloneVulkanDevice(std::string* error) {
+    return CreateStandaloneVulkanDeviceImpl(error,
+#ifndef NDEBUG
+        GpuTimingRequested(std::getenv("RYGT_GPU_TIMING"))
+#else
+        false
+#endif
+    );
+}
+
+#ifndef NDEBUG
 // Diagnostic harness uses the same backend, lease protocol and reader as gameplay.
 extern "C" __declspec(dllexport) int RytyNativeGpuTimingSelfTest(char* report, int report_size) {
     std::string error;
-    auto base = CreateStandaloneVulkanDevice(&error);
+    if (GpuTimingRequested(nullptr) || GpuTimingRequested("0") || !GpuTimingRequested("1") || GpuTimingRequested("11")) return 1;
+    auto off = CreateStandaloneVulkanDeviceImpl(&error, GpuTimingRequested(nullptr));
+    if (!off) return 1;
+    auto& off_device = static_cast<VulkanDevice&>(*off);
+    if (off_device.gpu_timing_enabled || off_device.gpu_timing_count || off_device.gpu_timing_reader.joinable()) return 1;
+    auto* off_list = off_device.AcquireCommandList(CommandListLevel::Primary);
+    off_list->Begin(); off_list->End(); off_device.ReleaseUnsubmitted(off_list);
+    if (off_device.gpu_timing_sequence.load() || off_device.gpu_timing_skipped.load()) return 1;
+    off.reset();
+    // Check the normal factory as well as the forced-on test path; this verifies
+    // the actual process environment without mutating it in a shared process.
+    auto configured = CreateStandaloneVulkanDevice(&error);
+    if (!configured) return 1;
+    auto& configured_device = static_cast<VulkanDevice&>(*configured);
+    const bool configured_enabled = GpuTimingRequested(std::getenv("RYGT_GPU_TIMING"));
+    const u32 configured_pools = configured_device.gpu_timing_count;
+    const bool configured_reader = configured_device.gpu_timing_reader.joinable();
+    if (configured_device.gpu_timing_enabled != configured_enabled ||
+        (!configured_enabled && (configured_pools || configured_reader)) ||
+        (configured_pools != 0) != configured_reader) return 1;
+    if (configured_enabled && configured_device.timestamp_bits && configured_device.timestamp_period > 0 && !configured_pools) return 1;
+    configured.reset();
+    auto base = CreateStandaloneVulkanDeviceImpl(&error, GpuTimingRequested("1"));
     if (!base) return 1;
     auto& device = static_cast<VulkanDevice&>(*base);
-    bool ok = device.gpu_timing_count == 64;
+    bool ok = device.gpu_timing_enabled && device.gpu_timing_count == 64 && device.gpu_timing_reader.joinable();
     // Exhaustion skips diagnostics, never recording or ownership. None of these
     // buffers execute: cancel must release their slots without reading stale queries.
     std::vector<CommandList*> unsubmitted;
@@ -2329,8 +2478,8 @@ extern "C" __declspec(dllexport) int RytyNativeGpuTimingSelfTest(char* report, i
             return 5;
         }
     }
-    const auto text = fmt::format("GPU timing: 64 bounded query pairs, 96 unsubmitted lists, 32 nonblocking skips, "
-        "cancellation, 240 reused query generations in primary/secondary lists and 10485760 GPU copy bytes verified: {}\n", ok ? "passed" : "FAILED");
+    const auto text = fmt::format("GPU timing: factory enabled={} pools={} reader={}; default-off 0 pools/0 reader/0 skipped; opt-in 64 bounded query pairs, 96 unsubmitted lists, 32 nonblocking skips, "
+        "cancellation, 240 reused query generations in primary/secondary lists and 10485760 GPU copy bytes verified: {}\n", configured_enabled, configured_pools, configured_reader, ok ? "passed" : "FAILED");
     if (report && report_size > 0) {
         const auto size = std::min<size_t>(text.size(), size_t(report_size - 1));
         std::memcpy(report, text.data(), size); report[size] = 0;
@@ -2338,6 +2487,8 @@ extern "C" __declspec(dllexport) int RytyNativeGpuTimingSelfTest(char* report, i
     return ok ? 0 : 6;
 }
 
+#endif
+#ifndef NDEBUG
 extern "C" __declspec(dllexport) int RytyNativeDescriptorBatchSelfTest(char* report,int report_size) {
     std::string error;
     auto base=CreateStandaloneVulkanDevice(&error);if(!base)return 1;
@@ -2428,5 +2579,7 @@ extern "C" __declspec(dllexport) int RytyNativeDescriptorBatchSelfTest(char* rep
     if(report&&report_size>0){const auto n=std::min(text.size(),size_t(report_size-1));std::memcpy(report,text.data(),n);report[n]=0;}
     return wrong==0&&old_calls==160&&batch_calls==64?0:11;
 }
+
+#endif
 
 } // namespace Native::Rhi

@@ -1,3 +1,4 @@
+#ifndef NDEBUG
 #include "ryty_gpu/native/cpu_texture_staging.h"
 #include "ryty_gpu/native/region_init_gaps.h"
 #include "ryty_gpu/native/local_tiled_source.h"
@@ -484,6 +485,33 @@ bool RunRegionMergeOrderCase(Rhi::Device& device, Rhi::Fence& fence, u64& tick,
     return ok;
 }
 
+bool RunUnmapTargetLifetimeCase(Rhi::Device& device, std::string& log) {
+    ImageRegistry registry{device};
+    auto info = MakeInfo(AmdGpu::TileMode::DisplayLinearAligned, 16, 16, 1,
+                         0x720000000000ull);
+    ImageEntry* target = registry.Find(info, true, 1);
+    if (!target || !target->image) return false;
+    bool ok = registry.Find(info, false, 2) == target;
+    registry.CpuWrite(info.guest_address, info.guest_size, info.guest_size);
+    ok = ok && !target->reused.load() && registry.Find(info, false, 3) == target;
+    const u64 generation = registry.Generation();
+    const std::pair<VAddr, VAddr> range{info.guest_address, info.guest_address + info.guest_size};
+    registry.Invalidate(info.guest_address + 1, 1, ImageRegistry::Stale::Unmap);
+    ok = ok && target->reused.load() && !registry.Untouched(generation, {&range, 1});
+    ok = ok && target->image && registry.Count() == 1;
+    ImageEntry* texture = registry.Find(info, false, 4);
+    ok = ok && texture && texture != target && texture->from_cpu && registry.Count() == 2;
+    ok = ok && registry.Find(info, false, 5) == texture;
+    u32 retired = 0;
+    ok = registry.Evict(10, [&](ImageEntry& e) { if (&e == target) ++retired; },
+                        [&](ImageEntry& e) { return &e == target; }) == 1 &&
+         retired == 0 && registry.Count() == 1 && ok;
+    ok = registry.Evict(10, [&](ImageEntry& e) { if (&e == target) ++retired; }) == 1 &&
+         retired == 1 && registry.Count() == 0 && ok;
+    log += fmt::format("unmapped target lifetime and alias: {}\n", ok ? "passed" : "FAILED");
+    return ok;
+}
+
 bool RunEvictionBudgetCase(Rhi::Device& device, std::string& log) {
     ImageRegistry registry{device};
     constexpr VAddr base = 0x710000000000ull;
@@ -587,7 +615,48 @@ bool RunAsyncMirrorCase(Rhi::Device& device, Rhi::Fence& fence, u64& tick,
             verified += bytes;
         }
     }
-    log += fmt::format("async mirror: six worker allocations, ordered GPU copies, {} bytes verified: passed\n", verified);
+    // Two blank allocations requested for A are filled from different B inputs
+    // in one GPU submission. Reuse must never imply that A's bytes were copied.
+    constexpr u64 bytes=4096;
+    using Worker=Vulkan::AsyncMirrorBuffer<Rhi::Buffer>;
+    std::array<std::unique_ptr<Rhi::Buffer>,2> sources,mirrors,readbacks;
+    for(u64 i=0;i<2;++i) {
+        sources[i]=device.CreateBuffer({.size=bytes,.usage=Rhi::BufferUsageTransferSrc,.memory=Rhi::MemoryKind::Upload});
+        readbacks[i]=device.CreateBuffer({.size=bytes,.usage=Rhi::BufferUsageTransferDst,.memory=Rhi::MemoryKind::Readback});
+        if(!sources[i] || !readbacks[i] || !sources[i]->Mapped() || !readbacks[i]->Mapped())return false;
+        std::memset(sources[i]->Mapped(),0xa5,bytes);
+        const u64 a=0x10000+i*0x40000,b=a+0x20000;
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        u32 starts=0;
+        while(!worker.TryPrepare({a,a+bytes,3},[&]{++starts;return true;})) {
+            if(std::chrono::steady_clock::now()>deadline)return false;
+            std::this_thread::yield();
+        }
+        if(starts!=1)return false;
+        Worker::Request owner{};
+        while(worker.TrySnapshot(owner)!=Worker::Snapshot::Present) {
+            if(std::chrono::steady_clock::now()>deadline)return false;
+            std::this_thread::yield();
+        }
+        if(owner!=Worker::Request{a,a+bytes,3})return false;
+        Worker::Observation observed{};
+        while(!(mirrors[i]=worker.TryAcquire({b,b+bytes,3},&observed))) {
+            if(std::chrono::steady_clock::now()>deadline)return false;
+            std::this_thread::yield();
+        }
+        if(observed!=Worker::Observation::Reused)return false;
+        // Mutate B after A's allocation is ready: copy the latest B bytes.
+        for(u64 j=0;j<bytes;++j)sources[i]->Mapped()[j]=u8((j*17+i*91+31)&255);
+    }
+    auto* list=device.AcquireCommandList();list->Begin();list->Barrier(Rhi::ScopeHost,Rhi::ScopeTransfer);
+    for(u32 i=0;i<2;++i)list->CopyBuffer(sources[i].get(),0,mirrors[i].get(),0,bytes);
+    list->Barrier(Rhi::ScopeTransfer,Rhi::ScopeTransfer);
+    for(u32 i=0;i<2;++i)list->CopyBuffer(mirrors[i].get(),0,readbacks[i].get(),0,bytes);
+    list->Barrier(Rhi::ScopeTransfer,Rhi::ScopeHost);list->End();
+    Rhi::CommandList* lists[]={list};device.GraphicsQueue().Submit(lists,{}, {&fence,++tick});
+    if(!fence.Wait(tick,5'000'000'000ULL))return false;
+    for(u32 i=0;i<2;++i) {readbacks[i]->Invalidate();if(std::memcmp(sources[i]->Mapped(),readbacks[i]->Mapped(),bytes))return false;}
+    log += fmt::format("async mirror: six exact allocations and two queue-only owner snapshots with cross-address allocations, ordered GPU copies, {} bytes verified: passed\n", verified+2*bytes);
     return true;
 }
 
@@ -698,6 +767,7 @@ bool RunImageSelfTest(std::string& log) {
     bool ok = true;
     ok = RunAsyncMirrorCase(*device,*fence,tick,log) && ok;
     ok = RunEvictionBudgetCase(*device, log) && ok;
+    ok = RunUnmapTargetLifetimeCase(*device, log) && ok;
     ok = RunUploadChunkCacheCase(*device,*fence,tick,log) && ok;
     ok = RunLargeGatherScratchCase(*device,*fence,tick,log) && ok;
     ok = RunRegionMergeOrderCase(*device,*fence,tick,log) && ok;
@@ -817,3 +887,5 @@ extern "C" __declspec(dllexport) int RytyNativeLocalUntileBenchmark(char* report
     if(report && report_size>0){const auto n=std::min<size_t>(text.size(),size_t(report_size-1));std::memcpy(report,text.data(),n);report[n]=0;}
     return 0;
 }
+
+#endif // !NDEBUG

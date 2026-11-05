@@ -5,6 +5,7 @@
 #include "common/debug.h"
 #include "common/guest_clock.h"
 #include "common/thread.h"
+#include "common/perf_monitor.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
@@ -48,6 +49,7 @@ constexpr u32 PixelFormatBpp(PixelFormat pixel_format) {
 }
 
 VideoOutDriver::VideoOutDriver(u32 width, u32 height) {
+    Common::FrameQueueTrace::Initialize();
     main_port.resolution.full_width = width;
     main_port.resolution.full_height = height;
     main_port.resolution.pane_width = width;
@@ -55,7 +57,14 @@ VideoOutDriver::VideoOutDriver(u32 width, u32 height) {
     present_thread = std::jthread([&](std::stop_token token) { PresentThread(token); });
 }
 
-VideoOutDriver::~VideoOutDriver() = default;
+VideoOutDriver::~VideoOutDriver() {
+    {
+        std::scoped_lock lock{mutex};
+        present_thread.request_stop();
+    }
+    request_cv.notify_all();
+    if (present_thread.joinable()) present_thread.join();
+}
 
 int VideoOutDriver::Open(const ServiceThreadParams* params) {
     if (main_port.is_open) {
@@ -71,7 +80,7 @@ void VideoOutDriver::Close(s32 handle) {
 
     // Mark as closed
     main_port.is_open = false;
-    main_port.flip_rate = 0;
+    main_port.flip_rate.store(0, std::memory_order_relaxed);
     main_port.prev_index = -1;
 
     // Clear port information
@@ -242,6 +251,7 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
 
 // PERF-DIAG-002: flip pacing. Submit-to-flip latency, Present() time, and queued flips at each
 // vblank, reported every 2 s.
+#ifndef NDEBUG
 namespace {
 struct FlipStats {
     std::mutex mutex;
@@ -272,18 +282,34 @@ void ReportFlipStats() {
     s.window = now;
 }
 } // namespace
+#endif
 
 void VideoOutDriver::Flip(const Request& req) {
+#ifndef NDEBUG
+    Common::FrameQueueTrace::Row trace{};
+    trace.ticket = req.trace;
+    if (trace.ticket.generation) {
+        trace.flip_begin = Common::FrameQueueTrace::Now(trace.ticket);
+        trace.ready_semaphore =
+            reinterpret_cast<std::uintptr_t>(static_cast<VkSemaphore>(req.frame->ready_semaphore));
+        trace.ready_tick = req.frame->ready_tick;
+        trace.frame_id = req.frame->id;
+    }
+    Common::FrameQueueTrace::Scope trace_scope{trace.ticket.generation ? &trace : nullptr};
+#endif
     // Update HDR status before presenting.
     presenter->SetHDR(req.port->is_hdr);
 
     // Present the frame.
+#ifndef NDEBUG
     const auto present_start = std::chrono::steady_clock::now();
     Common::Nvtx::Mark("flip"); // DIAG-056
+#endif
     {
         Common::Nvtx::Scope nvtx{"present"};
         presenter->Present(req.frame);
     }
+    #ifndef NDEBUG
     {
         const auto now = std::chrono::steady_clock::now();
         std::scoped_lock lk{g_flip_stats.mutex};
@@ -299,6 +325,19 @@ void VideoOutDriver::Flip(const Request& req) {
         st.max_latency_ms = std::max(st.max_latency_ms, latency_ms);
     }
 
+    if (trace.ticket.generation) {
+        auto& work = Common::GetWorkCounters();
+        trace.draws = work.draws.load(std::memory_order_relaxed);
+        trace.dispatches = work.dispatches.load(std::memory_order_relaxed);
+        trace.shaders = work.shaders_compiled.load(std::memory_order_relaxed);
+        trace.pipelines = work.pipelines_compiled.load(std::memory_order_relaxed);
+        trace.uploads = work.uploads.load(std::memory_order_relaxed);
+        trace.upload_bytes = work.upload_bytes.load(std::memory_order_relaxed);
+        trace.protects = work.protects.load(std::memory_order_relaxed);
+        trace.protect_bytes = work.protect_bytes.load(std::memory_order_relaxed);
+        Common::FrameQueueTrace::Complete(trace);
+    }
+#endif
     // Update flip status.
     auto* port = req.port;
     {
@@ -356,6 +395,7 @@ void VideoOutDriver::AntiLagInput() {
 
 bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
                                 bool is_eop /*= false*/) {
+    auto trace = Common::FrameQueueTrace::Start();
     RyDiag::Mark(RyDiag::Zone::GameFlip, u64(index));
     if (!is_eop) {
         presenter->AntiLagInput(); // PERF-210: on the game's thread, never the command thread
@@ -376,15 +416,21 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 
     if (!is_eop) {
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
-        liverpool->SendCommand([=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); });
+        liverpool->SendCommand(
+            [=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop, trace); });
     } else {
-        SubmitFlipInternal(port, index, flip_arg, is_eop);
+        SubmitFlipInternal(port, index, flip_arg, is_eop, trace);
     }
 
     return true;
 }
 
-void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
+void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
+                                        Common::FrameQueueTrace::Ticket trace) {
+#ifndef NDEBUG
+    if (trace.generation)
+        Common::FrameQueueTrace::Prepare(trace);
+#endif
     Vulkan::Frame* frame;
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
@@ -395,15 +441,25 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         frame = presenter->PrepareFrame(group, buffer.address_left);
     }
 
-    std::scoped_lock lock{mutex};
-    requests.push({
-        .frame = frame,
-        .port = port,
-        .flip_arg = flip_arg,
-        .index = index,
-        .eop = is_eop,
-        .submitted = std::chrono::steady_clock::now(),
-    });
+    {
+        std::scoped_lock lock{mutex};
+#ifndef NDEBUG
+        if (trace.generation)
+            Common::FrameQueueTrace::Enqueue(trace);
+#endif
+        requests.push({
+            .frame = frame,
+            .port = port,
+            .flip_arg = flip_arg,
+            .index = index,
+            .eop = is_eop,
+            .trace = trace,
+#ifndef NDEBUG
+            .submitted = std::chrono::steady_clock::now(),
+#endif
+        });
+    }
+    request_cv.notify_one();
 }
 
 void VideoOutDriver::PresentThread(std::stop_token token) {
@@ -411,8 +467,9 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                                                  EmulatorSettings.GetVblankFrequency());
     // FAST-FLIP (ryGT): a frame finished between two vblanks is flipped at once instead of at
     // the next vblank, so a 25 ms frame shows after 25 ms rather than 33 ms (GT Sport's races
-    // otherwise snap to 30 fps). The loop runs four times per vblank; the game's vblank events
-    // and status still come once per vblank. GPU.fast_flips in the game's config (the
+    // otherwise snap to 30 fps). Enqueue wakes the thread between four scheduled ticks per
+    // vblank; the game's vblank events and status still come once per vblank.
+    // GPU.fast_flips in the game's config (the
     // launcher's option) or RYGT_FAST_FLIPS=1.
     static const u32 ticks_per_vblank = [] {
         bool fast = false;
@@ -434,54 +491,9 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     Common::SetCurrentThreadName("shadGT:PresentThread");
     Common::SetCurrentThreadRealtime(tick_period);
 
-    Common::AccurateTimer timer{tick_period};
-
-    const auto receive_request = [this] -> Request {
-        std::scoped_lock lk{mutex};
-        if (!requests.empty()) {
-            const auto request = requests.front();
-            requests.pop();
-            return request;
-        }
-        return {};
-    };
-
-    while (!token.stop_requested()) {
-        timer.Start();
-
-        if (DebugState.IsGuestThreadsPaused()) {
-            DrawLastFrame();
-            timer.End();
-            continue;
-        }
-        if (Common::GuestClock::IsPaused()) {
-            // FIX-044: no vblank passes while the guest clocks are held for a shader or
-            // pipeline compile, as no time passes for the game. PERF-100: the last frame is
-            // shown again, with the compile notice drawn over it (PERF-102: or the splash
-            // screen, before the game's first frame).
-            if (timer.GetTotalWait().count() < 0) {
-                // Before the game's first frame a blank frame, which shows the splash screen
-                // and the precompile bar; after it the last frame (skipped while it is taken).
-                // DIAG-126 (SHADGT_NO_LAST_FRAME=1): compile pauses after the first frame keep
-                // what is on screen instead of showing the last frame again.
-                static const bool no_last_frame = [] {
-                    const char* env = std::getenv("SHADGT_NO_LAST_FRAME");
-                    return env && env[0] == '1';
-                }();
-                if (!main_port.is_open || !presenter->HasLastFrame()) {
-                    DrawBlankFrame();
-                } else if (!no_last_frame) {
-                    DrawLastFrame();
-                }
-            }
-            timer.End();
-            continue;
-        }
-
-        // Check if it's time to take a request.
-        auto& vblank_status = main_port.vblank_status;
-        // PERF-075: SHADGT_FPS_LOCK=<fps> (30 in Run-GTSportPerformance.ps1) paces flips evenly
-        // at that rate; GT Sport's races vary between 25 and 40 FPS, which shows as judder.
+    using Clock = std::chrono::steady_clock;
+    auto next_tick = Clock::now();
+    const auto current_flip_rate = [&] {
         static const u32 fps_lock = [] {
             const char* env = std::getenv("SHADGT_FPS_LOCK");
             const u32 fps = env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0;
@@ -490,25 +502,118 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             }
             return fps;
         }();
-        const int flip_rate =
-            LockedFlipRate(main_port.flip_rate, fps_lock, EmulatorSettings.GetVblankFrequency());
+        return LockedFlipRate(main_port.flip_rate.load(std::memory_order_relaxed), fps_lock,
+                              EmulatorSettings.GetVblankFrequency());
+    };
+    const auto early_allowed = [&] {
+        return ticks_per_vblank > 1 && !DebugState.IsGuestThreadsPaused() &&
+               !Common::GuestClock::IsPaused() && current_flip_rate() == 0;
+    };
+
+    const auto receive_request = [this] -> Request {
+        std::scoped_lock lk{mutex};
+        if (!requests.empty()) {
+            auto request = requests.front();
+            requests.pop();
+#ifndef NDEBUG
+            if (request.trace.generation)
+                Common::FrameQueueTrace::Dequeue(request.trace);
+#endif
+            return request;
+        }
+        return {};
+    };
+
+    while (!token.stop_requested()) {
+        auto now = Clock::now();
+        if (now < next_tick) {
+            if (early_allowed()) {
+                std::unique_lock lock{mutex};
+                request_cv.wait_until(lock, next_tick,
+                                      [&] { return token.stop_requested() || !requests.empty(); });
+                lock.unlock();
+                if (token.stop_requested()) {
+                    break;
+                }
+                now = Clock::now();
+                if (now < next_tick && early_allowed()) {
+                    if (const auto request = receive_request()) {
+#ifndef NDEBUG
+                        {
+                            std::scoped_lock stats_lock{g_flip_stats.mutex};
+                            ++g_flip_stats.early_flips;
+                        }
+#endif
+                        Flip(request);
+                        FRAME_END;
+                    }
+                    continue; // early wakes do not advance the vblank deadline
+                }
+            }
+            now = Clock::now();
+            if (now < next_tick) {
+                Common::AccurateSleep(next_tick - now, nullptr, false);
+            }
+        }
+        if (token.stop_requested()) {
+            break;
+        }
+        const bool overdue = Clock::now() > next_tick;
+        next_tick += tick_period;
+
+        if (DebugState.IsGuestThreadsPaused()) {
+            DrawLastFrame();
+            continue;
+        }
+        if (Common::GuestClock::IsPaused()) {
+            // FIX-044: no vblank passes while the guest clocks are held for a shader or
+            // pipeline compile, as no time passes for the game. PERF-100: the last frame is
+            // shown again, with the compile notice drawn over it (PERF-102: or the splash
+            // screen, before the game's first frame).
+            if (overdue) {
+                // Before the game's first frame a blank frame, which shows the splash screen
+                // and the precompile bar; after it the last frame (skipped while it is taken).
+                // DIAG-126 (SHADGT_NO_LAST_FRAME=1): compile pauses after the first frame keep
+                // what is on screen instead of showing the last frame again.
+#ifndef NDEBUG
+                static const bool no_last_frame = [] {
+                    const char* env = std::getenv("SHADGT_NO_LAST_FRAME");
+                    return env && env[0] == '1';
+                }();
+#else
+                constexpr bool no_last_frame = false;
+#endif
+                if (!main_port.is_open || !presenter->HasLastFrame()) {
+                    DrawBlankFrame();
+                } else if (!no_last_frame) {
+                    DrawLastFrame();
+                }
+            }
+            continue;
+        }
+
+        // Check if it's time to take a request.
+        auto& vblank_status = main_port.vblank_status;
+        const int flip_rate = current_flip_rate();
         const bool vblank_tick = tick++ % ticks_per_vblank == 0;
         if (!vblank_tick) {
             // FAST-FLIP: between vblanks, only a ready frame is flipped.
             if (flip_rate == 0) {
                 if (const auto request = receive_request()) {
+#ifndef NDEBUG
                     {
                         std::scoped_lock lk{g_flip_stats.mutex};
                         ++g_flip_stats.early_flips;
                     }
+#endif
                     Flip(request);
                     FRAME_END;
                 }
             }
-            timer.End();
             continue;
         }
         if (vblank_status.count % (flip_rate + 1) == 0) {
+#ifndef NDEBUG
             {
                 std::scoped_lock lk{mutex, g_flip_stats.mutex};
                 ++g_flip_stats.vblanks;
@@ -519,9 +624,10 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 }
                 ReportFlipStats();
             }
+#endif
             const auto request = receive_request();
             if (!request) {
-                if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
+                if (overdue) { // Dont draw too fast
                     if (!main_port.is_open) {
                         DrawBlankFrame();
                     } else if (ImGui::Core::MustKeepDrawing()) {
@@ -558,7 +664,6 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             main_port.vblank_cv.notify_all();
         }
 
-        timer.End();
     }
 }
 

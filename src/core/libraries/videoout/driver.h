@@ -3,10 +3,12 @@
 
 #pragma once
 
+#include "common/frame_queue_trace.h"
 #include "common/debug.h"
 #include "common/polyfill_thread.h"
 #include "core/libraries/videoout/video_out.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -32,7 +34,7 @@ struct VideoOutPort {
     std::mutex port_mutex;
     std::condition_variable vo_cv;
     std::condition_variable vblank_cv;
-    int flip_rate = 0;
+    std::atomic<int> flip_rate{0};
     int prev_index = -1;
     bool is_open = false;
     bool is_hdr = false;
@@ -105,7 +107,10 @@ private:
         s64 flip_arg;
         s32 index;
         bool eop;
+        Common::FrameQueueTrace::Ticket trace{};
+#ifndef NDEBUG
         std::chrono::steady_clock::time_point submitted{}; // PERF-DIAG-002
+#endif
 
         operator bool() const noexcept {
             return frame != nullptr;
@@ -115,10 +120,12 @@ private:
     void Flip(const Request& req);
     void DrawBlankFrame(); // Video port out not open
     bool DrawLastFrame();  // Used when there is no flip request
-    void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
+    void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
+                            Common::FrameQueueTrace::Ticket trace);
     void PresentThread(std::stop_token token);
 
     std::mutex mutex;
+    std::condition_variable request_cv;
     VideoOutPort main_port{};
     std::jthread present_thread;
     std::queue<Request> requests;

@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include "ryty_gpu/native/memory_range_runs.h"
+#include "ryty_gpu/native/epoch_lookup_memo.h"
 #include <string>
 #ifdef _WIN32
 #include <windows.h>
@@ -22,6 +24,8 @@
 #include "video_core/buffer_cache/defer_import_releases.h"
 #include "video_core/buffer_cache/import_cleanup_worker.h"
 #include "ryty_gpu/native/slow_call_trace.h"
+#include "ryty_gpu/native/direct_coherence_registry.h"
+#include "ryty_gpu/native/parallel_direct_capability.h"
 #include "video_core/buffer_cache/proto_import.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -29,6 +33,14 @@
 namespace VideoCore {
 
 namespace {
+// Every view insertion/removal and owner lifetime change invalidates all local
+// shortcuts. The view mutex still protects each lookup and returned wrapper.
+std::atomic<u64> imported_view_epoch{1};
+Native::Parallel::DirectCoherenceRegistry<> direct_coherence;
+bool TrackParallelDirect() noexcept {
+    static const bool active=[] { const char* p=std::getenv("RYGT_PARALLEL_D2"); return p && p[0]=='1' && p[1]=='\0'; }();
+    return active;
+}
 
 using MapAliasFn = void* (*)(std::uintptr_t, std::size_t);
 using UnmapAliasFn = void (*)(void*);
@@ -66,14 +78,25 @@ struct PendingRelease {
 
 } // namespace
 
+bool ParallelDirectViewsCoherent(const DirectMemory* owner, std::span<const std::pair<std::uint64_t,std::uint64_t>> ranges) noexcept {
+    return ranges.empty() || (TrackParallelDirect() && direct_coherence.CoversAll(owner,ranges));
+}
+
+bool ParallelDirectViewCoherent(const DirectMemory* owner, std::uint64_t base, std::uint64_t size) noexcept {
+    return TrackParallelDirect() && direct_coherence.Covers(owner,base,size);
+}
+
 DirectMemory::DirectMemory(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_)
     : instance{instance_}, scheduler{scheduler_} {
+    imported_view_epoch.fetch_add(1, std::memory_order_acq_rel);
     l1 = std::make_unique<Buffer>(instance, 0, L1Entries * sizeof(u64), MemoryType::Stream,
                                   "D1 page table L1");
     l2_pool = std::make_unique<Buffer>(instance, 0, MaxL2Tables * L2Entries * sizeof(u64),
                                        MemoryType::Stream, "D1 page table L2");
     zero_page = std::make_unique<Buffer>(instance, 0, 2 * PageSize, MemoryType::Stream,
                                          "D1 zero page");
+    if (TrackParallelDirect()) direct_coherence.Register(this,
+        l1->is_coherent && l2_pool->is_coherent && zero_page->is_coherent);
     std::memset(zero_page->mapped_data.data(), 0, zero_page->mapped_data.size());
     std::memset(l1->mapped_data.data(), 0, l1->mapped_data.size());
     l2_index.assign(L1Entries, 0);
@@ -89,7 +112,10 @@ DirectMemory::DirectMemory(const Vulkan::Instance& instance_, Vulkan::Scheduler&
                 l1->BufferDeviceAddress());
 }
 
-DirectMemory::~DirectMemory() = default;
+DirectMemory::~DirectMemory() {
+    if (TrackParallelDirect()) direct_coherence.Erase(this);
+    imported_view_epoch.fetch_add(1, std::memory_order_acq_rel);
+}
 
 bool DirectMemory::Enabled() {
     // D11: the direct renderer is the renderer (GPU.direct_renderer from older launchers is
@@ -168,19 +194,22 @@ u64* DirectMemory::L2For(VAddr address, bool create) {
 }
 
 void DirectMemory::MapPages(VAddr begin, VAddr end, vk::DeviceAddress device_address) {
-    for (VAddr page = begin; page < end; page += PageSize) {
-        if (u64* l2 = L2For(page, true)) {
-            l2[(page >> PageBits) & (L2Entries - 1)] = device_address + (page - begin);
+    Native::VisitPageTableRuns<PageBits, L2Bits>(begin, end,
+      [&](u64 address, u64 first, u64 count) {
+        if (u64* l2 = L2For(address, true)) {
+            for (u64 i = 0; i < count; ++i)
+                l2[first + i] = device_address + (address - begin) + i * PageSize;
         }
-    }
+      });
 }
 
 void DirectMemory::UnmapPages(VAddr begin, VAddr end) {
-    for (VAddr page = begin; page < end; page += PageSize) {
-        if (u64* l2 = L2For(page, false)) {
-            l2[(page >> PageBits) & (L2Entries - 1)] = 0;
+    Native::VisitPageTableRuns<PageBits, L2Bits>(begin, end,
+      [&](u64 address, u64 first, u64 count) {
+        if (u64* l2 = L2For(address, false)) {
+            std::fill_n(l2 + first, count, u64{0});
         }
-    }
+      });
 }
 
 bool DirectMemory::Covered(VAddr address, u64 size) const {
@@ -190,14 +219,19 @@ bool DirectMemory::Covered(VAddr address, u64 size) const {
 std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindBuffer(VAddr address,
                                                                      u64 size) const {
     std::scoped_lock lk{mutex};
+    static thread_local Native::EpochRangeMemo<const Buffer*> memo;
+    const auto epoch = imported_view_epoch.load(std::memory_order_acquire);
+    if (const auto found = memo.Find(this, epoch, address, size))
+        return std::make_pair(found->value, found->offset);
     auto it = views.upper_bound(address);
     if (it == views.begin()) {
         return std::nullopt;
     }
     const View& view = std::prev(it)->second;
-    if (address < view.begin || address + size > view.end || !view.wrapper) {
+    if (address < view.begin || address > view.end || size > view.end - address || !view.wrapper) {
         return std::nullopt;
     }
+    memo.Store(this, epoch, view.begin, view.end, view.wrapper.get());
     return std::make_pair(static_cast<const Buffer*>(view.wrapper.get()), address - view.begin);
 }
 
@@ -313,6 +347,9 @@ bool DirectMemory::ImportView(VAddr address) {
     trace.Next(7);
     auto wrapper = std::make_shared<Buffer>(instance, base, end - base, vk::Buffer{buffer});
     views.emplace(base, View{base, end, alias, memory, buffer, device_address, std::move(wrapper)});
+    if (TrackParallelDirect()) direct_coherence.Add(this,base,end,
+        bool(mem_props.memoryTypes[memory_type_index].propertyFlags & vk::MemoryPropertyFlagBits::eHostCoherent));
+    imported_view_epoch.fetch_add(1, std::memory_order_acq_rel);
     imported_bytes += end - base;
     imported_coverage.Publish(base, end); // publish only the completed view and page table
     if (views.size() <= 20 || views.size() % 100 == 0) {
@@ -347,11 +384,13 @@ bool DirectMemory::ForEachPart(VAddr address, u64 size,
 
 bool DirectMemory::TryForEachPart(
     VAddr address, u64 size, const std::function<bool()>& ready,
-    const std::function<void(const Buffer&, u64, u64, u64)>& fn) const {
+    const std::function<void(const Buffer&, u64, u64, u64)>& fn, PartOutcome* outcome) const {
+    if (outcome) *outcome = PartOutcome::Invalid;
     if (address > ImportedPageCoverage<>::Limit ||
         size == 0 || size > ImportedPageCoverage<>::Limit - address) return false;
     std::unique_lock lock{mutex, std::try_to_lock};
-    if (!lock.owns_lock()) return false;
+    if (!lock.owns_lock()) { if (outcome) *outcome = PartOutcome::Busy; return false; }
+    if (outcome) *outcome = PartOutcome::MissingCoverage;
     const VAddr end = address + size;
     // Two passes: a missing suffix must not leave a partially recorded copy.
     for (VAddr cursor = address; cursor < end;) {
@@ -359,8 +398,15 @@ bool DirectMemory::TryForEachPart(
         if (it == views.begin()) return false;
         const View& view = std::prev(it)->second;
         if (cursor < view.begin || cursor >= view.end || !view.wrapper) return false;
+        if (cursor == address && end <= view.end) {
+            if (outcome) *outcome = PartOutcome::Covered;
+            if (!ready()) return false;
+            fn(*view.wrapper, address - view.begin, 0, size);
+            return true;
+        }
         cursor = std::min(end, view.end);
     }
+    if (outcome) *outcome = PartOutcome::Covered;
     if (!ready()) return false;
     for (VAddr cursor = address; cursor < end;) {
         const View& view = std::prev(views.upper_bound(cursor))->second;
@@ -436,16 +482,22 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
         size > ImportedPageCoverage<>::Limit - address) return false;
     const VAddr end = address + size;
     trace.Next(5);
+#ifndef NDEBUG
     static thread_local u64 coverage_hits{}, coverage_misses{};
+#endif
     if (imported_coverage.Covers(address, size)) {
+#ifndef NDEBUG
         if ((++coverage_hits & 65535) == 0) {
             LOG_INFO(Render_Vulkan,
                      "IMPORT-COVERAGE: {} completed-range hits without view lock, {} misses",
                      coverage_hits, coverage_misses);
         }
+#endif
         return true;
     }
+#ifndef NDEBUG
     ++coverage_misses;
+#endif
     trace.Next(6);
     std::scoped_lock lk{mutex};
 #ifdef RYTY_GPU
@@ -490,9 +542,11 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
 void DirectMemory::OnUnmap(VAddr address, u64 size) {
     std::vector<PendingRelease> releases;
     std::unique_lock lk{mutex};
+    imported_view_epoch.fetch_add(1, std::memory_order_acq_rel);
     {
     auto invalidate_coverage = imported_coverage.Invalidate();
     const VAddr end = address + size;
+    if (TrackParallelDirect()) direct_coherence.Remove(this,address,end);
     auto it = views.upper_bound(address);
     if (it != views.begin()) {
         --it;

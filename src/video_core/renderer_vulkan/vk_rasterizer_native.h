@@ -3,6 +3,8 @@
 #include "video_core/renderer_vulkan/descriptor_set_reserve.h"
 #include "video_core/renderer_vulkan/prepared_descriptor_key.h"
 #include "video_core/renderer_vulkan/optional_mirror_budget.h"
+#include "ryty_gpu/native/prepared_sampled_view_proof.h"
+#include "ryty_gpu/native/prepared_proof_context.h"
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -51,6 +53,7 @@ struct Info;
 
 namespace VideoCore {
 class Sampler;
+class DirectMemory;
 }
 
 namespace Native {
@@ -211,6 +214,7 @@ private:
         std::vector<const Native::ImageEntry*> read;
         std::vector<Chunk> chunks;
         u64 chunk_used = 0;
+        u64 upload_incarnation = 1;
         // Flattened user data is read-only. Keep the last immutable upload for each
         // stage until this command list retires; compare bytes, never just addresses.
         struct FlatUpload {
@@ -238,7 +242,8 @@ private:
                            bool is_depth);
 
     Stream& Begin();
-    void EndRendering();
+    void EndRendering(u32 reason = 0);
+    bool ContinueSmallParallelPass(const RenderState& target, u32 reason, bool safe);
     void BeginRendering(const RenderState& state);
     void GlobalBarrier();
     /// NAT-140: attachment writes before it finish before attachment access after it (a pass
@@ -251,9 +256,9 @@ private:
     void ChunkFlushCheck();
 
     /// Upload memory of the stream's list: (buffer, offset, CPU pointer).
-    std::tuple<vk::Buffer, u64, u8*> Allocate(u64 size, u64 align);
+    std::tuple<vk::Buffer, u64, u8*> Allocate(u64 size, u64 align, bool* backing_proven = nullptr);
     Chunk TakeChunk(u64 size);
-    vk::DescriptorBufferInfo UploadFlatData(u32 stage, const u8* source, u32 size);
+    vk::DescriptorBufferInfo UploadFlatData(u32 stage, const u8* source, u32 size, bool* backing_proven = nullptr);
     vk::DescriptorPool TakeDescriptorPool();
 
     /// NAT-114: a range shaders write that no single imported view holds lives in a buffer of
@@ -326,6 +331,7 @@ private:
     u64 mirror_bytes = 0;
     std::unordered_map<VAddr, MirrorCandidate> mirror_candidates; ///< by page of the range start
     std::vector<std::pair<VAddr, VAddr>> pending_mirrors;          ///< made at a list's start
+    VAddr mirror_promotion_resume = 0; ///< fairness hint for merged pending ranges
     OptionalMirrorBudget mirror_promotion_budget; ///< shared across lists of this frame
     std::unordered_map<u64, u64> mirror_writes;    ///< granule -> frame the CPU wrote a mirror there
     std::unordered_map<u64, u64> dynamic_granules; ///< granule -> frame it was found CPU-written
@@ -333,11 +339,14 @@ private:
     std::map<VAddr, Mirror>::iterator FirstMirror(VAddr begin);
     /// The mirror holding all of the range, if any.
     Mirror* MirrorHolding(VAddr address, u64 size);
-    bool IsDynamic(VAddr begin, VAddr end);
+    bool IsDynamic(VAddr begin, VAddr end, u64* blocked_granule = nullptr, u64* blocked_age = nullptr);
     std::optional<std::pair<vk::Buffer, u64>> MirrorBuffer(VAddr address, u64 size);
     bool RefreshMirror(Mirror& mirror);
     void MakePendingMirrors();
-    void DropMirrors(VAddr address, u64 size);
+    void DropMirrors(VAddr address, u64 size, u32 diagnostic_reason = ~u32{0});
+    void NoteMirrorDiagnostic(u32 reason,u64 requested_begin,u64 requested_end,
+                              u64 expanded_begin,u64 expanded_end,u64 generation,
+                              u64 granule = ~u64{0},u64 age = ~u64{0});
     /// NAT-150: what the last GuestBuffer bound (for the NAT-142 counters).
     enum class Bound : u8 { InPlace, Region, Mirror };
     Bound last_bound = Bound::InPlace;
@@ -523,11 +532,50 @@ private:
         u32 epoch = 0;
         const GraphicsPipeline* pipeline = nullptr;
         std::shared_ptr<const void> pipeline_keepalive;
+        std::atomic<std::shared_ptr<void>> ahead_descriptor_lease;
+        // Producer-only metadata, published by the existing prepared-draw shard.
+        struct CpuProof {
+            struct StageSchema { u64 identity{}; size_t count{}; size_t table_local{SIZE_MAX}; size_t table_upload{SIZE_MAX}; };
+            std::array<StageSchema, Shader::MaxStageTypes - 1> stages{};
+            const void* prepared_identity{}; const void* pipeline_identity{}; vk::PipelineLayout pipeline_layout{};
+            const void* writes_data{}; size_t writes_size{}; const void* buffers_data{}; size_t buffers_size{}; const void* images_data{}; size_t images_size{};
+            const void* vertex_identity{}; const void* vertex_buffers_data{}; size_t vertex_buffers_size{};
+            bool descriptor_structure{},vertex_shape{},vertex_bindings{},vertex_pnext{};
+            std::array<u64,2> image_seal_mask{}; u64 image_seal_infos{},image_seal_rows{},image_seal_epoch{}; const void* image_seal_owner{};
+            std::array<const void*, Shader::Backend::MaxDescriptorSets> group_data{};
+            std::array<size_t, Shader::Backend::MaxDescriptorSets> group_sizes{};
+            size_t ordinary_writes{}, ordinary_buffers{}, ordinary_images{};
+            u32 counts_push{}; bool counts_valid{};
+            u32 push_index{}; const void* push_data{}; size_t push_size{}, push_buffer_first{}, push_buffer_count{};
+            std::shared_ptr<void> push_snapshot;
+        } cpu_proof;
+        // Bounded producer action plan; capacity is retained when the draw is recycled.
+        struct DescriptorAction {
+            u32 upload_size{};
+            u16 buffer_first{}, stage_local{};
+            u8 range_hint{255}, region_hint{255};
+            u8 stage_index{255};
+            // 0: no matching upload, 1: unique matching upload, 2: use the original scan.
+            u8 upload_match{2};
+            bool is_buffer{};
+        };
+        static_assert(sizeof(DescriptorAction)==16);
+        std::vector<DescriptorAction> descriptor_actions;
+        // Factory-proven buffer prefix; any failed guard retains the original loop.
+        bool buffer_prefix_sealed{}, buffer_prefix_clip{};
+        const VideoCore::DirectMemory* buffer_prefix_direct{};
+        u64 buffer_prefix_l1{}, buffer_prefix_zero{};
+        boost::container::small_vector<std::pair<VAddr,VAddr>,4> buffer_prefix_ranges;
+
         std::array<u64, Shader::MaxStageTypes> stage_hashes{};
         u64 image_generation = 0;
         u64 buffer_seq = 0;
         u64 unmap_gen = 0;
         DrawBindings bindings;
+        // Private heap packet metadata; no NativeRenderer layout change.
+        std::vector<Native::Parallel::SampledViewProof<vk::ImageView>> sampled_view_proofs;
+        std::shared_ptr<Native::Parallel::ProofProducerContext> proof_context;
+        u64 proof_mode_state{};
         struct RegionUse {
             Region* region;
             VAddr address;
@@ -547,11 +595,13 @@ private:
         };
         std::vector<u8> upload_bytes;
         boost::container::small_vector<Upload, 4> uploads;
+        u64 upload_receipt_incarnation = 0;
         u32 null_images = 0;
         /// OPT-011: vertex inputs and buffers and the index buffer (not for quad lists), as
         /// ResolveVertexBuffers and ResolveIndices work them out; the V#s they came from (a
         /// hash), the mirrors bound (copied in at commit) and the ranges read in place (mirror
         /// candidates, noted at commit).
+        bool native_vertex_receipt = false, native_index_receipt = false;
         bool has_vertices = false;
         std::unique_ptr<VertexIndexState> vertex_index;
         u64 vertex_hash = 0;
@@ -571,6 +621,10 @@ private:
             std::vector<u32> flattened;
         };
         std::array<StageCopy, Shader::MaxStageTypes> stage_copies;
+        struct SamplerOrigin { size_t slot{}; vk::Sampler handle{}; };
+        boost::container::static_vector<SamplerOrigin,Shader::NUM_SAMPLERS*(Shader::MaxStageTypes-1)> sampler_origins;
+        u64 sampler_origins_epoch{};
+        bool sampler_origins_valid{true};
         void Reset();
     };
     /// OPT-010: the guest ranges whose region or mirror was made or dropped, by sequence number
@@ -624,7 +678,8 @@ private:
     /// when it would need ordered work).
     std::optional<std::pair<vk::Buffer, u64>> JobVertexBuffer(VAddr address, u64 size,
                                                               PreparedDraw& p,
-                                                              Mirror** mirror_out);
+                                                              Mirror** mirror_out,
+                                                              bool* native_receipt);
     bool CommitPreparedVertices(PreparedDraw& p, const GraphicsPipeline& pipeline,
                                 const AmdGpu::Regs& regs, bool is_indexed, u32 index_offset,
                                 bool quad_triangles, bool trusted);
@@ -675,11 +730,17 @@ private:
         std::array<u64, 7> total{};
         u64 frames = 0;
         void Note(u32 kind, VAddr address, u64 size) {
+#if !defined(NDEBUG)
             pages[kind].Add(address, size);
+#endif
         }
     } in_place;
     bool InPlaceSampled() const {
+#if !defined(NDEBUG)
         return (frame & 7) == 0;
+#else
+        return false;
+#endif
     }
     /// NAT-150: the counter for a binding of that kind, by what GuestBuffer bound.
     u32 BoundKind(u32 kind) const {
@@ -737,6 +798,7 @@ private:
         /// OPT-010: draws bound from a prepared draw, without one, and prepared draws not used:
         /// another pipeline, other user data, memory unmapped, pictures or buffers changed.
         u64 flat_upload_hits = 0, flat_upload_bytes_saved = 0, flat_upload_misses = 0;
+        u64 flat_upload_bytes_hashed = 0, flat_upload_reference_bytes = 0, flat_upload_bytes_uploaded = 0;
         u64 descriptor_allocate_calls = 0, descriptor_reserve_hits = 0;
         u64 prepared_used = 0, prepared_missing = 0;
         std::array<u64, 5> prepared_rejected{};
@@ -749,6 +811,7 @@ private:
         u64 texture_memo_hits = 0, texture_lookups = 0; ///< OPT-002
         u64 buffer_memo_hits = 0;                        ///< OPT-003
         u64 mirror_binds = 0, mirrors_made = 0, mirror_made_bytes = 0, mirrors_dropped = 0,
+            mirror_cross_address_reuses = 0,
             mirrors_evicted = 0, mirror_over_budget = 0, mirror_refresh_pages = 0; ///< NAT-150
         u64 draws = 0, dispatches = 0, skipped = 0, no_pipeline = 0, passes = 0, barriers = 0,
             splices = 0, copied_reads = 0, copied_bytes = 0, unbound = 0, null_images = 0,
@@ -763,7 +826,20 @@ private:
         std::array<u64, 8> phase_ns{};
         std::atomic<u64> cpu_writes{0}; // NAT-105 (faults come from any thread)
     } stats;
+    // Accessed only by paths holding the existing renderer mutex, including OnUnmap.
+    struct MirrorDiagnostic {
+        struct Example {u32 reason{};u64 requested_begin{},requested_end{},expanded_begin{},expanded_end{},generation{},granule{},age{};};
+        std::array<u64,21> counts{};
+        std::array<Example,16> examples{};
+        u32 example_count{};
+        std::array<u64, 3> source_outcomes{}; // missing, busy, invalid probe
+        u64 warm_attempts{}, warm_queued{};
+    } mirror_diagnostic;
+#if !defined(NDEBUG)
     std::chrono::steady_clock::time_point last_report = std::chrono::steady_clock::now();
+#else
+    std::chrono::steady_clock::time_point last_report{};
+#endif
 };
 
 } // namespace Vulkan

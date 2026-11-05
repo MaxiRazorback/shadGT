@@ -1,4 +1,30 @@
+#include <exception>
 #include "ryty_gpu/native/cpu_stack_registry.h"
+#include "ryty_gpu/native/ahead_descriptor_pools.h"
+#include "ryty_gpu/native/per_draw_view_proof.h"
+#include "ryty_gpu/native/adaptive_xxh3.h"
+#include "ryty_gpu/native/batch_view_walk.h"
+#include "parallel_absent_sampled_image.h"
+#include "ryty_gpu/native/parallel_mode_control.h"
+#include "ryty_gpu/native/sync_owner_pins.h"
+#include "ryty_gpu/native/rhi/completed_owner_release.h"
+#include "ryty_gpu/native/prepared_direct_slot.h"
+#include "ryty_gpu/native/readonly_hint.h"
+#include "ryty_gpu/native/parallel_direct_capability.h"
+#include "ryty_gpu/native/parallel_gate_histogram.h"
+#include "core/emulator_settings.h"
+#include "ryty_gpu/native/parallel_rotate_segment.h"
+#include "ryty_gpu/native/natural_scope_boundary.h"
+#include "ryty_gpu/native/attachment_alias.h"
+#include "ryty_gpu/native/prepared_index_bounds.h"
+#include "ryty_gpu/native/prepared_direct_absent.h"
+#include "ryty_gpu/native/per_draw_stage_proof.h"
+#include "ryty_gpu/native/positive_handle_cache.h"
+#include "parallel_submit_context.h"
+#include "ryty_gpu/native/descriptor_alloc_metrics.h"
+#include "a82_capture_gate.h"
+#include "ryty_gpu/native/descriptor_pool_reuse.h"
+#include "ryty_gpu/native/epoch_lookup_memo.h"
 #include "ryty_gpu/native/descriptor_update_batch.h"
 #include "ryty_gpu/native/upload_phase_trace.h"
 #include "ryty_gpu/native/region_init_gaps.h"
@@ -80,15 +106,421 @@ namespace VideoCore {
 vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type);
 }
 
+#include "video_core/renderer_vulkan/scene_capture_trace.h"
+#include "video_core/renderer_vulkan/trace_mip_layout.h"
+#include "video_core/renderer_vulkan/trace_residency.h"
+#include "video_core/renderer_vulkan/resident_prt_view.h"
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+#if defined(NDEBUG)
+#define NATIVE_DIAGNOSTIC(...) ((void)0)
+#else
+#define NATIVE_DIAGNOSTIC(...) __VA_ARGS__
+#endif
+
 namespace Vulkan {
+namespace {
+enum MirrorDiagnosticReason : u32 { MirrorCandidateNew,MirrorCandidateSameFrame,MirrorCandidateDynamic,
+    MirrorCandidateQueued,MirrorPromotionRegion,MirrorPromotionDynamic,MirrorPromotionBudget,
+    MirrorSourceNotCalled,MirrorAcquireQueued,MirrorAcquireBusy,MirrorAcquirePending,MirrorAcquireReady,
+    MirrorAcquireReused,MirrorDiscardSize,MirrorDiscardGeneration,MirrorCpuDrop,MirrorUnmapDrop,
+    MirrorPromotionSuccess,MirrorPromotionCapacity,MirrorNoDirect,MirrorAcquireInvalid };
+bool MirrorDiagnosticEnabled() {
+#if !defined(NDEBUG)
+    static const bool enabled=[] {const char* p=std::getenv("RYGT_NATIVE_MIRROR_DIAG");return p && p[0]=='1' && !p[1];}();
+    return enabled;
+#else
+    return false;
+#endif
+}
+struct AheadVulkanBackend {
+    using Pool=vk::DescriptorPool;using Layout=vk::DescriptorSetLayout;using Set=vk::DescriptorSet;
+    static constexpr std::size_t MaxSetsPerPool=256;
+    static constexpr std::array<std::size_t,4> MaxDescriptorsPerPool{4096,4096,512,2048};
+    vk::Device device;
+    Pool Create() noexcept {try {
+        const std::array<vk::DescriptorPoolSize,4> sizes{{{vk::DescriptorType::eStorageBuffer,4096},{vk::DescriptorType::eSampledImage,4096},{vk::DescriptorType::eStorageImage,512},{vk::DescriptorType::eSampler,2048}}};
+        const auto [result,pool]=device.createDescriptorPool(vk::DescriptorPoolCreateInfo{.maxSets=u32(MaxSetsPerPool),.poolSizeCount=u32(sizes.size()),.pPoolSizes=sizes.data()});
+        return result==vk::Result::eSuccess?pool:Pool{};
+    } catch(...) {return {};}}
+    bool Reset(Pool pool) noexcept {try{return device.resetDescriptorPool(pool)==vk::Result::eSuccess;}catch(...){return false;}}
+    bool Allocate(Pool pool,std::span<const Layout> layouts,std::span<Set> sets) noexcept {try {
+        const vk::DescriptorSetAllocateInfo a{.descriptorPool=pool,.descriptorSetCount=u32(layouts.size()),.pSetLayouts=layouts.data()};
+        return device.allocateDescriptorSets(&a,sets.data())==vk::Result::eSuccess;
+    } catch(...) {return false;}}
+    void Destroy(Pool pool) noexcept {device.destroyDescriptorPool(pool);}
+};
+using AheadPools=Native::Parallel::AheadDescriptorPools<AheadVulkanBackend,4,Shader::Backend::MaxDescriptorSets>;
+struct AheadContext {
+    AheadPools pools;std::atomic<bool> closing{},mode{};std::atomic<u64> active{},attempts{},ready{},used{},unused{},used_sets{},unused_sets{},failures{},capacity{};
+    explicit AheadContext(vk::Device device):pools(AheadVulkanBackend{device}){}
+};
+struct AheadLease {
+    std::shared_ptr<AheadContext> context;AheadPools::LeasePtr lease;
+    std::array<vk::DescriptorSet,Shader::Backend::MaxDescriptorSets> sets{};
+    std::array<vk::DescriptorSetLayout,Shader::Backend::MaxDescriptorSets> layouts{};
+    vk::PipelineLayout pipeline_layout{};std::shared_ptr<const void> pipeline_owner;std::size_t prepared_sets{},used_sets{};bool used{};
+    ~AheadLease(){if(context && lease){if(!used)context->unused.fetch_add(1,std::memory_order_relaxed);context->unused_sets.fetch_add(prepared_sets-used_sets,std::memory_order_relaxed);}}
+};
+std::atomic<u32> ahead_enabled_contexts{};
+void SetAheadMode(AheadContext& c,bool enabled) noexcept {
+    const bool old=c.mode.exchange(enabled,std::memory_order_acq_rel);if(old==enabled)return;
+    c.pools.SetEnabled(enabled);if(enabled)ahead_enabled_contexts.fetch_add(1,std::memory_order_release);else ahead_enabled_contexts.fetch_sub(1,std::memory_order_release);
+}
+std::mutex ahead_context_mutex;
+std::unordered_map<const NativeRenderer*,std::shared_ptr<AheadContext>> ahead_contexts;
+bool AheadRequested() noexcept {static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_PRODUCER_DESCRIPTORS");return !p || (p[0]=='1' && !p[1]);}();return enabled;}
+
+std::shared_ptr<AheadContext> FindAheadBlocking(const NativeRenderer* renderer) {
+    if(!AheadRequested())return {};std::scoped_lock lock{ahead_context_mutex};const auto it=ahead_contexts.find(renderer);
+    return it==ahead_contexts.end()?std::shared_ptr<AheadContext>{}:it->second;
+}
+std::shared_ptr<AheadContext> FindAhead(const NativeRenderer* renderer) noexcept {
+    if(!ahead_enabled_contexts.load(std::memory_order_acquire))return {};
+    std::unique_lock lock{ahead_context_mutex,std::try_to_lock};if(!lock)return {};
+    const auto it=ahead_contexts.find(renderer);if(it==ahead_contexts.end())return {};
+    auto c=it->second;if(!c->mode.load(std::memory_order_acquire) || c->closing.load(std::memory_order_acquire))return {};
+    c->active.fetch_add(1,std::memory_order_acq_rel);return c;
+}
+std::shared_ptr<AheadContext> BeginAheadShutdown(const NativeRenderer* renderer) {
+    if(!AheadRequested())return {};std::scoped_lock lock{ahead_context_mutex};const auto it=ahead_contexts.find(renderer);
+    if(it==ahead_contexts.end())return {};auto c=it->second;c->closing.store(true,std::memory_order_release);SetAheadMode(*c,false);c->pools.BeginClose();ahead_contexts.erase(it);return c;
+}
+struct AheadPrepareGuard {
+    std::shared_ptr<AheadContext> context;
+    explicit AheadPrepareGuard(std::shared_ptr<AheadContext> c):context(std::move(c)) {}
+    ~AheadPrepareGuard(){if(context)context->active.fetch_sub(1,std::memory_order_release);}
+};
+}
+namespace {
+// Experimental sidecar: enabled only by RYGT_PARALLEL_RECORDING=1. The
+// renderer's recursive mutex serializes access to each sidecar; workers only
+// consume immutable pass packets and RHI device/instance handles.
+struct ParallelBindingCapture {
+    std::array<vk::DescriptorSet,Shader::Backend::MaxDescriptorSets> sets{};
+    AheadLease* ahead{};bool ahead_used{},write_structure_proven{},counts_proven{};
+    std::size_t ordinary_writes{},ordinary_buffers{},ordinary_images{};
+};
+thread_local ParallelBindingCapture* parallel_binding_capture=nullptr;
+struct ScopedParallelBindingCapture {
+    ParallelBindingCapture* previous;
+    explicit ScopedParallelBindingCapture(ParallelBindingCapture& capture):previous(parallel_binding_capture) {parallel_binding_capture=&capture;}
+    ~ScopedParallelBindingCapture(){parallel_binding_capture=previous;}
+};
+struct ProofPhaseStats {u64 count{},wall_ns{},wall_max{};};
+struct RecordPartitionMetric {u64 count{},wall_ns{};};
+bool BatchViewWalkRequested() noexcept {
+    static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_BATCH_VIEW_WALK");return p && p[0]=='1' && !p[1];}();
+    return enabled;
+}
+bool TransferPassesRequested() noexcept {
+    static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_TRANSFER_PASSES");return p && p[0]=='1' && !p[1];}();
+    return enabled;
+}
+bool PreparedSampledProofRequested() noexcept {
+    static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_PREPARED_VIEW_PROOF");return p && p[0]=='1' && !p[1];}();
+    return enabled;
+}
+Native::Parallel::ProofProducerRegistry prepared_proof_contexts;
+// Recorder-owned host update batch. Storage never moves while any write points into it.
+struct PendingDescriptorUpdates {
+    PendingDescriptorUpdates()=default;
+    PendingDescriptorUpdates(const PendingDescriptorUpdates&)=delete;
+    PendingDescriptorUpdates& operator=(const PendingDescriptorUpdates&)=delete;
+    PendingDescriptorUpdates(PendingDescriptorUpdates&&)=delete;
+    PendingDescriptorUpdates& operator=(PendingDescriptorUpdates&&)=delete;
+    static_assert(256*sizeof(vk::WriteDescriptorSet)+1024*sizeof(vk::DescriptorBufferInfo)+
+                  1024*sizeof(vk::DescriptorImageInfo)<=64*1024);
+    enum Reason : u32 { EndPass, Serial, Abandoned, Capacity, Unsupported, Exception, ReasonCount };
+    enum class Admission { Yes, Capacity, Unsupported };
+    std::array<vk::WriteDescriptorSet,256> writes{};
+    std::array<vk::DescriptorBufferInfo,1024> buffers{};
+    std::array<vk::DescriptorImageInfo,1024> images{};
+    std::size_t nw{},nb{},ni{};
+    u64 logical_draws{},actual_calls{},staged_rows{},immediate_draws{},overflow_draws{},unsupported_draws{},high_rows{};
+    std::array<u64,ReasonCount> flushes{};
+    template<bool Proven=false,class Groups>
+    Admission Check(const Groups& groups,u32 push,std::span<const vk::DescriptorBufferInfo> source_buffers,
+                    std::span<const vk::DescriptorImageInfo> source_images) const noexcept {
+        std::size_t w=nw,b=nb,i=ni;
+        for(u32 set=0;set<groups.size();++set) if(set!=push) for(const auto& row:groups[set]) {
+            if constexpr(Proven) {
+                if(row.pBufferInfo) {if(row.descriptorCount>buffers.size()-b)return Admission::Capacity;b+=row.descriptorCount;}
+                else {if(row.descriptorCount>images.size()-i)return Admission::Capacity;i+=row.descriptorCount;}
+            } else {
+                if(row.pNext || row.pTexelBufferView || !row.descriptorCount)return Admission::Unsupported;
+                const bool buffer=row.descriptorType==vk::DescriptorType::eUniformBuffer || row.descriptorType==vk::DescriptorType::eStorageBuffer;
+                const bool image=row.descriptorType==vk::DescriptorType::eSampler || row.descriptorType==vk::DescriptorType::eSampledImage;
+                if(buffer) {if(row.pImageInfo || !DescriptorSnapshot::BufferSliceValid(row.pBufferInfo,row.descriptorCount,source_buffers))return Admission::Unsupported;
+                    if(row.descriptorCount>buffers.size()-b)return Admission::Capacity;b+=row.descriptorCount;}
+                else if(image) {if(row.pBufferInfo || !DescriptorSnapshot::ImageSliceValid(row.pImageInfo,row.descriptorCount,source_images))return Admission::Unsupported;
+                    if(row.descriptorCount>images.size()-i)return Admission::Capacity;i+=row.descriptorCount;}
+                else return Admission::Unsupported;
+            }
+            if(w==writes.size())return Admission::Capacity;++w;
+        }
+        return Admission::Yes;
+    }
+    Admission CheckCounts(std::size_t w,std::size_t b,std::size_t i) const noexcept {
+        return Native::DescriptorCountsFit(w,b,i,writes.size()-nw,buffers.size()-nb,images.size()-ni) ? Admission::Yes : Admission::Capacity;
+    }
+    template<class Rows> void Stage(const Rows& rows,vk::DescriptorSet set) noexcept {
+        for(const auto& source:rows) {
+            auto row=source;row.dstSet=set;
+            if(row.pBufferInfo) {if(row.descriptorCount==1)buffers[nb]=*row.pBufferInfo;else std::copy_n(row.pBufferInfo,row.descriptorCount,buffers.data()+nb);row.pBufferInfo=buffers.data()+nb;nb+=row.descriptorCount;}
+            else {if(row.descriptorCount==1)images[ni]=*row.pImageInfo;else std::copy_n(row.pImageInfo,row.descriptorCount,images.data()+ni);row.pImageInfo=images.data()+ni;ni+=row.descriptorCount;}
+            writes[nw++]=row;NATIVE_DIAGNOSTIC(++staged_rows);
+        }
+        NATIVE_DIAGNOSTIC(high_rows=std::max<u64>(high_rows,nw));
+    }
+    void Flush(vk::Device device,Reason reason) noexcept {
+        if(!nw)return;
+        device.updateDescriptorSets(vk::ArrayProxy<const vk::WriteDescriptorSet>{static_cast<u32>(nw),writes.data()},{});
+        NATIVE_DIAGNOSTIC(++actual_calls);NATIVE_DIAGNOSTIC(++flushes[reason]);nw=nb=ni=0;
+    }
+};
+// Recorder-owned interval diagnostics. Closure bits describe predicates that
+// actually caused the close; queued means accepted by the coordinator only.
+enum PassCloseReason : u32 { CloseFast=1,CloseIneligible=2,CloseNotRendering=4,
+    CloseTarget=8,CloseFull=16,CloseMissingSets=32 };
+struct PassClosureStats {
+    // origin: split, preclosed serial scope, other boundary.
+    std::array<std::array<std::array<u64,7>,2>,3> sizes{};
+    // other/default, fast, ineligible, not-rendering, target, full, missing sets.
+    std::array<std::array<u64,7>,3> reasons{};
+    std::array<u64,3> empty_aborts{};
+    u32 origin=2;
+    static std::size_t Bucket(std::size_t n) noexcept {
+        return n==0?0:n==1?1:n<4?2:n<8?3:n<32?4:n<256?5:6;
+    }
+    void Close(std::size_t draws,bool queued,u32 mask) noexcept {
+#if !defined(NDEBUG)
+        ++sizes[origin][queued?0:1][Bucket(draws)];
+        if(!mask)++reasons[origin][0];
+        for(u32 i=0;i<6;++i)if(mask & (u32{1}<<i))++reasons[origin][i+1];
+#endif
+    }
+};
+static bool CanInlineContinuation(std::size_t draws,bool small_batch,bool closing,bool rendering,
+                                  bool same_target,bool same_list,bool same_cmd,bool same_epoch,
+                                  bool safe) noexcept {
+    return draws>0 && draws<8 && !small_batch && !closing && rendering && same_target &&
+           same_list && same_cmd && same_epoch && safe;
+}
+struct ParallelRuntime {
+    // Mode at Draw's record-phase entry; every metric uses the existing 1/16 sample.
+    std::array<std::array<RecordPartitionMetric,5>,2> record_partition{};
+    Native::Parallel::RotationDiag rotation_diag{};
+    std::array<u64,9> pass_size_hist{};
+    PassClosureStats pass_closure{};
+    Native::Rhi::CommandList* active_list{};
+    vk::CommandBuffer active_cmd{};
+    u64 inline_continuations{};
+    u64 small_admission_exceptions{},large_admission_exceptions{};
+    u64 serial_split_attempts{},serial_split_success{},serial_split_first_draws{};
+    PendingDescriptorUpdates descriptor_updates;
+    u64 producer_structure_hits{},producer_vertex_hits{},producer_snapshot_hits{};
+    u64 producer_action_hits{},producer_upload_lookup_hits{},producer_stage_schema_hits{},producer_stage_lookup_hits{},clip_fast_hits{},direct_table_cache_hits{};
+    std::unique_ptr<Native::Parallel::PassCoordinator> coordinator;
+    std::unique_ptr<Native::Parallel::ModeController> mode_controller;
+    Native::Parallel::AppliedMode applied_mode{true};bool mode_initial_logged{};
+    std::shared_ptr<Native::Parallel::ProofProducerContext> prepared_proof_context;
+    std::unique_ptr<Native::Parallel::ModeController> transfer_mode_controller;
+    Native::Parallel::AppliedMode transfer_applied_mode{TransferPassesRequested()};bool transfer_mode_initial_logged{};
+    std::unique_ptr<Native::Parallel::ModeController> view_mode_controller;
+    Native::Parallel::AppliedMode view_applied_mode{BatchViewWalkRequested()};bool view_mode_initial_logged{};
+    u64 whole_seq{},whole_samples{},whole_wall_ns{},whole_cpu_samples{},whole_cpu_100ns{},whole_max_ns{};
+    ParallelGateHistogram gates;
+    std::shared_ptr<Native::Parallel::Pass> active;
+    Native::Parallel::PassCoordinator::StreamTicket draw_stream;
+    bool stream_attempted{};
+    Native::Parallel::SyncOwnerPins<> sync_pins;
+    std::size_t pin_slot=Native::Parallel::SyncOwnerPins<>::Invalid;
+    std::vector<Native::Parallel::Draw> scratch_draws;
+    std::shared_ptr<const void> lease;
+    u64 epoch{};
+    std::array<u64,11> descriptor_fail_reasons{};u32 descriptor_samples{};u64 descriptor_readonly_attempts{},descriptor_readonly_regions{},descriptor_readonly_imports{},descriptor_readonly_uncontained{},descriptor_readonly_unmatched{},descriptor_clip_nulls{},readonly_range_hint_hits{},readonly_range_hint_misses{},readonly_region_hint_hits{},readonly_region_hint_misses{};
+    u64 image_batch_draws{},image_batch_infos{},image_batch_fallbacks{},image_batch_invalidations{};
+    u64 image_bitmap_draws{},image_bitmap_rows{};
+    u64 native_vi_attempts{},native_vi_accepts{},native_vi_fallbacks{},native_vi_skipped{};
+    u64 native_upload_attempts{},native_upload_accepts{},native_upload_fallbacks{},native_upload_skipped{};
+    u64 buffer_prefix_attempts{},buffer_prefix_accepts{},buffer_prefix_fallbacks{},buffer_prefix_coherence_misses{},buffer_prefix_invalidations{};
+    // Readonly attempt failures, not draw failures: another descriptor proof may succeed.
+    std::array<u64,7> readonly_guard_failures{};
+    std::array<u64,9> readonly_special_kinds{};
+    std::array<ProofPhaseStats,9> proof_phases{};
+    std::array<ProofPhaseStats,8> whole_phases{};
+    Native::Parallel::PositiveHandleCache<vk::Sampler> sampler_proof;
+    u64 sampler_proof_hits{},sampler_proof_misses{},sampler_scan_steps{},sampler_scan_positives{};
+    u64 natural_preclosed{},natural_captured{},natural_serial_fallback{},natural_binding_skip{};
+    u64 absent_mode0_attempts{},absent_mode0_accepted{},absent_mode0_rejected{};
+    u64 sampled_null_view{},sampled_nonnull_sampler{},sampled_nongeneral{},sampled_canonical_null{};
+    u64 absent_sampled_attempts{},absent_sampled_accepted{},absent_sampled_rejected{};
+    u64 prepared_view_attempts{},prepared_view_accepted{},prepared_view_fallbacks{};
+    std::array<u64,7> captured_vertex_counts{};u64 captured_vertex_sum{};
+    Native::Parallel::ViewProofStats view_proof_stats{};
+    struct ViewSample {u64 sequence{},draws{},queried_draws{},image_infos{},sampled_entries{};std::array<u64,10> cardinality{};Native::Parallel::ViewProofStats proof{};} view_sample;
+    struct AheadFlight {std::shared_ptr<AheadLease> lease;std::function<void()> release;u64 tick{};};
+    std::array<AheadFlight,2048> ahead_flights{};std::size_t ahead_cursor{},ahead_live{};std::shared_ptr<AheadContext> ahead_context;
+    u64 proof_table_builds{},proof_table_hits{},extended_clear_rejected{},fast_rejected{},no_pass_room_rejected{},serial_scope_bypassed{},owner_slot_pressure{},eligible_in_serial_scope{},eligible_in_active_scope{},eligible_at_boundary{},vertex_candidates{},vertex_preflight_draws{},vertex_backing_pass{},vertex_bad_structure{},vertex_bad_binding{},vertex_bad_pnext{},vertex_unknown_backing{},vertex_direct_ranges{},vertex_direct_attempts{},vertex_direct_matches{},direct_slot_attempts{},direct_slot_accepted{},passes{},draws{},queued{},synchronous{},considered{},eligible{},unknown_resource_key{},buffer_rejected{},alias_rejected{},descriptor_rejected{},missing_sets{},preflight_seq{},preflight_samples{},preflight_wall_ns{},preflight_cpu_100ns{},preflight_cpu_samples{},drain_ns{},coordinator_cpu_100ns{},coordinator_cpu_samples{};
+    u64 serial_eligible_run{},serial_eligible_run_max{};std::array<u64,4> serial_eligible_runs{};
+    void FinishSerialEligibleRun() noexcept {
+#if !defined(NDEBUG)
+        if(!serial_eligible_run)return;
+        const auto n=serial_eligible_run;++serial_eligible_runs[n==1?0:n<4?1:n<8?2:3];serial_eligible_run=0;
+#endif
+    }
+    void NoteSerialEligible() noexcept {
+#if !defined(NDEBUG)
+        if(serial_eligible_run!=UINT64_MAX)++serial_eligible_run;
+        serial_eligible_run_max=std::max(serial_eligible_run_max,serial_eligible_run);
+#endif
+    }
+    bool closing{};
+};
+std::mutex parallel_sidecars_mutex;
+std::unordered_map<const NativeRenderer*,std::unique_ptr<ParallelRuntime>> parallel_sidecars;
+std::atomic<u64> parallel_sidecars_generation{1};
+std::atomic<bool> parallel_sidecar_init_failed{false};
+bool ParallelRecordingRequested();
+ParallelRuntime* FindParallelRuntime(const NativeRenderer* renderer) {
+    if(!ParallelRecordingRequested())return nullptr;
+    struct Cache {const NativeRenderer* owner{};ParallelRuntime* sidecar{};u64 generation{};};
+    static thread_local Cache cache;
+    const u64 generation=parallel_sidecars_generation.load(std::memory_order_acquire);
+    if(cache.owner==renderer && cache.generation==generation)return cache.sidecar;
+    std::lock_guard lock(parallel_sidecars_mutex);
+    const auto it=parallel_sidecars.find(renderer);
+    cache={renderer,it==parallel_sidecars.end()?nullptr:it->second.get(),parallel_sidecars_generation.load(std::memory_order_relaxed)};
+    return cache.sidecar;
+}
+bool ParallelRecordingRequested() {
+    static const bool requested=[] {const char* p=std::getenv("RYGT_PARALLEL_RECORDING");return p&&p[0]=='1'&&p[1]=='\0';}();return requested;
+}
+bool ParallelReadonlyDescriptorEnabled() {static const bool yes=[] {const char* p=std::getenv("RYGT_PARALLEL_READONLY_DESCRIPTOR");return p && p[0]=='1' && p[1]=='\0';}();return yes;}
+bool ParallelDirectVertexEnabled() { static const bool yes=[] {const char* p=std::getenv("RYGT_PARALLEL_DIRECT_VERTEX");return p && p[0]=='1' && p[1]=='\0';}();return yes; }
+bool ParallelVertexEnabled() { static const bool yes=[] {const char* p=std::getenv("RYGT_PARALLEL_VERTEX");return p && p[0]=='1' && p[1]=='\0';}();return yes; }
+bool ParallelSmallPassBatchEnabled() { static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_SMALLPASS_BATCH");return !(p && p[0]=='0' && p[1]=='\0');}();return enabled; }
+// Experimental indexed/MRT/depth packet. Clear admission remains separately gated.
+bool ParallelExtendedEnabled() {static const bool on=[] {const char* p=std::getenv("RYGT_PARALLEL_EXTENDED");return p && p[0]=='1' && !p[1];}();return on;}
+bool ParallelD2Enabled() { static const bool yes=[] {const char* p=std::getenv("RYGT_PARALLEL_D2"); return p && p[0]=='1' && p[1]=='\0';}();return yes; }
+bool ParallelProofPhaseEnabled() {
+#if !defined(NDEBUG)
+static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_PROOF_PHASE_DIAG");return p && p[0]=='1' && !p[1];}();return enabled;
+#else
+    return false;
+#endif
+}
+bool ParallelGateDiagEnabled() {
+#if !defined(NDEBUG)
+    static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_GATE_DIAG");return p&&p[0]=='1'&&p[1]=='\0';}();return enabled;
+#else
+    return false;
+#endif
+}
+struct ParallelEligibilityStats {
+    u64 observed{}, eligible{}, race{}, nonindexed{}, single_color{}, no_clear{}, no_depth{}, no_descriptors{}, no_storage{}, no_feedback{}, eligible_draws_in_runs[7]{}, runs[7]{}, current{};
+    void Flush() { if (!current) return; unsigned bucket=0; u64 value=current; while(value>1 && bucket<6){value>>=1;++bucket;} ++runs[bucket]; eligible_draws_in_runs[bucket]+=current;current=0; }
+};
+thread_local ParallelEligibilityStats parallel_eligibility_stats;
+thread_local const NativeRenderer* parallel_eligibility_owner=nullptr;
+bool ParallelEligibilityEnabled() {
+#if !defined(NDEBUG)
+ static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_ELIGIBILITY_DIAG");return p&&p[0]=='1';}();return enabled;
+#else
+    return false;
+#endif
+}
+thread_local Native::DescriptorAllocMetrics descriptor_alloc_metrics;
+thread_local u64 descriptor_bind_sets[2]{}, descriptor_bind_runs[2]{}, descriptor_bind_multi[2]{};
+thread_local const NativeRenderer* descriptor_alloc_owner = nullptr;
+bool DescriptorAllocDiagEnabled() {
+#if !defined(NDEBUG)
+    static const bool enabled = [] { const char* e=std::getenv("RYGT_DESC_ALLOC_DIAG"); return e && e[0]=='1'; }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+bool DescriptorThreadCpu100ns(u64& result) {
+#if defined(_WIN32) && !defined(NDEBUG)
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) {
+        result=(u64(kernel.dwHighDateTime)<<32 | kernel.dwLowDateTime) + (u64(user.dwHighDateTime)<<32 | user.dwLowDateTime);
+        return true;
+    }
+#endif
+    result=0; return false;
+}
+#if !defined(NDEBUG)
+struct SampledProofTimer {
+    ProofPhaseStats* stats{};std::chrono::steady_clock::time_point start{};
+    SampledProofTimer(ProofPhaseStats& s,bool sampled) noexcept {if(sampled){stats=&s;start=std::chrono::steady_clock::now();}}
+    ~SampledProofTimer() {if(!stats)return;const auto raw=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();const u64 wall=raw>0?u64(raw):0;
+        ++stats->count;stats->wall_ns+=wall;stats->wall_max=std::max(stats->wall_max,wall);}
+};
+// Sequential slices of the existing whole-preflight sample. Counts differ when
+// guards skip sections; intervals include instrumentation overhead.
+struct WholePhaseTimer {
+    std::array<ProofPhaseStats,8>* phases{};std::chrono::steady_clock::time_point start{};size_t current{};
+    WholePhaseTimer(std::array<ProofPhaseStats,8>& p,bool sampled) noexcept {if(sampled){phases=&p;start=std::chrono::steady_clock::now();}}
+    void Stop() noexcept {if(!phases)return;const auto now=std::chrono::steady_clock::now();
+        const auto raw=std::chrono::duration_cast<std::chrono::nanoseconds>(now-start).count();const u64 wall=raw>0?u64(raw):0;
+        auto& s=(*phases)[current];++s.count;s.wall_ns+=wall;s.wall_max=std::max(s.wall_max,wall);start=now;}
+    void Next(size_t phase) noexcept {if(!phases)return;Stop();current=phase;}
+    ~WholePhaseTimer() {Stop();}
+};
+template<class F> auto TimedProofInvoke(ProofPhaseStats& stats,bool sampled,F&& fn) {
+    if(!sampled)return std::forward<F>(fn)();
+    SampledProofTimer timer{stats,true};return std::forward<F>(fn)();
+}
+#else
+struct SampledProofTimer {
+    constexpr SampledProofTimer(ProofPhaseStats&,bool) noexcept {}
+};
+struct WholePhaseTimer {
+    constexpr WholePhaseTimer(std::array<ProofPhaseStats,8>&,bool) noexcept {}
+    constexpr void Stop() noexcept {}
+    constexpr void Next(size_t) noexcept {}
+};
+template<class F> auto TimedProofInvoke(ProofPhaseStats&,bool,F&& fn) {
+    return std::forward<F>(fn)();
+}
+#endif
+
+}
+struct SceneIndirectArgs {u64 id,address,offset;};
+static std::unique_ptr<Native::Rhi::Buffer> scene_indirect_buffer;
+static std::vector<SceneIndirectArgs> scene_indirect_args;
+
 bool RytyGtsInRace();
 extern std::atomic<u64> g_prepared_frames;
 bool RytyGtsMenuSnapshotsAllowed();
 namespace {
+bool A82CaptureAfterRace() {
+#if !defined(NDEBUG)
+    static const bool enabled=[] { const char* p=std::getenv("RYGT_A82_CAPTURE_AFTER_RACE"); return p && p[0]=='1'; }();
+    if (!enabled) return true;
+    static A82RaceGate gate;
+    static std::atomic<bool> logged_race{}, logged_armed{};
+    const auto state=gate.Observe(RytyGtsInRace());
+    if (state==A82RaceGate::SawRace && !logged_race.exchange(true))
+        LOG_WARNING(Render_Vulkan,"DIAG-A82 gate observed race; capture budget remains untouched");
+    if (state==A82RaceGate::Armed && !logged_armed.exchange(true))
+        LOG_WARNING(Render_Vulkan,"DIAG-A82 gate armed after race; capture enabled");
+    return state==A82RaceGate::Armed;
+#else
+    return false;
+#endif
+}
 thread_local u64 descriptor_hash_reused = 0;
 thread_local u64 descriptor_hash_refreshed = 0;
 
 using FlatUploadMemo = ImmutableUploadMemo<vk::DescriptorBufferInfo, Shader::MaxStageTypes>;
+std::atomic<u64> sampler_cache_epoch{1};
+
 FlatUploadMemo& UploadMemoFor(const NativeRenderer* renderer) {
     struct Local { const NativeRenderer* owner{}; FlatUploadMemo memo; };
     static thread_local Local local;
@@ -369,6 +801,7 @@ T* Handle(u64 handle) {
 /// NAT-110: adds the time until the end of the scope to a counter.
 // OPT-001: the phase timers read the clock on one draw in 16 (reading it in every phase of every
 // draw was 7% of the recorder's time); the report divides by the draws timed.
+#if !defined(NDEBUG)
 thread_local bool t_timed = true;
 struct PhaseClock {
     u64* total;
@@ -386,6 +819,45 @@ struct PhaseClock {
         }
     }
 };
+// Diagnostic-only nested interval. Finish permits a precise boundary while
+// the destructor also records early returns; a completed sample is added once.
+struct RecordPartitionClock {
+    RecordPartitionMetric* metric{};
+    std::chrono::steady_clock::time_point start{};
+    explicit RecordPartitionClock(RecordPartitionMetric* value) : metric{t_timed ? value : nullptr} {
+        if(metric)start=std::chrono::steady_clock::now();
+    }
+    void Finish() noexcept {
+        if(!metric)return;
+        metric->wall_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();
+        ++metric->count;metric=nullptr;
+    }
+    ~RecordPartitionClock(){Finish();}
+};
+#else
+inline constexpr bool t_timed = false;
+struct PhaseClock {
+    explicit constexpr PhaseClock(u64&) noexcept {}
+};
+struct RecordPartitionClock {
+    explicit constexpr RecordPartitionClock(RecordPartitionMetric*) noexcept {}
+    constexpr void Finish() noexcept {}
+};
+#endif
+
+#if !defined(NDEBUG)
+thread_local RecordPartitionMetric* t_record_partition_end=nullptr;
+struct RecordPartitionEndGuard {
+    RecordPartitionMetric* previous;
+    explicit RecordPartitionEndGuard(RecordPartitionMetric* current) noexcept : previous{t_record_partition_end} {t_record_partition_end=current;}
+    ~RecordPartitionEndGuard(){t_record_partition_end=previous;}
+};
+#else
+inline constexpr RecordPartitionMetric* t_record_partition_end=nullptr;
+struct RecordPartitionEndGuard {
+    explicit constexpr RecordPartitionEndGuard(RecordPartitionMetric*) noexcept {}
+};
+#endif
 
 constexpr u64 ChunkSize = 8_MB;
 constexpr u32 SpliceAfter = 512; ///< commands per list before it is run and submitted
@@ -409,9 +881,9 @@ void NativeRenderer::DrawBindings::PrepareDescriptorKeys(const Pipeline& pipelin
     if (!groups_ready) PrepareWriteGroups();
     for (u32 set = 0; set < grouped_writes.size(); ++set) {
         if (grouped_writes[set].empty() || set == pipeline.PushSet()) continue;
-        descriptor_keys[set].Build(pipeline.SetLayout(set), grouped_writes[set]);
+        descriptor_keys[set].Build<false>(pipeline.SetLayout(set), grouped_writes[set]);
         auto& key = descriptor_keys[set];
-        if (key.cacheable) key.hash = XXH3_64bits(key.words.data(), key.words.size() * sizeof(u64));
+        if (key.cacheable) key.hash = Native::Parallel::AdaptiveXXH3(key.words.data(), key.words.size() * sizeof(u64));
     }
     key_layout = pipeline.GetLayout();
 }
@@ -472,19 +944,19 @@ void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Ta
     const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
     if (!fs || regs.num_indices > 6 ||
         regs.num_instances.NumInstances() != 1 || targets.state.num_color_attachments != 2 ||
-        bindings.sampled.size() != 4 || !targets.colors[0] || !targets.colors[1]) { static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 1, fs {:#x}", fs ? fs->pgm_hash : 0); return; }
+        bindings.sampled.size() != 4 || !targets.colors[0] || !targets.colors[1]) { NATIVE_DIAGNOSTIC(static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 1, fs {:#x}", fs ? fs->pgm_hash : 0);); return; }
     const auto* history_out = targets.colors[0];
     const auto* resolved = targets.colors[1];
     const vk::Extent2D size{resolved->info.size.width, resolved->info.size.height};
     if (history_out->info.pixel_format != vk::Format::eR16G16B16A16Sfloat ||
         resolved->info.pixel_format != vk::Format::eB10G11R11UfloatPack32 ||
         history_out->info.size.width != size.width || history_out->info.size.height != size.height)
-        { static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 2, fs {:#x}", fs ? fs->pgm_hash : 0); return; }
+        { NATIVE_DIAGNOSTIC(static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 2, fs {:#x}", fs ? fs->pgm_hash : 0);); return; }
     const Native::ImageEntry *color{}, *depth{}, *motion{}, *history{};
     for (const auto* e : bindings.sampled) {
         const auto& i = e->info;
         if (i.size.width != size.width || i.size.height != size.height || i.num_samples != 1 ||
-            i.resources.layers != 1 || i.resources.levels != 1) { static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 3, fs {:#x}", fs ? fs->pgm_hash : 0); return; }
+            i.resources.layers != 1 || i.resources.levels != 1) { NATIVE_DIAGNOSTIC(static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 3, fs {:#x}", fs ? fs->pgm_hash : 0);); return; }
         // The sampled R32 descriptor may alias the real depth/stencil attachment.
         // TemporalImage preserves its actual aspects; Capture extracts D32 through
         // a buffer into FSR's separate R32 image instead of making a D32-only view.
@@ -494,9 +966,9 @@ void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Ta
         else if (i.pixel_format == vk::Format::eR16G16Sfloat) motion = e;
         else if (i.pixel_format == vk::Format::eB10G11R11UfloatPack32) color = e;
         else if (i.pixel_format == vk::Format::eR16G16B16A16Sfloat) history = e;
-        else { static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 4, fs {:#x}", fs ? fs->pgm_hash : 0); return; }
+        else { NATIVE_DIAGNOSTIC(static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 4, fs {:#x}", fs ? fs->pgm_hash : 0);); return; }
     }
-    if (!color || !depth || !motion || !history || color == resolved || history == history_out) { static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 5, fs {:#x}", fs ? fs->pgm_hash : 0); return; }
+    if (!color || !depth || !motion || !history || color == resolved || history == history_out) { NATIVE_DIAGNOSTIC(static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 5, fs {:#x}", fs ? fs->pgm_hash : 0);); return; }
     std::array<float, 28> constants{};
     bool valid = false;
     for (const auto& buffer : fs->buffers) {
@@ -504,7 +976,7 @@ void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Ta
         const auto sharp = buffer.GetSharp(*fs);
         if (!sharp.base_address || sharp.GetSize() != sizeof(constants)) continue;
         if (!Core::RytyMemory::GuardedCopy(constants.data(),
-                reinterpret_cast<const void*>(sharp.base_address), sizeof(constants))) { static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 6, fs {:#x}", fs ? fs->pgm_hash : 0); return; }
+                reinterpret_cast<const void*>(sharp.base_address), sizeof(constants))) { NATIVE_DIAGNOSTIC(static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 6, fs {:#x}", fs ? fs->pgm_hash : 0);); return; }
         valid = std::ranges::all_of(constants, [](float v) { return std::isfinite(v); }) &&
             std::abs(constants[14] - size.width * .5f) <= .01f &&
             std::abs(constants[15] + size.height * .5f) <= .01f &&
@@ -513,15 +985,17 @@ void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Ta
             std::abs(constants[21] * constants[15]) <= 1.f;
         break;
     }
-    if (!valid) { static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 7, fs {:#x}", fs ? fs->pgm_hash : 0); return; }
+    if (!valid) { NATIVE_DIAGNOSTIC(static u32 rejected{}; if (rejected++ < 3) LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture gate 7, fs {:#x}", fs ? fs->pgm_hash : 0);); return; }
     Splice();
     const auto captured_frame = g_prepared_frames.load(std::memory_order_relaxed);
     const bool captured = r.temporalDlss.Capture(captured_frame, TemporalImage(*color),
         TemporalImage(*depth), TemporalImage(*motion), TemporalImage(*resolved), constants);
+#if !defined(NDEBUG)
     static u32 captured_logged{};
     if (captured_logged++ < 12)
         LOG_INFO(Render_Vulkan, "NATIVE-FSR: capture frame {} fs {:#x} accepted {} resolved {:#x}",
             captured_frame, fs->pgm_hash, captured, resolved->image->NativeHandle());
+#endif
 }
 
 bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, const Targets& targets,
@@ -628,6 +1102,8 @@ void NativeRenderer::FinishNativeFsr(const Targets& targets) {
 }
 
 NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
+    sampler_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
+    if(PreparedSampledProofRequested())try {prepared_proof_contexts.Register(this);} catch(...) {}
     device = Native::Rhi::CreateVulkanDevice(r.instance);
     ASSERT_MSG(device, "NAT-100: no native device");
     const VkSemaphore semaphore = r.scheduler.GetWorkSemaphore()->Handle();
@@ -857,10 +1333,15 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
     mirror_preparation = std::make_unique<AsyncMirrorBuffer<Native::Rhi::Buffer>>(
         [this](auto request) -> std::unique_ptr<Native::Rhi::Buffer> {
             if (request.generation != unmap_generation.load()) return {};
-            if (auto* direct = r.buffer_cache.GetDirectMemory()) {
-                direct->WarmImported(request.begin, request.end - request.begin);
-            }
-            if (request.generation != unmap_generation.load()) return {};
+            auto* direct = r.buffer_cache.GetDirectMemory();
+            if (!direct) return {};
+            direct->WarmImported(request.begin, request.end - request.begin);
+            VideoCore::DirectMemory::PartOutcome coverage{};
+            direct->TryForEachPart(request.begin, request.end - request.begin, [] { return false; },
+                [](const VideoCore::Buffer&, u64, u64, u64) {}, &coverage);
+            // Do not park a Ready allocation when bounded warming was partial or busy.
+            if (coverage != VideoCore::DirectMemory::PartOutcome::Covered ||
+                request.generation != unmap_generation.load()) return {};
             return device->CreateBuffer({.size = request.end - request.begin,
                 .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageVertex |
                          Native::Rhi::BufferUsageIndex | Native::Rhi::BufferUsageTransferSrc |
@@ -874,13 +1355,47 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
             SetThreadPriorityBoost(GetCurrentThread(), TRUE);
 #endif
         });
+    if(AheadRequested() && ParallelRecordingRequested() && !r.instance.IsIntel()) {
+        try {auto context=std::make_shared<AheadContext>(r.instance.GetDevice());std::scoped_lock guard{ahead_context_mutex};ahead_contexts.emplace(this,context);}
+        catch(...) {LOG_WARNING(Render_Vulkan,"PARALLEL-PRODUCER-DESC setup failed; using original descriptors");}
+    }
     LOG_INFO(Render_Vulkan, "NAT-100: native mode: draws, dispatches and copies are recorded with "
                             "native images and guest memory read in place");
 }
 
 NativeRenderer::~NativeRenderer() {
+    if(PreparedSampledProofRequested())prepared_proof_contexts.Close(this);
+    auto ahead_shutdown=BeginAheadShutdown(this);
+    if(ahead_shutdown)while(ahead_shutdown->active.load(std::memory_order_acquire) || !ahead_shutdown->pools.Quiescent())std::this_thread::yield();
+    scene_indirect_buffer.reset();scene_indirect_args.clear();
+    if(SceneTrace::state.pool){const auto pool=SceneTrace::state.pool;const auto device=r.instance.GetDevice();r.scheduler.DeferOperation([device,pool]{device.destroyQueryPool(pool);});SceneTrace::state={};}
     mirror_preparation.reset(); // Join before any device or direct-memory teardown.
+    sampler_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
     std::scoped_lock lock{mutex};
+    if (auto* sidecar=FindParallelRuntime(this)) {
+        sidecar->closing=true;
+        EndRendering();Splice();
+        const auto ahead_pending=[&] {return sidecar->ahead_live!=0;};
+        if(sidecar->coordinator->InFlightNodes() || sidecar->sync_pins.Waiting() || ahead_pending()) {
+            r.scheduler.Finish();
+            while(sidecar->coordinator->InFlightNodes() || sidecar->sync_pins.Waiting() || ahead_pending()) {
+                const u64 done=timeline->Completed();sidecar->coordinator->Collect(done);
+                sidecar->sync_pins.Collect(done,[&](auto& callback) noexcept {return Native::Rhi::TryEnqueueCompleted(*device,callback);});
+                for(auto& flight:sidecar->ahead_flights)if(flight.release && flight.tick && flight.tick<=done){
+                    flight.lease.reset();if(!Native::Rhi::TryEnqueueCompleted(*device,flight.release))continue;flight.tick=0;--sidecar->ahead_live;}
+                if(sidecar->coordinator->InFlightNodes() || sidecar->sync_pins.Waiting() || ahead_pending())std::this_thread::yield();
+            }
+        }
+        std::lock_guard sidecar_lock(parallel_sidecars_mutex);
+        parallel_sidecars_generation.fetch_add(1,std::memory_order_release);
+        parallel_sidecars.erase(this); // joins workers before device/view destruction
+    }
+    if(ahead_shutdown) {
+        {std::scoped_lock prepared_lock{prepared_pool_mutex};for(auto& prepared:prepared_all)if(prepared)prepared->ahead_descriptor_lease.store({},std::memory_order_release);}
+        r.scheduler.Finish();
+        while(!ahead_shutdown->pools.DestroyReady(timeline->Completed()))std::this_thread::yield();
+
+    }
     const vk::Device vk_device = r.instance.GetDevice();
     for (const auto pool : free_pools) {
         vk_device.destroyDescriptorPool(pool);
@@ -991,9 +1506,18 @@ Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bo
 vk::ImageView NativeRenderer::View(const Native::ImageEntry& entry,
                                    const VideoCore::ImageViewInfo& requested, ViewUse use) {
     std::scoped_lock lock{views_mutex};
+    auto trace_view=[&](vk::ImageView handle,bool cached){
+        if(!SceneTrace::Id())return;
+        const auto& d=entry.image->Desc();const u32 mips=std::max(d.mips,1u),layers=d.dim==Native::Rhi::ImageDim::D3?1u:std::max(d.layers,1u);
+        const u32 first=std::min<u32>(requested.range.base.level,mips-1),count=std::clamp<u32>(requested.range.extent.levels,1,mips-first);
+        const u32 layer=std::min<u32>(requested.range.base.layer,layers-1),layer_count=std::clamp<u32>(requested.range.extent.layers,1,layers-layer);
+        const float min_lod=requested.min_lod && r.instance.IsImageViewMinLodSupported()?std::min(float(requested.min_lod)/256.f,float(first+count-1)):0.f;
+        r.FrameDumpEvent(fmt::format("scene-view id={} address={:#x} handle={:#x} use={} cached={} normalized_mip={}+{} normalized_layer={}+{} effective_min_lod={} min_lod_supported={} image_format={} requested_format={}",SceneTrace::Id(),entry.info.guest_address,reinterpret_cast<u64>(static_cast<VkImageView>(handle)),u32(use),cached,first,count,layer,layer_count,min_lod,r.instance.IsImageViewMinLodSupported(),u32(d.format),u32(requested.format)));
+    };
     auto& records = views[&entry];
     for (const auto& record : records) {
         if (record.use == use && record.info == requested) {
+            trace_view(*record.view,true);
             return *record.view;
         }
     }
@@ -1085,6 +1609,8 @@ vk::ImageView NativeRenderer::View(const Native::ImageEntry& entry,
         return {};
     }
     const vk::ImageView handle = *view;
+    trace_view(handle,false);
+    if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-view-created id={} handle={:#x} format={} aspect={} type={}",SceneTrace::Id(),reinterpret_cast<u64>(static_cast<VkImageView>(handle)),u32(format),u32(aspect),u32(view_type)));
     records.push_back({requested, use, std::move(view)});
     return handle;
 }
@@ -1093,12 +1619,17 @@ vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& sharp,
                                        AmdGpu::BorderColorBuffer border, bool is_depth) {
     const u64 hash = XXH3_64bits(&sharp, sizeof(sharp)) ^
                      (is_depth ? 0x9E3779B97F4A7C15ULL : 0) ^ (u64(border.Address()) << 1);
+    static thread_local Native::EpochValueMemo<vk::Sampler> memo;
+    const auto epoch = sampler_cache_epoch.load(std::memory_order_acquire);
+    if (const auto found = memo.Find(this, epoch, hash)) return *found;
     std::scoped_lock lock{sampler_mutex};
     auto& slot = samplers[hash];
     if (!slot) {
         slot = std::make_unique<VideoCore::Sampler>(r.instance, sharp, border, is_depth);
     }
-    return slot->Handle();
+    const auto handle = slot->Handle();
+    memo.Store(this, epoch, hash, handle);
+    return handle;
 }
 
 NativeRenderer::Stream& NativeRenderer::Begin() {
@@ -1106,6 +1637,8 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     if (s.list) {
         return s;
     }
+    // Zero permanently disables receipts after incarnation overflow.
+    s.upload_incarnation=s.upload_incarnation && s.upload_incarnation!=UINT64_MAX ? s.upload_incarnation+1 : 0;
     UploadMemoFor(this).Clear(); // new list: old upload-buffer bindings cannot be reused
     if (r.instance.IsIntel()) {
         // FIX-188: Intel Arc (#65) records into the scheduler's own command buffer.
@@ -1130,11 +1663,109 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     return s;
 }
 
-void NativeRenderer::EndRendering() {
+void NativeRenderer::EndRendering(u32 reason) {
+    RecordPartitionClock end_partition{t_record_partition_end};
+    auto* sidecar=FindParallelRuntime(this);
+    if(sidecar)sidecar->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::EndPass);
+    if(sidecar)sidecar->FinishSerialEligibleRun();
+    if (sidecar && sidecar->active) {
+        auto& pass=*sidecar->active;
+        const auto captured_draws=pass.draws.size(); // transfer can swap the vector
+        NATIVE_DIAGNOSTIC(++sidecar->pass_size_hist[std::min<std::size_t>(8,pass.draws.size())]);
+        u64 coordinator_start=0,coordinator_end=0;const bool cpu_started=ParallelGateDiagEnabled() && DescriptorThreadCpu100ns(coordinator_start);
+        stream.rendering=false; // the captured pass has not begun on stream.cmd
+        if(sidecar->draw_stream) {
+            // CPU recording may already be underway, but all draw preparation
+            // stays in this prefix until the complete rendering scope is sealed.
+            auto ticket=std::move(sidecar->draw_stream);
+            sidecar->coordinator->FinishStream(ticket);
+            stream.list=sidecar->coordinator->StreamReplacement(ticket);
+            ASSERT_MSG(stream.list,"stream replacement command list missing");
+            stream.cmd=vk::CommandBuffer{reinterpret_cast<VkCommandBuffer>(stream.list->NativeHandle())};
+            stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;
+            sidecar->sync_pins.Queued(sidecar->pin_slot);
+            NATIVE_DIAGNOSTIC(++sidecar->queued);
+            sidecar->pass_closure.Close(captured_draws,true,reason);
+            sidecar->pin_slot=Native::Parallel::SyncOwnerPins<>::Invalid;
+            // FinishStream transferred the stable Draw backing to its Job.
+            // It must remain untouched until the corresponding GPU fence.
+            sidecar->active.reset();sidecar->lease.reset();sidecar->stream_attempted=false;
+            if(cpu_started && DescriptorThreadCpu100ns(coordinator_end) && coordinator_end>=coordinator_start) {
+                NATIVE_DIAGNOSTIC(sidecar->coordinator_cpu_100ns+=coordinator_end-coordinator_start);NATIVE_DIAGNOSTIC(++sidecar->coordinator_cpu_samples);
+            }
+            return;
+        }
+        bool queued=false;
+        if((pass.draws.size()>=8 || ParallelSmallPassBatchEnabled()) && !sidecar->closing) {
+            const auto reset=[&]() noexcept {stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;};
+            if(Native::Parallel::RotateSegment(*sidecar->coordinator,*device,sidecar->epoch,
+                    stream.list,stream.cmd,sidecar->lease,64*1024,reset,
+#if !defined(NDEBUG)
+                    &sidecar->rotation_diag
+#else
+                    nullptr
+#endif
+                    )) {
+                std::size_t bytes=sizeof(pass)+pass.draws.capacity()*sizeof(Native::Parallel::Draw);
+                for(const auto& draw:pass.draws) bytes+=draw.descriptor_bytes;
+                try {queued=pass.draws.size()>=8 ? (sidecar->transfer_applied_mode.Enabled() ? sidecar->coordinator->TryPassTransfer(sidecar->epoch,pass,bytes) : sidecar->coordinator->TryPass(sidecar->epoch,pass,bytes)) : sidecar->coordinator->TrySmallPass(sidecar->epoch,pass,bytes);}
+                catch(const std::bad_alloc&) {if(pass.draws.size()<8)NATIVE_DIAGNOSTIC(++sidecar->small_admission_exceptions);else NATIVE_DIAGNOSTIC(++sidecar->large_admission_exceptions);queued=false;}
+            }
+        }
+        if(queued) {NATIVE_DIAGNOSTIC(++sidecar->queued);sidecar->sync_pins.Queued(sidecar->pin_slot);} else {
+            NATIVE_DIAGNOSTIC(++sidecar->synchronous);
+            ASSERT_MSG(Native::Parallel::RecordPass(stream.cmd,r.instance,pass),"parallel pass synchronous fallback failed");
+            ASSERT_MSG(sidecar->sync_pins.Tag(sidecar->pin_slot,sidecar->epoch),"parallel synchronous owner pin failed");
+            stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;
+        }
+        sidecar->pass_closure.Close(captured_draws,queued,reason);
+        pass.draws.clear();sidecar->scratch_draws.swap(pass.draws);
+        sidecar->pin_slot=Native::Parallel::SyncOwnerPins<>::Invalid;
+        sidecar->active.reset();sidecar->lease.reset();
+        if(cpu_started && DescriptorThreadCpu100ns(coordinator_end) && coordinator_end>=coordinator_start) {
+            NATIVE_DIAGNOSTIC(sidecar->coordinator_cpu_100ns+=coordinator_end-coordinator_start);NATIVE_DIAGNOSTIC(++sidecar->coordinator_cpu_samples);
+        }
+        return;
+    }
     if (stream.rendering) {
         stream.cmd.endRendering();
         stream.rendering = false;
     }
+}
+
+bool NativeRenderer::ContinueSmallParallelPass(const RenderState& target,u32 reason,bool safe) {
+    auto* sidecar=FindParallelRuntime(this);
+    if(!sidecar || !sidecar->active || sidecar->draw_stream)return false;
+    auto& pass=*sidecar->active;
+    if(!CanInlineContinuation(pass.draws.size(),ParallelSmallPassBatchEnabled(),sidecar->closing,
+            stream.rendering,stream.render==target && pass.target==target,
+            stream.list==sidecar->active_list,stream.cmd==sidecar->active_cmd,
+            r.scheduler.CurrentTick()==sidecar->epoch,safe))return false;
+    // Trace state can change during preflight; an open scope would suppress
+    // SceneTrace::Prepare at the common serial tail.
+    if(!RytyGtsInRace() || r.FrameDumpActive() || SceneTrace::Id() || Native::GpuCheckpoints::Requested() ||
+       !Native::Parallel::ValidatePass(pass))return false;
+    sidecar->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::EndPass);
+    sidecar->FinishSerialEligibleRun();
+    const auto draws=pass.draws.size();
+    NATIVE_DIAGNOSTIC(++sidecar->pass_size_hist[std::min<std::size_t>(8,draws)]);
+    u64 begin=0,end=0;const bool timed=ParallelGateDiagEnabled() && DescriptorThreadCpu100ns(begin);
+    vk::Pipeline last{};
+    ASSERT_MSG(Native::Parallel::RecordPassInline(stream.cmd,r.instance,pass,stream.dynamic,last),
+               "parallel pass inline continuation failed");
+    ASSERT_MSG(sidecar->sync_pins.Tag(sidecar->pin_slot,sidecar->epoch),"parallel synchronous owner pin failed");
+    NATIVE_DIAGNOSTIC(++sidecar->synchronous);NATIVE_DIAGNOSTIC(++sidecar->inline_continuations);
+    sidecar->pass_closure.Close(draws,false,reason);
+    // Only graphics was bound by replay; preserve independent compute binding.
+    stream.pipelines.handles[0]=last;
+    stream.vertex_state_known=false;
+    pass.draws.clear();sidecar->scratch_draws.swap(pass.draws);
+    sidecar->pin_slot=Native::Parallel::SyncOwnerPins<>::Invalid;
+    sidecar->active.reset();sidecar->lease.reset();
+    if(timed && DescriptorThreadCpu100ns(end) && end>=begin) {
+        NATIVE_DIAGNOSTIC(sidecar->coordinator_cpu_100ns+=end-begin);NATIVE_DIAGNOSTIC(++sidecar->coordinator_cpu_samples);
+    }
+    return true;
 }
 
 void NativeRenderer::BeginRendering(const RenderState& state) {
@@ -1182,7 +1813,7 @@ void NativeRenderer::BeginRendering(const RenderState& state) {
     });
     s.rendering = true;
     s.render = state;
-    ++stats.passes;
+    NATIVE_DIAGNOSTIC(++stats.passes);
 }
 
 void NativeRenderer::GlobalBarrier() {
@@ -1202,7 +1833,7 @@ void NativeRenderer::GlobalBarrier() {
     s.buffers_written = false;
     s.attach_dirty.clear();
     s.read.clear();
-    ++stats.barriers;
+    NATIVE_DIAGNOSTIC(++stats.barriers);
     FlushWritebacks();
 }
 
@@ -1227,7 +1858,7 @@ void NativeRenderer::PassBarrier() {
         .pMemoryBarriers = &barrier,
     });
     s.attach_dirty.clear();
-    ++stats.pass_barriers;
+    NATIVE_DIAGNOSTIC(++stats.pass_barriers);
 }
 
 void NativeRenderer::FlushWritebacks() {
@@ -1251,7 +1882,7 @@ void NativeRenderer::FlushWritebacks() {
             reinterpret_cast<u64>(static_cast<VkBuffer>(found->first->Handle())),
             found->first->SizeBytes());
         if (registry->RecordDownload(*s.list, *entry, *out, found->second)) {
-            ++stats.writebacks;
+            NATIVE_DIAGNOSTIC(++stats.writebacks);
             if (RegionOver(address, size)) {
                 // Image writes are authoritative for their entire byte range. A CPU-page
                 // delta cannot represent them: its saved baseline can already contain the
@@ -1398,7 +2029,7 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
     return chunk;
 }
 
-std::tuple<vk::Buffer, u64, u8*> NativeRenderer::Allocate(u64 size, u64 align) {
+std::tuple<vk::Buffer, u64, u8*> NativeRenderer::Allocate(u64 size, u64 align, bool* backing_proven) {
     Stream& s = stream;
     align = std::max<u64>(align, 16);
     if (s.chunks.empty() ||
@@ -1409,50 +2040,72 @@ std::tuple<vk::Buffer, u64, u8*> NativeRenderer::Allocate(u64 size, u64 align) {
     const auto& buffer = *s.chunks.back().buffer;
     const u64 offset = Common::AlignUp(s.chunk_used, align);
     s.chunk_used = offset + size;
-    return {vk::Buffer{Handle<VkBuffer_T>(buffer.NativeHandle())}, offset, buffer.Mapped() + offset};
+    const vk::Buffer handle{Handle<VkBuffer_T>(buffer.NativeHandle())};
+    if(backing_proven) *backing_proven=bool(handle) && buffer.Mapped() && size &&
+        offset<=buffer.Size() && size<=buffer.Size()-offset;
+    return {handle, offset, buffer.Mapped() + offset};
 }
 
-vk::DescriptorBufferInfo NativeRenderer::UploadFlatData(u32 stage, const u8* source, u32 size) {
+static bool FlatUploadReuseEnabled() {
+    // Diagnostic A/B control, sampled once at startup; reuse remains on by default.
+    static const bool reuse_enabled = [] {
+        const char* value = std::getenv("RYGT_FLAT_UPLOAD_REUSE");
+        return !value || value[0] != '0' || value[1] != '\0';
+    }();
+    return reuse_enabled;
+}
+
+vk::DescriptorBufferInfo NativeRenderer::UploadFlatData(u32 stage, const u8* source, u32 size, bool* backing_proven) {
     Native::SlowCallTrace<5> trace{t_timed, "upload-flat-data",
         {"compare", "allocate", "copy-upload", "copy-reference", "finish"}};
     trace.Next(0, reinterpret_cast<u64>(source), size);
+    const bool reuse_enabled = FlatUploadReuseEnabled();
     auto& memo = UploadMemoFor(this);
     const std::span<const u8> bytes{source, size};
-    const auto lookup = memo.Find(stage, bytes, [](const void* data, size_t length) {
-        return XXH3_64bits(data, length);
-    });
-    if (lookup.binding) {
-        ++stats.flat_upload_hits;
-        stats.flat_upload_bytes_saved += size;
-        return *lookup.binding;
+    FlatUploadMemo::Lookup lookup;
+    if (reuse_enabled) {
+        lookup = memo.Find(stage, bytes, [this](const void* data, size_t length) {
+            NATIVE_DIAGNOSTIC(stats.flat_upload_bytes_hashed += length);
+            return Native::Parallel::AdaptiveXXH3(data, length);
+        });
+        if (lookup.binding) {
+            if(backing_proven)*backing_proven=lookup.backing_proven;
+            NATIVE_DIAGNOSTIC(++stats.flat_upload_hits);
+            NATIVE_DIAGNOSTIC(stats.flat_upload_bytes_saved += size);
+            return *lookup.binding;
+        }
     }
-    ++stats.flat_upload_misses;
+    // This is also the uploaded count in the existing report: include bypasses.
+    NATIVE_DIAGNOSTIC(++stats.flat_upload_misses);
     trace.Next(1);
-    const auto [buffer, offset, data] = Allocate(size, r.instance.StorageMinAlignment());
+    bool allocated_backing=false;
+    const auto [buffer, offset, data] = Allocate(size, r.instance.StorageMinAlignment(), backing_proven?&allocated_backing:nullptr);
+    if(backing_proven)*backing_proven=allocated_backing;
     trace.Next(2);
     std::memcpy(data, source, size);
+    NATIVE_DIAGNOSTIC(stats.flat_upload_bytes_uploaded += size);
     const vk::DescriptorBufferInfo binding{buffer, offset, size};
     trace.Next(3);
-    memo.Store(lookup, stage, bytes, binding);
+    if (reuse_enabled) {
+        memo.Store(lookup, stage, bytes, binding, allocated_backing);
+        if (lookup.slot < 128) NATIVE_DIAGNOSTIC(stats.flat_upload_reference_bytes += size);
+    }
     trace.Next(4);
     return binding;
 }
 
 vk::DescriptorPool NativeRenderer::TakeDescriptorPool() {
     const vk::Device vk_device = r.instance.GetDevice();
+    vk::DescriptorPool ready;
+    bool reset = false;
     {
         std::scoped_lock lock{chunk_mutex};
-        const u64 known = r.scheduler.GetWorkSemaphore()->KnownGpuTick();
-        while (!retiring_pools.empty() && retiring_pools.front().first <= known) {
-            std::ignore = vk_device.resetDescriptorPool(retiring_pools.front().second);
-            free_pools.push_back(retiring_pools.front().second);
-            retiring_pools.pop_front();
-        }
-        if (!free_pools.empty()) {
-            const auto pool = free_pools.back();
-            free_pools.pop_back();
-            return pool;
-        }
+        std::tie(ready, reset) = Native::TakeReadyDescriptorPool(free_pools, retiring_pools,
+            r.scheduler.GetWorkSemaphore()->KnownGpuTick());
+    }
+    if (ready) {
+        if (reset) std::ignore = vk_device.resetDescriptorPool(ready);
+        return ready;
     }
     static constexpr std::array<vk::DescriptorPoolSize, 4> sizes{{
         {vk::DescriptorType::eStorageBuffer, 8192},
@@ -1602,7 +2255,8 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
     // CPU writes to it from now on are copied in before its next use.
     WatchPages(begin, end - begin);
     DropMirrors(begin, end - begin); // NAT-150: reads there use the region from now on
-    ++stats.regions_made;
+    NATIVE_DIAGNOSTIC(++stats.regions_made);
+#if !defined(NDEBUG)
     if (end-begin >= 4_MB && !merged.empty()) {
         LOG_INFO(Render_Vulkan,
             "NAT-REGION-INIT: begin={:#x} bytes={} guest-init={} gpu-retained={} gaps={} old-regions={}",
@@ -1610,6 +2264,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
     }
     LOG_INFO(Render_Vulkan, "NAT-114: region {:#x}+{:#x} on the GPU ({} taken in)", begin,
              end - begin, merged.size());
+#endif
     std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
     auto [it, inserted] = regions.emplace(begin, std::move(region));
     return &it->second;
@@ -1619,6 +2274,7 @@ void NativeRenderer::SortRegionWrites() {
     if (!has_pending_region_writes.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
+    const bool mirror_diag=MirrorDiagnosticEnabled();
     std::vector<std::pair<VAddr, VAddr>> writes, stack_retirements;
     {
         std::scoped_lock lock{region_dirty_mutex};
@@ -1653,14 +2309,17 @@ void NativeRenderer::SortRegionWrites() {
             const VAddr from = std::max(begin, mirror.begin);
             const VAddr to = std::min(end, mirror.end);
             bool dynamic = false;
+            u64 blocked_granule=~u64{0},blocked_age=~u64{0};
             for (u64 granule = from >> 16; granule <= (to - 1) >> 16; ++granule) {
                 const auto [written, first] = mirror_writes.try_emplace(granule, frame);
                 if (!first && written->second != frame && frame - written->second < 600) {
                     dynamic = true;
+                    if(mirror_diag && blocked_granule==~u64{0}) {blocked_granule=granule<<16;blocked_age=frame-written->second;}
                     dynamic_granules[granule] = frame;
                 }
                 written->second = frame;
             }
+#if !defined(NDEBUG)
             // FIX-184 (diagnosis, RYGT_NATIVE_MIRROR_NODROP=1): CPU-written mirrors stay (their
             // pages are copied in at the next use as usual).
             static const bool no_drop = [] {
@@ -1670,9 +2329,11 @@ void NativeRenderer::SortRegionWrites() {
             if (dynamic && no_drop) {
                 dynamic = false;
             }
+#endif
             if (dynamic) {
+                if(mirror_diag)NoteMirrorDiagnostic(MirrorCpuDrop,begin,end,mirror.begin,mirror.end,unmap_generation.load(),blocked_granule,blocked_age);
                 mirror_bytes -= mirror.end - mirror.begin;
-                ++stats.mirrors_dropped;
+                NATIVE_DIAGNOSTIC(++stats.mirrors_dropped);
                 ++buffer_generation; // OPT-003
                 buffer_log.Note(mirror.begin, mirror.end); // OPT-010
                 retired_watch_ranges.emplace_back(mirror.begin, mirror.end);
@@ -1708,7 +2369,20 @@ NativeRenderer::Mirror* NativeRenderer::MirrorHolding(VAddr address, u64 size) {
     return address >= mirror.begin && address + size <= mirror.end ? &mirror : nullptr;
 }
 
-bool NativeRenderer::IsDynamic(VAddr begin, VAddr end) {
+void NativeRenderer::NoteMirrorDiagnostic(u32 reason,u64 requested_begin,u64 requested_end,
+                                          u64 expanded_begin,u64 expanded_end,u64 generation,
+                                          u64 granule,u64 age) {
+    auto& d=mirror_diagnostic;
+    if(reason>=d.counts.size())return;
+    ++d.counts[reason];
+    // Preserve room for useful outcomes: common candidate insert/hit events
+    // contribute counts but do not fill the bounded example list.
+    if(reason<=MirrorCandidateSameFrame || d.example_count>=d.examples.size())return;
+    for(u32 i=0;i<d.example_count;++i)if(d.examples[i].reason==reason)return;
+    d.examples[d.example_count++]={reason,requested_begin,requested_end,expanded_begin,expanded_end,generation,granule,age};
+}
+
+bool NativeRenderer::IsDynamic(VAddr begin, VAddr end, u64* blocked_granule, u64* blocked_age) {
     constexpr u64 DynamicFrames = 600; // then the granule may be mirrored again
     if (dynamic_granules.empty()) {
         return false;
@@ -1719,6 +2393,8 @@ bool NativeRenderer::IsDynamic(VAddr begin, VAddr end) {
             continue;
         }
         if (frame - it->second < DynamicFrames) {
+            if(blocked_granule)*blocked_granule=granule << 16;
+            if(blocked_age)*blocked_age=frame-it->second;
             return true;
         }
         dynamic_granules.erase(it);
@@ -1743,7 +2419,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr add
     if (mirror) {
         if (!RefreshMirror(*mirror)) return std::nullopt;
         mirror->used_frame = frame;
-        ++stats.mirror_binds;
+        NATIVE_DIAGNOSTIC(++stats.mirror_binds);
         memo_kind = MemoKind::Mirror; // OPT-003
         memo_mirror = mirror;
         return std::pair{vk::Buffer{Handle<VkBuffer_T>(mirror->buffer->NativeHandle())},
@@ -1771,18 +2447,24 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::MirrorBuffer(VAddr add
     }
     const auto [it, inserted] = mirror_candidates.try_emplace(begin, MirrorCandidate{end, frame});
     MirrorCandidate& candidate = it->second;
+    const bool mirror_diag=MirrorDiagnosticEnabled();
     if (inserted) {
+        if(mirror_diag)NoteMirrorDiagnostic(MirrorCandidateNew,address,address+size,begin,end,unmap_generation.load());
         return std::nullopt;
     }
     candidate.end = std::max(candidate.end, end);
     if (candidate.frame == frame) {
+        if(mirror_diag)NoteMirrorDiagnostic(MirrorCandidateSameFrame,address,address+size,begin,candidate.end,unmap_generation.load());
         return std::nullopt;
     }
     candidate.frame = frame; // looked at again next frame at the earliest
-    if (IsDynamic(begin, candidate.end)) {
+    u64 blocked_granule=~u64{0},blocked_age=~u64{0};
+    if (IsDynamic(begin, candidate.end,mirror_diag?&blocked_granule:nullptr,mirror_diag?&blocked_age:nullptr)) {
+        if(mirror_diag)NoteMirrorDiagnostic(MirrorCandidateDynamic,address,address+size,begin,candidate.end,unmap_generation.load(),blocked_granule,blocked_age);
         return std::nullopt;
     }
     pending_mirrors.emplace_back(begin, candidate.end);
+    if(mirror_diag)NoteMirrorDiagnostic(MirrorCandidateQueued,address,address+size,begin,candidate.end,unmap_generation.load());
     mirror_candidates.erase(it);
     return std::nullopt;
 }
@@ -1835,7 +2517,7 @@ bool NativeRenderer::RefreshMirror(Mirror& mirror) {
         }
     }
     s.buffers_written = true;
-    stats.mirror_refresh_pages += pages.size();
+    NATIVE_DIAGNOSTIC(stats.mirror_refresh_pages += pages.size());
     return true;
 }
 
@@ -1844,7 +2526,9 @@ void NativeRenderer::MakePendingMirrors() {
         return;
     }
     mirror_promotion_budget.BeginFrame(frame);
+    const bool mirror_diag=MirrorDiagnosticEnabled();
     if (!mirror_promotion_budget.Available()) {
+        if(mirror_diag)NoteMirrorDiagnostic(MirrorPromotionBudget,~u64{0},~u64{0},~u64{0},~u64{0},unmap_generation.load());
         return; // Later draws still bind the original imported guest ranges.
     }
     std::vector<std::pair<VAddr, VAddr>> pending;
@@ -1857,6 +2541,25 @@ void NativeRenderer::MakePendingMirrors() {
         } else {
             ranges.emplace_back(begin, end);
         }
+    }
+    // Resume at the saved address, including a range grown over that address.
+    auto resume = std::lower_bound(ranges.begin(), ranges.end(), mirror_promotion_resume,
+        [](const auto& range, VAddr address) { return range.first < address; });
+    if (resume != ranges.begin() && std::prev(resume)->second > mirror_promotion_resume) --resume;
+    if (resume == ranges.end()) resume = ranges.begin();
+    std::rotate(ranges.begin(), resume, ranges.end());
+    using MirrorWorker = AsyncMirrorBuffer<Native::Rhi::Buffer>;
+    MirrorWorker::Request owner{};
+    const auto snapshot = mirror_preparation->TrySnapshot(owner);
+    if (snapshot == MirrorWorker::Snapshot::Busy) {
+        pending_mirrors.insert(pending_mirrors.end(), ranges.begin(), ranges.end());
+        return;
+    }
+    if (snapshot == MirrorWorker::Snapshot::Present && owner.generation == unmap_generation.load()) {
+        const auto found = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) {
+            return range.first <= owner.begin && owner.end <= range.second;
+        });
+        if (found != ranges.end()) std::rotate(ranges.begin(), found, ranges.end());
     }
     static const u64 budget = [] {
         const char* env = std::getenv("RYGT_NATIVE_MIRROR_MB");
@@ -1874,9 +2577,14 @@ void NativeRenderer::MakePendingMirrors() {
             const char* env = std::getenv("RYGT_NATIVE_MIRROR_REGION_GAP");
             return env && *env ? std::strtoull(env, nullptr, 10) * 1024 : u64{0};
         }();
-        if (!direct || RegionOver(begin, end - begin) || IsDynamic(begin, end) ||
-            (region_gap != 0 && RegionOver(begin > region_gap ? begin - region_gap : 0,
-                                           end - begin + 2 * region_gap))) {
+        bool region_block=false,gap_block=false;
+        u64 blocked_granule=~u64{0},blocked_age=~u64{0};
+        if (!direct || (region_block=bool(RegionOver(begin, end - begin))) ||
+            IsDynamic(begin,end,mirror_diag?&blocked_granule:nullptr,mirror_diag?&blocked_age:nullptr) ||
+            (region_gap != 0 && (gap_block=bool(RegionOver(begin > region_gap ? begin - region_gap : 0,
+                                           end - begin + 2 * region_gap))))) {
+            if(mirror_diag)NoteMirrorDiagnostic(!direct?MirrorNoDirect:(region_block||gap_block)?MirrorPromotionRegion:MirrorPromotionDynamic,
+                ~u64{0},~u64{0},begin,end,unmap_generation.load(),blocked_granule,blocked_age);
             continue; // shaders write there (the region holds it), or the CPU does
         }
         // The new mirror takes in the mirrors it overlaps.
@@ -1889,10 +2597,46 @@ void NativeRenderer::MakePendingMirrors() {
         if (end - begin > 256_MB) {
             continue;
         }
+        using PartOutcome = VideoCore::DirectMemory::PartOutcome;
+        PartOutcome source_outcome = PartOutcome::Invalid;
+        const auto probe_start = std::chrono::steady_clock::now();
+        direct->TryForEachPart(begin, end - begin, [] { return false; },
+            [](const VideoCore::Buffer&, u64, u64, u64) {}, &source_outcome);
+        mirror_promotion_budget.Account(std::chrono::steady_clock::now() - probe_start);
+        if (source_outcome != PartOutcome::Covered) {
+            if (mirror_diag) {
+                NoteMirrorDiagnostic(MirrorSourceNotCalled, ~u64{0}, ~u64{0}, begin, end, unmap_generation.load());
+                ++mirror_diagnostic.source_outcomes[source_outcome == PartOutcome::Busy ? 1 :
+                                                    source_outcome == PartOutcome::MissingCoverage ? 0 : 2];
+            }
+            bool budget_denied = false;
+            bool warm_queued = false;
+            if (source_outcome == PartOutcome::MissingCoverage && mirror_promotion_budget.Available()) {
+                const auto warm_start = std::chrono::steady_clock::now();
+                if (mirror_diag) ++mirror_diagnostic.warm_attempts;
+                warm_queued = mirror_preparation->TryPrepare({begin, end, unmap_generation.load()}, [&] {
+                    if (!mirror_promotion_budget.TryStart(end - begin)) { budget_denied = true; return false; }
+                    return true;
+                });
+                if (mirror_diag && warm_queued) ++mirror_diagnostic.warm_queued;
+                mirror_promotion_budget.Account(std::chrono::steady_clock::now() - warm_start);
+            }
+            pending_mirrors.emplace_back(ranges[range_index]);
+            if (source_outcome == PartOutcome::Busy || warm_queued || budget_denied || !mirror_promotion_budget.Available()) {
+                const size_t next = range_index + 1;
+                mirror_promotion_resume = source_outcome == PartOutcome::Busy || warm_queued || budget_denied ?
+                    ranges[range_index].first : (next < ranges.size() ? ranges[next].first : ranges[0].first);
+                pending_mirrors.insert(pending_mirrors.end(), ranges.begin() + next, ranges.end());
+                break;
+            }
+            continue;
+        }
         if (!mirror_promotion_budget.TryStart(end - begin)) {
+            if(mirror_diag)NoteMirrorDiagnostic(MirrorPromotionBudget,~u64{0},~u64{0},begin,end,unmap_generation.load());
             // Preserve the original ranges, not pointers into mutable mirror
             // storage. Mapping, CPU/GPU writes and overlaps are checked again
             // when a later frame has budget. Nothing incomplete is published.
+            mirror_promotion_resume = ranges[range_index].first;
             pending_mirrors.insert(pending_mirrors.end(), ranges.begin() + range_index,
                                    ranges.end());
             break;
@@ -1914,7 +2658,7 @@ void NativeRenderer::MakePendingMirrors() {
                 if (it->second.used_frame + 120 < frame &&
                     !(it->second.begin < end && it->second.end > begin)) {
                     mirror_bytes -= it->second.end - it->second.begin;
-                    ++stats.mirrors_evicted;
+                    NATIVE_DIAGNOSTIC(++stats.mirrors_evicted);
                     ++buffer_generation;
                     buffer_log.Note(it->second.begin, it->second.end);
                     retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
@@ -1925,24 +2669,53 @@ void NativeRenderer::MakePendingMirrors() {
             }
         }
         if (mirror_bytes - taken + (end - begin) > budget) {
-            ++stats.mirror_over_budget;
+            NATIVE_DIAGNOSTIC(++stats.mirror_over_budget);
+            if(mirror_diag)NoteMirrorDiagnostic(MirrorPromotionCapacity,~u64{0},~u64{0},begin,end,unmap_generation.load());
             continue;
         }
         promotion_trace.Next(1);
         std::unique_ptr<Native::Rhi::Buffer> buffer;
+        MirrorWorker::Observation observation=MirrorWorker::Observation::None;
+        bool source_callback=false;
         // Source views and destination must both be ready. Neither mutex may
         // make the recorder wait; a miss preserves the imported-buffer path.
         const bool ready = direct->TryForEachPart(begin, end - begin, [&] {
+            source_callback=true;
             buffer = mirror_preparation->TryAcquire(
-                {begin, end, unmap_generation.load()});
+                {begin, end, unmap_generation.load()},&observation);
             return bool(buffer);
         }, [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset, u64 bytes) {
             const vk::Buffer dst{Handle<VkBuffer_T>(buffer->NativeHandle())};
             s.cmd.copyBuffer(view.Handle(), dst, vk::BufferCopy{
                 .srcOffset = view_offset, .dstOffset = offset, .size = bytes});
         });
+        if(mirror_diag) {
+            u32 why=MirrorAcquirePending;
+            switch(observation) {
+            case MirrorWorker::Observation::None: why=MirrorAcquireInvalid;break;
+            case MirrorWorker::Observation::Busy: why=MirrorAcquireBusy;break;
+            case MirrorWorker::Observation::Queued: why=MirrorAcquireQueued;break;
+            case MirrorWorker::Observation::Pending: why=MirrorAcquirePending;break;
+            case MirrorWorker::Observation::Ready: why=MirrorAcquireReady;break;
+            case MirrorWorker::Observation::Reused: why=MirrorAcquireReused;break;
+            case MirrorWorker::Observation::DiscardSize: why=MirrorDiscardSize;break;
+            case MirrorWorker::Observation::DiscardGeneration: why=MirrorDiscardGeneration;break;
+            }
+            if(!source_callback)why=MirrorSourceNotCalled;
+            NoteMirrorDiagnostic(why,~u64{0},~u64{0},begin,end,unmap_generation.load());
+        }
         if (!ready) {
             pending_mirrors.emplace_back(ranges[range_index]);
+            if (!source_callback || observation == MirrorWorker::Observation::Queued ||
+                observation == MirrorWorker::Observation::Pending ||
+                observation == MirrorWorker::Observation::Busy ||
+                observation == MirrorWorker::Observation::DiscardSize ||
+                observation == MirrorWorker::Observation::DiscardGeneration) {
+                mirror_promotion_resume = ranges[range_index].first;
+                pending_mirrors.insert(pending_mirrors.end(), ranges.begin() + range_index + 1,
+                                       ranges.end());
+                break;
+            }
             continue;
         }
         // Copies are already recorded; retain their destination on a conflict.
@@ -1954,6 +2727,8 @@ void NativeRenderer::MakePendingMirrors() {
             continue;
         }
 
+        if(observation==MirrorWorker::Observation::Reused)NATIVE_DIAGNOSTIC(++stats.mirror_cross_address_reuses);
+        if(mirror_diag)NoteMirrorDiagnostic(MirrorPromotionSuccess,~u64{0},~u64{0},begin,end,unmap_generation.load());
         promotion_trace.Next(3);
         ++buffer_generation; // Only actual map changes invalidate prepared draws.
         {
@@ -1970,8 +2745,8 @@ void NativeRenderer::MakePendingMirrors() {
         promotion_trace.Next(5);
         WatchPages(begin, end - begin);
         mirror_bytes += end - begin;
-        ++stats.mirrors_made;
-        stats.mirror_made_bytes += end - begin;
+        NATIVE_DIAGNOSTIC(++stats.mirrors_made);
+        NATIVE_DIAGNOSTIC(stats.mirror_made_bytes += end - begin);
         promotion_trace.Next(6);
         mirrors.emplace(begin, Mirror{.begin = begin,
                                       .end = end,
@@ -1985,8 +2760,10 @@ void NativeRenderer::MakePendingMirrors() {
     }
 }
 
-void NativeRenderer::DropMirrors(VAddr address, u64 size) {
+void NativeRenderer::DropMirrors(VAddr address, u64 size, u32 diagnostic_reason) {
     for (auto it = FirstMirror(address); it != mirrors.end() && it->second.begin < address + size;) {
+        if(diagnostic_reason!=~u32{0} && MirrorDiagnosticEnabled())
+            NoteMirrorDiagnostic(diagnostic_reason,address,address+size,it->second.begin,it->second.end,unmap_generation.load());
         mirror_bytes -= it->second.end - it->second.begin;
         ++buffer_generation; // OPT-003
         buffer_log.Note(it->second.begin, it->second.end); // OPT-010
@@ -2019,6 +2796,7 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
     }
     std::vector<VAddr> pages(first, last);
     dirty.erase(first, last);
+#if !defined(NDEBUG)
     const auto refresh_start = std::chrono::steady_clock::now();
     struct Timed {
         std::chrono::steady_clock::time_point start;
@@ -2029,7 +2807,9 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
                          .count();
         }
     } timed{refresh_start, stats.region_refresh_ns};
-    stats.region_refresh_pages += pages.size();
+    NATIVE_DIAGNOSTIC(stats.region_refresh_pages += pages.size());
+
+#endif
     auto* direct = r.buffer_cache.GetDirectMemory();
     if (!direct) {
         return;
@@ -2127,16 +2907,18 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
             copy_snapshot(page + run_begin, now.data() + run_begin, run_end - run_begin);
             changed += run_end - run_begin;
         }
-        ++stats.region_partial_pages;
-        stats.region_partial_bytes += changed;
+        NATIVE_DIAGNOSTIC(++stats.region_partial_pages);
+        NATIVE_DIAGNOSTIC(stats.region_partial_bytes += changed);
     }
     s.buffers_written = true;
-    ++stats.region_refreshes;
+    NATIVE_DIAGNOSTIC(++stats.region_refreshes);
+#if !defined(NDEBUG)
     if (stats.region_partial_pages != 0 && Sample(logged_partial)) {
         LOG_INFO(Render_Vulkan, "FIX-173: region pages copied in part: {} ({:.1f} KB of {:.1f} KB)",
                  stats.region_partial_pages, stats.region_partial_bytes / 1024.0,
                  stats.region_partial_pages * 4.0);
     }
+#endif
 }
 
 u64 NativeRenderer::SnapshotBelow() {
@@ -2155,7 +2937,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
         return std::nullopt;
     }
     PhaseClock guest_clock{stats.guest_buffer_ns}; // NAT-145
-    ++stats.guest_buffer_calls;
+    NATIVE_DIAGNOSTIC(++stats.guest_buffer_calls);
     last_mirror = nullptr; // OPT-004
     // OPT-003: the range's last result, when nothing it depends on changed.
     const u32 flags = u32(write) | (u32(mirror) << 1);
@@ -2177,14 +2959,14 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
             (!memo.mirror || memo.mirror->dirty_pages.empty());
         if (fresh) {
             if (memo.region) {
-                ++stats.region_binds;
+                NATIVE_DIAGNOSTIC(++stats.region_binds);
             } else if (memo.mirror) {
-                ++stats.mirror_binds;
+                NATIVE_DIAGNOSTIC(++stats.mirror_binds);
                 memo.mirror->used_frame = frame;
             }
             last_bound = memo.bound;
             last_mirror = memo.mirror; // OPT-004
-            ++stats.buffer_memo_hits;
+            NATIVE_DIAGNOSTIC(++stats.buffer_memo_hits);
             return std::pair{memo.buffer, memo.offset};
         }
     }
@@ -2222,7 +3004,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
         }
         if (region) {
             RefreshRegion(*region, address, size);
-            ++stats.region_binds;
+            NATIVE_DIAGNOSTIC(++stats.region_binds);
             memo_kind = MemoKind::Region; // OPT-003
             memo_region = region;
             return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
@@ -2269,7 +3051,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     });
     if (write && write_regions && size <= 256_MB && address < inplace_from && !listed_in_place) {
         if (Region* region = MakeRegion(address, size)) {
-            ++stats.region_binds;
+            NATIVE_DIAGNOSTIC(++stats.region_binds);
             memo_kind = MemoKind::Region; // OPT-003
             memo_region = region;
             return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
@@ -2308,11 +3090,11 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     }
     if (write) {
         if (Region* region = MakeRegion(address, size)) {
-            ++stats.region_binds;
+            NATIVE_DIAGNOSTIC(++stats.region_binds);
             return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
                              u64{address - region->begin}};
         }
-        ++stats.unbound;
+        NATIVE_DIAGNOSTIC(++stats.unbound);
         static std::atomic<u32> logged{};
         if (Sample(logged)) {
             LOG_WARNING(Render_Vulkan,
@@ -2323,7 +3105,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
         return std::nullopt;
     }
     if (size > 64_MB) {
-        ++stats.unbound;
+        NATIVE_DIAGNOSTIC(++stats.unbound);
         static std::atomic<u32> logged{};
         if (Sample(logged)) {
             LOG_WARNING(Render_Vulkan,
@@ -2349,8 +3131,8 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
     if (readable < size) {
         std::memset(data + readable, 0, size - readable);
     }
-    ++stats.copied_reads;
-    stats.copied_bytes += size;
+    NATIVE_DIAGNOSTIC(++stats.copied_reads);
+    NATIVE_DIAGNOSTIC(stats.copied_bytes += size);
     return std::pair{buffer, offset};
 }
 
@@ -2386,8 +3168,8 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GatherOnGpu(VAddr addr
     if (!all) {
         return std::nullopt;
     }
-    ++stats.gathers;
-    stats.gathered_bytes += size;
+    NATIVE_DIAGNOSTIC(++stats.gathers);
+    NATIVE_DIAGNOSTIC(stats.gathered_bytes += size);
     return std::pair{dst, u64{0}};
 }
 
@@ -2599,7 +3381,7 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
         const VideoCore::TextureCache::ImageDesc desc{col_buf, r.liverpool->DrawCbExtent(cb)};
         Native::ImageEntry* entry = registry->Find(desc.info, true, frame);
         if (!entry) {
-            ++stats.null_images;
+            NATIVE_DIAGNOSTIC(++stats.null_images);
             continue;
         }
         const vk::ImageView view = View(*entry, desc.view_info, ViewUse::Attachment);
@@ -2607,6 +3389,7 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
             continue;
         }
         ApplyRewrite(*entry); // NAT-120
+#if !defined(NDEBUG)
         if (Native::WatchedTexture(entry->info.guest_address, entry->info.guest_address + 1) &&
             Native::WatchSample()) {
             LOG_WARNING(Render_Vulkan, "FIX-153 watch: draw into target {:#x} {}x{} layers {} "
@@ -2616,6 +3399,7 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
                         entry->info.guest_size, desc.view_info.range.base.layer,
                         desc.view_info.range.extent.layers, desc.view_info.range.base.level);
         }
+#endif
         out.colors[cb] = entry;
         out.color_formats[cb] = desc.view_info.format;
         // FIX-154: the draw covers the target it names, not the larger picture it may share
@@ -2673,7 +3457,7 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
                 if (!meta_clear && desc.info.meta_info.htile_addr != 0 && !entry->from_cpu &&
                     entry->write_version.load(std::memory_order_relaxed) == 0) {
                     meta_clear = fresh = true;
-                    ++stats.meta_clears;
+                    NATIVE_DIAGNOSTIC(++stats.meta_clears);
                 }
             }
             const auto aspects =
@@ -2681,6 +3465,7 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
                                          regs.depth_render_control, meta_clear);
             const bool depth_clear = bool(aspects & vk::ImageAspectFlagBits::eDepth);
             const bool stencil_clear = bool(aspects & vk::ImageAspectFlagBits::eStencil);
+#if !defined(NDEBUG)
             if (Native::WatchedTexture(entry->info.guest_address, entry->info.guest_address + 1) &&
                 Native::WatchSample()) {
                 const auto& dc = regs.depth_control;
@@ -2698,6 +3483,7 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
                             u32(regs.depth_render_control.depth_clear_enable),
                             u32(regs.depth_render_control.stencil_clear_enable), frame);
             }
+#endif
             db.image_view = view;
             if (r.FrameDumpCollecting() && entry->info.guest_address == 0x100ca70000) {
                 r.FrameDumpEvent(fmt::format(
@@ -2723,7 +3509,7 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
             num_layers = std::min<u32>(num_layers, desc.view_info.range.extent.layers);
             out.depth = entry;
         } else {
-            ++stats.null_images;
+            NATIVE_DIAGNOSTIC(++stats.null_images);
         }
     }
     state.width = static_cast<u16>(std::min<u32>(width, 0xffff));
@@ -2769,6 +3555,7 @@ void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
 void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& regs, bool compute,
                                  Shader::Backend::Bindings& binding, DrawBindings& b) {
     const u64 alignment = r.instance.StorageMinAlignment();
+#if !defined(NDEBUG)
     if (r.FrameDumpCollecting() && !compute &&
         regs.depth_buffer.DepthAddress() == 0x100ca70000 &&
         stage.sw_stage == Shader::SwStage::Vertex) {
@@ -2812,6 +3599,9 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
         LOG_WARNING(Render_Vulkan, "DIAG-150: native shader {:#x} use {} sources:{}",
                     stage.pgm_hash, watched_bind, sources);
     }
+#else
+    constexpr bool log_watched = false;
+#endif
     // AMD defaults to the validated descriptor-backed buffer path
     // rather than repeating guest page-table walks for each scalar constant load.
     static const bool composition_descriptors = [&] {
@@ -2827,7 +3617,21 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
     const bool descriptor_postprocess = postprocess_descriptors &&
         stage.sw_stage == Shader::SwStage::Fragment &&
         (stage.pgm_hash == 0x184b619c || stage.pgm_hash == 0x7cd92fb8);
-    auto* direct = stage.uses_direct && !descriptor_composition
+#if !defined(NDEBUG)
+    // Diagnostic A/B: retain shader compilation but use descriptor bindings.
+    static const bool descriptor_only_a82d2fe = [] {
+        const char* value = std::getenv("RYGT_A82D2FE_DESCRIPTOR_ONLY");
+        return value && value[0] == '1';
+    }();
+    const bool force_descriptor = descriptor_only_a82d2fe &&
+        stage.sw_stage == Shader::SwStage::Compute && stage.pgm_hash == 0xa82d2fe;
+    static std::atomic<bool> descriptor_diagnostic_logged{};
+    if (force_descriptor && !descriptor_diagnostic_logged.exchange(true))
+        LOG_WARNING(Render_Vulkan, "DIAG: 0xa82d2fe descriptor-only buffer binding active");
+#else
+    constexpr bool force_descriptor = false;
+#endif
+    auto* direct = stage.uses_direct && !descriptor_composition && !force_descriptor
         ? r.buffer_cache.GetDirectMemory() : nullptr;
     // D3's table: page table L1 and zero page, then base, size and valid of each buffer read
     // through it.
@@ -2920,6 +3724,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
             const auto vsharp = desc.GetSharp(stage);
             const u64 base = vsharp.base_address;
             const u64 sharp_size = vsharp.GetSize();
+#if !defined(NDEBUG)
             // DIAG-204 (RYGT_PROBE_SHADER=<hash>): that program's buffers and their first bytes.
             static const u64 probe_hash = [] {
                 const char* env = std::getenv("RYGT_PROBE_SHADER");
@@ -2942,6 +3747,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                                      : std::string{"unreadable"});
                 }
             }
+#endif
             // FIX-031 / FIX-036 / FIX-046: V#s that are not buffers are bound empty.
             const bool impossible =
                 vsharp.num_records != UINT32_MAX &&
@@ -2951,6 +3757,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                 !impossible && base != 0 && sharp_size != 0 && !r.IsMappedStart(base);
             if (base != 0 && sharp_size != 0 && !impossible && !unmapped) {
                 const u64 size = r.memory->ClampRangeSize(base, sharp_size);
+#if !defined(NDEBUG)
                 // FIX-174 (diagnosis, RYGT_NATIVE_WATCH_BUFFER=<hex address>+<hex size>): the
                 // shaders that bind a buffer over that range (the first ones, then now and then).
                 static const std::pair<VAddr, VAddr> watch_buffer = [] {
@@ -2975,6 +3782,8 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                                     size, frame);
                     }
                 }
+#endif
+#if !defined(NDEBUG)
                 const auto log_buffer = [&](const char* how) {
                     if (!log_watched) {
                         return;
@@ -2993,6 +3802,9 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                                                    head[2], head[3])
                                      : std::string{"unreadable"});
                 };
+#else
+                constexpr auto log_buffer = [](const char*) {};
+#endif
                 // This known shader's 12-byte arguments are CPU command parameters. Freeze
                 // them once for both the shader fallback and transfer path; GPU-backed
                 // arguments retain the normal shader path and are never read as CPU values.
@@ -3093,6 +3905,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                 }
             }
         }
+        if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-buffer id={} stage={} program={:#x} binding={} descriptor={} special={} written={} handle={:#x} offset={} range={} direct={}",SceneTrace::Id(),u32(stage.sw_stage),stage.pgm_hash,binding.unified,buffer_index,desc.IsSpecial(),desc.is_written,reinterpret_cast<u64>(static_cast<VkBuffer>(info.buffer)),info.offset,info.range,stage.uses_direct));
         b.buffers.push_back(info);
         b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
         b.writes.push_back(vk::WriteDescriptorSet{
@@ -3110,6 +3923,47 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
 
 void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs& regs,
                                   Shader::Backend::Bindings& binding, DrawBindings& b) {
+    if(SceneTrace::Id()) {
+        std::string constants;
+        for(size_t i=0;i<std::min<size_t>(stage.flattened_ud_buf.size(),128);++i)constants+=fmt::format(" {}:{:08x}",i,stage.flattened_ud_buf[i]);
+        r.FrameDumpEvent(fmt::format("scene-stage id={} stage={} program={:#x} image_count={} sampler_count={} scalar_words={} captured_words={} values{}",SceneTrace::Id(),u32(stage.sw_stage),stage.pgm_hash,stage.images.size(),stage.samplers.size(),stage.flattened_ud_buf.size(),std::min<size_t>(stage.flattened_ud_buf.size(),128),constants));
+    }
+    // Local, F8-only Autopolis cascade-consumer trace. Never changes bindings.
+    const bool trace_cascade = r.FrameDumpCollecting() &&
+        stage.sw_stage == Shader::SwStage::Fragment &&
+        std::ranges::any_of(stage.images, [&](const auto& image) {
+            const auto address = image.GetSharp(stage).Address();
+            return address == 0x100ca70000 || address == 0x2900000000 ||
+                   address == 0x2920000000;
+        });
+    if (trace_cascade) {
+        std::string values;
+        for (size_t i = 0; i < std::min<size_t>(stage.flattened_ud_buf.size(), 384); ++i) {
+            values += fmt::format(" {}:{:08x}@{:x}", i, stage.flattened_ud_buf[i],
+                i < stage.flattened_ud_src.size() ? stage.flattened_ud_src[i] : 0);
+        }
+        r.FrameDumpEvent(fmt::format("cascade-reader ps {:#x} indices {} instances {}:{}",
+            stage.pgm_hash, regs.num_indices, regs.num_instances.NumInstances(), values));
+        for (const auto& sampler : stage.samplers) {
+            const auto sharp = sampler.GetSharp(stage);
+            std::array<u32, sizeof(sharp) / sizeof(u32)> words{};
+            std::memcpy(words.data(), &sharp, sizeof(sharp));
+            std::string raw;
+            for (const auto word : words) raw += fmt::format(" {:08x}", word);
+            std::array<u32,4> color{};
+            const auto address = regs.ta_bc_base.Address() +
+                u64(sharp.border_color_ptr.Value()) * sizeof(color);
+            const bool custom = sharp.border_color_type.Value() == AmdGpu::BorderColor::Custom;
+            const bool readable = custom && Core::RytyMemory::GuardedCopy(
+                color.data(), reinterpret_cast<const void*>(address), sizeof(color));
+            r.FrameDumpEvent(fmt::format(
+                "cascade-sampler ps {:#x} compare {} lod {}..{} bias {} border {:#x} "
+                "custom {} readable {} rgba {:08x}/{:08x}/{:08x}/{:08x} raw{}",
+                stage.pgm_hash, sampler.is_depth, sharp.MinLod(), sharp.MaxLod(),
+                sharp.LodBias(), address, custom, readable, color[0],color[1],color[2],color[3],raw));
+        }
+    }
+#if !defined(NDEBUG)
     // DIAG-207 (RYGT_NULL_TEXTURES=<hash>:<hex slot mask>): that program's chosen texture slots
     // are bound empty, to see which one carries a wrong colour. Recorder-side draws only.
     static const std::pair<u64, u64> null_textures = [] {
@@ -3123,10 +3977,13 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
         return std::pair<u64, u64>{hash, mask};
     }();
     u32 slot = 0;
+#endif
     for (const auto& image_desc : stage.images) {
+#if !defined(NDEBUG)
         const bool null_slot = null_textures.first != 0 && stage.pgm_hash == null_textures.first &&
                                slot < 64 && ((null_textures.second >> slot) & 1);
         ++slot;
+#endif
         auto tsharp = image_desc.GetSharp(stage);
         MatchExperimentalCompositionTexture(tsharp, stage, image_desc, *registry);
         const bool cube_sampling = image_desc.post_op == Shader::SharpFetchPostOp::NativeCubeSampling;
@@ -3147,13 +4004,15 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             binding.unified += num_bindings;
         };
         const auto bind_null = [&](u32 reason) {
+            if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-null-image id={} stage={} program={:#x} binding={} reason={} address={:#x}",SceneTrace::Id(),u32(stage.sw_stage),stage.pgm_hash,binding.unified,reason,tsharp.Address()));
             for (u32 i = 0; i < num_bindings; ++i) {
                 b.images.push_back({VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral});
             }
-            ++stats.null_images;
-            ++stats.null_reasons[reason];
+            NATIVE_DIAGNOSTIC(++stats.null_images);
+            NATIVE_DIAGNOSTIC(++stats.null_reasons[reason]);
             add_write();
         };
+#if !defined(NDEBUG)
         if (null_slot) {
             static std::atomic<u32> logged{};
             if (logged++ < 16) {
@@ -3163,8 +4022,9 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             bind_null(0);
             continue;
         }
+#endif
         // OPT-002: the picture and views this T# resolved to last time.
-        ++stats.texture_lookups;
+        NATIVE_DIAGNOSTIC(++stats.texture_lookups);
         TextureMemo* memo = nullptr;
         std::array<u64, 4> raw_sharp{};
         static_assert(sizeof(tsharp) == sizeof(raw_sharp));
@@ -3182,10 +4042,12 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                 memo->generation == registry->Generation() + unmap_generation) {
                 Native::ImageEntry* entry = memo->entry;
                 entry->last_use.store(frame, std::memory_order_relaxed);
+#if !defined(NDEBUG)
                 if (Native::WatchedTexture(entry->info.guest_address,
                                            entry->info.guest_address + 1)) {
                     WatchBind(*entry, tsharp, storage, true, stage.pgm_hash); // FIX-157
                 }
+#endif
                 ApplyRewrite(*entry); // NAT-120
                 if (!storage && entry->from_cpu) {
                     RefreshSources(*entry); // NAT-104
@@ -3195,7 +4057,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                 }
                 (storage ? b.stored : b.sampled).push_back(entry);
                 add_write();
-                ++stats.texture_memo_hits;
+                NATIVE_DIAGNOSTIC(++stats.texture_memo_hits);
                 continue;
             }
         }
@@ -3219,11 +4081,58 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             bind_null(3);
             continue;
         }
-        const VideoCore::TextureCache::ImageDesc desc{tsharp, image_desc};
+        VideoCore::TextureCache::ImageDesc desc{tsharp, image_desc};
+        const bool original_backing=HasImageBacking(desc.info.guest_address,desc.info.guest_size);
+        const u64 original_address=desc.info.guest_address;
+        const u32 original_first_mip=desc.view_info.range.base.level;
+        const bool resident_view=!original_backing && !storage && !cube_sampling && num_bindings==1 &&
+            image_desc.mip_fallback_mode==Shader::MipStorageFallbackMode::None &&
+            RebaseResidentPrtView(desc,[&](u64 address,u64 bytes){return HasImageBacking(address,bytes);});
+        if (resident_view && SceneTrace::Id()) r.FrameDumpEvent(fmt::format(
+            "scene-prt-resident-view id={} program={:#x} original={:#x} first_mip={} resolved={:#x} bytes={} size={}x{} levels={}",
+            SceneTrace::Id(),stage.pgm_hash,original_address,original_first_mip,desc.info.guest_address,
+            desc.info.guest_size,desc.info.size.width,desc.info.size.height,desc.info.resources.levels));
+        const auto trace_rejected_backing = [&](const char* failure) {
+#ifdef _WIN32
+            if (!SceneTrace::Id()) return;
+            static thread_local u64 observed_frame=~u64{};
+            static thread_local std::vector<std::pair<u64,u64>> seen;
+            if (observed_frame!=frame) { observed_frame=frame; seen.clear(); }
+            const std::pair<u64,u64> key{desc.info.guest_address,desc.info.guest_size};
+            if (std::find(seen.begin(),seen.end(),key)!=seen.end() || seen.size()>=64) return;
+            seen.push_back(key);
+            const auto snapshot=SceneResidency::Observe(key.first,key.second,[](u64 address,SceneResidency::Region& region) {
+                MEMORY_BASIC_INFORMATION info{};
+                if (!VirtualQuery(reinterpret_cast<const void*>(address),&info,sizeof(info))) return false;
+                const auto begin=reinterpret_cast<u64>(info.BaseAddress);
+                if (info.RegionSize>std::numeric_limits<u64>::max()-begin) return false;
+                region={begin,begin+info.RegionSize,info.State,info.Protect,info.Type};
+                return true;
+            });
+            const auto total=SceneResidency::Cover(snapshot,key.first,key.second);
+            r.FrameDumpEvent(fmt::format("scene-rejected-backing id={} failure={} program={:#x} binding={} address={:#x} bytes={} tile={} prt={} size={}x{} levels={} layers={} view_base_mip={} view_last_mip={} min_lod={} cached_image={} observed={} committed={} complete={} query_failed={} invalid={} raw={:016x}/{:016x}/{:016x}/{:016x}",
+                SceneTrace::Id(),failure,stage.pgm_hash,binding.unified,key.first,key.second,
+                u32(desc.info.tile_mode),AmdGpu::IsPrt(desc.info.array_mode),desc.info.size.width,desc.info.size.height,
+                desc.info.resources.levels,desc.info.resources.layers,u32(tsharp.base_level),u32(tsharp.last_level),
+                float(tsharp.min_lod)/256.0f,registry->HasImageAt(key.first),total.observed,total.committed,snapshot.Complete(),
+                snapshot.query_failed,snapshot.invalid,raw_sharp[0],raw_sharp[1],raw_sharp[2],raw_sharp[3]));
+            for (const auto& region:snapshot.regions) {
+                r.FrameDumpEvent(fmt::format("scene-backing-region id={} address={:#x} begin={:#x} end={:#x} state={:#x} protect={:#x} type={:#x}",
+                    SceneTrace::Id(),key.first,region.begin,region.end,region.state,region.protect,region.type));
+            }
+            for (u32 mip=0;mip<std::min<u32>(desc.info.resources.levels,desc.info.mips_layout.size());++mip) {
+                const auto& layout=desc.info.mips_layout[mip];
+                const auto coverage=SceneResidency::Cover(snapshot,key.first+layout.offset,layout.size);
+                r.FrameDumpEvent(fmt::format("scene-backing-mip id={} address={:#x} mip={} offset={} bytes={} observed={} committed={} complete={}",
+                    SceneTrace::Id(),key.first,mip,layout.offset,layout.size,coverage.observed,coverage.committed,coverage.complete));
+            }
+#endif
+        };
         // A valid base address is not sufficient: stale optional descriptors can
         // span gigabytes beyond their allocation. Reject before image creation,
         // guest-memory import, staging allocation or a detiling dispatch.
-        if (!HasImageBacking(desc.info.guest_address, desc.info.guest_size)) {
+        if (!original_backing && !resident_view) {
+            trace_rejected_backing("span");
             static std::atomic<u32> logged{};
             if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
                 LOG_WARNING(Render_Vulkan,
@@ -3243,6 +4152,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
         // shader reads garbage T#s from one slot when the texture is unused; from there only an
         // image the game already made is bound.
         if (!r.IsMappedStart(desc.info.guest_address)) {
+            trace_rejected_backing("start");
             bind_null(4);
             continue;
         }
@@ -3262,9 +4172,11 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             bind_null(7);
             continue;
         }
+#if !defined(NDEBUG)
         if (Native::WatchedTexture(desc.info.guest_address, desc.info.guest_address + 1)) {
             WatchBind(*entry, tsharp, storage, false, stage.pgm_hash); // FIX-157 (diagnosis)
         }
+#endif
         ApplyRewrite(*entry); // NAT-120 (NAT-133: textures too)
         if (!storage && r.FrameDumpCollecting()) {
             // FIX-152 (diagnosis): RYGT_FRAME_DUMP_ALL_TEXTURES=1 dumps uploaded ones too.
@@ -3272,7 +4184,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                 const char* env = std::getenv("RYGT_FRAME_DUMP_ALL_TEXTURES");
                 return env && env[0] == '1';
             }();
-            if (dump_all || !entry->from_cpu) {
+            if (dump_all || !entry->from_cpu || SceneTrace::Id()) {
                 auto key = Rasterizer::FrameDumpTextureKey(desc.info); // NAT-123
                 if (std::ranges::find(dump_textures, key, &decltype(dump_textures)::value_type::first) ==
                     dump_textures.end()) {
@@ -3299,6 +4211,23 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                 View(*entry, view_info, storage ? ViewUse::Storage
                                                : cube_sampling ? ViewUse::CubeSampled
                                                            : ViewUse::Sampled);
+            if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-image id={} stage={} program={:#x} binding={} element={} storage={} comparison={} requested={:#x} actual={:#x} format={} size={}x{} levels={} layers={} view_mip={}+{} view_layer={}+{} min_lod={} fallback={} version={} dirty={} from_cpu={}",SceneTrace::Id(),u32(stage.sw_stage),stage.pgm_hash,binding.unified,i,storage,image_desc.is_depth,desc.info.guest_address,entry->info.guest_address,u32(entry->info.pixel_format),entry->info.size.width,entry->info.size.height,entry->info.resources.levels,entry->info.resources.layers,view_info.range.base.level,view_info.range.extent.levels,view_info.range.base.layer,view_info.range.extent.layers,view_info.min_lod,u32(fallback),entry->write_version.load(),entry->needs_upload.load(),entry->from_cpu));
+            if (trace_cascade) {
+                r.FrameDumpEvent(fmt::format(
+                    "cascade-view ps {:#x} requested {:#x} {}x{} mips {} layers {} "
+                    "actual {:#x} {}x{} mips {} layers {} from-cpu {} depth {} "
+                    "view mip {}+{} layer {}+{} min-lod {} comparison {} raw {:016x}/{:016x}/{:016x}/{:016x} "
+                    "version {} uploads {} dirty {} kept {} tracked {} guest-modified {}",
+                    stage.pgm_hash, desc.info.guest_address, desc.info.size.width, desc.info.size.height,
+                    desc.info.resources.levels, desc.info.resources.layers, entry->info.guest_address,
+                    entry->info.size.width, entry->info.size.height, entry->info.resources.levels,
+                    entry->info.resources.layers, entry->from_cpu, bool(entry->info.props.is_depth),
+                    view_info.range.base.level, view_info.range.extent.levels,
+                    view_info.range.base.layer, view_info.range.extent.layers, view_info.min_lod,
+                    image_desc.is_depth, raw_sharp[0],raw_sharp[1],raw_sharp[2],raw_sharp[3],
+                    entry->write_version.load(),entry->total_uploads.load(),entry->needs_upload.load(),
+                    entry->kept.load(),entry->guest_writes_tracked,entry->guest_modified.load()));
+            }
             b.images.push_back({VK_NULL_HANDLE, view, vk::ImageLayout::eGeneral});
         }
         if (memo) {
@@ -3320,6 +4249,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                                 regs.ta_bc_base.Address() == 0)) {
             ssharp = AmdGpu::Sampler{};
         }
+        if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-sampler id={} stage={} program={:#x} binding={} comparison={} compare_op={} min_lod={} max_lod={} original_bias={} sanitized_bias={} effective_bias={} effective_max_lod={} mip_filter={} min_filter={} mag_filter={} anisotropy={} clamp={}/{}/{} border={}",SceneTrace::Id(),u32(stage.sw_stage),stage.pgm_hash,binding.unified,sampler.is_depth,u32(ssharp.depth_compare_func.Value()),ssharp.MinLod(),ssharp.MaxLod(),sampler.GetSharp(stage).LodBias(),ssharp.LodBias(),std::min(ssharp.LodBias(),r.instance.MaxSamplerLodBias()),std::max(ssharp.MinLod(),ssharp.MaxLod()),u32(ssharp.mip_filter.Value()),u32(ssharp.xy_min_filter.Value()),u32(ssharp.xy_mag_filter.Value()),ssharp.MaxAniso(),u32(ssharp.clamp_x.Value()),u32(ssharp.clamp_y.Value()),u32(ssharp.clamp_z.Value()),u32(ssharp.border_color_type.Value())));
         b.images.push_back({SamplerFor(ssharp, regs.ta_bc_base, sampler.is_depth), VK_NULL_HANDLE,
                             vk::ImageLayout::eGeneral});
         b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
@@ -3336,6 +4266,9 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
 
 void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoint bind_point,
                                   DrawBindings& b) {
+    auto* pending_owner=FindParallelRuntime(this);
+    if(!parallel_binding_capture && pending_owner)
+        pending_owner->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::Serial);
     Native::SlowCallTrace<9> trace{t_timed, "descriptor-bindings",
         {"push-constants", "groups-keys", "push-descriptor", "hash-lookup", "allocate",
          "copy-writes", "update-descriptors", "store-key", "bind-set"}};
@@ -3343,7 +4276,7 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
     const CmdBuf cmdbuf{s.cmd};
     const auto stage_flags =
         pipeline.IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
-    cmdbuf.pushConstants(pipeline.GetLayout(), stage_flags, 0u, sizeof(b.push), &b.push);
+    if(!parallel_binding_capture) cmdbuf.pushConstants(pipeline.GetLayout(), stage_flags, 0u, sizeof(b.push), &b.push);
     if (b.writes.empty()) {
         return;
     }
@@ -3356,7 +4289,37 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
     static thread_local boost::container::small_vector<vk::WriteDescriptorSet, 64> updates;
     updates.clear();
     std::array<vk::DescriptorSet, Shader::Backend::MaxDescriptorSets> sets{};
-    for (u32 index = 0; index < by_set.size(); ++index) {
+    PendingDescriptorUpdates* pending=parallel_binding_capture && pending_owner ? &pending_owner->descriptor_updates : nullptr;
+    bool deferred=false;u64 staged_before=0;
+    if(pending) {
+        const auto check=[&] {
+            const auto buffers=std::span<const vk::DescriptorBufferInfo>{b.buffers.data(),b.buffers.size()};
+            const auto images=std::span<const vk::DescriptorImageInfo>{b.images.data(),b.images.size()};
+            if(parallel_binding_capture->counts_proven)
+                return pending->CheckCounts(parallel_binding_capture->ordinary_writes,parallel_binding_capture->ordinary_buffers,parallel_binding_capture->ordinary_images);
+            return parallel_binding_capture->write_structure_proven
+                ? pending->Check<true>(by_set,pipeline.PushSet(),buffers,images)
+                : pending->Check(by_set,pipeline.PushSet(),buffers,images);
+        };
+        auto admission=check();
+        if(admission==PendingDescriptorUpdates::Admission::Capacity) {
+            NATIVE_DIAGNOSTIC(++pending->overflow_draws);
+            pending->Flush(vk_device,PendingDescriptorUpdates::Capacity);
+            admission=check(); // revalidate all rows; capacity may have stopped the first scan
+        }
+        deferred=admission==PendingDescriptorUpdates::Admission::Yes;
+        if(!deferred) {
+            const bool overflow=admission==PendingDescriptorUpdates::Admission::Capacity;
+            if(!overflow)NATIVE_DIAGNOSTIC(++pending->unsupported_draws);
+            pending->Flush(vk_device,overflow?PendingDescriptorUpdates::Capacity:PendingDescriptorUpdates::Unsupported);
+        }
+        staged_before=pending->staged_rows;
+    }
+    const bool alloc_diag = DescriptorAllocDiagEnabled();
+    const unsigned alloc_kind = pipeline.IsCompute() ? 1 : 0;
+    u32 alloc_misses = 0;
+    if (alloc_diag && descriptor_alloc_owner != this) { descriptor_alloc_metrics = {}; std::fill_n(descriptor_bind_sets, 2, 0); std::fill_n(descriptor_bind_runs, 2, 0); std::fill_n(descriptor_bind_multi, 2, 0); descriptor_alloc_owner = this; }
+    try { for (u32 index = 0; index < by_set.size(); ++index) {
         auto& writes = by_set[index];
         if (writes.empty()) {
             continue;
@@ -3376,29 +4339,44 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         const bool cacheable = prepared_key.cacheable;
         const std::span<const u64> descriptor_key{key.data(), key.size()};
         if (cacheable && key_changed) {
-            prepared_key.hash = XXH3_64bits(key.data(), key.size() * sizeof(u64));
-            ++descriptor_hash_refreshed;
+            prepared_key.hash = Native::Parallel::AdaptiveXXH3(key.data(), key.size() * sizeof(u64));
+            NATIVE_DIAGNOSTIC(++descriptor_hash_refreshed);
         } else if (cacheable) {
-            ++descriptor_hash_reused;
+            NATIVE_DIAGNOSTIC(++descriptor_hash_reused);
         }
         const u64 key_hash = cacheable ? prepared_key.hash : 0;
         if (cacheable) {
             if (const auto reused = s.descriptor_sets.Find(key_hash, descriptor_key)) {
                 sets[index] = reused;
-                ++stats.descriptor_reuses;
+                NATIVE_DIAGNOSTIC(++stats.descriptor_reuses);
+                if (alloc_diag) ++descriptor_alloc_metrics.cache_hits[alloc_kind];
                 continue;
             }
         }
         trace.Next(4);
         const u64 layout_key = u64(VkDescriptorSetLayout(layout));
-        vk::DescriptorSet set = s.descriptor_reserve.Take(layout_key);
-        if (set) ++stats.descriptor_reserve_hits;
+        vk::DescriptorSet set{};
+        if(parallel_binding_capture && parallel_binding_capture->ahead) {
+            auto* ahead=parallel_binding_capture->ahead;
+            if(ahead->pipeline_layout==pipeline.GetLayout() && ahead->layouts[index]==layout && ahead->sets[index]) {
+                set=ahead->sets[index];++ahead->used_sets;ahead->context->used_sets.fetch_add(1,std::memory_order_relaxed);parallel_binding_capture->ahead_used=true;
+            }
+        }
+        const bool ahead_hit=bool(set);
+        if(!set)set=s.descriptor_reserve.Take(layout_key);
+        const bool reserve_hit=bool(set) && !ahead_hit;
+        if(reserve_hit)NATIVE_DIAGNOSTIC(++stats.descriptor_reserve_hits);
+        if (alloc_diag) { if (reserve_hit) ++descriptor_alloc_metrics.reserve_hits[alloc_kind]; else if(!set) ++alloc_misses; }
+        if(!set) {
         std::array<vk::DescriptorSetLayout, 32> layouts;
         layouts.fill(layout);
         std::array<vk::DescriptorSet, 32> allocated{};
-        u32 allocate_count = set ? 0 : u32(s.descriptor_reserve.BatchSize(layout_key));
+        u32 allocate_count = u32(s.descriptor_reserve.BatchSize(layout_key));
         for (u32 attempt = 0; attempt < 3 && !set; ++attempt) {
-            if (s.pools.empty() || attempt == 2) s.pools.push_back(TakeDescriptorPool());
+            if (s.pools.empty() || attempt == 2) {
+                if (alloc_diag) { if (s.pools.empty()) ++descriptor_alloc_metrics.pool_initial; else ++descriptor_alloc_metrics.pool_rotate; }
+                s.pools.push_back(TakeDescriptorPool());
+            }
             // A block may not fit: try one in the same pool, then one in a new pool.
             if (attempt != 0) allocate_count = 1;
             const vk::DescriptorSetAllocateInfo alloc{
@@ -3406,13 +4384,34 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
                 .descriptorSetCount = allocate_count,
                 .pSetLayouts = layouts.data(),
             };
-            ++stats.descriptor_allocate_calls;
-            if (vk_device.allocateDescriptorSets(&alloc, allocated.data()) == vk::Result::eSuccess) {
+            NATIVE_DIAGNOSTIC(++stats.descriptor_allocate_calls);
+#if !defined(NDEBUG)
+            const bool sampled = alloc_diag && descriptor_alloc_metrics.NextSample();
+            u64 cpu_before=0, cpu_after=0;
+            const bool cpu_started = sampled && DescriptorThreadCpu100ns(cpu_before);
+            const auto wall_start = sampled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+#endif
+            const auto allocation_result = vk_device.allocateDescriptorSets(&alloc, allocated.data());
+#if !defined(NDEBUG)
+            if (alloc_diag) {
+                u64 wall_ns=0; bool cpu_valid=false;
+                if (sampled) {
+                    wall_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-wall_start).count();
+                    cpu_valid=cpu_started && DescriptorThreadCpu100ns(cpu_after) && cpu_after >= cpu_before;
+                }
+                const auto result = allocation_result == vk::Result::eSuccess ? Native::DescriptorResult::Success :
+                    (allocation_result == vk::Result::eErrorOutOfPoolMemory || allocation_result == vk::Result::eErrorFragmentedPool)
+                        ? Native::DescriptorResult::Capacity : Native::DescriptorResult::Other;
+                descriptor_alloc_metrics.Attempt(allocate_count > 1, attempt, result, sampled, wall_ns, cpu_valid, cpu_valid ? cpu_after-cpu_before : 0);
+            }
+#endif
+            if (allocation_result == vk::Result::eSuccess) {
                 set = allocated[0];
-                stats.descriptor_allocations += allocate_count;
+                NATIVE_DIAGNOSTIC(stats.descriptor_allocations += allocate_count);
                 if (allocate_count > 1) s.descriptor_reserve.Store(layout_key,
                     std::span<const vk::DescriptorSet>{allocated.data() + 1, allocate_count - 1});
             }
+        }
         }
         if (!set) {
             static std::atomic<u32> logged{};
@@ -3424,19 +4423,50 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         // A miss needs mutable destinations. Hits and push sets borrow the original
         // writes directly; never leave a destination handle in per-draw storage.
         trace.Next(5);
-        Native::AppendDescriptorUpdates(writes,set,updates);
+        if(deferred)pending->Stage(writes,set);
+        else Native::AppendDescriptorUpdates(writes,set,updates);
         trace.Next(7);
         if (cacheable) s.descriptor_sets.Store(key_hash, descriptor_key, set);
         sets[index] = set;
+    }} catch(...) {
+        // A partially built immediate draw may already have published earlier sets.
+        // Keep its borrowed payload alive until all such writes have been applied.
+        if(pending) {
+            pending->Flush(vk_device,PendingDescriptorUpdates::Exception);
+            if(!updates.empty()) {vk_device.updateDescriptorSets(updates,{});NATIVE_DIAGNOSTIC(++pending->actual_calls);}
+        }
+        throw;
     }
+    if (alloc_diag) descriptor_alloc_metrics.Draw(alloc_kind, alloc_misses);
+    if(parallel_binding_capture) {
+        if(deferred && pending->staged_rows!=staged_before)NATIVE_DIAGNOSTIC(++pending->logical_draws);
+        if(!updates.empty()) {trace.Next(6);vk_device.updateDescriptorSets(updates,{});
+            if(pending){NATIVE_DIAGNOSTIC(++pending->actual_calls);NATIVE_DIAGNOSTIC(++pending->logical_draws);NATIVE_DIAGNOSTIC(++pending->immediate_draws);}}
+        parallel_binding_capture->sets=sets;
+        return;
+    }
+    std::array<vk::DescriptorSet, Shader::Backend::MaxDescriptorSets> bind_run{};
+    u32 bind_first = 0, bind_count = 0;
+    const auto flush_bind_run = [&] {
+        if (!bind_count) return;
+        trace.Next(8);
+        cmdbuf.bindDescriptorSets(bind_point, pipeline.GetLayout(), bind_first,
+                                  vk::ArrayProxy<const vk::DescriptorSet>{bind_count, bind_run.data()}, {});
+        if (alloc_diag) { descriptor_bind_sets[alloc_kind] += bind_count; ++descriptor_bind_runs[alloc_kind]; if (bind_count > 1) ++descriptor_bind_multi[alloc_kind]; }
+        bind_count = 0;
+    };
     Native::CommitDescriptorBatch(updates,sets,pipeline.PushSet(),by_set,
         [&](const auto& all) {trace.Next(6);vk_device.updateDescriptorSets(all,{});},
         [&](u32 index,const auto& writes) {
+            flush_bind_run();
             trace.Next(2);cmdbuf.pushDescriptorSetKHR(bind_point,pipeline.GetLayout(),index,writes);
         },
         [&](u32 index,vk::DescriptorSet set) {
-            trace.Next(8);cmdbuf.bindDescriptorSets(bind_point,pipeline.GetLayout(),index,set,{});
+            if (bind_count && index != bind_first + bind_count) flush_bind_run();
+            if (!bind_count) bind_first = index;
+            bind_run[bind_count++] = set;
         });
+    flush_bind_run();
 }
 
 bool NativeRenderer::MirrorKind(char kind) {
@@ -3481,8 +4511,8 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
             size = sharp_size;
             found = std::pair{vk::Buffer{Handle<VkBuffer_T>(near->buffer->NativeHandle())},
                               u64{base - near->begin}};
-            ++stats.mirror_binds;
-            ++stats.vertex_near;
+            NATIVE_DIAGNOSTIC(++stats.mirror_binds);
+            NATIVE_DIAGNOSTIC(++stats.vertex_near);
         } else if (base != 0 && sharp_size > 0 && r.memory->MappedAreaEnd(base, base + 1) != 0) {
             size = r.memory->ClampRangeSize(base, sharp_size);
             found = GuestBuffer(base, size, false, MirrorKind('v')); // FIX-177
@@ -3509,6 +4539,7 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
 
 void NativeRenderer::CheckVertexReach(const GraphicsPipeline& pipeline, const AmdGpu::Regs& regs,
                                       bool is_indexed, u32 index_offset) {
+#if !defined(NDEBUG)
     // FIX-181 (diagnosis, RYGT_NATIVE_VERTEX_REACH_CHECK=<n>): every n-th draw, the highest
     // vertex it can read (its indices read from guest memory, or its vertex count) against each
     // vertex V#'s end and the mirror bound there: draws reading past a mirror's end got zeros
@@ -3559,7 +4590,7 @@ void NativeRenderer::CheckVertexReach(const GraphicsPipeline& pipeline, const Am
     } else {
         max_index = count == 0 ? 0 : count - 1;
     }
-    ++stats.reach_checks;
+    NATIVE_DIAGNOSTIC(++stats.reach_checks);
     for (u32 i = 0; i < guest_buffers.size(); ++i) {
         const auto& guest = guest_buffers[i];
         const u64 stride = guest.GetStride();
@@ -3577,10 +4608,10 @@ void NativeRenderer::CheckVertexReach(const GraphicsPipeline& pipeline, const Am
         if (reach <= sharp_end) {
             continue;
         }
-        ++stats.reach_past_sharp;
+        NATIVE_DIAGNOSTIC(++stats.reach_past_sharp);
         const Mirror* mirror = MirrorHolding(base, 1);
         const bool past_mirror = mirror && reach > mirror->end;
-        stats.reach_past_mirror += past_mirror ? 1 : 0;
+        NATIVE_DIAGNOSTIC(stats.reach_past_mirror += past_mirror ? 1 : 0);
         static std::atomic<u32> logged{};
         if (Sample(logged)) {
             LOG_WARNING(Render_Vulkan,
@@ -3597,9 +4628,11 @@ void NativeRenderer::CheckVertexReach(const GraphicsPipeline& pipeline, const Am
                                : std::string{});
         }
     }
+#endif
 }
 
 void NativeRenderer::CheckMirrorBind(Mirror& mirror, VAddr base, u64 size) {
+#if !defined(NDEBUG)
     // FIX-179 (diagnosis, RYGT_NATIVE_MIRROR_CHECK=<n>): every n-th vertex range bound from a
     // mirror, the mirror's bytes and guest memory's bytes there are copied out side by side right
     // before the draw (the GPU's view of both at that point) and compared once the GPU is done.
@@ -3626,9 +4659,9 @@ void NativeRenderer::CheckMirrorBind(Mirror& mirror, VAddr base, u64 size) {
                 ++differ;
             }
         }
-        ++stats.mirror_checks;
+        NATIVE_DIAGNOSTIC(++stats.mirror_checks);
         if (differ != 0) {
-            ++stats.mirror_check_differ;
+            NATIVE_DIAGNOSTIC(++stats.mirror_check_differ);
             static std::atomic<u32> logged{};
             if (Sample(logged)) {
                 LOG_WARNING(Render_Vulkan,
@@ -3678,6 +4711,7 @@ void NativeRenderer::CheckMirrorBind(Mirror& mirror, VAddr base, u64 size) {
     mirror_checks.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, bytes, base,
                              frame, mirror.begin, mirror.end - mirror.begin, mirror.used_frame,
                              mirror.dirty_pages.size()});
+#endif
 }
 
 bool NativeRenderer::ResolveIndices(const AmdGpu::Regs& regs, bool is_indexed, u32 index_offset,
@@ -3766,7 +4800,7 @@ void NativeRenderer::RecordVertexIndex(const VertexIndexState& v) {
             s.input_bindings.assign(v.input_bindings.begin(), v.input_bindings.end());
             s.attributes.assign(v.attributes.begin(), v.attributes.end());
         } else {
-            ++stats.vertex_skipped;
+            NATIVE_DIAGNOSTIC(++stats.vertex_skipped);
         }
     }
     if (const u32 count = static_cast<u32>(v.buffers.size()); count != 0) {
@@ -3821,10 +4855,13 @@ void NativeRenderer::Written(const Native::ImageEntry* entry, u64 at) {
         return;
     }
     auto* written = const_cast<Native::ImageEntry*>(entry);
+#if !defined(NDEBUG)
     const bool watched = Native::WatchedTexture(entry->info.guest_address,
                                                 entry->info.guest_address + 1);
     const bool first_write = watched && written->write_version.load(std::memory_order_relaxed) == 0;
+#endif
     written->write_version.store(at != 0 ? at : ++write_clock, std::memory_order_relaxed);
+#if !defined(NDEBUG)
     if (watched) {
         // FIX-159 (diagnosis, RYGT_FRAME_DUMP_ON_STORE=<seconds>): from that long after start,
         // the first write of a watched picture starts a frame dump there (the frames a
@@ -3849,6 +4886,7 @@ void NativeRenderer::Written(const Native::ImageEntry* entry, u64 at) {
                         written->write_version.load(), frame);
         }
     }
+#endif
     // NAT-111: the textures made of it copy its picture in before their next read.
     std::scoped_lock lock{written->sources_mutex};
     for (auto* texture : written->dependents) {
@@ -3981,7 +5019,7 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
         index += layers;
     }
     s.written.push_back(&texture); // read after the next barrier
-    stats.source_copies += picks.size();
+    NATIVE_DIAGNOSTIC(stats.source_copies += picks.size());
     ++s.commands;
 }
 
@@ -4063,9 +5101,116 @@ struct PixelTrace {
 
 void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     std::scoped_lock lock{mutex};
+    struct StreamUnwindGuard {
+        NativeRenderer& renderer;
+        int exceptions=std::uncaught_exceptions();
+        ~StreamUnwindGuard() noexcept {
+            if(std::uncaught_exceptions()>exceptions) {
+                if(auto* runtime=FindParallelRuntime(&renderer);runtime && runtime->draw_stream)
+                    renderer.EndRendering();
+            }
+        }
+    } stream_unwind_guard{*this};
+    if (ParallelRecordingRequested() && !parallel_sidecar_init_failed.load(std::memory_order_relaxed) && RytyGtsInRace() && !r.instance.IsIntel() && !FindParallelRuntime(this)) {
+        try {
+            auto sidecar=std::make_unique<ParallelRuntime>();
+            sidecar->ahead_context=FindAheadBlocking(this);
+            if(PreparedSampledProofRequested()) {
+                sidecar->prepared_proof_context=prepared_proof_contexts.FindBlocking(this);
+            }
+#if !defined(NDEBUG)
+            if(const char* path=std::getenv("RYGT_PARALLEL_MODE_FILE");path && *path) {
+                const char* initial=std::getenv("RYGT_PARALLEL_INITIAL_MODE");
+                const bool enabled=Native::Parallel::InitialMode(path,initial);
+                sidecar->applied_mode=Native::Parallel::AppliedMode(enabled);
+                sidecar->mode_controller=std::make_unique<Native::Parallel::ModeController>(std::filesystem::path(path),enabled);
+            }
+            if(const char* path=std::getenv("RYGT_PARALLEL_VIEW_MODE_FILE");path && *path)
+                sidecar->view_mode_controller=std::make_unique<Native::Parallel::ModeController>(std::filesystem::path(path),sidecar->view_applied_mode.Enabled());
+#endif
+            // Worker count configurable via RYGT_PARALLEL_WORKERS (default 2, range 1-8)
+            int worker_count = 2;
+            if (const char* env = std::getenv("RYGT_PARALLEL_WORKERS")) {
+                worker_count = std::clamp(std::atoi(env), 1, 8);
+            }
+            // CPU affinity masks configurable via RYGT_PARALLEL_AFFINITY (comma-separated hex masks, e.g., "0x400,0x1000" for CPUs 10,12)
+            using AffinityMask = Native::Parallel::AffinityMask;
+            std::vector<AffinityMask> worker_affinity_masks;
+            bool affinity_parse_failed = false;
+            if (const char* env = std::getenv("RYGT_PARALLEL_AFFINITY")) {
+                std::string affinity_str(env);
+                // Check for trailing comma (trailing empty entry)
+                if (!affinity_str.empty() && affinity_str.back() == ',') {
+                    LOG_ERROR(Render_Vulkan, "RYGT_PARALLEL_AFFINITY: trailing comma (empty entry); ignoring all affinity settings");
+                    affinity_parse_failed = true;
+                }
+                size_t start = 0;
+                while (start < affinity_str.size() && !affinity_parse_failed) {
+                    size_t end = affinity_str.find(',', start);
+                    if (end == std::string::npos) end = affinity_str.size();
+                    std::string mask_str = affinity_str.substr(start, end - start);
+                    // Trim whitespace
+                    size_t mask_start = mask_str.find_first_not_of(" \t");
+                    size_t mask_end = mask_str.find_last_not_of(" \t");
+                    if (mask_start == std::string::npos || mask_end == std::string::npos) {
+                        LOG_ERROR(Render_Vulkan, "RYGT_PARALLEL_AFFINITY: empty mask entry at position {}", worker_affinity_masks.size());
+                        affinity_parse_failed = true;
+                        break;
+                    }
+                    mask_str = mask_str.substr(mask_start, mask_end - mask_start + 1);
+                    // Reject negative masks (e.g., "-1")
+                    if (!mask_str.empty() && mask_str[0] == '-') {
+                        LOG_ERROR(Render_Vulkan, "RYGT_PARALLEL_AFFINITY: negative mask '{}' not allowed", mask_str);
+                        affinity_parse_failed = true;
+                        break;
+                    }
+                    char* endptr = nullptr;
+                    errno = 0;
+                    unsigned long long mask_val = std::strtoull(mask_str.c_str(), &endptr, 0);
+                    if (endptr != mask_str.c_str() + mask_str.size()) {
+                        LOG_ERROR(Render_Vulkan, "RYGT_PARALLEL_AFFINITY: invalid mask '{}' (trailing characters)", mask_str);
+                        affinity_parse_failed = true;
+                        break;
+                    } else if (errno == ERANGE || mask_val == 0) {
+                        LOG_ERROR(Render_Vulkan, "RYGT_PARALLEL_AFFINITY: invalid mask '{}' (out of range or zero)", mask_str);
+                        affinity_parse_failed = true;
+                        break;
+                    } else {
+                        worker_affinity_masks.push_back(static_cast<AffinityMask>(mask_val));
+                    }
+                    start = end + 1;
+                }
+            }
+            if (affinity_parse_failed) {
+                LOG_ERROR(Render_Vulkan, "RYGT_PARALLEL_AFFINITY: parsing failed; ignoring all affinity settings");
+                worker_affinity_masks.clear();
+            } else if (!worker_affinity_masks.empty() && worker_affinity_masks.size() != static_cast<size_t>(worker_count)) {
+                LOG_WARNING(Render_Vulkan, "RYGT_PARALLEL_AFFINITY mask count ({}) does not match worker count ({}); ignoring affinity",
+                    worker_affinity_masks.size(), worker_count);
+                worker_affinity_masks.clear();
+            }
+            sidecar->coordinator=std::make_unique<Native::Parallel::PassCoordinator>(*device,r.instance,*timeline,worker_count,32,64*1024*1024,64,worker_affinity_masks);
+#if !defined(NDEBUG)
+            if(const char* path=std::getenv("RYGT_PARALLEL_TRANSFER_MODE_FILE");path && *path)
+                sidecar->transfer_mode_controller=std::make_unique<Native::Parallel::ModeController>(std::filesystem::path(path),sidecar->transfer_applied_mode.Enabled());
+#endif
+            std::lock_guard sidecar_lock(parallel_sidecars_mutex);
+            auto [where,inserted]=parallel_sidecars.emplace(this,std::move(sidecar));
+            if(inserted && where->second->prepared_proof_context)where->second->prepared_proof_context->SetMode(where->second->applied_mode.Enabled());
+            if(inserted && where->second->ahead_context) {
+                std::scoped_lock ahead_lock{ahead_context_mutex};
+                if(!where->second->ahead_context->closing.load(std::memory_order_acquire))
+                    SetAheadMode(*where->second->ahead_context,where->second->applied_mode.Enabled());
+            }
+            parallel_sidecars_generation.fetch_add(1,std::memory_order_release);
+        } catch(const std::exception&) {parallel_sidecar_init_failed.store(true,std::memory_order_relaxed);LOG_WARNING(Render_Vulkan,"PARALLEL-RECORD: initialization failed, using serial recorder");}
+    }
+#if !defined(NDEBUG)
     const auto start = std::chrono::steady_clock::now();
-    t_timed = (++timing_tick & 15) == 0; // OPT-001
-    stats.timed_draws += t_timed ? 1 : 0;
+    t_timed = r.FrameDumpCollecting() || (++timing_tick & 15) == 0; // F8: every draw
+    SceneTrace::CpuScope scene_trace{r.FrameDumpCollecting(),frame,"draw",stats.phase_ns,stats.record_ns};
+    if (SceneTrace::Id()) r.FrameDumpEvent(fmt::format("scene-pass id={} kind=draw indexed={} index_offset={}", SceneTrace::Id(),is_indexed,index_offset));
+    NATIVE_DIAGNOSTIC(stats.timed_draws += t_timed ? 1 : 0);
     struct Timed {
         std::chrono::steady_clock::time_point start;
         Stats& stats;
@@ -4082,7 +5227,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         ~Timed() {
             const u64 elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - start).count();
-            stats.draw_ns += elapsed;
+            NATIVE_DIAGNOSTIC(stats.draw_ns += elapsed);
             if (!sampled || elapsed < 1'000'000) {
                 return;
             }
@@ -4114,6 +5259,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 parts[4], parts[5], parts[6], parts[7]);
         }
     } timed{start, stats};
+
+#endif
     r.scheduler.PopPendingOperations();
     const auto& regs = r.liverpool->DrawRegs();
     switch (Classify(regs)) {
@@ -4147,12 +5294,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 ++s.commands;
             }
         }
-        ++stats.skipped;
+        NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
     case Filter::FmaskDecompress:
     case Filter::NoPrimitive:
-        ++stats.skipped;
+        NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     case Filter::Resolve:
         ResolveDraw(regs);
@@ -4162,7 +5309,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         if (Sample(logged)) {
             LOG_WARNING(Render_Vulkan, "NAT-102: depth/stencil copy draw skipped");
         }
-        ++stats.skipped;
+        NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
     case Filter::Draw:
@@ -4175,9 +5322,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     // OPT-010: the draw a game job thread prepared, if any.
     static const bool prepare = PrepareEnabled();
     PreparedDraw* prepared = nullptr;
-    if (prepare && !r.FrameDumpCollecting()) {
+    if (prepare && !r.FrameDumpCollecting() && RytyGtsInRace()) {
         prepared = TakePrepared(Rasterizer::t_draw_packet);
-        stats.prepared_missing += prepared ? 0 : 1;
+        NATIVE_DIAGNOSTIC(stats.prepared_missing += prepared ? 0 : 1);
     }
     struct GiveBack {
         NativeRenderer& n;
@@ -4208,9 +5355,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             !quad_list);
     }();
     if (!pipeline) {
-        ++stats.no_pipeline;
+        NATIVE_DIAGNOSTIC(++stats.no_pipeline);
         return;
     }
+#if !defined(NDEBUG)
     // DIAG-152 (RYGT_NATIVE_SKIP_PS=<hex,...>): draws with these pixel shaders are skipped.
     static const std::vector<u64> skip_ps = [] {
         std::vector<u64> hashes;
@@ -4228,7 +5376,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         const auto& stages = pipeline->GetStages();
         const Shader::Info* fs = stages[u32(Shader::SwStage::Fragment)];
         if (fs && std::ranges::find(skip_ps, fs->pgm_hash) != skip_ps.end()) {
-            ++stats.skipped;
+            NATIVE_DIAGNOSTIC(++stats.skipped);
             static std::atomic<u32> logged{};
             if (logged++ < 32) {
                 LOG_WARNING(Render_Vulkan, "DIAG-152: draw with ps {:#x} skipped", fs->pgm_hash);
@@ -4236,6 +5384,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             return;
         }
     }
+#endif
     if (RytyGhost::ShouldSmooth(regs) && ++smooth_ghost_draws == 1) {
         const auto& appearance = RytyGhost::GetAppearance();
         LOG_INFO(Render_Vulkan,
@@ -4289,9 +5438,29 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     }
     // OPT-010: the bindings the job thread worked out ahead, when they hold.
     bool from_prepared = false;
+    bool buffer_freshness_certified = false;
+    u64 buffer_freshness_seq = 0;
     if (prepared) {
         PhaseClock clock{stats.phase_ns[2]};
         from_prepared = CommitPrepared(*prepared, *pipeline, regs, trusted);
+        if (from_prepared) {
+            buffer_freshness_seq = buffer_log.Seq();
+            buffer_freshness_certified = true;
+        }
+    }
+    bool prepared_vertices_valid=false;
+    if(from_prepared && prepared->has_vertices && !prepared->bindings.failed) {
+        PhaseClock clock{stats.phase_ns[5]};
+        prepared_vertices_valid=CommitPreparedVertices(*prepared,*pipeline,regs,is_indexed,index_offset,quad_triangles,trusted);
+        // MirrorBuffer may process CPU writes after CommitPrepared. A changed
+        // range invalidates both prepared bindings and vertices, not only vi.
+        if(prepared->unmap_gen!=unmap_generation.load(std::memory_order_acquire) ||
+           !buffer_log.Untouched(prepared->buffer_seq,prepared->buffer_ranges)) {
+            from_prepared=false;prepared_vertices_valid=false;buffer_freshness_certified=false;
+        } else {
+            buffer_freshness_seq=buffer_log.Seq();
+            buffer_freshness_certified=true;
+        }
     }
     DrawBindings& b = from_prepared ? prepared->bindings : bindings;
     if (!from_prepared) {
@@ -4300,22 +5469,20 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         BindStages(pipeline->GetStages(), regs, false, b);
     }
     if (b.failed) {
-        ++stats.skipped;
+        NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
     static thread_local VertexIndexState vertex_index;
     const VertexIndexState* vi = &vertex_index;
     {
         PhaseClock clock{stats.phase_ns[5]};
-        if (from_prepared && prepared->has_vertices &&
-            CommitPreparedVertices(*prepared, *pipeline, regs, is_indexed, index_offset,
-                                   quad_triangles, trusted)) {
+        if (from_prepared && prepared_vertices_valid) {
             vi = prepared->vertex_index.get(); // OPT-011
         } else {
             vertex_index = {};
             ResolveVertexBuffers(*pipeline, regs, vertex_index);
             if (!ResolveIndices(regs, is_indexed, index_offset, quad_triangles, vertex_index)) {
-                ++stats.skipped;
+                NATIVE_DIAGNOSTIC(++stats.skipped);
                 return;
             }
             CheckVertexReach(*pipeline, regs, is_indexed, index_offset); // FIX-181 (diagnosis)
@@ -4328,7 +5495,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     const bool native_fsr_composition = BeginNativeFsr(*pipeline, targets, b);
     if (native_fsr_composition) scale_composition = false;
     if (!native_fsr_composition && !PrepareUiTarget(targets, *pipeline)) {
-        ++stats.skipped;
+        NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
     Begin();
@@ -4448,12 +5615,1067 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         } else if (pass_change && targets_in(s.attach_dirty)) {
             PassBarrier();
         } else if (pass_change) {
-            ++stats.passes_unblocked;
+            NATIVE_DIAGNOSTIC(++stats.passes_unblocked);
         }
     }
+    auto* parallel=FindParallelRuntime(this);
+    const auto partition_mode=parallel && parallel->applied_mode.Enabled()?1u:0u;
+    RecordPartitionEndGuard end_partition_guard{parallel?&parallel->record_partition[partition_mode][4]:nullptr};
+    RecordPartitionClock admission_partition{parallel?&parallel->record_partition[partition_mode][0]:nullptr};
+    // Narrow upper bound only; no draw eligibility is enabled. Unknown query,
+    // alias and lifetime constraints are not established by these counters.
+    if (ParallelEligibilityEnabled()) {
+        if (parallel_eligibility_owner != this) { parallel_eligibility_stats={}; parallel_eligibility_owner=this; }
+        auto& probe=parallel_eligibility_stats;
+        if (!s.rendering || !(s.render==targets.state)) probe.Flush();
+        ++probe.observed;
+        const auto& depth=targets.state.depth_stencil_attachment;
+        const bool in_race=RytyGtsInRace();
+        probe.race+=in_race; probe.nonindexed+=!quad_list && !is_indexed;
+        probe.single_color+=targets.state.num_color_attachments==1;
+        probe.no_clear+=targets.state.num_color_attachments==1 && !targets.state.color_attachments[0].is_clear;
+        probe.no_depth+=!depth.has_depth && !depth.has_stencil; probe.no_descriptors+=b.writes.empty();
+        probe.no_storage+=!b.writes_buffers && b.stored.empty(); probe.no_feedback+=feedback.empty();
+        const bool eligible=in_race && !r.FrameDumpActive() && !quad_list && !is_indexed &&
+            targets.state.num_color_attachments==1 && !targets.state.color_attachments[0].is_clear &&
+            !depth.has_depth && !depth.has_stencil && b.writes.empty() && !b.writes_buffers &&
+            b.stored.empty() && feedback.empty();
+        if (eligible) {++probe.eligible;++probe.current;} else probe.Flush();
+    }
+    // Experimental first subset: a complete, descriptor-free, vertexless color
+    // scope. Every eligibility uncertainty falls back to the existing recorder.
+    // Declared after GiveBack: an uncommitted draw flushes before prepared owners
+    // and the renderer mutex are released, including during exception unwinding.
+    struct PendingDrawGuard {
+        PendingDescriptorUpdates* pending;vk::Device device;bool committed{};
+        ~PendingDrawGuard() noexcept {if(pending && !committed)pending->Flush(device,PendingDescriptorUpdates::Abandoned);}
+    } pending_draw_guard{parallel?&parallel->descriptor_updates:nullptr,r.instance.GetDevice()};
+    static const bool natural_boundary_enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_NATURAL_BOUNDARY");return p && p[0]=='1' && !p[1];}();
+    bool preclosed_serial_scope=false;
+    bool serial_split_started=false;
+    bool serial_split_prebound=false;
+    const auto cancel_empty_split=[&]() noexcept {
+        if(!serial_split_started || !parallel || !parallel->active || !parallel->active->draws.empty())return;
+        NATIVE_DIAGNOSTIC(++parallel->pass_closure.empty_aborts[parallel->pass_closure.origin]);
+        parallel->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::Abandoned);
+        if(!parallel->sync_pins.CancelEmpty(parallel->pin_slot))std::terminate();
+        parallel->pin_slot=Native::Parallel::SyncOwnerPins<>::Invalid;
+        parallel->scratch_draws.swap(parallel->active->draws);
+        parallel->active.reset();parallel->lease.reset();s.rendering=false;
+        s.dynamic.Invalidate();s.pipelines.Invalidate();s.vertex_state_known=false;
+    };
+    struct EmptySplitGuard {
+        const decltype(cancel_empty_split)& cancel;
+        ~EmptySplitGuard() noexcept {cancel();}
+    } empty_split_guard{cancel_empty_split};
+    if(parallel && !parallel->closing && parallel->applied_mode.Enabled() && natural_boundary_enabled) {
+        preclosed_serial_scope=Native::Parallel::CloseChangedSerialScope(true,bool(parallel->active),s.rendering,s.render,targets.state,[&]{EndRendering();});
+        if(preclosed_serial_scope)NATIVE_DIAGNOSTIC(++parallel->natural_preclosed);
+    }
+    bool parallel_draw=false;
+    bool parallel_index_safe=false;u64 parallel_index_bytes=0;
+    ParallelBindingCapture parallel_bindings{};
+    std::shared_ptr<const DescriptorSnapshot> parallel_push_writes;
+    std::size_t parallel_descriptor_bytes=0;
+    u32 parallel_required_sets=0;
+    PreparedDraw::CpuProof* worker_result=nullptr;
+    bool worker_identity=false;
+    // Producer totals cover every ordinary row, including descriptor-cache hits.
+    // Match each bounded group span before using them with the live structure proof.
+    // Like known_structure, this relies on published row metadata remaining immutable.
+    const auto set_count_proof=[&] {
+        if(!worker_identity || !worker_result->descriptor_structure || !worker_result->counts_valid ||
+           !b.groups_ready || worker_result->counts_push!=pipeline->PushSet())return;
+        for(size_t i=0;i<b.grouped_writes.size();++i)
+            if(worker_result->group_data[i]!=b.grouped_writes[i].data() || worker_result->group_sizes[i]!=b.grouped_writes[i].size())return;
+        parallel_bindings.counts_proven=true;
+        parallel_bindings.ordinary_writes=worker_result->ordinary_writes;
+        parallel_bindings.ordinary_buffers=worker_result->ordinary_buffers;
+        parallel_bindings.ordinary_images=worker_result->ordinary_images;
+    };
+    if(parallel && !parallel->closing && parallel->applied_mode.Enabled()) {
+#if !defined(NDEBUG)
+        static const bool whole_enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_WHOLE_PREFLIGHT");return p && p[0]=='1' && p[1]=='\0';}();
+        const bool whole_sample=whole_enabled && ((++parallel->whole_seq & 127u)==0);
+        u64 whole_cpu_begin=0,whole_cpu_end=0;
+        const bool whole_cpu_started=whole_sample && DescriptorThreadCpu100ns(whole_cpu_begin);
+        const auto whole_begin=whole_sample?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+
+#else
+        constexpr bool whole_sample=false;
+#endif
+        WholePhaseTimer whole_phases{parallel->whole_phases,whole_sample};
+        NATIVE_DIAGNOSTIC(++parallel->considered);
+        const auto& fast_depth=targets.state.depth_stencil_attachment;
+        const bool extended=ParallelExtendedEnabled();
+        bool any_clear=targets.state.color_attachments[0].is_clear;
+        if(extended) {
+            any_clear=fast_depth.depth_clear || fast_depth.stencil_clear;
+            for(u32 i=0;i<targets.state.num_color_attachments && i<targets.state.color_attachments.size();++i)any_clear|=targets.state.color_attachments[i].is_clear;
+        }
+        const bool prohibited_clear=any_clear;
+        const bool fast_race=RytyGtsInRace(),fast_patch=EmulatorSettings.IsPatchShaders();
+        const bool fast_trace=r.FrameDumpActive() || SceneTrace::Id() || Native::GpuCheckpoints::Requested();
+        const bool inline_safe=bool(parallel->active) && fast_race && !fast_trace && !prohibited_clear && feedback.empty() &&
+            !scale_composition && !native_fsr_composition;
+#if !defined(NDEBUG)
+        static const bool serial_audit=[] {const char* p=std::getenv("RYGT_PARALLEL_SERIAL_AUDIT");return p && p[0]=='1' && p[1]=='\0';}();
+#else
+        constexpr bool serial_audit=false;
+#endif
+        // Split only a matching scope whose attachments need LOAD on continuation.
+        bool split_clear=fast_depth.depth_clear || fast_depth.stencil_clear;
+        for(u32 i=0;i<targets.state.num_color_attachments && i<targets.state.color_attachments.size();++i)
+            split_clear|=targets.state.color_attachments[i].is_clear;
+        const bool same_serial_scope=s.rendering && !parallel->active && s.render==targets.state;
+        const bool split_candidate=same_serial_scope && !split_clear;
+        const bool serial_scope_bypass=!serial_audit && s.rendering && !parallel->active && !split_candidate;
+        // Do not build a captured pass when even its prefix and pass nodes
+        // cannot fit. Recheck on later serial draws as retired nodes may free.
+        const bool no_pass_room=!parallel->active && !parallel->coordinator->HasRoomForPass();
+        bool fast_reject=no_pass_room || serial_scope_bypass || !fast_race || fast_patch || fast_trace || quad_list || quad_triangles ||
+            (!extended && is_indexed) || scale_composition || native_fsr_composition ||
+            (!extended && targets.state.num_color_attachments!=1) || targets.state.num_color_attachments>8 || prohibited_clear ||
+            (!extended && (fast_depth.has_depth || fast_depth.has_stencil || bool(vi->index_buffer))) ||
+            !feedback.empty() || !prepared || !from_prepared ||
+            prepared->pipeline!=pipeline || !prepared->pipeline_keepalive ||
+            b.writes_buffers || !b.gpu_writes.empty() || !b.stored.empty();
+        // UI/stream preparation may retire mirrors after vertex commit. Do not
+        // inspect prepared owner pointers if any prepared range changed since.
+        // The recorder owns log writes. Reuse only a successful check from this
+        // Draw while its sequence is unchanged; otherwise scan the original ranges.
+        if(!fast_reject && (prepared->unmap_gen!=unmap_generation.load(std::memory_order_acquire) ||
+           !(from_prepared && buffer_freshness_certified && buffer_log.Seq()==buffer_freshness_seq) &&
+           !buffer_log.Untouched(prepared->buffer_seq,prepared->buffer_ranges))) fast_reject=true;
+        if(fast_reject) {
+            NATIVE_DIAGNOSTIC(++parallel->fast_rejected);if(no_pass_room)NATIVE_DIAGNOSTIC(++parallel->no_pass_room_rejected);if(extended && any_clear)NATIVE_DIAGNOSTIC(++parallel->extended_clear_rejected);if(serial_scope_bypass)NATIVE_DIAGNOSTIC(++parallel->serial_scope_bypassed);
+            if(ParallelGateDiagEnabled()) {
+                // Bit 25 means deeper stage/view/alias/descriptor checks were not examined.
+                u64 mask=u64{1}<<25;if(serial_scope_bypass)mask|=u64{1}<<26;const auto fail=[&](u32 bit,bool bad){if(bad)mask|=u64{1}<<bit;};
+                fail(27,no_pass_room);fail(0,!fast_race);fail(1,fast_patch);fail(2,fast_trace);fail(4,!feedback.empty());
+                fail(5,!extended && targets.state.num_color_attachments!=1);fail(6,prohibited_clear);
+                fail(7,!extended && (fast_depth.has_depth || fast_depth.has_stencil));fail(8,quad_list || quad_triangles || (!extended && is_indexed));
+                fail(9,scale_composition || native_fsr_composition);fail(12,!extended && bool(vi->index_buffer));
+                fail(13,!prepared || !from_prepared || prepared->pipeline!=pipeline || !prepared->pipeline_keepalive);
+                fail(23,b.writes_buffers || !b.gpu_writes.empty() || !b.stored.empty());parallel->gates.Add(mask,true);
+            }
+            parallel->FinishSerialEligibleRun();
+            if(parallel->active && !ContinueSmallParallelPass(targets.state,CloseFast,inline_safe)) {
+                EndRendering(CloseFast);PassBarrier();
+            }
+        } else {
+        whole_phases.Next(1);
+        worker_result = parallel && prepared && from_prepared && prepared->pipeline==pipeline ? &prepared->cpu_proof : nullptr;
+        worker_identity = worker_result && worker_result->prepared_identity==prepared &&
+            worker_result->pipeline_identity==pipeline && worker_result->pipeline_layout==pipeline->GetLayout() &&
+            worker_result->writes_data==b.writes.data() && worker_result->writes_size==b.writes.size() &&
+            worker_result->buffers_data==b.buffers.data() && worker_result->buffers_size==b.buffers.size() &&
+            worker_result->images_data==b.images.data() && worker_result->images_size==b.images.size();
+        const auto& db=targets.state.depth_stencil_attachment;
+        // These draw-local requirements are mandatory in cheap_eligible below.
+        // Avoid region/mirror scans for draws that can never be admitted.
+        const bool vertex_preflight= !quad_list && !quad_triangles && (extended || !is_indexed) &&
+            !scale_composition && !native_fsr_composition && (extended || targets.state.num_color_attachments==1) &&
+            !prohibited_clear && (extended || (!db.has_depth && !db.has_stencil && !vi->index_buffer)) &&
+            feedback.empty() && prepared && from_prepared &&
+            prepared->pipeline==pipeline && prepared->pipeline_keepalive;
+        const bool vertex_requested=ParallelVertexEnabled();
+        const bool has_vertex_input=!vi->buffers.empty() || !vi->input_bindings.empty() || !vi->attributes.empty();
+        bool vertex_safe=!has_vertex_input && vi->offsets.empty() && vi->sizes.empty() && vi->strides.empty() && (extended || !vi->index_buffer);
+        bool vertex_shape_ok=false,vertex_binding_ok=true,vertex_pnext_ok=true,vertex_owner_missing=false;
+        bool native_vi_receipt_used=false,native_vi_attempted=false,native_upload_receipt_used=false,native_upload_attempted=false;size_t native_vertex_skipped=0;
+        const bool native_receipt_valid=trusted && from_prepared && prepared && worker_identity &&
+            prepared->proof_context && prepared->proof_context==parallel->prepared_proof_context &&
+            prepared->proof_context->Valid(prepared->proof_mode_state) &&
+            prepared->unmap_gen==unmap_generation.load(std::memory_order_acquire) &&
+            buffer_freshness_certified && buffer_log.Seq()==buffer_freshness_seq;
+        const bool known_shape=worker_identity && worker_result->vertex_identity==vi &&
+            worker_result->vertex_buffers_data==vi->buffers.data() && worker_result->vertex_buffers_size==vi->buffers.size() && worker_result->vertex_shape;
+        if(vertex_requested && has_vertex_input && vertex_preflight &&
+           prepared->has_vertices && prepared->vertex_index.get()==vi &&
+            (known_shape || (vi->buffers.size()<=32 && vi->input_bindings.size()<=32 && vi->attributes.size()<=32 &&
+           vi->buffers.size()==vi->offsets.size() && vi->buffers.size()==vi->sizes.size() &&
+           vi->buffers.size()==vi->strides.size() && !vi->buffers.empty() &&
+            vi->buffers.size()==vi->input_bindings.size() && vi->buffers.size()==vi->attributes.size()))) {
+            vertex_shape_ok=true;vertex_safe=true;
+            if (known_shape) {vertex_binding_ok=worker_result->vertex_bindings;vertex_pnext_ok=worker_result->vertex_pnext;NATIVE_DIAGNOSTIC(++parallel->producer_vertex_hits);}
+            else {
+                for(std::size_t i=0;i<vi->buffers.size();++i)
+                    if(vi->input_bindings[i].binding!=i || vi->attributes[i].binding!=i)vertex_binding_ok=false;
+                for(const auto& x:vi->input_bindings) if(x.pNext)vertex_pnext_ok=false;
+                for(const auto& x:vi->attributes) if(x.pNext)vertex_pnext_ok=false;
+            }
+            vertex_safe=vertex_binding_ok && vertex_pnext_ok;
+            const bool native_vertex=vertex_safe && known_shape && native_receipt_valid && prepared->native_vertex_receipt;
+            if(native_vertex) {native_vi_receipt_used=true;native_vertex_skipped=vi->buffers.size();}
+            if(!native_vertex) {
+            const Region* vertex_region_hint=nullptr;
+            const Mirror* vertex_mirror_hint=nullptr;
+            vk::Buffer vertex_handle_hint{};
+            // Direct vertex ranges are appended in binding order by PrepareVertices.
+            // This is only a scan hint; every candidate still gets a live proof.
+            std::size_t vertex_direct_hint=0;
+            for(std::size_t i=0;i<vi->buffers.size() && vertex_safe;++i) {
+                const auto handle=vi->buffers[i];const auto offset=vi->offsets[i],size=vi->sizes[i];
+                bool owned=false;
+                const auto matches=[&](const auto* value){
+                    if(!value || !value->buffer || !handle || !size)return false;
+                    if(vk::Buffer{Handle<VkBuffer_T>(value->buffer->NativeHandle())}!=handle)return false;
+                    const u64 capacity=value->buffer->Size();return offset<=capacity && size<=capacity-offset;
+                };
+                if(handle==vertex_handle_hint)
+                    owned=matches(vertex_region_hint) || matches(vertex_mirror_hint);
+                if(!owned) {
+                    vertex_region_hint=nullptr;vertex_mirror_hint=nullptr;vertex_handle_hint=vk::Buffer{};
+                    for(const auto& region:prepared->regions) if(matches(region.region)){owned=true;vertex_region_hint=region.region;break;}
+                    if(!owned)for(const auto* mirror:prepared->mirrors)if(matches(mirror)){owned=true;vertex_mirror_hint=mirror;break;}
+                    if(owned)vertex_handle_hint=handle;
+                }
+                if(!owned && handle && size && ParallelDirectVertexEnabled() && ParallelD2Enabled() &&
+                   prepared->in_place.size()<=32) {
+                    auto* direct=r.buffer_cache.GetDirectMemory();
+                    auto candidate=vertex_direct_hint;
+                    if(direct) for(std::size_t n=0;n<prepared->in_place.size();++n) {
+                        const auto& [address,bytes]=prepared->in_place[candidate];
+                        const auto next=candidate+1==prepared->in_place.size()?0:candidate+1;
+                        if(bytes!=size){candidate=next;continue;}
+                        NATIVE_DIAGNOSTIC(++parallel->vertex_direct_attempts);
+                        u32 parts=0;bool exact=false;
+                        const bool covered=direct->TryForEachPart(address,bytes,
+                            [&] {return VideoCore::ParallelDirectViewCoherent(direct,address,bytes);},
+                            [&](const VideoCore::Buffer& source,u64 source_offset,u64 part_offset,u64 length) {
+                                ++parts;exact=source.Handle()==handle && source_offset==offset && part_offset==0 && length==bytes;
+                            });
+                        if(covered && parts==1 && exact){
+                            owned=true;NATIVE_DIAGNOSTIC(++parallel->vertex_direct_matches);
+                            vertex_direct_hint=next;
+                            break;
+                        }
+                        candidate=next;
+                    }
+                }
+                if(!owned){vertex_owner_missing=true;vertex_safe=false;}
+            }
+            }
+        }
+        if(vertex_requested && has_vertex_input) {
+            if(vertex_preflight) {native_vi_attempted=true;NATIVE_DIAGNOSTIC(++parallel->native_vi_attempts);}
+            NATIVE_DIAGNOSTIC(++parallel->vertex_candidates);
+            if(vertex_preflight) {
+                NATIVE_DIAGNOSTIC(++parallel->vertex_preflight_draws);
+                if(!vertex_shape_ok)NATIVE_DIAGNOSTIC(++parallel->vertex_bad_structure);
+                else if(!vertex_binding_ok)NATIVE_DIAGNOSTIC(++parallel->vertex_bad_binding);
+                else if(!vertex_pnext_ok)NATIVE_DIAGNOSTIC(++parallel->vertex_bad_pnext);
+                else if(vertex_owner_missing)NATIVE_DIAGNOSTIC(++parallel->vertex_unknown_backing);
+                if(prepared && !prepared->in_place.empty())NATIVE_DIAGNOSTIC(++parallel->vertex_direct_ranges);
+            }
+            if(vertex_safe)NATIVE_DIAGNOSTIC(++parallel->vertex_backing_pass);
+        }
+        whole_phases.Next(2);
+        bool stages_safe=true,resource_key_known=true;
+        const auto& stage_summary=pipeline->GetParallelStageSummary();
+        // An older seed/shadow can retain unknown flags after the same canonical
+        // identity recovers them. Preserve the original live gate for that draw.
+        const bool draw_stages_known=stage_summary.known && std::ranges::all_of(pipeline->GetStages(),[](const auto* stage) {
+            return !stage || (stage->attribute_flags_known && stage->resource_usage_known);
+        });
+        if(draw_stages_known) {
+            stages_safe=stage_summary.safe &&
+                (!stage_summary.vertex_fetch || (vertex_requested && has_vertex_input && vertex_safe)) &&
+                (!stage_summary.uses_direct || ParallelD2Enabled());
+        } else for(const auto* stage:pipeline->GetStages()) if(stage) {
+            if(!stage->resource_usage_known) resource_key_known=false;
+            if(!stage->fmasks.empty() || !stage->attribute_flags_known || !stage->resource_usage_known || stage->translation_failed ||
+             (stage->sw_stage!=Shader::SwStage::Vertex && stage->sw_stage!=Shader::SwStage::Fragment) ||
+             (stage->has_fetch_shader && !(vertex_requested && has_vertex_input && vertex_safe && stage->sw_stage==Shader::SwStage::Vertex)) || stage->uses_patches || stage->uses_dma ||
+             (stage->uses_direct && !ParallelD2Enabled()) ||
+             stage->has_storage_images || stage->uses_shader_clock ||
+             std::ranges::any_of(stage->buffers,[](const auto& buffer){return buffer.is_written;})) stages_safe=false;
+        }
+        if(!resource_key_known) NATIVE_DIAGNOSTIC(++parallel->unknown_resource_key);
+        // Submission-window N protects only views actually tracked by the native
+        // registry; the epoch token itself is not an owning image reference.
+        whole_phases.Next(3);
+        bool native_attachment=true;
+        {
+            std::scoped_lock views_lock{views_mutex};
+            const auto tracked=[&](const Native::ImageEntry* entry,vk::ImageView handle) {
+                if(!entry || !handle)return false;
+                const auto found=views.find(entry);
+                return found!=views.end() && std::ranges::any_of(found->second,[&](const auto& view){return view.use==ViewUse::Attachment && *view.view==handle;});
+            };
+            for(u32 i=0;i<targets.state.num_color_attachments;++i) {
+                const auto handle=targets.state.color_attachments[i].image_view;
+                if(handle ? !tracked(targets.colors[i],handle) : bool(targets.colors[i]))native_attachment=false;
+            }
+            if(db.has_depth || db.has_stencil) {
+                if(!tracked(targets.depth,db.image_view))native_attachment=false;
+            } else if(extended && (targets.depth || db.image_view))native_attachment=false;
+            if(!extended && (!targets.colors[0] || !targets.state.color_attachments[0].image_view))native_attachment=false;
+        }
+        std::array<Native::Parallel::GuestImageRange,9> writable_ranges{};std::size_t writable_count=0;
+        if(extended) {
+            for(u32 i=0;i<targets.state.num_color_attachments;++i)if(const auto* e=targets.colors[i])
+                writable_ranges[writable_count++]={e->info.guest_address,e->info.guest_size};
+            if(targets.depth)writable_ranges[writable_count++]={targets.depth->info.guest_address,targets.depth->info.guest_size};
+        }
+        bool sampled_alias=extended && !Native::Parallel::WritableRangesDisjoint(writable_ranges,writable_count);
+        for(const auto* sampled:b.sampled) {
+            if(!sampled || !sampled->info.guest_size || (extended && !Native::Parallel::ValidGuestImageRange({sampled->info.guest_address,sampled->info.guest_size}))){sampled_alias=true;break;}
+            const auto overlaps=[&](const Native::ImageEntry* target) {
+                if(!target)return false;const u64 a=sampled->info.guest_address,as=sampled->info.guest_size;
+                const u64 t=target->info.guest_address,ts=target->info.guest_size;
+                return !ts || (a<=t ? t-a<as : a-t<ts);
+            };
+            for(const auto* target:targets.colors)if(overlaps(target)){sampled_alias=true;break;}
+            if(extended && overlaps(targets.depth))sampled_alias=true;
+            if(sampled_alias)break;
+        }
+        // Match the committed index packet to the exact prepared guest interval
+        // and a currently tracked backing. The worker retains handles only.
+        bool index_safe=!is_indexed && !vi->index_buffer;
+        u64 checked_index_bytes=0;
+        if(extended && is_indexed && prepared && prepared->has_vertices && prepared->vertex_index.get()==vi &&
+           prepared->indexed && prepared->index_offset==index_offset && vi->index_buffer && vi->index_count==regs.num_indices &&
+           (vi->index_type==vk::IndexType::eUint16 || vi->index_type==vk::IndexType::eUint32)) {
+            const u64 element=vi->index_type==vk::IndexType::eUint16?2:4;
+            const u64 base=regs.index_base_address.Address<VAddr>();
+            const u64 address=prepared->index_address;
+            if(Native::Parallel::PreparedIndexRange(base,index_offset,regs.num_indices,element,address,vi->index_offset,checked_index_bytes)) {
+                if(!native_vi_attempted){native_vi_attempted=true;NATIVE_DIAGNOSTIC(++parallel->native_vi_attempts);}
+                const auto matches=[&](const auto* value){
+                    if(!value || !value->buffer || vk::Buffer{Handle<VkBuffer_T>(value->buffer->NativeHandle())}!=vi->index_buffer)return false;
+                    return Native::Parallel::PreparedIndexBacking(address,checked_index_bytes,value->begin,value->end,vi->index_offset,value->buffer->Size());
+                };
+                if(native_receipt_valid && prepared->native_index_receipt) {index_safe=true;native_vi_receipt_used=true;}
+                else {
+                    for(const auto& use:prepared->regions)if(matches(use.region)){index_safe=true;break;}
+                    if(!index_safe)for(const auto* mirror:prepared->mirrors)if(matches(mirror)){index_safe=true;break;}
+                }
+                if(!index_safe && ParallelDirectVertexEnabled() && ParallelD2Enabled()) {
+                    auto* direct=r.buffer_cache.GetDirectMemory();
+                    if(direct && std::ranges::any_of(prepared->in_place,[&](const auto& part){return part.first==address && part.second==checked_index_bytes;})) {
+                        u32 parts=0;bool exact=false;
+                        const bool covered=direct->TryForEachPart(address,checked_index_bytes,
+                            [&]{return VideoCore::ParallelDirectViewCoherent(direct,address,checked_index_bytes);},
+                            [&](const VideoCore::Buffer& source,u64 source_offset,u64 part_offset,u64 length){++parts;exact=source.Handle()==vi->index_buffer && source_offset==vi->index_offset && !part_offset && length==checked_index_bytes;});
+                        index_safe=covered && parts==1 && exact;
+                    }
+                }
+            }
+        }
+        if(!b.buffers.empty())NATIVE_DIAGNOSTIC(++parallel->buffer_rejected);
+        if(sampled_alias)NATIVE_DIAGNOSTIC(++parallel->alias_rejected);
+        const bool cheap_eligible=native_attachment && !sampled_alias && !EmulatorSettings.IsPatchShaders() && RytyGtsInRace() &&
+            !r.FrameDumpActive() && !SceneTrace::Id() && !Native::GpuCheckpoints::Requested() &&
+            !quad_list && !quad_triangles && (extended || !is_indexed) && !scale_composition && !native_fsr_composition &&
+            (extended || targets.state.num_color_attachments==1) && !prohibited_clear &&
+            (extended || (!db.has_depth && !db.has_stencil)) && feedback.empty() && vertex_safe && index_safe &&
+            prepared && from_prepared && prepared->pipeline==pipeline && prepared->pipeline_keepalive && stages_safe;
+        bool descriptor_safe=cheap_eligible && !b.writes_buffers && b.gpu_writes.empty() && b.stored.empty();
+        u32 descriptor_fail_reason=0;
+#if !defined(NDEBUG)
+        const bool sample_preflight=descriptor_safe && ((++parallel->preflight_seq & 127u)==0);
+        const bool phase_sample=sample_preflight && ParallelProofPhaseEnabled();
+        u64 preflight_cpu_begin=0,preflight_cpu_end=0;
+        const bool preflight_cpu_started=sample_preflight && DescriptorThreadCpu100ns(preflight_cpu_begin);
+        const auto preflight_begin=sample_preflight?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+
+#else
+        constexpr bool sample_preflight=false;
+        constexpr bool phase_sample=false;
+#endif
+        whole_phases.Next(4);
+        if(descriptor_safe && !b.writes.empty()) {
+            try {
+                constexpr std::size_t MaxSnapshotBytes=64*1024;
+                // Inspect ordinary writes in place; only the push group is copied.
+                const auto image_infos=std::span<const vk::DescriptorImageInfo>{b.images.data(),b.images.size()};
+                const auto buffer_infos=std::span<const vk::DescriptorBufferInfo>{b.buffers.data(),b.buffers.size()};
+                static const bool reuse_stage_proof=[] {const char* p=std::getenv("RYGT_PARALLEL_DRAW_PROOF_REUSE");return p && p[0]=='1' && !p[1];}();
+                std::optional<Native::Parallel::PerDrawStageProof<Shader::Info,Shader::MaxStageTypes-1>> stage_proof;
+                if(reuse_stage_proof)stage_proof.emplace();
+                static const bool view_proof_enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_VIEW_PROOF_INDEX");return p && p[0]=='1' && !p[1];}();
+                static const bool wanted_view_filter=[] {const char* p=std::getenv("RYGT_PARALLEL_WANTED_VIEW_FILTER");return p && p[0]=='1' && !p[1];}();
+#if !defined(NDEBUG)
+                static const bool view_sample_enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_VIEW_PROOF_SAMPLE");return p && p[0]=='1' && !p[1];}();
+#else
+                constexpr bool view_sample_enabled=false;
+#endif
+                const bool sample_view=view_sample_enabled && ((++parallel->view_sample.sequence & 127u)==0);
+                Native::Parallel::ViewProofStats local_view_stats{};const bool gate_view=ParallelGateDiagEnabled();
+                Native::Parallel::PerDrawViewProof<vk::ImageView> view_proof{sample_view?&local_view_stats:(gate_view?&parallel->view_proof_stats:nullptr),wanted_view_filter};
+                const auto note_view_cardinality=[&](std::size_t n) {if(sample_view)NATIVE_DIAGNOSTIC(++parallel->view_sample.cardinality[n==0?0:n==1?1:n==2?2:n<=4?3:n<=8?4:n<=16?5:n<=32?6:n<=64?7:n<=128?8:9]);};
+                const bool known_structure=worker_identity && worker_result->descriptor_structure;
+                const bool image_batch=known_structure && (worker_result->image_seal_mask[0] || worker_result->image_seal_mask[1]) &&
+                    worker_result->image_seal_owner==this && feedback.empty() && prepared->proof_context &&
+                    prepared->proof_context==parallel->prepared_proof_context &&
+                    prepared->proof_context->Valid(prepared->proof_mode_state) &&
+                    sampler_cache_epoch.load(std::memory_order_acquire)==worker_result->image_seal_epoch;
+                if(!image_batch)NATIVE_DIAGNOSTIC(++parallel->image_batch_fallbacks);
+                size_t image_batch_infos=0;
+                const bool known_actions=known_structure && prepared->descriptor_actions.size()==b.writes.size();
+                const auto current_stages=pipeline->GetStages();
+                bool known_stage_schema=known_actions;
+                if(known_stage_schema)for(size_t si=0;si<worker_result->stages.size();++si) {
+                    const auto* stage=si<current_stages.size()?current_stages[si]:nullptr;
+                    const auto& schema=worker_result->stages[si];
+                    if((stage && !stage->identity) || (stage ? stage->identity : 0)!=schema.identity ||
+                       (stage ? stage->buffers.size() : 0)!=schema.count){known_stage_schema=false;break;}
+                }
+                bool buffer_prefix=false;
+                if(prepared && from_prepared) {
+                    NATIVE_DIAGNOSTIC(++parallel->buffer_prefix_attempts);
+                    if(prepared->buffer_prefix_sealed) {
+                        const auto prefix=b.buffers.size();
+                        buffer_prefix=trusted && known_structure && known_actions && known_stage_schema && prefix<=128 && prefix<=b.writes.size() &&
+                            prepared->proof_context && prepared->proof_context==parallel->prepared_proof_context &&
+                            prepared->proof_context->Valid(prepared->proof_mode_state) &&
+                            prepared->unmap_gen==unmap_generation.load(std::memory_order_acquire) &&
+                            buffer_freshness_certified && buffer_log.Seq()==buffer_freshness_seq &&
+                            (!prepared->buffer_prefix_clip || (ParallelReadonlyDescriptorEnabled() && !regs.clipper_control.user_clip_plane_enable));
+                        if(buffer_prefix && prepared->buffer_prefix_direct) {
+                            const auto* direct=r.buffer_cache.GetDirectMemory();
+                            buffer_prefix=direct==prepared->buffer_prefix_direct && direct && r.instance.GetDevice() &&
+                                direct->L1Address()==prepared->buffer_prefix_l1 && direct->ZeroPageAddress()==prepared->buffer_prefix_zero;
+                            if(buffer_prefix && !prepared->buffer_prefix_ranges.empty() &&
+                               !VideoCore::ParallelDirectViewsCoherent(direct,std::span{prepared->buffer_prefix_ranges.data(),prepared->buffer_prefix_ranges.size()})) {
+                                NATIVE_DIAGNOSTIC(++parallel->buffer_prefix_coherence_misses);buffer_prefix=false;
+                            }
+                        }
+                        // CommitPrepared is the sole writer of these buffer infos after
+                        // publication; a new list or Splice invalidates this receipt.
+                        if(buffer_prefix && !prepared->uploads.empty()) {
+                            native_upload_attempted=true;NATIVE_DIAGNOSTIC(++parallel->native_upload_attempts);
+                            native_upload_receipt_used=prepared->upload_receipt_incarnation &&
+                                prepared->upload_receipt_incarnation==s.upload_incarnation;
+                        }
+                        if(buffer_prefix)for(const auto& upload:prepared->uploads) {
+                            if(upload.info>=prefix) {buffer_prefix=false;break;}
+                            const auto& info=b.buffers[upload.info];
+                            if(info.range!=upload.size || !info.range || info.range==VK_WHOLE_SIZE ||
+                               (!native_upload_receipt_used && !std::ranges::any_of(s.chunks,[&](const auto& chunk) {
+                                   if(!chunk.buffer || !chunk.buffer->Mapped() ||
+                                      vk::Buffer{Handle<VkBuffer_T>(chunk.buffer->NativeHandle())}!=info.buffer)return false;
+                                   const u64 size=chunk.buffer->Size();return info.offset<=size && info.range<=size-info.offset;
+                               }))) {buffer_prefix=false;break;}
+                        }
+                        if(!buffer_prefix)native_upload_receipt_used=false;
+                    }
+                    if(buffer_prefix)NATIVE_DIAGNOSTIC(++parallel->buffer_prefix_accepts);else NATIVE_DIAGNOSTIC(++parallel->buffer_prefix_fallbacks);
+                }
+                if(known_structure)NATIVE_DIAGNOSTIC(++parallel->producer_structure_hits);
+                if(known_actions)NATIVE_DIAGNOSTIC(++parallel->producer_action_hits);
+                if(known_stage_schema)NATIVE_DIAGNOSTIC(++parallel->producer_stage_schema_hits);
+                struct DrawTableCache {const std::byte* data{};std::size_t size{};const void* owner{};u64 l1{},zero{};};
+                std::array<DrawTableCache,Shader::MaxStageTypes-1> table_cache{};
+                whole_phases.Next(5);
+                std::size_t action_index=buffer_prefix?b.buffers.size():0, action_upload_lookups=0;
+                const auto low_mask=[](size_t n) {return n==64 ? ~u64{0} : (u64{1}<<n)-1;};
+                bool image_bitmap=image_batch && worker_result->image_seal_infos && worker_result->image_seal_infos<=SIZE_MAX &&
+                    b.writes.size()<=128 && action_index<=b.writes.size();
+                std::array<u64,2> pending{};
+                if(image_bitmap) {
+                    for(size_t word=0;word<2;++word) {
+                        const size_t base=word*64;
+                        const size_t before=action_index<=base?0:std::min<size_t>(64,action_index-base);
+                        const size_t used=b.writes.size()<=base?0:std::min<size_t>(64,b.writes.size()-base);
+                        if(worker_result->image_seal_mask[word] & low_mask(before))image_bitmap=false;
+                        pending[word]=~worker_result->image_seal_mask[word] & low_mask(used) & ~low_mask(before);
+                    }
+                }
+                if(image_bitmap) {
+                    image_batch_infos=worker_result->image_seal_infos;
+                    NATIVE_DIAGNOSTIC(++parallel->image_bitmap_draws);NATIVE_DIAGNOSTIC(parallel->image_bitmap_rows+=worker_result->image_seal_rows);
+                }
+                size_t linear_row=action_index, word=0;
+                const auto next_row=[&]() -> size_t {
+                    if(!image_bitmap)return linear_row<b.writes.size()?linear_row++:b.writes.size();
+                    while(word<2 && !pending[word])++word;
+                    if(word==2)return b.writes.size();
+                    const size_t row=word*64+std::countr_zero(pending[word]);
+                    pending[word]&=pending[word]-1;return row;
+                };
+                for(size_t row=next_row();row<b.writes.size();row=next_row()) {
+                    const auto& write=b.writes[row];action_index=row+1;
+                    if(!image_bitmap && image_batch && action_index<=128 && (worker_result->image_seal_mask[(action_index-1)/64] & (u64{1}<<((action_index-1)%64)))) {
+                        image_batch_infos+=write.descriptorCount;continue;
+                    }
+                    const auto* action=known_actions ? &prepared->descriptor_actions[action_index-1] : nullptr;
+                    if(!known_structure && (write.pNext || write.pTexelBufferView)){descriptor_fail_reason=1;descriptor_safe=false;break;}
+                    const bool buffer_type=action ? action->is_buffer :
+                        (write.descriptorType==vk::DescriptorType::eUniformBuffer || write.descriptorType==vk::DescriptorType::eStorageBuffer);
+                    if(buffer_type) {
+                        SampledProofTimer phase{parallel->proof_phases[0],phase_sample};
+                        if(!known_structure && (write.pImageInfo || !DescriptorSnapshot::BufferSliceValid(write.pBufferInfo,write.descriptorCount,buffer_infos))) {descriptor_fail_reason=2;descriptor_safe=false;break;}
+                        for(u32 j=0;j<write.descriptorCount;++j) {
+                            const auto* info=&write.pBufferInfo[j];
+                            const std::size_t index=action ? action->buffer_first+j : static_cast<std::size_t>(info-b.buffers.data());
+                            bool planned_stage_checked=false;const Shader::Info* planned_stage_value=nullptr;
+                            const auto planned_stage=[&]() -> const Shader::Info* {
+                                if(planned_stage_checked)return planned_stage_value;
+                                planned_stage_checked=true;
+                                if(!known_stage_schema || !action || write.descriptorCount!=1 ||
+                                   action->stage_index>=current_stages.size() || action->stage_index>=worker_result->stages.size())return nullptr;
+                                const auto* stage=current_stages[action->stage_index];
+                                if(stage && action->stage_local<stage->buffers.size()) {NATIVE_DIAGNOSTIC(++parallel->producer_stage_lookup_hits);planned_stage_value=stage;return stage;}
+                                return nullptr;
+                            };
+                            // This is the old final clip proof reached early only for a
+                            // validated current stage and the same live null/clip predicates.
+                            if(ParallelReadonlyDescriptorEnabled() && write.descriptorType==vk::DescriptorType::eStorageBuffer &&
+                               !info->buffer && info->offset==0 && info->range==VK_WHOLE_SIZE && !regs.clipper_control.user_clip_plane_enable) {
+                                const auto fast_clip=[&]() -> bool {
+                                    if(const auto* stage=planned_stage()) {
+                                        const auto& desc=stage->buffers[action->stage_local];
+                                        if(desc.buffer_type==Shader::BufferType::ClipPlanes && !desc.is_written) {
+                                            NATIVE_DIAGNOSTIC(++parallel->descriptor_clip_nulls);NATIVE_DIAGNOSTIC(++parallel->clip_fast_hits);return true;
+                                        }
+                                    }
+                                    return false;
+                                };
+                                if(TimedProofInvoke(parallel->proof_phases[8],phase_sample,fast_clip))continue;
+                            }
+                            const auto absent_slot=[&](const Shader::Info& stage,std::size_t local,std::span<const std::byte> bytes) -> bool {
+                                static const bool enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_ABSENT_GUEST");return p && p[0]=='1' && !p[1];}();
+                                if(!enabled || write.descriptorType!=vk::DescriptorType::eStorageBuffer || local>=stage.buffers.size() ||
+                                   stage.buffers.size()>(SIZE_MAX-16)/16 || bytes.size()!=16+stage.buffers.size()*16)return false;
+                                u32 words[4]{};std::memcpy(words,bytes.data()+16+local*16,sizeof(words));
+                                if(words[3]!=0)return false;
+                                NATIVE_DIAGNOSTIC(++parallel->absent_mode0_attempts);
+                                const auto& desc=stage.buffers[local];const auto sharp=desc.GetSharp(stage);
+                                // The linked Instance requires and enables nullDescriptor before
+                                // exposing its logical device; see vk_instance.cpp 394-400, 687.
+                                const bool null_enabled=bool(r.instance.GetDevice());
+                                const bool accepted=Native::Parallel::IsPreparedAbsentDirectSlot(bytes,stage.buffers.size(),local,
+                                    desc.IsDirectEligible(),null_enabled,!info->buffer,info->offset,info->range,sharp.base_address,sharp.GetSize());
+                                if(accepted)NATIVE_DIAGNOSTIC(++parallel->absent_mode0_accepted);else NATIVE_DIAGNOSTIC(++parallel->absent_mode0_rejected);
+                                return accepted;
+                            };
+                            const auto direct_slot=[&]() -> bool {
+                                if(info->buffer || info->offset!=0 || info->range!=VK_WHOLE_SIZE) return false;
+                                auto* direct=r.buffer_cache.GetDirectMemory();if(!direct)return false;
+                                const auto stages=pipeline->GetStages();
+                                if(const auto* stage=planned_stage()) {
+                                    const auto& schema=worker_result->stages[action->stage_index];
+                                    if(schema.table_local<stage->buffers.size() && schema.table_upload<prepared->uploads.size() &&
+                                       stage->buffers[schema.table_local].buffer_type==Shader::BufferType::DirectTable &&
+                                       index>=action->stage_local && index-action->stage_local<=SIZE_MAX-schema.table_local &&
+                                       prepared->uploads[schema.table_upload].info==index-action->stage_local+schema.table_local) {
+                                        const auto local=action->stage_local;
+                                        const auto n=stage->buffers.size();
+                                        if(!stage->uses_direct || !stage->buffers[local].IsDirectEligible() || n>(SIZE_MAX-16)/16)return false;
+                                        const auto expected=16+n*16;const auto& upload=prepared->uploads[schema.table_upload];
+                                        auto& cached=table_cache[action->stage_index];const u64 l1=direct->L1Address(),zero=direct->ZeroPageAddress();
+                                        const std::byte* data=cached.data;
+                                        if(data && cached.owner==direct && cached.size==expected && cached.l1==l1 && cached.zero==zero)NATIVE_DIAGNOSTIC(++parallel->direct_table_cache_hits);
+                                        else {
+                                            if(upload.flat_stage>=0 || upload.size!=expected || upload.offset>prepared->upload_bytes.size() ||
+                                               expected>prepared->upload_bytes.size()-upload.offset)return false;
+                                            data=reinterpret_cast<const std::byte*>(prepared->upload_bytes.data()+upload.offset);
+                                            u32 header[4]{};std::memcpy(header,data,sizeof(header));
+                                            if((u64(header[0])|(u64(header[1])<<32))!=l1 || (u64(header[2])|(u64(header[3])<<32))!=zero)return false;
+                                            cached={data,expected,direct,l1,zero};
+                                        }
+                                        const auto bytes=std::span<const std::byte>{reinterpret_cast<const std::byte*>(data),expected};
+                                        if(absent_slot(*stage,local,bytes))return true;
+                                        if(!Native::Parallel::IsPreparedDirectSlot(bytes,n,local,true,true,info->offset,info->range))return false;
+                                        u32 words[4]{};std::memcpy(words,data+16+local*16,sizeof(words));
+                                        return VideoCore::ParallelDirectViewCoherent(direct,u64(words[0])|(u64(words[1])<<32),words[2]);
+                                    }
+                                }
+                                if(reuse_stage_proof) {
+                                    const auto* hit=stage_proof->Find(stages,index);if(!hit)return false;
+                                    const auto local=index-hit->begin;const auto* stage=hit->stage;
+                                    if(!stage->uses_direct || !stage->buffers[local].IsDirectEligible())return false;
+                                    const auto bytes=stage_proof->Table(hit,prepared->uploads,prepared->upload_bytes,
+                                        direct->L1Address(),direct->ZeroPageAddress(),[](const auto& slot){return slot.buffer_type==Shader::BufferType::DirectTable;});
+                                    if(bytes.empty())return false;
+                                    if(absent_slot(*stage,local,bytes))return true;
+                                    if(!Native::Parallel::IsPreparedDirectSlot(bytes,hit->count,local,true,true,info->offset,info->range))return false;
+                                    u32 words[4]{};std::memcpy(words,bytes.data()+16+local*16,sizeof(words));
+                                    const u64 address=u64(words[0])|(u64(words[1])<<32);
+                                    return VideoCore::ParallelDirectViewCoherent(direct,address,words[2]);
+                                }
+                                const auto count=std::min<std::size_t>(stages.size(),Shader::MaxStageTypes-1);
+                                std::size_t base_index=0;
+                                for(std::size_t si=0;si<count;++si) {
+                                    const auto* stage=stages[si];if(!stage)continue;
+                                    const auto n=stage->buffers.size();
+                                    if(index<base_index || index-base_index>=n){base_index+=n;continue;}
+                                    const auto local=index-base_index;
+                                    if(!stage->uses_direct || !stage->buffers[local].IsDirectEligible())return false;
+                                    std::size_t table_index=n;
+                                    for(std::size_t j=0;j<n;++j)if(stage->buffers[j].buffer_type==Shader::BufferType::DirectTable){if(table_index!=n)return false;table_index=j;}
+                                    if(table_index==n || n>(SIZE_MAX-16)/16)return false;
+                                    const auto expected=16+n*16;const auto global_table=base_index+table_index;
+                                    const PreparedDraw::Upload* table_upload=nullptr;
+                                    for(const auto& upload:prepared->uploads)if(upload.info==global_table){if(table_upload)return false;table_upload=&upload;}
+                                    if(!table_upload || table_upload->flat_stage>=0 || table_upload->size!=expected ||
+                                       table_upload->offset>prepared->upload_bytes.size() || expected>prepared->upload_bytes.size()-table_upload->offset)return false;
+                                    const auto* data=prepared->upload_bytes.data()+table_upload->offset;
+                                    u32 header[4]{};std::memcpy(header,data,sizeof(header));
+                                    const u64 l1=u64(header[0])|(u64(header[1])<<32),zero=u64(header[2])|(u64(header[3])<<32);
+                                    if(l1!=direct->L1Address() || zero!=direct->ZeroPageAddress())return false;
+                                    const auto bytes=std::span<const std::byte>{reinterpret_cast<const std::byte*>(data),expected};
+                                    if(absent_slot(*stage,local,bytes))return true;
+                                    if(!Native::Parallel::IsPreparedDirectSlot(bytes,n,local,true,true,info->offset,info->range))return false;
+                                    u32 words[4]{};std::memcpy(words,data+16+local*16,sizeof(words));
+                                    const u64 address=u64(words[0])|(u64(words[1])<<32);
+                                    return VideoCore::ParallelDirectViewCoherent(direct,address,words[2]);
+                                }
+                                return false;
+                            };
+                            const bool recorded=TimedProofInvoke(parallel->proof_phases[4],phase_sample,[&] {
+                                if(action && action->upload_match!=2) {
+                                    ++action_upload_lookups;
+                                    return action->upload_match==1 && action->upload_size==info->range;
+                                }
+                                return std::ranges::any_of(prepared->uploads,[&](const auto& upload){return upload.info==index && upload.size==info->range;});
+                            });
+                            const auto retained_scan=[&] {return TimedProofInvoke(parallel->proof_phases[5],phase_sample,[&] {return std::ranges::any_of(s.chunks,[&](const auto& chunk){
+                                if(!chunk.buffer || !chunk.buffer->Mapped() ||
+                                   vk::Buffer{Handle<VkBuffer_T>(chunk.buffer->NativeHandle())}!=info->buffer ||
+                                   info->range==VK_WHOLE_SIZE || !info->range)return false;
+                                const u64 size=chunk.buffer->Size();return info->offset<=size && info->range<=size-info->offset;
+                            });});};
+                            const bool retained=recorded && retained_scan();
+                            const auto readonly_slot=[&]() -> bool {
+                                if(!ParallelReadonlyDescriptorEnabled() || write.descriptorType!=vk::DescriptorType::eStorageBuffer || !info->buffer || !info->range ||
+                                   info->range==VK_WHOLE_SIZE || prepared->buffer_ranges.size()>64 || prepared->regions.size()>64)return false;
+                                NATIVE_DIAGNOSTIC(++parallel->descriptor_readonly_attempts);
+                                const auto stages=pipeline->GetStages();const auto stage_count=std::min<std::size_t>(stages.size(),Shader::MaxStageTypes-1);
+                                const Shader::Info* matched=planned_stage();std::size_t local=matched?action->stage_local:0,start=0;
+                                if(!matched)for(std::size_t si=0;si<stage_count;++si){const auto* stage=stages[si];if(!stage)continue;const auto n=stage->buffers.size();
+                                    if(index>=start && index-start<n){matched=stage;local=index-start;break;}start+=n;}
+                                if(!matched){NATIVE_DIAGNOSTIC(++parallel->readonly_guard_failures[0]);return false;}
+                                const auto& desc=matched->buffers[local];
+                                if(desc.IsSpecial()) {
+                                    NATIVE_DIAGNOSTIC(++parallel->readonly_guard_failures[1]);
+                                    const auto kind=static_cast<std::size_t>(desc.buffer_type);
+                                    NATIVE_DIAGNOSTIC(++parallel->readonly_special_kinds[std::min(kind,parallel->readonly_special_kinds.size()-1)]);
+                                    return false;
+                                }
+                                if(desc.is_written){NATIVE_DIAGNOSTIC(++parallel->readonly_guard_failures[2]);return false;}
+                                const auto sharp=desc.GetSharp(*matched);const u64 base=sharp.base_address,sharp_size=sharp.GetSize();
+                                // ClampRangeSize returns the original size below 1 GiB without a map lookup.
+                                // Larger ranges remain on the serial path; do not add a recorder map lock.
+                                constexpr u64 Limit=u64{1}<<40,NoClampLimit=u64{1}<<30;
+                                if(!base){NATIVE_DIAGNOSTIC(++parallel->readonly_guard_failures[3]);return false;}
+                                if(!sharp_size){NATIVE_DIAGNOSTIC(++parallel->readonly_guard_failures[4]);return false;}
+                                if(sharp_size>=NoClampLimit){NATIVE_DIAGNOSTIC(++parallel->readonly_guard_failures[5]);return false;}
+                                if(base>=Limit || sharp_size>Limit-base){NATIVE_DIAGNOSTIC(++parallel->readonly_guard_failures[6]);return false;}
+                                const u64 bytes=sharp_size;
+                                const auto contains=[&](const auto& range) {
+                                    const auto [begin,end]=range;
+                                    return begin<=base && end>=base && bytes<=end-base;
+                                };
+                                bool range_hit=false;
+                                const bool contained=Native::Parallel::ReadonlyHintOrScan(prepared->buffer_ranges,
+                                    action ? action->range_hint : SIZE_MAX,contains,range_hit);
+                                if(range_hit)NATIVE_DIAGNOSTIC(++parallel->readonly_range_hint_hits);else NATIVE_DIAGNOSTIC(++parallel->readonly_range_hint_misses);
+                                if(!contained){NATIVE_DIAGNOSTIC(++parallel->descriptor_readonly_uncontained);return false;}
+                                const u64 alignment=r.instance.StorageMinAlignment();if(!alignment)return false;
+                                const auto normalized=[&](u64 source_offset,u64 count) {
+                                    const u64 aligned=Common::AlignDown(source_offset,alignment),adjust=source_offset-aligned;
+                                    return count<=UINT64_MAX-adjust && info->offset==aligned && info->range==count+adjust;
+                                };
+                                const auto matches_region=[&](const auto& use) {
+                                    if(use.address!=base || use.size!=bytes || !use.region || !use.region->buffer || base<use.region->begin)return false;
+                                    const auto& buffer=*use.region->buffer;const u64 source_offset=base-use.region->begin;
+                                    return vk::Buffer{Handle<VkBuffer_T>(buffer.NativeHandle())}==info->buffer &&
+                                       source_offset<=buffer.Size() && bytes<=buffer.Size()-source_offset && normalized(source_offset,bytes);
+                                };
+                                bool region_hit=false;
+                                const bool region_match=Native::Parallel::ReadonlyHintOrScan(prepared->regions,
+                                    action ? action->region_hint : SIZE_MAX,matches_region,region_hit);
+                                if(region_hit)NATIVE_DIAGNOSTIC(++parallel->readonly_region_hint_hits);else NATIVE_DIAGNOSTIC(++parallel->readonly_region_hint_misses);
+                                if(region_match){NATIVE_DIAGNOSTIC(++parallel->descriptor_readonly_regions);return true;}
+                                auto* direct=r.buffer_cache.GetDirectMemory();
+                                if(direct){u32 parts=0;bool exact=false;
+                                    const bool covered=direct->TryForEachPart(base,bytes,
+                                        [&]{return VideoCore::ParallelDirectViewCoherent(direct,base,bytes);},
+                                        [&](const VideoCore::Buffer& source,u64 source_offset,u64 part_offset,u64 length){
+                                            ++parts;exact=source.Handle()==info->buffer && part_offset==0 && length==bytes && normalized(source_offset,bytes);
+                                        });
+                                    if(covered && parts==1 && exact){NATIVE_DIAGNOSTIC(++parallel->descriptor_readonly_imports);return true;}
+                                }
+                                NATIVE_DIAGNOSTIC(++parallel->descriptor_readonly_unmatched);
+                                return false;
+                            };
+                            const auto disabled_clip_null=[&]() -> bool {
+                                if(!ParallelReadonlyDescriptorEnabled() || write.descriptorType!=vk::DescriptorType::eStorageBuffer ||
+                                   info->buffer || info->offset!=0 || info->range!=VK_WHOLE_SIZE ||
+                                   regs.clipper_control.user_clip_plane_enable!=0)return false;
+                                if(const auto* stage=planned_stage()) {
+                                    const auto& desc=stage->buffers[action->stage_local];
+                                    if(desc.buffer_type!=Shader::BufferType::ClipPlanes || desc.is_written)return false;
+                                    NATIVE_DIAGNOSTIC(++parallel->descriptor_clip_nulls);return true;
+                                }
+                                const auto stages=pipeline->GetStages();std::size_t start=0;
+                                for(std::size_t si=0;si<std::min<std::size_t>(stages.size(),Shader::MaxStageTypes-1);++si){
+                                    const auto* stage=stages[si];if(!stage)continue;const auto n=stage->buffers.size();
+                                    if(index>=start && index-start<n){const auto& desc=stage->buffers[index-start];
+                                        if(desc.buffer_type!=Shader::BufferType::ClipPlanes || desc.is_written)return false;
+                                        NATIVE_DIAGNOSTIC(++parallel->descriptor_clip_nulls);return true;
+                                    }start+=n;
+                                }
+                                return false;
+                            };
+                            if(!recorded || !retained){NATIVE_DIAGNOSTIC(++parallel->direct_slot_attempts);const bool direct_ok=TimedProofInvoke(parallel->proof_phases[6],phase_sample,direct_slot);if(!direct_ok && !TimedProofInvoke(parallel->proof_phases[7],phase_sample,readonly_slot) && !TimedProofInvoke(parallel->proof_phases[8],phase_sample,disabled_clip_null)){
+                                descriptor_fail_reason=3;
+                                if(sample_preflight && parallel->descriptor_samples<4) {
+                                    NATIVE_DIAGNOSTIC(++parallel->descriptor_samples);u32 stage_id=~u32{0},kind=~u32{0},mode=~u32{0};bool stage_direct=false,eligible=false;
+                                    std::size_t start=0;const auto stages=pipeline->GetStages();
+                                    for(std::size_t si=0;si<std::min<std::size_t>(stages.size(),Shader::MaxStageTypes-1);++si) {
+                                        const auto* stage=stages[si];if(!stage)continue;const auto n=stage->buffers.size();
+                                        if(index>=start && index-start<n) {
+                                            const auto local=index-start;stage_id=static_cast<u32>(si);const auto& desc=stage->buffers[local];
+                                            kind=static_cast<u32>(desc.buffer_type);stage_direct=stage->uses_direct;eligible=desc.IsDirectEligible();
+                                            for(std::size_t k=0;k<n;++k)if(stage->buffers[k].buffer_type==Shader::BufferType::DirectTable)
+                                                for(const auto& upload:prepared->uploads)if(upload.info==start+k && upload.flat_stage<0 &&
+                                                   upload.offset<=prepared->upload_bytes.size() && upload.size<=prepared->upload_bytes.size()-upload.offset &&
+                                                   n<=(SIZE_MAX-16)/16 && upload.size==16+n*16) {
+                                                    std::memcpy(&mode,prepared->upload_bytes.data()+upload.offset+16+local*16+12,4);
+                                                }
+                                            break;
+                                        }
+                                        start+=n;
+                                    }
+                                    LOG_INFO(Render_Vulkan,"PARALLEL-DESCRIPTOR-SAMPLE index={} type={} null={} offset={} range={} upload={} retained={} stage={} resource_kind={} stage_direct={} direct_eligible={} direct_mode={}",
+                                        index,u32(write.descriptorType),!info->buffer,info->offset,info->range,recorded,
+                                        recorded ? retained : retained_scan(),stage_id,kind,stage_direct,eligible,mode);
+                                }
+                                descriptor_safe=false;break;}else if(direct_ok)NATIVE_DIAGNOSTIC(++parallel->direct_slot_accepted);}
+                        }
+                        if(!descriptor_safe)break;
+                        continue;
+                    }
+                    if(!known_structure && (write.pBufferInfo || !DescriptorSnapshot::ImageSliceValid(write.pImageInfo,write.descriptorCount,image_infos) ||
+                       (write.descriptorType!=vk::DescriptorType::eSampledImage && write.descriptorType!=vk::DescriptorType::eSampler))) {descriptor_fail_reason=4;descriptor_safe=false;break;}
+                    for(u32 j=0;j<write.descriptorCount;++j) {
+                        const auto& info=write.pImageInfo[j];
+                        if(write.descriptorType==vk::DescriptorType::eSampler) {
+                            SampledProofTimer phase{parallel->proof_phases[1],phase_sample};
+                            if(!info.sampler || info.imageView) {descriptor_fail_reason=5;descriptor_safe=false;break;}
+                            bool known=false;
+                            static const bool sampler_cache_enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_SAMPLER_PROOF_CACHE");return p && p[0]=='1' && !p[1];}();
+                            if(sampler_cache_enabled) {
+                                const auto handle_key=reinterpret_cast<u64>(static_cast<VkSampler>(info.sampler));
+                                const bool diag=ParallelGateDiagEnabled();
+                                known=parallel->sampler_proof.Contains(info.sampler,handle_key);
+                                if(known) {if(diag)NATIVE_DIAGNOSTIC(++parallel->sampler_proof_hits);}
+                                else {
+                                    if(diag)NATIVE_DIAGNOSTIC(++parallel->sampler_proof_misses);
+                                    std::scoped_lock sampler_lock{sampler_mutex};
+                                    for(const auto& [key,value]:samplers) {if(diag)NATIVE_DIAGNOSTIC(++parallel->sampler_scan_steps);if(value && value->Handle()==info.sampler) {known=true;break;}}
+                                    if(known){parallel->sampler_proof.Insert(info.sampler,handle_key);if(diag)NATIVE_DIAGNOSTIC(++parallel->sampler_scan_positives);}
+                                }
+                            } else {std::scoped_lock sampler_lock{sampler_mutex};
+                                for(const auto& [key,value]:samplers) if(value && value->Handle()==info.sampler) {known=true;break;}}
+                            if(!known){descriptor_fail_reason=6;descriptor_safe=false;break;}
+                        } else {
+                            SampledProofTimer phase{parallel->proof_phases[2],phase_sample};
+                            if(!info.imageView || info.sampler || info.imageLayout!=vk::ImageLayout::eGeneral) {
+                                if(ParallelGateDiagEnabled()) {
+                                    if(!info.imageView)NATIVE_DIAGNOSTIC(++parallel->sampled_null_view);
+                                    if(info.sampler)NATIVE_DIAGNOSTIC(++parallel->sampled_nonnull_sampler);
+                                    if(info.imageLayout!=vk::ImageLayout::eGeneral)NATIVE_DIAGNOSTIC(++parallel->sampled_nongeneral);
+                                    if(!info.imageView && !info.sampler && info.imageLayout==vk::ImageLayout::eGeneral)NATIVE_DIAGNOSTIC(++parallel->sampled_canonical_null);
+                                }
+                                static const bool absent_sampled_enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_ABSENT_SAMPLED_IMAGE");return p && p[0]=='1' && !p[1];}();
+                                bool absent_sampled=false;
+                                const bool canonical_attempt=absent_sampled_enabled && !info.imageView && !info.sampler && info.imageLayout==vk::ImageLayout::eGeneral;
+                                if(canonical_attempt && ParallelGateDiagEnabled())NATIVE_DIAGNOSTIC(++parallel->absent_sampled_attempts);
+                                if(absent_sampled_enabled && !info.imageView && !info.sampler &&
+                                   info.imageLayout==vk::ImageLayout::eGeneral && r.instance.GetDevice() &&
+                                   b.write_sets.size()==b.writes.size()) {
+                                    const auto index=static_cast<std::size_t>(&write-b.writes.data());
+                                    const auto stages=pipeline->GetStages();
+                                    absent_sampled=Native::Parallel::AbsentSampledImage<Shader::Info>(
+                                        {stages.data(),stages.size()},b.write_sets[index],write.dstBinding,
+                                        write.dstArrayElement,write.descriptorCount,
+                                        [](const Shader::Info& stage) {return Shader::Backend::StageSet(u32(stage.sw_stage));},
+                                        [](const Shader::Info& stage) -> u64 {
+                                            const auto start=Shader::Backend::StageStart(u32(stage.sw_stage));
+                                            if(stage.buffers.size()>u64(UINT32_MAX)-start.unified)return UINT64_MAX;
+                                            // Only the texture base is needed; avoid planning unused later bindings.
+                                            return u64(start.unified)+stage.buffers.size();
+                                        });
+                                }
+                                if(absent_sampled) {if(ParallelGateDiagEnabled())NATIVE_DIAGNOSTIC(++parallel->absent_sampled_accepted);continue;}
+                                if(canonical_attempt && ParallelGateDiagEnabled())NATIVE_DIAGNOSTIC(++parallel->absent_sampled_rejected);
+                                descriptor_fail_reason=7;descriptor_safe=false;break;
+                            }
+                            const auto full_scan=[&](vk::ImageView wanted) {
+                                std::scoped_lock views_lock{views_mutex};
+                                for(const auto* entry:b.sampled) {const auto it=views.find(entry);if(sample_view)note_view_cardinality(it==views.end()?0:it->second.size());if(it==views.end())continue;
+                                    if(std::ranges::any_of(it->second,[&](const auto& view){return (view.use==ViewUse::Sampled || view.use==ViewUse::CubeSampled) && *view.view==wanted;}))return true;}
+                                return false;
+                            };
+                            bool known=false;
+                            if(PreparedSampledProofRequested() && from_prepared && prepared && prepared->pipeline==pipeline &&
+                               prepared->proof_context && prepared->proof_context->Valid(prepared->proof_mode_state)) {
+                                NATIVE_DIAGNOSTIC(++parallel->prepared_view_attempts);
+                                const auto slot=static_cast<std::size_t>(&info-b.images.data());
+                                known=Native::Parallel::MatchSampledViewProof(prepared->sampled_view_proofs,slot,info.imageView,
+                                    sampler_cache_epoch.load(std::memory_order_acquire),b.sampled);
+                                if(known)NATIVE_DIAGNOSTIC(++parallel->prepared_view_accepted);else NATIVE_DIAGNOSTIC(++parallel->prepared_view_fallbacks);
+                            }
+                            if(!known && view_proof_enabled) {
+                                const auto hash=[](vk::ImageView h) noexcept {u64 key=reinterpret_cast<u64>(static_cast<VkImageView>(h));key^=key>>33;key*=0xff51afd7ed558ccdULL;key^=key>>33;return key;};
+                                const auto walk=[&](std::size_t& cursor,vk::ImageView wanted,auto&& add) {
+                                    std::scoped_lock views_lock{views_mutex};
+                                    if(parallel->view_applied_mode.Enabled()) return Native::Parallel::BatchViewWalk(cursor,b.sampled.size(),wanted,
+                                        [&](std::size_t i,auto&& visit) {
+                                            const auto it=views.find(b.sampled[i]);
+                                            if(sample_view)note_view_cardinality(it==views.end()?0:it->second.size());
+                                            if(it!=views.end())for(const auto& view:it->second) {
+                                                const bool sampled=view.use==ViewUse::Sampled || view.use==ViewUse::CubeSampled;
+                                                if(!visit(sampled,sampled?*view.view:vk::ImageView{}))return false;
+                                            }
+                                            return true;
+                                        },add);
+                                    while(cursor<b.sampled.size()) {
+                                        const auto it=views.find(b.sampled[cursor]);if(sample_view)note_view_cardinality(it==views.end()?0:it->second.size());bool found=false;
+                                        if(it!=views.end())for(const auto& view:it->second) {
+                                            if(view.use!=ViewUse::Sampled && view.use!=ViewUse::CubeSampled)continue;
+                                            const auto handle=*view.view;found|=handle==wanted;
+                                            if(!add(handle))return false;
+                                        }
+                                        ++cursor;if(found)return true;
+                                    }
+                                    return false;
+                                };
+                                const auto build_wanted=[&](auto&& add) {
+                                    // b.images is owned and stable through this draw; do not inspect
+                                    // future write pointers before their normal validation.
+                                    if(b.images.size()>512)return false;
+                                    for(const auto& image:b.images)if(image.imageView && !image.sampler && image.imageLayout==vk::ImageLayout::eGeneral)
+                                        if(!add(image.imageView))return false;
+                                    return true;
+                                };
+                                known=view_proof.Query(info.imageView,hash,full_scan,walk,build_wanted);
+                            } else if(!known) known=full_scan(info.imageView);
+                            if(!known){descriptor_fail_reason=8;descriptor_safe=false;break;}
+                        }
+                    }
+                    if(!descriptor_safe)break;
+                }
+                if(descriptor_safe && (image_batch_infos || buffer_prefix || native_vi_receipt_used)) {
+                    const bool context_valid=prepared->proof_context->Valid(prepared->proof_mode_state);
+                    const bool image_valid=!image_batch_infos || sampler_cache_epoch.load(std::memory_order_acquire)==worker_result->image_seal_epoch;
+                    const bool buffer_valid=(!buffer_prefix && !native_vi_receipt_used) ||
+                        (prepared->unmap_gen==unmap_generation.load(std::memory_order_acquire) &&
+                         buffer_freshness_certified && buffer_log.Seq()==buffer_freshness_seq &&
+                         (!native_upload_receipt_used || (prepared->upload_receipt_incarnation &&
+                          prepared->upload_receipt_incarnation==s.upload_incarnation)));
+                    if(!context_valid || !image_valid || !buffer_valid) {
+                        descriptor_fail_reason=10;descriptor_safe=false;
+                        if(image_batch_infos && (!context_valid || !image_valid))NATIVE_DIAGNOSTIC(++parallel->image_batch_invalidations);
+                        if(buffer_prefix && (!context_valid || !buffer_valid))NATIVE_DIAGNOSTIC(++parallel->buffer_prefix_invalidations);
+                    } else if(image_batch_infos) {NATIVE_DIAGNOSTIC(++parallel->image_batch_draws);NATIVE_DIAGNOSTIC(parallel->image_batch_infos+=image_batch_infos);}
+                }
+                NATIVE_DIAGNOSTIC(parallel->producer_upload_lookup_hits+=action_upload_lookups);
+                if(sample_view) {
+                    auto& v=parallel->view_sample;++v.draws;if(local_view_stats.queries)++v.queried_draws;
+                    v.image_infos+=b.images.size();v.sampled_entries+=b.sampled.size();
+                    const auto add=[](auto& to,const auto& from) {to.queries+=from.queries;to.first_hits+=from.first_hits;to.index_hits+=from.index_hits;to.walks+=from.walks;to.fallbacks+=from.fallbacks;to.overflows+=from.overflows;to.wanted_builds+=from.wanted_builds;to.wanted_overflows+=from.wanted_overflows;to.filtered_views+=from.filtered_views;};
+                    add(v.proof,local_view_stats);if(gate_view)add(parallel->view_proof_stats,local_view_stats);
+                }
+                if(stage_proof && ParallelGateDiagEnabled()){NATIVE_DIAGNOSTIC(parallel->proof_table_builds+=stage_proof->Builds());NATIVE_DIAGNOSTIC(parallel->proof_table_hits+=stage_proof->Hits());}
+                whole_phases.Next(6);
+                if(descriptor_safe) {
+                    if(!b.groups_ready)b.PrepareWriteGroups();
+                    const u32 push=pipeline->PushSet();
+                    if(push<b.grouped_writes.size() && !b.grouped_writes[push].empty()) {
+                        SampledProofTimer phase{parallel->proof_phases[3],phase_sample};
+                        const auto snapshot_matches=[&] {
+                            if(!worker_identity || !known_structure || !feedback.empty() || !worker_result->push_snapshot || worker_result->push_index!=push ||
+                               worker_result->push_data!=b.grouped_writes[push].data() || worker_result->push_size!=b.grouped_writes[push].size()) return false;
+                            // Producer group rows and image values remain immutable after publication; feedback is excluded above.
+                            return true;
+                        };
+                        bool reused_snapshot=false;
+                        if(snapshot_matches() && worker_result->push_snapshot.use_count()==1 &&
+                           worker_result->push_buffer_first<=b.buffers.size() &&
+                           worker_result->push_buffer_count<=b.buffers.size()-worker_result->push_buffer_first) {
+                            auto owned=std::static_pointer_cast<DescriptorSnapshot>(std::move(worker_result->push_snapshot));
+                            const auto current=std::span<const vk::DescriptorBufferInfo>{b.buffers.data(),b.buffers.size()}.subspan(worker_result->push_buffer_first,worker_result->push_buffer_count);
+                            if(owned->PatchBufferBindings(current)) {
+                                parallel_push_writes=std::move(owned);NATIVE_DIAGNOSTIC(++parallel->producer_snapshot_hits);
+                                parallel_descriptor_bytes=parallel_push_writes->OwnedBytes()+128;reused_snapshot=true;
+                            }
+                        }
+                        if(!reused_snapshot) {
+                            auto snap=DescriptorSnapshot::Make(b.grouped_writes[push],
+                                std::span<const vk::DescriptorBufferInfo>{b.buffers.data(),b.buffers.size()},
+                                std::span<const vk::DescriptorImageInfo>{b.images.data(),b.images.size()},MaxSnapshotBytes);
+                            if(!snap){descriptor_fail_reason=9;descriptor_safe=false;}
+                            else {parallel_descriptor_bytes=snap->OwnedBytes()+128;parallel_push_writes=std::make_shared<const DescriptorSnapshot>(std::move(*snap));}
+                        }
+                    }
+                }
+            } catch(const std::bad_alloc&) {descriptor_fail_reason=9;descriptor_safe=false;parallel_push_writes.reset();}
+        }
+        if(descriptor_safe && b.writes.empty() && native_vi_receipt_used &&
+           (!prepared->proof_context->Valid(prepared->proof_mode_state) ||
+            prepared->unmap_gen!=unmap_generation.load(std::memory_order_acquire) ||
+            !buffer_freshness_certified || buffer_log.Seq()!=buffer_freshness_seq)) {
+            descriptor_fail_reason=10;descriptor_safe=false;
+        }
+        whole_phases.Next(7);
+#if !defined(NDEBUG)
+        if(sample_preflight) {
+            NATIVE_DIAGNOSTIC(++parallel->preflight_samples);
+            NATIVE_DIAGNOSTIC(parallel->preflight_wall_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-preflight_begin).count());
+            if(preflight_cpu_started && DescriptorThreadCpu100ns(preflight_cpu_end) && preflight_cpu_end>=preflight_cpu_begin) {
+                NATIVE_DIAGNOSTIC(++parallel->preflight_cpu_samples);NATIVE_DIAGNOSTIC(parallel->preflight_cpu_100ns+=preflight_cpu_end-preflight_cpu_begin);
+            }
+        }
+
+#endif
+        if(native_vi_attempted) {
+            if(descriptor_safe && native_vi_receipt_used) {NATIVE_DIAGNOSTIC(++parallel->native_vi_accepts);NATIVE_DIAGNOSTIC(parallel->native_vi_skipped+=native_vertex_skipped);}
+            else NATIVE_DIAGNOSTIC(++parallel->native_vi_fallbacks);
+        }
+        if(native_upload_attempted) {
+            if(descriptor_safe && native_upload_receipt_used) {NATIVE_DIAGNOSTIC(++parallel->native_upload_accepts);NATIVE_DIAGNOSTIC(parallel->native_upload_skipped+=prepared->uploads.size());}
+            else NATIVE_DIAGNOSTIC(++parallel->native_upload_fallbacks);
+        }
+        if(cheap_eligible && !descriptor_safe){NATIVE_DIAGNOSTIC(++parallel->descriptor_rejected);NATIVE_DIAGNOSTIC(++parallel->descriptor_fail_reasons[descriptor_fail_reason]);}
+        if(ParallelGateDiagEnabled()) {
+            u64 mask=0;const auto fail=[&](u32 bit,bool bad){if(bad)mask|=u64{1}<<bit;};
+            fail(0,!RytyGtsInRace());fail(1,EmulatorSettings.IsPatchShaders());
+            fail(2,r.FrameDumpActive() || SceneTrace::Id() || Native::GpuCheckpoints::Requested());
+            fail(3,!native_attachment);fail(4,sampled_alias || !feedback.empty());
+            fail(5,!extended && targets.state.num_color_attachments!=1);fail(6,prohibited_clear);
+            fail(7,!extended && (db.has_depth || db.has_stencil));fail(8,quad_list || quad_triangles || (!extended && is_indexed));
+            fail(9,scale_composition || native_fsr_composition);fail(10,vertex_preflight && !vertex_safe && !vi->buffers.empty());
+            fail(11,vertex_preflight && !vertex_safe && (!vi->input_bindings.empty() || !vi->attributes.empty()));fail(12,!index_safe);
+            fail(13,!prepared || !from_prepared || prepared->pipeline!=pipeline || !prepared->pipeline_keepalive);
+            for(const auto* stage:pipeline->GetStages()) if(stage) {
+                fail(14,(stage->sw_stage!=Shader::SwStage::Vertex && stage->sw_stage!=Shader::SwStage::Fragment) || stage->uses_patches);
+                fail(15,!stage->attribute_flags_known);fail(16,!stage->resource_usage_known);fail(17,stage->translation_failed);
+                fail(18,stage->has_fetch_shader && !(vertex_requested && has_vertex_input && (!vertex_preflight || vertex_safe) && stage->sw_stage==Shader::SwStage::Vertex));fail(19,stage->uses_dma || (stage->uses_direct && !ParallelD2Enabled()));
+                fail(20,!stage->fmasks.empty() || stage->has_storage_images);fail(21,stage->uses_shader_clock);
+                fail(22,std::ranges::any_of(stage->buffers,[](const auto& buffer){return buffer.is_written;}));
+            }
+            const bool stable=(mask==0)==cheap_eligible;
+            fail(23,cheap_eligible && (b.writes_buffers || !b.gpu_writes.empty() || !b.stored.empty()));
+            fail(24,cheap_eligible && !descriptor_safe && !b.writes_buffers && b.gpu_writes.empty() && b.stored.empty());
+            parallel->gates.Add(mask,stable);
+        }
+        // A streaming reservation covers each descriptor snapshot before its
+        // immutable slot becomes visible to the recording worker.
+        const bool eligible=descriptor_safe && parallel_descriptor_bytes<=
+            Native::Parallel::PassCoordinator::StreamDescriptorBytesPerDraw;
+        if(eligible) {NATIVE_DIAGNOSTIC(++parallel->eligible);
+            if(parallel->active)NATIVE_DIAGNOSTIC(++parallel->eligible_in_active_scope);
+            else if(s.rendering)NATIVE_DIAGNOSTIC(++parallel->eligible_in_serial_scope);
+            else NATIVE_DIAGNOSTIC(++parallel->eligible_at_boundary);
+        }
+        if(eligible && same_serial_scope)
+            parallel->NoteSerialEligible();
+        else parallel->FinishSerialEligibleRun();
+        // Bound stable storage for incremental publication. Every draw still
+        // passes the existing admission proof before worker visibility.
+        u32 close_reason=0;
+        if(parallel->active && ((!eligible && (close_reason|=CloseIneligible,true)) ||
+           (!s.rendering && (close_reason|=CloseNotRendering,true)) ||
+           (!(s.render==targets.state) && (close_reason|=CloseTarget,true)) ||
+           (parallel->active->draws.size()>=Native::Parallel::PassCoordinator::StreamDrawLimit && (close_reason|=CloseFull,true)))) {
+            if(close_reason!=CloseIneligible || !ContinueSmallParallelPass(targets.state,close_reason,inline_safe)) {
+                EndRendering(close_reason);PassBarrier(); // continuation uses LOAD, with an attachment dependency
+            }
+        }
+        const bool split_now=split_candidate && s.rendering && !parallel->active && s.render==targets.state;
+        if(eligible && !parallel->active && (!s.rendering || split_now)) {
+            // Allocate every packet container before changing logical rendering.
+            try {
+                if(split_now)NATIVE_DIAGNOSTIC(++parallel->serial_split_attempts);
+                parallel->sync_pins.Collect(r.scheduler.GetWorkSemaphore()->KnownGpuTick(),
+                    [&](auto& callback) noexcept {return Native::Rhi::TryEnqueueCompleted(*device,callback);});
+                const auto slot=parallel->sync_pins.Reserve();
+                if(slot!=Native::Parallel::SyncOwnerPins<>::Invalid) {
+                    parallel->pin_slot=slot;
+                    struct ReservedPinGuard {
+                        ParallelRuntime* parallel;
+                        bool committed=false;
+                        ~ReservedPinGuard() noexcept {
+                            if(!committed) {
+                                if(!parallel->sync_pins.CancelEmpty(parallel->pin_slot))std::terminate();
+                                parallel->pin_slot=Native::Parallel::SyncOwnerPins<>::Invalid;
+                            }
+                        }
+                    } reserved_pin{parallel};
+                    parallel->scratch_draws.reserve(Native::Parallel::PassCoordinator::StreamDrawLimit);
+                    const u64 epoch=r.scheduler.CurrentTick();
+                    auto lease=std::make_shared<const u64>(epoch);
+                    Native::Parallel::Pass pass{};pass.target=targets.state;pass.resource_lease=lease;pass.extended_verified=extended;
+                    bool prebind_ok=true;
+                    if(split_now) {
+                        const auto* prebind_list=s.list;
+                        const auto prebind_cmd=s.cmd;
+                        parallel_bindings.write_structure_proven=true;
+                        set_count_proof();
+                        {ScopedParallelBindingCapture capture{parallel_bindings};PushBindings(*pipeline,vk::PipelineBindPoint::eGraphics,b);}
+                        if(!b.writes.empty())for(u32 i=0;i<b.grouped_writes.size();++i) {
+                            if(i==pipeline->PushSet() || b.grouped_writes[i].empty())continue;
+                            parallel_required_sets|=u32{1}<<i;
+                            if(!parallel_bindings.sets[i])prebind_ok=false;
+                        }
+                        prebind_ok=prebind_ok && s.rendering && !parallel->active && s.render==targets.state &&
+                            s.list==prebind_list && s.cmd==prebind_cmd && r.scheduler.CurrentTick()==epoch;
+                        if(!prebind_ok)parallel->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::Abandoned);
+                    }
+                    if(prebind_ok) {
+                        static_assert(std::is_nothrow_move_constructible_v<Native::Parallel::Pass>);
+                        pass.draws.swap(parallel->scratch_draws);
+                        auto active=std::make_shared<Native::Parallel::Pass>(std::move(pass));
+                        if(split_now) {EndRendering();PassBarrier();serial_split_started=true;NATIVE_DIAGNOSTIC(++parallel->serial_split_success);serial_split_prebound=true;}
+                        parallel->epoch=epoch;parallel->lease=std::move(lease);parallel->active=std::move(active);
+                        parallel->stream_attempted=false;
+                        parallel->active_list=s.list;parallel->active_cmd=s.cmd;
+                        NATIVE_DIAGNOSTIC(parallel->pass_closure.origin=split_now?0:preclosed_serial_scope?1:2);
+                        reserved_pin.committed=true;
+                        s.rendering=true;s.render=targets.state;NATIVE_DIAGNOSTIC(++stats.passes);NATIVE_DIAGNOSTIC(++parallel->passes);
+                    }
+                } else NATIVE_DIAGNOSTIC(++parallel->owner_slot_pressure);
+            } catch(const std::bad_alloc&) {
+                if(parallel->pin_slot!=Native::Parallel::SyncOwnerPins<>::Invalid)parallel->sync_pins.CancelEmpty(parallel->pin_slot);
+                parallel->pin_slot=Native::Parallel::SyncOwnerPins<>::Invalid;parallel->active.reset();parallel->lease.reset();
+            }
+        }
+        parallel_draw=parallel->active && s.rendering && s.render==targets.state && eligible;
+        if(parallel_draw){parallel_index_safe=index_safe;parallel_index_bytes=checked_index_bytes;}
+        }
+#if !defined(NDEBUG)
+        whole_phases.Stop();
+        whole_phases.phases=nullptr;
+        if(whole_sample) {
+            const u64 elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-whole_begin).count();
+            NATIVE_DIAGNOSTIC(++parallel->whole_samples);NATIVE_DIAGNOSTIC(parallel->whole_wall_ns+=elapsed);parallel->whole_max_ns=std::max(parallel->whole_max_ns,elapsed);
+            if(whole_cpu_started && DescriptorThreadCpu100ns(whole_cpu_end) && whole_cpu_end>=whole_cpu_begin){
+                NATIVE_DIAGNOSTIC(++parallel->whole_cpu_samples);NATIVE_DIAGNOSTIC(parallel->whole_cpu_100ns+=whole_cpu_end-whole_cpu_begin);
+            }
+        }
+#endif
+
+    }
+    // Wait for an existing non-rendering boundary: never restart a clear pass for diagnostics.
+    if(preclosed_serial_scope && !parallel_draw)NATIVE_DIAGNOSTIC(++parallel->natural_serial_fallback);
+    if(SceneTrace::Id() && !SceneTrace::state.attempted && !s.rendering && !preclosed_serial_scope) {
+        const auto families=r.instance.GetPhysicalDevice().getQueueFamilyProperties();
+        const u32 family=r.instance.GetGraphicsQueueFamilyIndex();
+        SceneTrace::Prepare(r.instance.GetDevice(),s.cmd,
+            family<families.size()?families[family].timestampValidBits:0,
+            r.instance.GetPhysicalDevice().getProperties().limits.timestampPeriod);
+    }
+    admission_partition.Finish();
     {
         PhaseClock part{stats.record_ns[1]};
-        BeginRendering(targets.state);
+        if(!parallel_draw) BeginRendering(targets.state);
     }
 
     // The renderer's dynamic state code, filling this list's state.
@@ -4501,24 +6723,81 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             s.dynamic.SetViewports(viewports);
             s.dynamic.SetScissors(scissors);
         }
-        s.dynamic.Commit(r.instance, CmdBuf{s.cmd});
+        if(!parallel_draw) s.dynamic.Commit(r.instance, CmdBuf{s.cmd});
         Rasterizer::t_dynamic_state = saved;
     }
     {
         PhaseClock part{stats.record_ns[3]};
-        RecordVertexIndex(*vi);
+        if(!parallel_draw) RecordVertexIndex(*vi);
     }
     const u32 index_count = vi->index_count;
     const CmdBuf cmdbuf{s.cmd};
     {
         PhaseClock part{stats.record_ns[4]};
-        s.pipelines.Graphics(pipeline->Handle(), [&] {
+        if(!parallel_draw) s.pipelines.Graphics(pipeline->Handle(), [&] {
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
         });
     }
     {
         PhaseClock part{stats.record_ns[5]};
-        PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
+        if(parallel_draw) {
+            std::shared_ptr<AheadLease> ahead;std::function<void()> ahead_release;
+            std::size_t ahead_slot=parallel->ahead_flights.size();
+            if(!serial_split_prebound && from_prepared && prepared && AheadRequested()) {
+                ahead=std::static_pointer_cast<AheadLease>(prepared->ahead_descriptor_lease.load(std::memory_order_acquire));
+                if(ahead && ahead->context && ahead->lease && ahead->context->mode.load(std::memory_order_acquire)) {
+                    for(std::size_t n=0;n<parallel->ahead_flights.size();++n) {
+                        const auto i=(parallel->ahead_cursor+n)%parallel->ahead_flights.size();
+                        if(!parallel->ahead_flights[i].release){ahead_slot=i;parallel->ahead_cursor=(i+1)%parallel->ahead_flights.size();break;}
+                    }
+                    if(ahead_slot<parallel->ahead_flights.size()) {
+                        try {ahead_release=[owner=ahead]{};parallel_bindings.ahead=ahead.get();}
+                        catch(...) {ahead_slot=parallel->ahead_flights.size();}
+                    }
+                    else ahead->context->capacity.fetch_add(1,std::memory_order_relaxed);
+                }
+            }
+            // Retain before PushBindings: an exception after caching an ahead set must
+            // not allow its pool to reset while that cache entry is still reachable.
+            if(ahead && ahead_slot<parallel->ahead_flights.size()) {
+                parallel->ahead_flights[ahead_slot].lease=ahead;parallel->ahead_flights[ahead_slot].release=std::move(ahead_release);parallel->ahead_flights[ahead_slot].tick=0;++parallel->ahead_live;
+            }
+            if(!serial_split_prebound) {
+                parallel_bindings.write_structure_proven=true; // descriptor_safe validated every source row
+                set_count_proof();
+                {ScopedParallelBindingCapture capture{parallel_bindings};PushBindings(*pipeline,vk::PipelineBindPoint::eGraphics,b);}
+            }
+            if(parallel_bindings.ahead_used) {
+                ASSERT_MSG(ahead && ahead_slot<parallel->ahead_flights.size(),"ahead descriptor lease missing");
+                ahead->used=true;ahead->context->used.fetch_add(1,std::memory_order_relaxed);
+            } else if(ahead && ahead_slot<parallel->ahead_flights.size()) {
+                // No ahead set reached the cache or command stream.
+                auto& flight=parallel->ahead_flights[ahead_slot];flight.lease.reset();flight.release={};--parallel->ahead_live;
+            }
+            static_assert(Shader::Backend::MaxDescriptorSets<=32);
+            bool missing=false;
+            if(!b.writes.empty()) for(u32 i=0;i<b.grouped_writes.size();++i) {
+                if(i==pipeline->PushSet() || b.grouped_writes[i].empty())continue;
+                parallel_required_sets|=u32{1}<<i;
+                if(!parallel_bindings.sets[i])missing=true;
+            }
+            if(missing) {
+                // A fresh secondary cannot inherit a serial command buffer's old
+                // descriptor bindings. Never enqueue an incomplete packet.
+                if(parallel->active->draws.empty()) {
+                    NATIVE_DIAGNOSTIC(++parallel->pass_closure.empty_aborts[parallel->pass_closure.origin]);
+                    parallel->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::Abandoned);
+                    ASSERT_MSG(parallel->sync_pins.CancelEmpty(parallel->pin_slot),"parallel empty owner slot not empty");
+                    parallel->pin_slot=Native::Parallel::SyncOwnerPins<>::Invalid;
+                    parallel->scratch_draws.swap(parallel->active->draws);
+                    parallel->active.reset();parallel->lease.reset();s.rendering=false;
+                    s.dynamic.Invalidate();s.pipelines.Invalidate();s.vertex_state_known=false;
+                } else {EndRendering(CloseMissingSets);PassBarrier();}
+                if(preclosed_serial_scope)NATIVE_DIAGNOSTIC(++parallel->natural_binding_skip);
+                NATIVE_DIAGNOSTIC(++parallel->missing_sets);NATIVE_DIAGNOSTIC(++stats.skipped);
+                return;
+            }
+        } else PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
     }
     {
         PhaseClock part{stats.record_ns[6]};
@@ -4527,6 +6806,72 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             DrawOffsets(regs, vs_info, pipeline->GetFetchShader());
         const u32 instances = regs.num_instances.NumInstances();
         const auto* fs = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+#if !defined(NDEBUG)
+        scene_trace.Programs(vs_info.pgm_hash,fs?fs->pgm_hash:0);
+#endif
+        if(SceneTrace::Id()) {
+            const auto& d=s.dynamic;
+            r.FrameDumpEvent(fmt::format("scene-occlusion-registers id={} db_render={:08x} db_count={:08x} db_depth_view={:08x} db_override={:08x}",SceneTrace::Id(),regs.reg_array[0xA000],regs.reg_array[0xA001],regs.reg_array[0xA002],regs.reg_array[0xA003]));
+            r.FrameDumpEvent(fmt::format("scene-draw id={} vs={:#x} ps={:#x} indices={} instances={} vertex_offset={} instance_offset={} depth_test={} depth_write={} compare={} bias_enable={} depth_bias={}/{}/{} cull={} front={} discard={} viewport_count={} depth_target={:#x} size={}x{} layers={}",
+                SceneTrace::Id(),vs_info.pgm_hash,fs?fs->pgm_hash:0,regs.num_indices,instances,vertex_offset,instance_offset,
+                d.depth_test_enabled,d.depth_write_enabled,u32(d.depth_compare_op),d.depth_bias_enabled,d.depth_bias_constant,d.depth_bias_slope,d.depth_bias_clamp,
+                u32(d.cull_mode),u32(d.front_face),d.rasterizer_discard_enable,d.viewports.size(),targets.depth?targets.depth->info.guest_address:0,targets.state.width,targets.state.height,targets.state.num_layers));
+            if(targets.depth)r.FrameDumpEvent(fmt::format("scene-depth id={} address={:#x} format={} clear_depth={} clear_stencil={} write={}",SceneTrace::Id(),targets.depth->info.guest_address,u32(targets.depth->info.pixel_format),targets.state.depth_stencil_attachment.depth_clear,targets.state.depth_stencil_attachment.stencil_clear,d.depth_write_enabled));
+            for(size_t cb=0;cb<targets.colors.size();++cb)if(const auto* e=targets.colors[cb])r.FrameDumpEvent(fmt::format("scene-target id={} attachment={} address={:#x} size={}x{} format={} samples={} levels={} layers={} mask={} clear={}",SceneTrace::Id(),cb,e->info.guest_address,e->info.size.width,e->info.size.height,u32(e->info.pixel_format),e->info.num_samples,e->info.resources.levels,e->info.resources.layers,regs.color_target_mask.GetMask(cb),targets.state.color_attachments[cb].is_clear));
+            for(size_t vi=0;vi<d.viewports.size();++vi){const auto& v=d.viewports[vi];r.FrameDumpEvent(fmt::format("scene-viewport id={} slot={} xy={}/{} size={}/{} depth={}/{}",SceneTrace::Id(),vi,v.x,v.y,v.width,v.height,v.minDepth,v.maxDepth));}
+        }
+        if(parallel_draw) {
+            auto& draws=parallel->active->draws;
+            draws.emplace_back();
+            struct UnfinishedDrawGuard {
+                std::vector<Native::Parallel::Draw>& draws;
+                bool committed=false;
+                ~UnfinishedDrawGuard() {if(!committed)draws.pop_back();}
+            } unfinished_draw_guard{draws};
+            auto& captured=draws.back();
+            captured.pipeline=pipeline->Handle();captured.layout=pipeline->GetLayout();
+            captured.pipeline_owner=prepared->pipeline_keepalive;captured.dynamic=s.dynamic;captured.push=b.push;
+            captured.sets=parallel_bindings.sets;captured.required_sets_mask=parallel_required_sets;
+            captured.immutable_upload_buffers_verified=true;captured.push_writes=std::move(parallel_push_writes);
+            captured.push_set=pipeline->PushSet()<captured.sets.size()?pipeline->PushSet():static_cast<u32>(captured.sets.size());
+            captured.descriptor_bytes=parallel_descriptor_bytes;
+            captured.vertex_attribute_count=static_cast<u32>(vi->attributes.size());
+            captured.vertex_binding_count=static_cast<u32>(vi->input_bindings.size());
+            captured.vertex_buffer_count=static_cast<u32>(vi->buffers.size());
+            captured.vertex_backing_verified=true;
+            captured.vertex_attributes.assign(vi->attributes.begin(),vi->attributes.end());
+            captured.vertex_bindings.assign(vi->input_bindings.begin(),vi->input_bindings.end());
+            captured.vertex_buffers.assign(vi->buffers.begin(),vi->buffers.end());
+            captured.vertex_offsets.assign(vi->offsets.begin(),vi->offsets.end());
+            captured.vertex_sizes.assign(vi->sizes.begin(),vi->sizes.end());
+            captured.vertex_strides.assign(vi->strides.begin(),vi->strides.end());
+            captured.vertices=regs.num_indices;captured.instances=instances;
+            captured.first_vertex=vertex_offset;captured.first_instance=instance_offset;
+            if(is_indexed) {captured.indexed=true;captured.index_backing_verified=parallel_index_safe;
+                captured.index_buffer=vi->index_buffer;captured.index_offset=vi->index_offset;captured.index_size=parallel_index_bytes;
+                captured.index_type=vi->index_type;captured.vertex_offset=s32(vertex_offset);}
+            ASSERT_MSG(parallel->sync_pins.Pin(parallel->pin_slot,captured.pipeline_owner),"parallel pipeline owner pin failed");
+            if(ParallelGateDiagEnabled()) {const auto n=captured.vertex_buffer_count;
+                NATIVE_DIAGNOSTIC(++parallel->captured_vertex_counts[n==0?0:n==1?1:n<4?2:n<8?3:n<16?4:n<32?5:6]);NATIVE_DIAGNOSTIC(parallel->captured_vertex_sum+=n);}
+            unfinished_draw_guard.committed=true;pending_draw_guard.committed=true;NATIVE_DIAGNOSTIC(++parallel->draws);
+            if(serial_split_started)NATIVE_DIAGNOSTIC(++parallel->serial_split_first_draws);
+            if(preclosed_serial_scope)NATIVE_DIAGNOSTIC(++parallel->natural_captured);
+            // Use one worker invocation and command list for the whole scope.
+            // Publish from the first fully admitted draw. Later packets share
+            // this worker/list and retain the ordered prefix until pass closure.
+            if(parallel->draw_stream || !parallel->stream_attempted) {
+                parallel->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::EndPass);
+                if(parallel->draw_stream) {
+                    ASSERT_MSG(parallel->coordinator->PublishStream(parallel->draw_stream,draws.size()),
+                               "parallel draw publication failed");
+                } else {
+                    parallel->stream_attempted=true;
+                    parallel->draw_stream=parallel->coordinator->BeginStream(parallel->epoch,parallel->active,
+                        s.list,parallel->lease);
+                }
+            }
+        } else {
+        SceneTrace::GpuBegin(s.cmd);
         Native::GpuCheckpoints::Record(static_cast<VkCommandBuffer>(s.cmd), 1, frame,
             vs_info.pgm_hash, fs ? fs->pgm_hash : 0, regs.num_indices);
         if (quad_triangles) {
@@ -4540,11 +6885,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         } else {
             cmdbuf.draw(regs.num_indices, instances, vertex_offset, instance_offset);
         }
+        SceneTrace::GpuEnd(s.cmd);
+        }
     }
     {
         PhaseClock part{stats.record_ns[7]};
         NoteWrites(&targets, b);
     }
+    RecordPartitionClock tail_partition{parallel?&parallel->record_partition[partition_mode][1]:nullptr};
     if (!feedback.empty()) {
         EndRendering();
         feedback_layout(vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT,
@@ -4554,6 +6902,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
 
     // DIAG-208 (RYGT_PIXEL_TRACE=1): while a frame is dumped, the scene target's traced pixels
     // are copied after each draw into it, to name the draw that first writes a wrong colour.
+#if !defined(NDEBUG)
     static const bool pixel_trace = [] {
         const char* env = std::getenv("RYGT_PIXEL_TRACE");
         return env && env[0] == '1';
@@ -4594,6 +6943,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         }
     }
 
+#endif
     if (native_fsr_composition) FinishNativeFsr(targets);
     else CaptureNativeFsr(*pipeline, targets, b);
 
@@ -4640,10 +6990,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         }
     }
 
-    ++stats.draws;
+    NATIVE_DIAGNOSTIC(++stats.draws);
     ++s.commands;
-    ChunkFlushCheck();
-    Report();
+    tail_partition.Finish();
+    {RecordPartitionClock chunk_partition{parallel?&parallel->record_partition[partition_mode][2]:nullptr};ChunkFlushCheck();}
+    {RecordPartitionClock report_partition{parallel?&parallel->record_partition[partition_mode][3]:nullptr};Report();}
 }
 
 bool NativeRenderer::PrepareEnabled() {
@@ -4663,6 +7014,14 @@ void NativeRenderer::PreparedDraw::Reset() {
     packet = nullptr;
     epoch = 0;
     pipeline = nullptr;
+    if(AheadRequested())ahead_descriptor_lease.store({},std::memory_order_release);
+    cpu_proof = {};
+    descriptor_actions.clear(); // retain capacity for the next prepared draw
+    buffer_prefix_sealed=false;buffer_prefix_clip=false;buffer_prefix_direct=nullptr;
+    buffer_prefix_l1=buffer_prefix_zero=0;buffer_prefix_ranges.clear();
+    sampled_view_proofs.clear();
+    sampler_origins.clear();sampler_origins_epoch=0;sampler_origins_valid=true;
+    proof_context.reset();proof_mode_state=0;
     pipeline_keepalive.reset();
     stage_hashes = {};
     bindings.Clear();
@@ -4671,7 +7030,9 @@ void NativeRenderer::PreparedDraw::Reset() {
     buffer_ranges.clear();
     upload_bytes.clear();
     uploads.clear();
+    upload_receipt_incarnation = 0;
     null_images = 0;
+    native_vertex_receipt = native_index_receipt = false;
     has_vertices = false;
     vertex_hash = 0;
     indexed = false;
@@ -4725,6 +7086,7 @@ void NativeRenderer::FreePrepared(PreparedDraw* draw) {
 }
 
 bool NativeRenderer::HasPrepared(const void* packet) {
+    if (!RytyGtsInRace()) return false; // required menu work stays on the recorder
     if (!packet) {
         return false;
     }
@@ -4756,7 +7118,7 @@ const GraphicsPipeline* NativeRenderer::InstallPrepared(PreparedDraw& p) {
     if (!installed) {
         return nullptr;
     }
-    ++stats.prepared_installed;
+    NATIVE_DIAGNOSTIC(++stats.prepared_installed);
     return p.pipeline;
 }
 
@@ -4796,7 +7158,7 @@ u64 NativeRenderer::StageHash(const Shader::Info& info) {
     for (const auto& desc : info.samplers) {
         add(desc.GetSharp(info));
     }
-    return XXH3_64bits_withSeed(words.data(), words.size() * sizeof(u32), info.pgm_base);
+    return Native::Parallel::AdaptiveXXH3Seed(words.data(), words.size() * sizeof(u32), info.pgm_base);
 }
 
 void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu::Regs& regs,
@@ -4804,8 +7166,16 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
                                     std::shared_ptr<const void> pipeline_keepalive,
                                     std::span<const Shader::Info* const> stages, bool is_indexed,
                                     u32 index_offset) {
+    if (!RytyGtsInRace()) return; // do not retain speculative menu bindings
+    AheadPrepareGuard ahead_guard{FindAhead(this)};
+    auto proof_guard=PreparedSampledProofRequested()?prepared_proof_contexts.TryEnter(this):Native::Parallel::ProofProducerGuard{};
+
+#if !defined(NDEBUG)
     const auto start = std::chrono::steady_clock::now();
+
+#endif
     PreparedDraw* p = NewPrepared();
+    p->proof_context=proof_guard.context;p->proof_mode_state=proof_guard.state;
     p->packet = packet;
     p->epoch = epoch;
     p->pipeline = &pipeline;
@@ -4856,7 +7226,7 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
         }
     }
     if (!ok) {
-        ++prepare_stats.failed;
+        NATIVE_DIAGNOSTIC(++prepare_stats.failed);
         FreePrepared(p);
         return;
     }
@@ -4875,6 +7245,292 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
     if (DrawPreparationEnabled(2)) StableUniquePrepared(p->regions);
     p->bindings.PrepareWriteGroups(); // binding-owned spans, published with this draw
     p->bindings.PrepareDescriptorKeys(pipeline);
+    if (ParallelRecordingRequested()) try {
+        auto* candidate=&p->cpu_proof;candidate->prepared_identity=p;candidate->pipeline_identity=&pipeline;
+        candidate->pipeline_layout=pipeline.GetLayout();
+        const auto& b=p->bindings;candidate->writes_data=b.writes.data();candidate->writes_size=b.writes.size();
+        candidate->buffers_data=b.buffers.data();candidate->buffers_size=b.buffers.size();candidate->images_data=b.images.data();candidate->images_size=b.images.size();
+        const auto buffers=std::span<const vk::DescriptorBufferInfo>{b.buffers.data(),b.buffers.size()};
+        const auto images=std::span<const vk::DescriptorImageInfo>{b.images.data(),b.images.size()};
+        candidate->descriptor_structure=true;
+        size_t stage_base=0;
+        for(size_t si=0;si<candidate->stages.size();++si) {
+            auto& schema=candidate->stages[si];schema={};schema.table_upload=SIZE_MAX;
+            if(si>=stages.size() || !stages[si])continue;
+            const auto& stage=*stages[si];schema.identity=stage.identity;schema.count=stage.buffers.size();
+            size_t table=SIZE_MAX;
+            for(size_t j=0;j<schema.count;++j)if(stage.buffers[j].buffer_type==Shader::BufferType::DirectTable) {
+                if(table!=SIZE_MAX){table=SIZE_MAX-1;break;}table=j;
+            }
+            if(table<schema.count && stage_base<=SIZE_MAX-table) {
+                schema.table_local=table;
+                const auto global=stage_base+table;
+                for(size_t j=0;j<p->uploads.size();++j)if(p->uploads[j].info==global) {
+                    if(schema.table_upload!=SIZE_MAX){schema.table_upload=SIZE_MAX-1;break;}
+                    schema.table_upload=j;
+                }
+            }
+            if(schema.count>SIZE_MAX-stage_base){candidate->descriptor_structure=false;break;}
+            stage_base+=schema.count;
+        }
+        p->descriptor_actions.clear();
+        static_assert(Shader::MaxStageTypes-1<255);
+        const bool build_actions=candidate->descriptor_structure && b.writes.size()<=128 &&
+            b.buffers.size()<=UINT16_MAX;
+        if(build_actions)p->descriptor_actions.reserve(b.writes.size());
+        for(const auto& w:b.writes) {
+            const bool buf=w.descriptorType==vk::DescriptorType::eUniformBuffer || w.descriptorType==vk::DescriptorType::eStorageBuffer;
+            const bool img=w.descriptorType==vk::DescriptorType::eSampledImage || w.descriptorType==vk::DescriptorType::eSampler;
+            if(w.pNext || w.pTexelBufferView || (buf ? (w.pImageInfo || !DescriptorSnapshot::BufferSliceValid(w.pBufferInfo,w.descriptorCount,buffers)) :
+                (!img || w.pBufferInfo || !DescriptorSnapshot::ImageSliceValid(w.pImageInfo,w.descriptorCount,images)))) {candidate->descriptor_structure=false;break;}
+            if(build_actions) {
+                PreparedDraw::DescriptorAction action{};action.is_buffer=buf;
+                if(buf) {
+                    action.buffer_first=static_cast<u16>(w.pBufferInfo-b.buffers.data());
+                    if(w.descriptorCount==1) {
+                        size_t base=0;
+                        for(size_t si=0;si<candidate->stages.size();++si) {
+                            const auto n=candidate->stages[si].count;
+                            if(action.buffer_first>=base && action.buffer_first-base<n) {
+                                action.stage_index=static_cast<u8>(si);action.stage_local=static_cast<u16>(action.buffer_first-base);break;
+                            }
+                            base+=n;
+                        }
+                        // Indices are hints only; the recorder rechecks every predicate and scans on a miss.
+                        if(action.stage_index<stages.size() && stages[action.stage_index] &&
+                           action.stage_local<stages[action.stage_index]->buffers.size() &&
+                           p->buffer_ranges.size()<=64 && p->regions.size()<=64) {
+                            const auto& stage=*stages[action.stage_index];
+                            const auto& desc=stage.buffers[action.stage_local];
+                            if(!desc.IsSpecial() && !desc.is_written) {
+                                const auto sharp=desc.GetSharp(stage);const u64 base=sharp.base_address,bytes=sharp.GetSize();
+                                for(size_t i=0;i<p->buffer_ranges.size();++i) {
+                                    const auto [begin,end]=p->buffer_ranges[i];
+                                    if(begin<=base && end>=base && bytes<=end-base){action.range_hint=static_cast<u8>(i);break;}
+                                }
+                                for(size_t i=0;i<p->regions.size();++i) {
+                                    const auto& use=p->regions[i];
+                                    if(use.address==base && use.size==bytes){action.region_hint=static_cast<u8>(i);break;}
+                                }
+                            }
+                        }
+                        action.upload_match=0;
+                        for(const auto& upload:p->uploads) if(upload.info==action.buffer_first) {
+                            if(action.upload_match==1){action.upload_match=2;break;}
+                            action.upload_match=1;action.upload_size=upload.size;
+                        }
+                    }
+                }
+                p->descriptor_actions.push_back(action);
+            }
+        }
+        if(!candidate->descriptor_structure)p->descriptor_actions.clear();
+        if(p->has_vertices && p->vertex_index) {
+            const auto& v=*p->vertex_index;candidate->vertex_identity=&v;candidate->vertex_buffers_data=v.buffers.data();candidate->vertex_buffers_size=v.buffers.size();
+            const size_t n=v.buffers.size();candidate->vertex_shape=n && n<=32 && v.input_bindings.size()==n && v.attributes.size()==n && v.offsets.size()==n && v.sizes.size()==n && v.strides.size()==n;
+            if(candidate->vertex_shape) {
+                candidate->vertex_bindings=true;candidate->vertex_pnext=true;
+                for(size_t i=0;i<n;++i)if(v.input_bindings[i].binding!=i || v.attributes[i].binding!=i)candidate->vertex_bindings=false;
+                for(const auto& x:v.input_bindings)if(x.pNext)candidate->vertex_pnext=false;
+                for(const auto& x:v.attributes)if(x.pNext)candidate->vertex_pnext=false;
+            }
+        }
+        candidate->counts_valid=candidate->descriptor_structure;
+        candidate->counts_push=pipeline.PushSet();
+        for(size_t set=0;candidate->counts_valid && set<b.grouped_writes.size();++set) {
+            const auto group=b.grouped_writes[set];candidate->group_data[set]=group.data();candidate->group_sizes[set]=group.size();
+            if(set==candidate->counts_push)continue;
+            for(const auto& row:group) {
+                auto& count=row.pBufferInfo ? candidate->ordinary_buffers : candidate->ordinary_images;
+                if(candidate->ordinary_writes==SIZE_MAX || row.descriptorCount>SIZE_MAX-count) {candidate->counts_valid=false;break;}
+                ++candidate->ordinary_writes;count+=row.descriptorCount;
+            }
+        }
+        const u32 push=pipeline.PushSet();
+        if(candidate->descriptor_structure && push<b.grouped_writes.size() && !b.grouped_writes[push].empty()) {
+            const auto& group=b.grouped_writes[push];bool contiguous=true,has_buffer=false;size_t first=0,count=0;
+            for(const auto& w:group) if(w.pBufferInfo) {
+                // descriptor_structure validated this exact slice before pointer subtraction.
+                const size_t offset=static_cast<size_t>(w.pBufferInfo-b.buffers.data());
+                if(!has_buffer){first=offset;has_buffer=true;}
+                if(offset!=first+count || w.descriptorCount>b.buffers.size()-offset){contiguous=false;break;}
+                count+=w.descriptorCount;
+            }
+            if(contiguous)if(auto snap=DescriptorSnapshot::Make(group,buffers,images,64*1024)) {
+                candidate->push_index=push;candidate->push_data=group.data();candidate->push_size=group.size();
+                candidate->push_buffer_first=first;candidate->push_buffer_count=count;
+                candidate->push_snapshot=std::make_shared<DescriptorSnapshot>(std::move(*snap));
+            }
+        }
+    } catch(const std::bad_alloc&) {p->cpu_proof = {};p->descriptor_actions.clear();}
+    if(auto context=ahead_guard.context;context && p->pipeline_keepalive && context->mode.load(std::memory_order_acquire)) {
+        context->attempts.fetch_add(1,std::memory_order_relaxed);
+        try {
+            std::array<vk::DescriptorSetLayout,Shader::Backend::MaxDescriptorSets> layouts{};
+            std::array<u32,Shader::Backend::MaxDescriptorSets> indices{};std::array<std::size_t,4> counts{};std::size_t n=0;bool supported=true;
+            const auto& groups=p->bindings.grouped_writes;
+            // Validate both the selected job schema and the pipeline's immutable
+            // canonical schema against every ordinary write. DynamicIndex counts
+            // depend on mutable T# values and cannot be safely speculated here.
+            const auto schema_matches=[&](auto stage_list) {
+                std::array<bool,Shader::Backend::MaxDescriptorSets> seen_sets{};
+                bool valid=groups.size()<=layouts.size();
+                for(const auto* stage:stage_list)if(valid && stage) {
+                    const auto set=Shader::Backend::StageSet(u32(stage->sw_stage));
+                    if(set>=groups.size() || seen_sets[set]){valid=false;break;}seen_sets[set]=true;
+                    for(const auto& image:stage->images)if(image.mip_fallback_mode==Shader::MipStorageFallbackMode::DynamicIndex){valid=false;break;}
+                    if(!valid || set==pipeline.PushSet())continue;
+                    const auto& group=groups[set];std::size_t at=0;u32 binding=0;
+                    const auto expect=[&](vk::DescriptorType type,u32 n){
+                        if(at>=group.size())return false;const auto& w=group[at++];
+                        const bool ok=!w.pNext && w.dstBinding==binding && w.dstArrayElement==0 && w.descriptorType==type && w.descriptorCount==n;
+                        if(n>UINT32_MAX-binding)return false;binding+=n;return ok;
+                    };
+                    for(const auto& buffer:stage->buffers){(void)buffer;if(!expect(vk::DescriptorType::eStorageBuffer,1)){valid=false;break;}}
+                    for(const auto& image:stage->images)if(!expect(image.is_written?vk::DescriptorType::eStorageImage:vk::DescriptorType::eSampledImage,1)){valid=false;break;}
+                    for(const auto& sampler:stage->samplers){(void)sampler;if(!expect(vk::DescriptorType::eSampler,1)){valid=false;break;}}
+                    if(at!=group.size())valid=false;
+                }
+                for(std::size_t i=0;valid && i<groups.size();++i)if(i!=pipeline.PushSet() && !groups[i].empty() && !seen_sets[i])valid=false;
+                return valid;
+            };
+            const auto& canonical=pipeline.CanonicalStages();
+            constexpr std::size_t graphics_stages=Shader::MaxStageTypes-1;
+            if(stages.size()<graphics_stages || canonical.size()<graphics_stages)supported=false;
+            if(supported) supported=schema_matches(std::span<const Shader::Info* const>{stages.data(),graphics_stages}) &&
+                schema_matches(std::span<const Shader::Info* const>{canonical.data(),graphics_stages});
+            for(u32 i=0;supported && i<groups.size();++i) {
+                if(groups[i].empty() || i==pipeline.PushSet())continue;
+                auto layout=pipeline.SetLayout(i);if(!layout || n==layouts.size()){supported=false;break;}
+                layouts[n]=layout;indices[n++]=i;
+                for(const auto& w:groups[i]) {
+                    std::size_t type=0;
+                    switch(w.descriptorType){case vk::DescriptorType::eStorageBuffer:type=0;break;case vk::DescriptorType::eSampledImage:type=1;break;case vk::DescriptorType::eStorageImage:type=2;break;case vk::DescriptorType::eSampler:type=3;break;default:supported=false;continue;}
+                    if(w.descriptorCount>AheadVulkanBackend::MaxDescriptorsPerPool[type]-counts[type]){supported=false;break;}
+                    counts[type]+=w.descriptorCount;
+                }
+            }
+            if(supported && n) {
+                auto candidate=std::make_shared<AheadLease>();candidate->context=context;candidate->pipeline_owner=p->pipeline_keepalive;candidate->pipeline_layout=pipeline.GetLayout();
+                for(std::size_t k=0;k<n;++k)candidate->layouts[indices[k]]=layouts[k];
+                AheadPools::Failure reason{};
+                auto lease=context->pools.TryPrepare(std::span<const vk::DescriptorSetLayout>{layouts.data(),n},counts,p->pipeline_keepalive,r.scheduler.GetWorkSemaphore()->KnownGpuTick(),&reason);
+                if(lease) {for(std::size_t k=0;k<n;++k)candidate->sets[indices[k]]=lease->sets[k];candidate->prepared_sets=n;candidate->lease=std::move(lease);p->ahead_descriptor_lease.store(std::move(candidate),std::memory_order_release);context->ready.fetch_add(1,std::memory_order_relaxed);}
+                else if(reason==AheadPools::Failure::Capacity)context->capacity.fetch_add(1,std::memory_order_relaxed);
+                else if(reason!=AheadPools::Failure::Disabled)context->failures.fetch_add(1,std::memory_order_relaxed);
+            } else context->capacity.fetch_add(1,std::memory_order_relaxed);
+        } catch(...) {context->failures.fetch_add(1,std::memory_order_relaxed);}
+    }
+    // Seal only a complete factory-built buffer prefix. Dynamic ownership is
+    // rechecked by the recorder; unsupported or ambiguous rows retain the old loop.
+    if(p->cpu_proof.descriptor_structure && p->proof_context &&
+       p->proof_context->Valid(p->proof_mode_state) &&
+       p->bindings.buffers.size()<=128 && p->bindings.buffers.size()<=p->bindings.writes.size() &&
+       p->descriptor_actions.size()==p->bindings.writes.size()) try {
+        const auto& b=p->bindings;const auto prefix=b.buffers.size();bool safe=prefix!=0;
+        // Buffer metadata is published with the canonical stage identity; the
+        // recorder still evaluates its live stage eligibility independently.
+        const auto& canonical=pipeline.CanonicalStages();
+        for(size_t si=0;safe && si<p->cpu_proof.stages.size();++si) {
+            const auto* stage=si<stages.size()?stages[si]:nullptr;
+            const auto* original=si<canonical.size()?canonical[si]:nullptr;
+            if(bool(stage)!=bool(original) || (stage && (!stage->identity || stage->identity!=original->identity ||
+               stage->buffers.size()!=original->buffers.size())))safe=false;
+        }
+        bool clip=false;const VideoCore::DirectMemory* owner=nullptr;u64 l1=0,zero=0;
+        std::array<bool,128> uploads{};
+        for(const auto& upload:p->uploads) {
+            if(upload.info>=prefix || uploads[upload.info]) {safe=false;break;}
+            uploads[upload.info]=true;
+        }
+        static const bool absent_enabled=[] {const char* q=std::getenv("RYGT_PARALLEL_ABSENT_GUEST");return q && q[0]=='1' && !q[1];}();
+        for(size_t i=0;safe && i<prefix;++i) {
+            const auto& w=b.writes[i];const auto& a=p->descriptor_actions[i];const auto& info=b.buffers[i];
+            if(w.descriptorType!=vk::DescriptorType::eStorageBuffer || w.descriptorCount!=1 ||
+               w.pBufferInfo!=&info || !a.is_buffer || a.buffer_first!=i || a.upload_match==2) {safe=false;break;}
+            if(a.upload_match==1) {
+                if(!uploads[i] || a.upload_size!=info.range || !info.range || info.range==VK_WHOLE_SIZE) safe=false;
+                continue;
+            }
+            if(uploads[i] || a.stage_index>=stages.size() || !stages[a.stage_index] ||
+               a.stage_local>=stages[a.stage_index]->buffers.size()) {safe=false;break;}
+            const auto& stage=*stages[a.stage_index];const auto& desc=stage.buffers[a.stage_local];
+            if(ParallelReadonlyDescriptorEnabled() && !info.buffer && !info.offset && info.range==VK_WHOLE_SIZE &&
+               !regs.clipper_control.user_clip_plane_enable && desc.buffer_type==Shader::BufferType::ClipPlanes && !desc.is_written) {
+                clip=true;continue;
+            }
+            if(info.buffer || info.offset || info.range!=VK_WHOLE_SIZE || !stage.identity || !stage.uses_direct ||
+               !desc.IsDirectEligible()) {safe=false;break;}
+            auto* direct=r.buffer_cache.GetDirectMemory();const auto& schema=p->cpu_proof.stages[a.stage_index];
+            if(!direct || (owner && owner!=direct) || schema.table_local>=stage.buffers.size() ||
+               schema.table_upload>=p->uploads.size() || stage.buffers[schema.table_local].buffer_type!=Shader::BufferType::DirectTable ||
+               i<a.stage_local || i-a.stage_local>SIZE_MAX-schema.table_local ||
+               p->uploads[schema.table_upload].info!=i-a.stage_local+schema.table_local ||
+               stage.buffers.size()>(SIZE_MAX-16)/16) {safe=false;break;}
+            const auto expected=16+stage.buffers.size()*16;const auto& upload=p->uploads[schema.table_upload];
+            if(upload.flat_stage>=0 || upload.size!=expected || upload.offset>p->upload_bytes.size() ||
+               expected>p->upload_bytes.size()-upload.offset) {safe=false;break;}
+            const auto* data=reinterpret_cast<const std::byte*>(p->upload_bytes.data()+upload.offset);
+            u32 header[4]{},words[4]{};std::memcpy(header,data,sizeof(header));std::memcpy(words,data+16+size_t(a.stage_local)*16,sizeof(words));
+            const u64 dl1=direct->L1Address(),dzero=direct->ZeroPageAddress();
+            if((u64(header[0])|(u64(header[1])<<32))!=dl1 || (u64(header[2])|(u64(header[3])<<32))!=dzero ||
+               (owner && (l1!=dl1 || zero!=dzero))) {safe=false;break;}
+            owner=direct;l1=dl1;zero=dzero;const auto bytes=std::span<const std::byte>{data,expected};
+            if(words[3]==0) {
+                const auto sharp=desc.GetSharp(stage);
+                if(!absent_enabled || !Native::Parallel::IsPreparedAbsentDirectSlot(bytes,stage.buffers.size(),a.stage_local,
+                    desc.IsDirectEligible(),bool(r.instance.GetDevice()),true,info.offset,info.range,sharp.base_address,sharp.GetSize()))safe=false;
+            } else if(Native::Parallel::IsPreparedDirectSlot(bytes,stage.buffers.size(),a.stage_local,true,true,info.offset,info.range)) {
+                const u64 begin=u64(words[0])|(u64(words[1])<<32);
+                if(words[2]>UINT64_MAX-begin || p->buffer_prefix_ranges.size()>=128) {safe=false;break;}
+                p->buffer_prefix_ranges.emplace_back(begin,begin+words[2]);
+            } else safe=false;
+        }
+        if(safe && p->proof_context->Valid(p->proof_mode_state)) {
+            p->buffer_prefix_sealed=true;p->buffer_prefix_clip=clip;p->buffer_prefix_direct=owner;
+            p->buffer_prefix_l1=l1;p->buffer_prefix_zero=zero;
+        } else p->buffer_prefix_ranges.clear();
+    } catch(const std::bad_alloc&) {p->buffer_prefix_ranges.clear();}
+    // Seal each complete image/sampler row independently. Unproved rows keep
+    // the original recorder path, including canonical null image proofs.
+    if(p->cpu_proof.descriptor_structure && p->proof_context && p->sampler_origins_valid &&
+       p->bindings.writes.size()<=128 && p->proof_context->Valid(p->proof_mode_state)) {
+        const auto seal_epoch=sampler_cache_epoch.load(std::memory_order_acquire);
+        const auto& b=p->bindings;
+        const auto images=std::span<const vk::DescriptorImageInfo>{b.images.data(),b.images.size()};
+        std::array<u64,2> sealed_rows{};u64 sealed_infos=0,sealed_count=0;
+        for(size_t row=0;row<b.writes.size();++row) {
+            const auto& w=b.writes[row];
+            if(w.descriptorType==vk::DescriptorType::eUniformBuffer || w.descriptorType==vk::DescriptorType::eStorageBuffer)continue;
+            if((w.descriptorType!=vk::DescriptorType::eSampledImage && w.descriptorType!=vk::DescriptorType::eSampler) ||
+               w.pNext || w.pTexelBufferView || w.pBufferInfo ||
+               !DescriptorSnapshot::ImageSliceValid(w.pImageInfo,w.descriptorCount,images))continue;
+            bool sealed=true;
+            for(u32 j=0;j<w.descriptorCount;++j) {
+                const auto& info=w.pImageInfo[j];const auto slot=static_cast<size_t>(&info-b.images.data());
+                if(w.descriptorType==vk::DescriptorType::eSampler) {
+                    if(!info.sampler || info.imageView || p->sampler_origins_epoch!=seal_epoch || !std::ranges::any_of(p->sampler_origins,[&](const auto& origin) {
+                        return origin.slot==slot && origin.handle==info.sampler;
+                    })) {sealed=false;break;}
+                } else if(!info.imageView || info.sampler || info.imageLayout!=vk::ImageLayout::eGeneral) {
+                    sealed=false;break;
+                } else if(!Native::Parallel::MatchSampledViewProof(p->sampled_view_proofs,slot,info.imageView,seal_epoch,b.sampled)) {
+                    sealed=false;break;
+                }
+            }
+            if(sealed) {sealed_rows[row/64]|=u64{1}<<(row%64);sealed_infos+=w.descriptorCount;++sealed_count;}
+        }
+        if((sealed_rows[0] || sealed_rows[1]) && p->proof_context->Valid(p->proof_mode_state) &&
+           sampler_cache_epoch.load(std::memory_order_acquire)==seal_epoch) {
+            p->cpu_proof.image_seal_mask=sealed_rows;p->cpu_proof.image_seal_infos=sealed_infos;p->cpu_proof.image_seal_rows=sealed_count;p->cpu_proof.image_seal_epoch=seal_epoch;
+            p->cpu_proof.image_seal_owner=this;
+        }
+    }
+    // An off/on transition invalidates all tokens from the old mode generation.
+    // A transition racing this check is also rejected by the recorder's Valid check.
+    if(p->proof_context && !p->proof_context->Valid(p->proof_mode_state)) {
+        p->sampled_view_proofs.clear();p->proof_context.reset();p->proof_mode_state=0;
+    }
     std::vector<PreparedDraw*> dropped;
     {
         PreparedShard& shard = ShardFor(packet);
@@ -4895,17 +7551,20 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
         if (!inserted) {
             dropped.push_back(it->second);
             it->second = p;
-            ++prepare_stats.replaced;
+            NATIVE_DIAGNOSTIC(++prepare_stats.replaced);
         }
     }
-    prepare_stats.stale += dropped.size();
+    NATIVE_DIAGNOSTIC(prepare_stats.stale += dropped.size());
     for (PreparedDraw* draw : dropped) {
         FreePrepared(draw);
     }
-    ++prepare_stats.made;
+    NATIVE_DIAGNOSTIC(++prepare_stats.made);
+#if !defined(NDEBUG)
     prepare_stats.ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - start)
                             .count();
+#endif
+
 }
 
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobGuestBuffer(VAddr address, u64 size,
@@ -4937,6 +7596,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobGuestBuffer(VAddr a
 bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Regs& regs,
                                     Shader::Backend::Bindings& binding, PreparedDraw& p) {
     // As BindBuffers, without its side effects.
+#if !defined(NDEBUG)
     // DIAG-205 (RYGT_RECORDER_SHADER=<hash>): that program's draws go to the recorder, which
     // reads their buffers later (tests whether the job threads read per-frame constants early).
     static const u64 recorder_hash = [] {
@@ -4946,6 +7606,7 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
     if (recorder_hash != 0 && stage.pgm_hash == recorder_hash) {
         return false; // the recorder
     }
+#endif
     DrawBindings& b = p.bindings;
     const u64 alignment = r.instance.StorageMinAlignment();
     // Match BindBuffers: prepared and recorder-side draws must choose the same path.
@@ -4962,7 +7623,21 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
     const bool descriptor_postprocess = postprocess_descriptors &&
         stage.sw_stage == Shader::SwStage::Fragment &&
         (stage.pgm_hash == 0x184b619c || stage.pgm_hash == 0x7cd92fb8);
-    auto* direct = stage.uses_direct && !descriptor_composition
+#if !defined(NDEBUG)
+    // Diagnostic A/B: retain shader compilation but use descriptor bindings.
+    static const bool descriptor_only_a82d2fe = [] {
+        const char* value = std::getenv("RYGT_A82D2FE_DESCRIPTOR_ONLY");
+        return value && value[0] == '1';
+    }();
+    const bool force_descriptor = descriptor_only_a82d2fe &&
+        stage.sw_stage == Shader::SwStage::Compute && stage.pgm_hash == 0xa82d2fe;
+    static std::atomic<bool> descriptor_diagnostic_logged{};
+    if (force_descriptor && !descriptor_diagnostic_logged.exchange(true))
+        LOG_WARNING(Render_Vulkan, "DIAG: 0xa82d2fe descriptor-only buffer binding active");
+#else
+    constexpr bool force_descriptor = false;
+#endif
+    auto* direct = stage.uses_direct && !descriptor_composition && !force_descriptor
         ? r.buffer_cache.GetDirectMemory() : nullptr;
     static thread_local std::vector<std::array<u32, 4>> direct_entries;
     direct_entries.assign(stage.buffers.size(), {});
@@ -5032,6 +7707,7 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
             const auto vsharp = desc.GetSharp(stage);
             const u64 base = vsharp.base_address;
             const u64 sharp_size = vsharp.GetSize();
+#if !defined(NDEBUG)
             // DIAG-204 (RYGT_PROBE_SHADER=<hash>): that program's buffers and their first bytes.
             static const u64 probe_hash = [] {
                 const char* env = std::getenv("RYGT_PROBE_SHADER");
@@ -5054,6 +7730,7 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
                                      : std::string{"unreadable"});
                 }
             }
+#endif
             const bool impossible =
                 vsharp.num_records != UINT32_MAX &&
                 (sharp_size >= GpuAddressLimit || base + sharp_size > GpuAddressLimit ||
@@ -5130,6 +7807,12 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
     };
     const u64 now_frame = shared_frame.load(std::memory_order_relaxed);
     static thread_local std::array<TextureMemo, 4096> memos{};
+    using ProofMemoArray=std::array<Native::Parallel::SampledMemoProof<vk::ImageView>,4096>;
+    static_assert(std::tuple_size_v<ProofMemoArray> == std::tuple_size_v<decltype(memos)>);
+    static thread_local std::unique_ptr<ProofMemoArray> proof_memos;
+    const bool proof_enabled=p.proof_context && p.proof_context->Valid(p.proof_mode_state);
+    if(proof_enabled && !proof_memos)proof_memos.reset(new(std::nothrow) ProofMemoArray{});
+    const u64 proof_epoch=proof_enabled ? sampler_cache_epoch.load(std::memory_order_acquire) : 0;
     for (const auto& image_desc : stage.images) {
         auto tsharp = image_desc.GetSharp(stage);
         if (!MatchExperimentalCompositionTexture(tsharp, stage, image_desc, *registry)) {
@@ -5174,6 +7857,7 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
         TextureMemo& memo = memos[XXH3_64bits_withSeed(raw_sharp.data(), sizeof(raw_sharp),
                                                        memo_flags) &
                                   (memos.size() - 1)];
+        auto* proof_memo=proof_enabled && proof_memos ? &(*proof_memos)[static_cast<std::size_t>(&memo-memos.data()) & (proof_memos->size()-1)] : nullptr;
         const VAddr address = tsharp.Address();
         if (memo.entry && memo.flags == memo_flags && memo.sharp == raw_sharp &&
             memo.generation == memo_generation) {
@@ -5186,7 +7870,30 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
                 b.images.push_back({VK_NULL_HANDLE, memo.views[i], vk::ImageLayout::eGeneral});
             }
             (storage ? b.stored : b.sampled).push_back(entry);
-            p.image_ranges.emplace_back(address, address + std::max<u64>(entry->info.guest_size, 1));
+            if(proof_memo && !storage && p.proof_context->Valid(p.proof_mode_state) && sampler_cache_epoch.load(std::memory_order_acquire)==proof_epoch) {
+                bool known=proof_memo->Matches(this,&memo,entry,proof_epoch,p.image_generation,p.unmap_gen,raw_sharp,memo_flags,cube_sampling,memo.views);
+                if(!known) {
+                    // An ordinary memo can predate proof mode. Rebuild its proof only
+                    // from live owner records; contention simply retains fallback.
+                    std::unique_lock views_lock{views_mutex,std::try_to_lock};
+                    if(views_lock.owns_lock()) {
+                        const auto it=views.find(entry);
+                        known=it!=views.end() && num_bindings!=0;
+                        for(u32 i=0;known && i<num_bindings;++i) {
+                            const auto wanted=memo.views[i];
+                            known=bool(wanted) && std::ranges::any_of(it->second,[&](const auto& view) {
+                                return (view.use==ViewUse::Sampled || view.use==ViewUse::CubeSampled) && view.view && *view.view==wanted;
+                            });
+                        }
+                        if(known && p.proof_context->Valid(p.proof_mode_state) && sampler_cache_epoch.load(std::memory_order_acquire)==proof_epoch)
+                            *proof_memo={this,&memo,entry,proof_epoch,p.image_generation,p.unmap_gen,raw_sharp,memo_flags,cube_sampling,memo.views};
+                        else known=false;
+                    }
+                }
+                if(known)
+                    for(u32 i=0;i<num_bindings;++i)Native::Parallel::AddSampledViewProof(p.sampled_view_proofs,first+i,b.sampled.size()-1,memo.views[i],entry,proof_epoch,cube_sampling);
+            }
+            p.image_ranges.emplace_back(entry->info.guest_address, entry->info.guest_address + std::max<u64>(entry->info.guest_size, 1));
             add_write();
             continue;
         }
@@ -5201,11 +7908,21 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
             bind_null();
             continue;
         }
-        const VideoCore::TextureCache::ImageDesc desc{tsharp, image_desc};
+        VideoCore::TextureCache::ImageDesc desc{tsharp, image_desc};
+        const bool original_backing=HasImageBacking(desc.info.guest_address,desc.info.guest_size);
+        const u64 original_address=desc.info.guest_address;
+        const u32 original_first_mip=desc.view_info.range.base.level;
+        const bool resident_view=!original_backing && !storage && !cube_sampling && num_bindings==1 &&
+            image_desc.mip_fallback_mode==Shader::MipStorageFallbackMode::None &&
+            RebaseResidentPrtView(desc,[&](u64 address,u64 bytes){return HasImageBacking(address,bytes);});
+        if (resident_view && SceneTrace::Id()) r.FrameDumpEvent(fmt::format(
+            "scene-prt-resident-view id={} program={:#x} original={:#x} first_mip={} resolved={:#x} bytes={} size={}x{} levels={}",
+            SceneTrace::Id(),stage.pgm_hash,original_address,original_first_mip,desc.info.guest_address,
+            desc.info.guest_size,desc.info.size.width,desc.info.size.height,desc.info.resources.levels));
         // A valid base address is not sufficient: stale optional descriptors can
         // span gigabytes beyond their allocation. Reject before image creation,
         // guest-memory import, staging allocation or a detiling dispatch.
-        if (!HasImageBacking(desc.info.guest_address, desc.info.guest_size)) {
+        if (!original_backing && !resident_view) {
             static std::atomic<u32> logged{};
             if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
                 LOG_WARNING(Render_Vulkan,
@@ -5259,7 +7976,14 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
             memo.views[i] = b.images[first + i].imageView;
         }
         memo.generation = memo_generation;
+        if(proof_memo) {
+            if(!storage && p.proof_context->Valid(p.proof_mode_state) && sampler_cache_epoch.load(std::memory_order_acquire)==proof_epoch)
+                *proof_memo={this,&memo,entry,proof_epoch,p.image_generation,p.unmap_gen,raw_sharp,memo_flags,cube_sampling,memo.views};
+            else *proof_memo={};
+        }
         (storage ? b.stored : b.sampled).push_back(entry);
+        if(proof_enabled && !storage && p.proof_context->Valid(p.proof_mode_state) && sampler_cache_epoch.load(std::memory_order_acquire)==proof_epoch)
+            for(u32 i=0;i<num_bindings;++i)Native::Parallel::AddSampledViewProof(p.sampled_view_proofs,first+i,b.sampled.size()-1,memo.views[i],entry,proof_epoch,cube_sampling);
         p.image_ranges.emplace_back(desc.info.guest_address,
                                     desc.info.guest_address +
                                         std::max<u64>(desc.info.guest_size, 1));
@@ -5271,8 +7995,15 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
                                 regs.ta_bc_base.Address() == 0)) {
             ssharp = AmdGpu::Sampler{};
         }
-        b.images.push_back({SamplerFor(ssharp, regs.ta_bc_base, sampler.is_depth), VK_NULL_HANDLE,
-                            vk::ImageLayout::eGeneral});
+        const auto origin_epoch=p.proof_context ? sampler_cache_epoch.load(std::memory_order_acquire) : 0;
+        const auto sampler_handle=SamplerFor(ssharp, regs.ta_bc_base, sampler.is_depth);
+        if(p.proof_context) {
+            if(!sampler_handle || p.sampler_origins.size()==p.sampler_origins.capacity() ||
+               (!p.sampler_origins.empty() && p.sampler_origins_epoch!=origin_epoch) ||
+               sampler_cache_epoch.load(std::memory_order_acquire)!=origin_epoch) p.sampler_origins_valid=false;
+            else {p.sampler_origins_epoch=origin_epoch;p.sampler_origins.push_back({b.images.size(),sampler_handle});}
+        }
+        b.images.push_back({sampler_handle, VK_NULL_HANDLE, vk::ImageLayout::eGeneral});
         b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
         b.writes.push_back(vk::WriteDescriptorSet{
             .dstSet = VK_NULL_HANDLE,
@@ -5303,21 +8034,30 @@ u64 NativeRenderer::VertexHash(const GraphicsPipeline& pipeline, const Shader::I
             count += 4;
         }
     }
-    return XXH3_64bits(words.data(), count * sizeof(u32));
+    return Native::Parallel::AdaptiveXXH3(words.data(), count * sizeof(u32));
 }
 
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobVertexBuffer(VAddr address, u64 size,
                                                                           PreparedDraw& p,
-                                                                          Mirror** mirror_out) {
+                                                                          Mirror** mirror_out,
+                                                                          bool* native_receipt) {
     // As GuestBufferLookup for vertices and indices (a region, else a mirror, else in place).
     // The caller holds buffer_map_mutex shared.
     *mirror_out = nullptr;
+    if(native_receipt)*native_receipt = false;
+    const auto valid_native = [&](const auto& owner) {
+        if(!owner.buffer || !size || address<owner.begin || address>owner.end || size>owner.end-address)return false;
+        const u64 offset=address-owner.begin,capacity=owner.buffer->Size();
+        return bool(vk::Buffer{Handle<VkBuffer_T>(owner.buffer->NativeHandle())}) &&
+            offset<=capacity && size<=capacity-offset;
+    };
     {
         if (Region* region = RegionOver(address, size)) {
             if (address < region->begin || address + size > region->end) {
                 return std::nullopt;
             }
             p.regions.push_back({region, address, size});
+            if(native_receipt)*native_receipt=valid_native(*region);
             return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
                              u64{address - region->begin}};
         }
@@ -5333,6 +8073,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobVertexBuffer(VAddr 
                         p.mirrors.push_back(mirror);
                     }
                     *mirror_out = mirror;
+                    if(native_receipt)*native_receipt=valid_native(*mirror);
                     return std::pair{vk::Buffer{Handle<VkBuffer_T>(mirror->buffer->NativeHandle())},
                                      u64{address - mirror->begin}};
                 }
@@ -5369,7 +8110,10 @@ bool NativeRenderer::PrepareVertices(PreparedDraw& p, const AmdGpu::Regs& regs,
     // Regions and mirrors stay put while this thread reads them.
     std::shared_lock map_lock{buffer_map_mutex};
     Mirror* near = nullptr;
+    const bool receipt_requested=p.proof_context && p.proof_context->Valid(p.proof_mode_state);
+    bool all_native=receipt_requested && !guest_buffers.empty();
     for (const auto& guest : guest_buffers) {
+        bool native_receipt=false;
         std::optional<std::pair<vk::Buffer, u64>> found;
         u64 size = 0;
         const VAddr base = guest.base_address;
@@ -5383,13 +8127,19 @@ bool NativeRenderer::PrepareVertices(PreparedDraw& p, const AmdGpu::Regs& regs,
             size = sharp_size; // OPT-004 on this thread
             found = std::pair{vk::Buffer{Handle<VkBuffer_T>(near->buffer->NativeHandle())},
                               u64{base - near->begin}};
+            if(receipt_requested && near->buffer) {
+                const u64 off=base-near->begin,capacity=near->buffer->Size();
+                native_receipt=bool(found->first) && base<=near->end && size<=near->end-base &&
+                    off<=capacity && size<=capacity-off;
+            }
         } else if (base != 0 && sharp_size > 0 && r.memory->MappedAreaEnd(base, base + 1) != 0) {
             size = r.memory->ClampRangeSize(base, sharp_size);
-            found = JobVertexBuffer(base, size, p, &near);
+            found = JobVertexBuffer(base, size, p, &near, receipt_requested?&native_receipt:nullptr);
             if (!found) {
                 return false;
             }
         }
+        all_native=all_native && native_receipt;
         if (size != 0) {
             p.buffer_ranges.emplace_back(base, base + size);
         }
@@ -5412,7 +8162,8 @@ bool NativeRenderer::PrepareVertices(PreparedDraw& p, const AmdGpu::Regs& regs,
             return false;
         }
         Mirror* unused = nullptr;
-        const auto found = JobVertexBuffer(address, bytes, p, &unused);
+        bool native_receipt=false;
+        const auto found = JobVertexBuffer(address, bytes, p, &unused, receipt_requested?&native_receipt:nullptr);
         if (!found) {
             return false;
         }
@@ -5420,7 +8171,9 @@ bool NativeRenderer::PrepareVertices(PreparedDraw& p, const AmdGpu::Regs& regs,
         p.index_address = address;
         v.index_buffer = found->first;
         v.index_offset = found->second;
+        p.native_index_receipt=native_receipt;
     }
+    p.native_vertex_receipt=all_native;
     return true;
 }
 
@@ -5430,7 +8183,7 @@ bool NativeRenderer::CommitPreparedVertices(PreparedDraw& p, const GraphicsPipel
                                             bool trusted) {
     // (The ranges were checked with the bindings'.)
     const auto reject = [&] {
-        ++stats.prepared_vertices_rejected;
+        NATIVE_DIAGNOSTIC(++stats.prepared_vertices_rejected);
         return false;
     };
     if (quad_triangles || p.indexed != is_indexed || p.index_offset != index_offset) {
@@ -5459,12 +8212,12 @@ bool NativeRenderer::CommitPreparedVertices(PreparedDraw& p, const GraphicsPipel
     for (Mirror* mirror : p.mirrors) {
         if (!RefreshMirror(*mirror)) return reject();
         mirror->used_frame = frame;
-        ++stats.mirror_binds;
+        NATIVE_DIAGNOSTIC(++stats.mirror_binds);
     }
     for (const auto& [address, size] : p.in_place) {
         MirrorBuffer(address, size);
     }
-    ++stats.prepared_vertices;
+    NATIVE_DIAGNOSTIC(++stats.prepared_vertices);
     return true;
 }
 
@@ -5474,7 +8227,7 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
         {"stage-validation", "image-freshness", "sort-cpu-writes", "buffer-freshness",
          "refresh-regions", "upload-data", "image-rewrite-sources", "push-data"}};
     const auto reject = [&](u32 why) {
-        ++stats.prepared_rejected[why];
+        NATIVE_DIAGNOSTIC(++stats.prepared_rejected[why]);
         return false;
     };
     if (p.pipeline != &pipeline) {
@@ -5505,6 +8258,9 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     trace.Next(2);
     SortRegionWrites(); // CPU writes since (may drop mirrors)
     trace.Next(3);
+    // A successful first scan certifies history through this earlier checkpoint;
+    // the second scan must still check every later change. Sampling after the scan is unsafe.
+    const u64 recheck_from = buffer_log.Seq();
     if (!buffer_log.Untouched(p.buffer_seq, p.buffer_ranges)) {
         return reject(4);
     }
@@ -5512,11 +8268,16 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     trace.Next(4);
     for (const auto& use : p.regions) {
         RefreshRegion(*use.region, use.address, use.size);
-        ++stats.region_binds;
+        NATIVE_DIAGNOSTIC(++stats.region_binds);
     }
     const u64 alignment = r.instance.StorageMinAlignment();
     trace.Next(5);
+    p.upload_receipt_incarnation=0;
+    const u64 upload_incarnation=stream.upload_incarnation;
+    const bool receipt_requested=trusted && p.proof_context && p.proof_context->Valid(p.proof_mode_state);
+    bool uploads_proven=receipt_requested && upload_incarnation && !p.uploads.empty();
     for (const auto& upload : p.uploads) {
+        bool backing_proven=false;
         const u8* source = p.upload_bytes.data() + upload.offset;
         u32 size = upload.size;
         if (upload.flat_stage >= 0) {
@@ -5524,13 +8285,16 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
         }
         if (upload.flat_stage >= 0) {
             p.bindings.buffers[upload.info] =
-                UploadFlatData(static_cast<u32>(upload.flat_stage), source, size);
+                UploadFlatData(static_cast<u32>(upload.flat_stage), source, size, receipt_requested?&backing_proven:nullptr);
         } else {
-            const auto [buffer, offset, data] = Allocate(size, alignment);
+            const auto [buffer, offset, data] = Allocate(size, alignment, receipt_requested?&backing_proven:nullptr);
             std::memcpy(data, source, size);
             p.bindings.buffers[upload.info] = vk::DescriptorBufferInfo{buffer, offset, size};
         }
+        uploads_proven=uploads_proven && backing_proven;
     }
+    if(uploads_proven && stream.upload_incarnation==upload_incarnation)
+        p.upload_receipt_incarnation=upload_incarnation;
     trace.Next(6);
     for (const auto* stored : p.bindings.stored) {
         auto& entry = *const_cast<Native::ImageEntry*>(stored);
@@ -5545,6 +8309,13 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
             RefreshSources(entry); // NAT-104
         }
     }
+    // RefreshRegion can process CPU writes again after the first freshness
+    // check and retire a prepared mirror. Settle any new stream/promotion,
+    // then reject the whole prepared draw before selecting its bindings or
+    // dereferencing its vertex mirrors if any prepared range changed.
+    Begin();
+    if (p.unmap_gen != unmap_generation.load(std::memory_order_acquire)) return reject(2);
+    if (!buffer_log.Untouched(recheck_from, p.buffer_ranges)) return reject(4);
     // The viewport transform the shaders get, from the registers as recorded.
     trace.Next(7);
     const Shader::PushData fresh = UserData(regs);
@@ -5553,8 +8324,8 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     p.bindings.push.yoffset = fresh.yoffset;
     p.bindings.push.yscale = fresh.yscale;
     p.bindings.push.quad_sample_mask = fresh.quad_sample_mask;
-    stats.null_images += p.null_images;
-    ++stats.prepared_used;
+    NATIVE_DIAGNOSTIC(stats.null_images += p.null_images);
+    NATIVE_DIAGNOSTIC(++stats.prepared_used);
     return true;
 }
 
@@ -5723,6 +8494,7 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
         return;
     }
     const auto& info = entry.info;
+#if !defined(NDEBUG)
     if (Native::WatchedTexture(info.guest_address, info.guest_address + 1) &&
         Native::WatchSample()) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: apply {} to {} {:#x} ({:#x} bytes of {:#x}, "
@@ -5733,6 +8505,7 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
                     entry.from_cpu ? "texture" : "target", info.guest_address, entry.rewrite_bytes,
                     info.guest_size, entry.rewrite_pattern[0], entry.rewrite_pattern[1]);
     }
+#endif
     const Rewrite rewrite = std::exchange(entry.rewrite, Rewrite::None);
     const bool stencil = std::exchange(entry.stencil_clear_pending, false) &&
                          info.props.has_stencil && entry.image;
@@ -5763,21 +8536,21 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
         const u32 rows = u32(std::min<u64>((entry.rewrite_bytes + row_bytes - 1) / row_bytes,
                                            info.size.height));
         if (rows != 0 && FillImage(entry, lo, hi, rows)) {
-            ++stats.rewrite_partial;
+            NATIVE_DIAGNOSTIC(++stats.rewrite_partial);
         }
     } else if (rewrite == Rewrite::Clear && !depth_value && !color_zero) {
         // NAT-132: other patterns (GT Sport fills pictures in its scratch pool with non-zero
         // values) are filled in on the GPU; uploading them from memory cost 1-3 GB a second in
         // the menus.
         if (FillImage(entry, lo, hi, 0)) {
-            ++stats.rewrite_fills;
+            NATIVE_DIAGNOSTIC(++stats.rewrite_fills);
         } else if (info.num_samples == 1) {
             registry->RequestUpload(entry); // in GPU order, before the next draw or dispatch
-            ++stats.rewrite_uploads;
+            NATIVE_DIAGNOSTIC(++stats.rewrite_uploads);
         }
     } else if (rewrite == Rewrite::Upload && info.num_samples == 1) {
         registry->RequestUpload(entry);
-        ++stats.rewrite_uploads;
+        NATIVE_DIAGNOSTIC(++stats.rewrite_uploads);
     }
     if (!depth_value && !color_zero && !stencil) {
         return;
@@ -5812,7 +8585,7 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
     Written(&entry, entry.rewrite_clock); // NAT-148
     s.buffers_written = true; // the next work waits for the clear
     ++s.commands;
-    ++stats.rewrite_clears;
+    NATIVE_DIAGNOSTIC(++stats.rewrite_clears);
 }
 
 void NativeRenderer::ReadFillShader(const Shader::Info& cs, DrawBindings& b) {
@@ -5853,7 +8626,7 @@ void NativeRenderer::ReadFillShader(const Shader::Info& cs, DrawBindings& b) {
     b.fill_pattern = std::array<u32, 2>{words[0], words[1]};
     b.fill_address = out_sharp.base_address;
     b.fill_size = std::min<u64>(u64(words[2]) * 4, out_sharp.GetSize());
-    ++stats.fill_shaders;
+    NATIVE_DIAGNOSTIC(++stats.fill_shaders);
 }
 
 bool NativeRenderer::MetaClearDispatch(const Shader::Info& cs) {
@@ -5880,12 +8653,13 @@ bool NativeRenderer::MetaClearDispatch(const Shader::Info& cs) {
             }
         }
     }
-    stats.meta_clears += cleared;
+    NATIVE_DIAGNOSTIC(stats.meta_clears += cleared);
     return cleared;
 }
 
 void NativeRenderer::DispatchDirect() {
     std::scoped_lock lock{mutex};
+#if !defined(NDEBUG)
     const auto start = std::chrono::steady_clock::now();
     struct Timed {
         std::chrono::steady_clock::time_point start;
@@ -5896,12 +8670,20 @@ void NativeRenderer::DispatchDirect() {
                          .count();
         }
     } timed{start, stats.dispatch_ns};
+
+#endif
+#if !defined(NDEBUG)
+    SceneTrace::CpuScope scene_trace{r.FrameDumpCollecting(),frame,"dispatch"};
+#endif
+    if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-pass id={} kind=dispatch",SceneTrace::Id()));
+#if !defined(NDEBUG)
     t_timed = false; // OPT-001: the phase timers are the draws'
+#endif
     r.scheduler.PopPendingOperations();
     const auto& cs_program = r.liverpool->DrawCsRegs();
     const ComputePipeline* pipeline = r.AcquireComputePipeline();
     if (!pipeline) {
-        ++stats.no_pipeline;
+        NATIVE_DIAGNOSTIC(++stats.no_pipeline);
         return;
     }
     const auto& regs = r.liverpool->DrawRegs();
@@ -5918,12 +8700,141 @@ void NativeRenderer::DispatchDirect() {
     b.push = UserData(regs);
     BindStages(pipeline->GetStages(), regs, true, b);
     if (b.failed) {
-        ++stats.skipped;
+        NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
     ReadFillShader(pipeline->GetStage(Shader::SwStage::Compute), b); // NAT-120
     PrepareImages();
     GlobalBarrier();
+    // Intrusive opt-in diagnostic. Submit the bound input copy and wait before
+    // recording this dispatch; shader and loop bounds are never modified.
+#if !defined(NDEBUG)
+    const auto& diag_cs = pipeline->GetStage(Shader::SwStage::Compute);
+    static const u64 capture_budget = [] {
+        const char* p=std::getenv("RYGT_A82_GPU_CAPTURE");
+        return p && *p ? std::min<u64>(std::strtoull(p,nullptr,0),256) : u64{0};
+    }();
+    static const u64 capture_from = [] {
+        const char* p=std::getenv("RYGT_A82_GPU_CAPTURE_FROM_FRAME");
+        return p && *p ? std::strtoull(p,nullptr,0) : u64{0};
+    }();
+    static u64 captures=0;
+    const char* forced_descriptor=std::getenv("RYGT_A82D2FE_DESCRIPTOR_ONLY");
+    const bool after_race_ready=A82CaptureAfterRace();
+    if (after_race_ready && capture_budget && captures < capture_budget && frame >= capture_from &&
+        diag_cs.pgm_hash == 0xa82d2fe && forced_descriptor && forced_descriptor[0]=='1' &&
+        !diag_cs.buffers.empty() && !diag_cs.buffers[0].IsSpecial() && !b.buffers.empty()) {
+        constexpr u64 max_bytes=512;
+        const u64 bytes = b.buffers[0].range == VK_WHOLE_SIZE || b.buffers[0].range < b.push.buf_offsets[0]
+            ? 0 : std::min<u64>((b.buffers[0].range-b.push.buf_offsets[0]) & ~u64{3},max_bytes);
+        const auto descriptor=b.buffers[0];
+        const u64 adjust=b.push.buf_offsets[0];
+        const bool valid=descriptor.buffer && bytes >= 332 && adjust % 4 == 0 &&
+            descriptor.offset <= std::numeric_limits<u64>::max()-adjust-bytes &&
+            (descriptor.range != VK_WHOLE_SIZE &&
+             (descriptor.range >= adjust && descriptor.range-adjust >= bytes));
+        auto readback=valid ? device->CreateBuffer({.size=bytes,
+            .usage=Native::Rhi::BufferUsageTransferDst | Native::Rhi::BufferUsageStorage,
+            .memory=Native::Rhi::MemoryKind::Readback, .name="a82 input diagnostic"}) : nullptr;
+        if (readback && readback->Mapped()) {
+            const u64 capture=++captures;
+            const auto original_push=b.push;
+            std::string push_words;
+            std::array<u32,sizeof(original_push)/4> push{};
+            std::memcpy(push.data(), &original_push, sizeof(original_push));
+            for(u32 word:push) push_words += fmt::format(" {:08x}",word);
+            s.cmd.copyBuffer(descriptor.buffer,
+                vk::Buffer{Handle<VkBuffer_T>(readback->NativeHandle())},
+                vk::BufferCopy{.srcOffset=descriptor.offset+adjust,.dstOffset=0,.size=bytes});
+            const vk::MemoryBarrier2 to_host{
+                .srcStageMask=vk::PipelineStageFlagBits2::eAllTransfer,
+                .srcAccessMask=vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask=vk::PipelineStageFlagBits2::eHost,
+                .dstAccessMask=vk::AccessFlagBits2::eHostRead};
+            s.cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount=1,.pMemoryBarriers=&to_host});
+            Splice();
+            r.scheduler.Finish();
+            readback->Invalidate(0,bytes);
+            std::array<u32,128> words{};
+            std::memcpy(words.data(),readback->Mapped(),bytes);
+            std::string raw; for(u64 i=0;i<bytes/4;++i) raw+=fmt::format(" {:08x}",words[i]);
+            LOG_WARNING(Render_Vulkan,
+                "DIAG-A82 GPU-PRE-DISPATCH capture={} frame={} groups={}x{}x{} "
+                "descriptor={:#x} offset={} range={} adjust={} bytes={} n={} push:{} words:{}",
+                capture,frame,cs_program.dim_x,cs_program.dim_y,cs_program.dim_z,
+                reinterpret_cast<u64>(static_cast<VkBuffer>(descriptor.buffer)),
+                descriptor.offset,descriptor.range,adjust,bytes,words[72],push_words,raw);
+            LOG_WARNING(Render_Vulkan,
+                "DIAG-A82 GPU-METADATA capture={} local={}x{}x{} lds_per_group={} bound_lds_range={}",
+                capture,cs_program.num_thread_x.full,cs_program.num_thread_y.full,
+                cs_program.num_thread_z.full,cs_program.SharedMemSize(),
+                b.buffers.size()>2 ? b.buffers[2].range : u64{0});
+            for(size_t i=0;i<b.images.size();++i) {
+                const auto& d=b.images[i];
+                LOG_WARNING(Render_Vulkan,"DIAG-A82 GPU-METADATA capture={} bound_image={} view={:#x} sampler={:#x} layout={}",
+                    capture,i,reinterpret_cast<u64>(static_cast<VkImageView>(d.imageView)),
+                    reinterpret_cast<u64>(static_cast<VkSampler>(d.sampler)),u32(d.imageLayout));
+            }
+            for(size_t i=0;i<diag_cs.images.size();++i) {
+                const auto sharp=diag_cs.images[i].GetSharp(diag_cs);
+                std::array<u32,sizeof(sharp)/4> raw_sharp{};
+                std::memcpy(raw_sharp.data(),&sharp,sizeof(sharp));
+                std::string text;for(u32 word:raw_sharp)text+=fmt::format(" {:08x}",word);
+                LOG_WARNING(Render_Vulkan,"DIAG-A82 GPU-METADATA capture={} image_sharp={} words:{}",capture,i,text);
+            }
+            for(size_t i=0;i<diag_cs.samplers.size();++i) {
+                const auto sharp=diag_cs.samplers[i].GetSharp(diag_cs);
+                std::array<u32,sizeof(sharp)/4> raw_sharp{};
+                std::memcpy(raw_sharp.data(),&sharp,sizeof(sharp));
+                std::string text;for(u32 word:raw_sharp)text+=fmt::format(" {:08x}",word);
+                LOG_WARNING(Render_Vulkan,"DIAG-A82 GPU-METADATA capture={} sampler_sharp={} words:{}",capture,i,text);
+            }
+            // Splice retires upload chunks. Rebuild all bindings in a fresh stream;
+            // the subsequent descriptor can differ, so this is a pre-rebind snapshot.
+            Begin();
+            b.Clear();
+            b.push=UserData(regs);
+            BindStages(pipeline->GetStages(),regs,true,b);
+            if (b.failed) { NATIVE_DIAGNOSTIC(++stats.skipped); return; }
+            PrepareImages();
+            GlobalBarrier();
+            const auto rebound=b.buffers.empty()?vk::DescriptorBufferInfo{}:b.buffers[0];
+            // Only replace when the entire original logical descriptor was copied.
+            // This does not rely on the hash identifying a particular SPIR-V variant.
+            const char* freeze_env=std::getenv("RYGT_A82_FREEZE_CAPTURE");
+            const bool frozen=freeze_env && freeze_env[0]=='1' && !b.buffers.empty() &&
+                !diag_cs.buffers[0].is_written && descriptor.range-adjust == bytes;
+            if (frozen) {
+                b.buffers[0]={Handle<VkBuffer_T>(readback->NativeHandle()),0,bytes};
+                b.push.buf_offsets[0]=0;
+                s.keep.push_back(std::move(readback)); // retained until this command list completes
+            }
+            std::array<u32,sizeof(b.push)/4> effective_push{};
+            std::memcpy(effective_push.data(),&b.push,sizeof(b.push));
+            std::string effective;for(u32 word:effective_push)effective+=fmt::format(" {:08x}",word);
+            LOG_WARNING(Render_Vulkan,
+                "DIAG-A82 POST-REBIND capture={} descriptor={:#x} offset={} range={} adjust={} frozen={} push:{}",
+                capture,reinterpret_cast<u64>(static_cast<VkBuffer>(rebound.buffer)),
+                rebound.offset,rebound.range,b.push.buf_offsets[0],frozen,effective);
+        } else {
+            LOG_WARNING(Render_Vulkan,"DIAG-A82 GPU input capture skipped: invalid descriptor or readback allocation");
+            captures=capture_budget; // avoid repeating a failed diagnostic every dispatch
+        }
+    }
+#endif
+    // Wait for an existing non-rendering boundary: never restart a clear pass for diagnostics.
+    if(SceneTrace::Id() && !SceneTrace::state.attempted && !s.rendering) {
+        const auto families=r.instance.GetPhysicalDevice().getQueueFamilyProperties();
+        const u32 family=r.instance.GetGraphicsQueueFamilyIndex();
+        SceneTrace::Prepare(r.instance.GetDevice(),s.cmd,
+            family<families.size()?families[family].timestampValidBits:0,
+            r.instance.GetPhysicalDevice().getProperties().limits.timestampPeriod);
+    }
+#if !defined(NDEBUG)
+    scene_trace.Programs(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash);
+#endif
+    if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-compute id={} cs={:#x} groups={}x{}x{} threads={}x{}x{} host_subgroup={}",SceneTrace::Id(),pipeline->GetStage(Shader::SwStage::Compute).pgm_hash,cs_program.dim_x,cs_program.dim_y,cs_program.dim_z,cs_program.num_thread_x.full,cs_program.num_thread_y.full,cs_program.num_thread_z.full,r.instance.SubgroupSize()));
+    SceneTrace::GpuBegin(s.cmd);
     const CmdBuf cmdbuf{s.cmd};
     bool transferred = false;
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
@@ -5960,17 +8871,117 @@ void NativeRenderer::DispatchDirect() {
         s.pipelines.Compute(pipeline->Handle(), r.instance.IsIntel(), [&] {
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
         });
-        PushBindings(*pipeline, vk::PipelineBindPoint::eCompute, b);
+        // CPU guest bytes may differ from the GPU descriptor; label accordingly.
+#if !defined(NDEBUG)
+        static const bool capture_a82 = [] {
+            const char* p = std::getenv("RYGT_A82_INPUT_DIAG"); return p && p[0] == '1';
+        }();
+        if (capture_a82 && cs.pgm_hash == 0xa82d2fe && !cs.buffers.empty() &&
+            !cs.buffers[0].IsSpecial() && !b.buffers.empty()) {
+            const auto sharp = cs.buffers[0].GetSharp(cs);
+            const u64 base = sharp.base_address, size = sharp.GetSize();
+            std::array<u32, 80> words{};
+            const bool readable = base && size >= sizeof(words) &&
+                Core::RytyMemory::GuardedCopy(words.data(),
+                    reinterpret_cast<const void*>(base), sizeof(words));
+            static u64 serial = 0;
+            static u32 last_n = ~u32{0};
+            static u64 last_base = ~u64{0};
+            static bool last_readable = false;
+            const u64 number = ++serial;
+            const u32 n = readable ? words[72] : 0;
+            if (number <= 4 || number % 300 == 0 || base != last_base ||
+                readable != last_readable || (readable && n != last_n)) {
+                last_n = n; last_base = base; last_readable = readable;
+                const auto& descriptor = b.buffers[0];
+                std::string raw;
+                if (readable) for (u32 word : words) raw += fmt::format(" {:08x}", word);
+                LOG_WARNING(Render_Vulkan,
+                    "DIAG-A82 CPU-GUEST-NOT-GPU frame={} serial={} groups={}x{}x{} "
+                    "buffer0={:#x}+{:#x} region={} readable={} n={} gpu_buffer={:#x} "
+                    "gpu_offset={} gpu_range={} push_offset={} words:{}",
+                    frame, number, cs_program.dim_x, cs_program.dim_y, cs_program.dim_z,
+                    base, size, RegionOver(base, size) != nullptr, readable, n,
+                    reinterpret_cast<u64>(static_cast<VkBuffer>(descriptor.buffer)),
+                    descriptor.offset, descriptor.range, b.push.buf_offsets[0], raw);
+                for (size_t i=0; i<b.images.size(); ++i) {
+                    const auto& d = b.images[i];
+                    LOG_WARNING(Render_Vulkan, "DIAG-A82 bound_image={} view={:#x} sampler={:#x} layout={}",
+                        i, reinterpret_cast<u64>(static_cast<VkImageView>(d.imageView)),
+                        reinterpret_cast<u64>(static_cast<VkSampler>(d.sampler)), u32(d.imageLayout));
+                }
+                for (size_t i=0; i<cs.samplers.size(); ++i) {
+                    const auto sharp_sampler=cs.samplers[i].GetSharp(cs);
+                    std::array<u32, sizeof(sharp_sampler)/sizeof(u32)> data{};
+                    std::memcpy(data.data(), &sharp_sampler, sizeof(sharp_sampler));
+                    std::string sampler_words;
+                    for (u32 word : data) sampler_words += fmt::format(" {:08x}", word);
+                    LOG_WARNING(Render_Vulkan, "DIAG-A82 sampler={} words:{}", i, sampler_words);
+                }
+                for (size_t i=0; i<cs.images.size(); ++i) {
+                    const auto image = cs.images[i].GetSharp(cs);
+                    LOG_WARNING(Render_Vulkan,
+                        "DIAG-A82 image={} guest={:#x} {}x{} layers={}-{} type={} fmt={}/{}",
+                        i, image.Address(), image.width+1, image.height+1,
+                        u32(image.base_array), u32(image.last_array), u32(image.GetType()),
+                        u32(image.GetDataFmt()), u32(image.GetNumberFmt()));
+                }
+            }
+        }
+        // Opt-in: when buffer0 is an upload chunk, its already-copied bytes are
+        // the bound snapshot, unlike a second read of mutable guest memory.
+        static const bool inspect_snapshot=[] {
+            const char* p=std::getenv("RYGT_A82_INPUT_DIAG"); return p && p[0]=='1';
+        }();
+        if (inspect_snapshot && cs.pgm_hash==0xa82d2fe && !b.buffers.empty()) {
+            constexpr u64 wanted=336;
+            const auto info=b.buffers[0]; const u64 adjust=b.push.buf_offsets[0];
+            bool found=false;
+            for (const auto& chunk:s.chunks) {
+                if (!chunk.buffer || !chunk.buffer->Mapped() ||
+                    vk::Buffer{Handle<VkBuffer_T>(chunk.buffer->NativeHandle())}!=info.buffer ||
+                    info.offset>chunk.buffer->Size() || adjust>chunk.buffer->Size()-info.offset ||
+                    wanted>chunk.buffer->Size()-info.offset-adjust ||
+                    info.range==VK_WHOLE_SIZE || info.range<adjust || wanted>info.range-adjust) continue;
+                std::array<u32,84> copied{};
+                std::memcpy(copied.data(),chunk.buffer->Mapped()+info.offset+adjust,wanted);
+                static u64 serial=0;static u32 last=~u32{0};static u64 last_base=~u64{0};
+                const u64 number=++serial;
+                const u64 base=cs.buffers.empty() || cs.buffers[0].IsSpecial()
+                    ? 0 : cs.buffers[0].GetSharp(cs).base_address;
+                if (number<=4 || number%300==0 || copied[72]!=last || base!=last_base) {
+                    last=copied[72];last_base=base;std::string raw;
+                    for(u32 word:copied)raw+=fmt::format(" {:08x}",word);
+                    LOG_WARNING(Render_Vulkan,
+                        "DIAG-A82 UPLOAD-SNAPSHOT frame={} serial={} guest={:#x} n={} buffer={:#x} offset={} adjust={} words:{}",
+                        frame,number,base,copied[72],reinterpret_cast<u64>(static_cast<VkBuffer>(info.buffer)),
+                        info.offset,adjust,raw);
+                }
+                found=true;break;
+            }
+            if (!found) {
+                static std::atomic<u64> missing{};const auto n=++missing;
+                if(n<=4 || n%300==0)LOG_WARNING(Render_Vulkan,
+                    "DIAG-A82 UPLOAD-SNAPSHOT-UNAVAILABLE frame={} count={} descriptor={:#x}",
+                    frame,n,reinterpret_cast<u64>(static_cast<VkBuffer>(info.buffer)));
+            }
+        }
+    #endif
+    PushBindings(*pipeline, vk::PipelineBindPoint::eCompute, b);
         Native::GpuCheckpoints::Record(static_cast<VkCommandBuffer>(s.cmd), 2, frame,
             cs.pgm_hash, cs_program.dim_x, u64(cs_program.dim_y) << 32 | cs_program.dim_z);
         cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     }
+    SceneTrace::GpuEnd(s.cmd);
+    if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-compute-path id={} transfer_rewrite={}",SceneTrace::Id(),transferred));
     NoteWrites(nullptr, b);
+#if !defined(NDEBUG)
     if (Native::g_dump_request.exchange(false)) {
         r.StartFrameDumpNow(); // FIX-156 (diagnosis): a watched fill
     }
+#endif
     s.buffers_written = true; // what the dispatch wrote is seen after the next barrier
-    ++stats.dispatches;
+    NATIVE_DIAGNOSTIC(++stats.dispatches);
     ++s.commands;
     ChunkFlushCheck();
     Report();
@@ -5978,11 +8989,17 @@ void NativeRenderer::DispatchDirect() {
 
 void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     std::scoped_lock lock{mutex};
+#if !defined(NDEBUG)
+    SceneTrace::CpuScope scene_trace{r.FrameDumpCollecting(),frame,"dispatch-indirect"};
+#endif
+    if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-pass id={} kind=dispatch-indirect arguments={:#x}+{} bytes={}",SceneTrace::Id(),address,offset,size));
+#if !defined(NDEBUG)
     t_timed = false; // OPT-001
+#endif
     r.scheduler.PopPendingOperations();
     const ComputePipeline* pipeline = r.AcquireComputePipeline();
     if (!pipeline) {
-        ++stats.no_pipeline;
+        NATIVE_DIAGNOSTIC(++stats.no_pipeline);
         return;
     }
     const auto& regs = r.liverpool->DrawRegs();
@@ -5995,7 +9012,7 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     Stream& s = Begin();
     const auto args = GuestBuffer(address + offset, std::max<u32>(size, 12), false);
     if (!args) {
-        ++stats.skipped;
+        NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
     DrawBindings& b = bindings;
@@ -6010,10 +9027,31 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     });
     PushBindings(*pipeline, vk::PipelineBindPoint::eCompute, b);
+    // Wait for an existing non-rendering boundary: never restart a clear pass for diagnostics.
+    if(SceneTrace::Id() && !SceneTrace::state.attempted && !s.rendering) {
+        const auto families=r.instance.GetPhysicalDevice().getQueueFamilyProperties();
+        const u32 family=r.instance.GetGraphicsQueueFamilyIndex();
+        SceneTrace::Prepare(r.instance.GetDevice(),s.cmd,
+            family<families.size()?families[family].timestampValidBits:0,
+            r.instance.GetPhysicalDevice().getProperties().limits.timestampPeriod);
+    }
+#if !defined(NDEBUG)
+    scene_trace.Programs(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash);
+#endif
+    if(SceneTrace::Id() && scene_indirect_args.size()<128) {
+        if(!scene_indirect_buffer)scene_indirect_buffer=device->CreateBuffer({.size=128*16,.usage=Native::Rhi::BufferUsageTransferDst,.memory=Native::Rhi::MemoryKind::Readback,.name="scene indirect arguments"});
+        if(scene_indirect_buffer && scene_indirect_buffer->Mapped()){
+            const u64 target=scene_indirect_args.size()*16;
+            s.cmd.copyBuffer(args->first,vk::Buffer{Handle<VkBuffer_T>(scene_indirect_buffer->NativeHandle())},vk::BufferCopy{.srcOffset=args->second,.dstOffset=target,.size=12});
+            scene_indirect_args.push_back({SceneTrace::Id(),address,offset});
+        } else r.FrameDumpEvent(fmt::format("scene-indirect-snapshot id={} skipped=allocation",SceneTrace::Id()));
+    }else if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-indirect-snapshot id={} skipped=capacity",SceneTrace::Id()));
+    SceneTrace::GpuBegin(s.cmd);
     cmdbuf.dispatchIndirect(args->first, args->second);
+    SceneTrace::GpuEnd(s.cmd);
     NoteWrites(nullptr, b);
     s.buffers_written = true;
-    ++stats.dispatches;
+    NATIVE_DIAGNOSTIC(++stats.dispatches);
     ++s.commands;
     ChunkFlushCheck();
 }
@@ -6108,13 +9146,13 @@ void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is
     const bool meta = known_meta.contains(address);
     if (meta) {
         cleared_meta.insert(address); // a CMASK/HTILE cleared by the CP
-        ++stats.meta_clears;
+        NATIVE_DIAGNOSTIC(++stats.meta_clears);
     }
     if (r.FrameDumpActive()) {
         r.FrameDumpEvent(fmt::format("fill {:#x}+{:#x} = {:#x}{}", address, num_bytes, value,
                                      meta ? " (metadata clear)" : "")); // NAT-117
     }
-    ++stats.fills;
+    NATIVE_DIAGNOSTIC(++stats.fills);
     if (const auto found = GuestBuffer(address, num_bytes, true)) {
         GlobalBarrier();
         CmdBuf{s.cmd}.fillBuffer(found->first, found->second, num_bytes, value);
@@ -6142,7 +9180,7 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
         SyncUiRange(dst, num_bytes, false);
     }
     Stream& s = Begin();
-    ++stats.copies;
+    NATIVE_DIAGNOSTIC(++stats.copies);
     if (r.FrameDumpActive()) {
         r.FrameDumpEvent(fmt::format("copy {:#x}{} <- {:#x}{} ({:#x} bytes)", dst,
                                      dst_gds ? " (GDS)" : "", src, src_gds ? " (GDS)" : "",
@@ -6221,7 +9259,7 @@ bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
     }
     s.buffers_written = true;
     ++s.commands;
-    ++stats.inline_writes;
+    NATIVE_DIAGNOSTIC(++stats.inline_writes);
     return true;
 }
 
@@ -6246,9 +9284,11 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
             }
         }
     }
+#if !defined(NDEBUG)
     if (Native::WatchedTexture(address, address + size)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: unmap {:#x}+{:#x}", address, size);
     }
+#endif
     Native::ForgetReadable(address, size); // NAT-147
     // FIX-153: the pages stop being watched (Ryty tells before it unmaps them). Memory mapped
     // there again comes writable; a watch left in place counted as one in the page manager but
@@ -6275,7 +9315,7 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
             }
         }
     }
-    DropMirrors(address, size); // NAT-150
+    DropMirrors(address, size, MirrorUnmapDrop); // NAT-150
     {
         std::scoped_lock pending_lock{region_dirty_mutex}; // FIX-173
         std::erase_if(page_snapshots, [&](const auto& snapshot) {
@@ -6288,6 +9328,7 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
 
 void NativeRenderer::WatchBind(const Native::ImageEntry& entry, const AmdGpu::Image& tsharp,
                                bool storage, bool memo, u64 program) {
+#if !defined(NDEBUG)
     if (!Native::WatchSample()) {
         return;
     }
@@ -6304,9 +9345,11 @@ void NativeRenderer::WatchBind(const Native::ImageEntry& entry, const AmdGpu::Im
                 memo ? " (memo)" : "", program, entry.from_cpu ? "texture" : "target",
                 entry.info.size.width, entry.info.size.height, entry.info.resources.layers,
                 entry.write_version.load(), sources, frame);
+#endif
 }
 
 void NativeRenderer::ProbeWatchedPictures() {
+#if !defined(NDEBUG)
     // FIX-156 (diagnosis, RYGT_NATIVE_WATCH_TEXTURE): what the pictures at the watched address
     // hold, every half second (read back from the GPU), to see when one loses its content.
     const auto& watched_list = Native::WatchedTextures();
@@ -6500,6 +9543,7 @@ void NativeRenderer::ProbeWatchedPictures() {
             }
         });
     }
+#endif
 }
 
 void NativeRenderer::EvictImages() {
@@ -6536,7 +9580,7 @@ void NativeRenderer::EvictImages() {
     // Mirror collection keeps its original cadence. Image retirement below is
     // incremental instead of concentrating 30 frames of retirement in one frame.
     for (const auto& [address, bytes] : cold_mirrors) {
-        ++stats.mirrors_evicted;
+        NATIVE_DIAGNOSTIC(++stats.mirrors_evicted);
         DropMirrors(address, bytes); // invalidates bindings; existing GPU-safe destruction
     }
     // FIX-157: a picture the GPU wrote stays past its idle time
@@ -6599,10 +9643,12 @@ void NativeRenderer::EvictImages() {
         kept_bytes += size;
         WatchPages(address, size);
         ++newly_kept;
+#if !defined(NDEBUG)
         if (Native::WatchedTexture(address, address + 1)) {
             LOG_WARNING(Render_Vulkan, "FIX-157 watch: {:#x} kept (version {}, frame {})",
                         address, version, frame);
         }
+#endif
         return true;
     };
     trace.Next(2);
@@ -6614,6 +9660,7 @@ void NativeRenderer::EvictImages() {
         if (entry.kept.load(std::memory_order_relaxed)) {
             kept_bytes -= std::min<u64>(kept_bytes, std::max<u64>(entry.info.guest_size, 1));
         }
+#if !defined(NDEBUG)
         if (Native::WatchedTexture(entry.info.guest_address, entry.info.guest_address + 1)) {
             LOG_WARNING(Render_Vulkan, "FIX-157 watch: {} {:#x} {}x{} layers {} evicted (last "
                         "use frame {}, version {}, frame {})",
@@ -6622,6 +9669,7 @@ void NativeRenderer::EvictImages() {
                         entry.info.resources.layers, entry.last_use.load(),
                         entry.write_version.load(), frame);
         }
+#endif
         {
             std::scoped_lock lock{views_mutex};
             if (const auto it = views.find(&entry); it != views.end()) {
@@ -6656,10 +9704,12 @@ void NativeRenderer::WatchPages(VAddr address, u64 size) {
     const auto fresh = page_watches.Track(begin,end,[&](VAddr run,u64 bytes) {
         r.page_manager.UpdatePageWatchers(run,bytes,VideoCore::PageOp::Track);
     });
+#if !defined(NDEBUG)
     if (Native::WatchedTexture(begin,end)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: watch {:#x}-{:#x}, {} pages newly watched",
                     begin,end,fresh);
     }
+#endif
 }
 
 void NativeRenderer::UnwatchPages(VAddr begin, VAddr end) {
@@ -6738,10 +9788,12 @@ void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
     // textures over them are uploaded again when next used (which watches them again).
     const VAddr begin = VideoCore::PageManager::GetPageAddr(address);
     const VAddr end = VideoCore::PageManager::GetNextPageAddr(address + std::max<u64>(size, 1) - 1);
+#if !defined(NDEBUG)
     if (Native::WatchedTexture(begin, end)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: CPU write fault {:#x}+{:#x} (exact {:#x}); "
                     "memory {}", address, size, exact, Native::WatchedBytes(address));
     }
+#endif
     // FIX-173: a region page holds what the GPU wrote there, which guest memory never got; a
     // CPU write to the page copies in only the bytes the CPU changed (RefreshRegion compares
     // with this copy of the page from before the write), not the whole page from guest memory.
@@ -6773,7 +9825,7 @@ void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
         Native::UploadCause::ScopedCpuFault cause{address,size,exact};
         registry->CpuWrite(begin, end - begin, exact != 0 ? (address - begin) + exact : 0);
     }
-    ++stats.cpu_writes;
+    NATIVE_DIAGNOSTIC(++stats.cpu_writes);
     // NAT-114: pages of regions written by the CPU (a fault on any thread) are copied in before
     // the region's next use; the recorder sorts them to their regions.
     {
@@ -6797,6 +9849,8 @@ void NativeRenderer::Splice() {
     if (!s.list) {
         return;
     }
+    s.upload_incarnation=s.upload_incarnation && s.upload_incarnation!=UINT64_MAX ? s.upload_incarnation+1 : 0;
+    const u64 boundary_signal=ActiveSubmitSignal()?ActiveSubmitSignal():r.scheduler.CurrentTick();
     EndRendering();
     if (!writebacks.empty()) {
         GlobalBarrier(); // NAT-112: written back in this submission
@@ -6806,6 +9860,31 @@ void NativeRenderer::Splice() {
         s.list->End();
     }
     r.scheduler.EndRendering();
+    if (auto* sidecar=FindParallelRuntime(this); sidecar) {
+        const u64 signal=boundary_signal;
+        ASSERT_MSG(sidecar->sync_pins.AssignPending(signal),"parallel synchronous pin epoch mismatch");
+        sidecar->coordinator->Collect(r.scheduler.GetWorkSemaphore()->KnownGpuTick());
+        sidecar->sync_pins.Collect(r.scheduler.GetWorkSemaphore()->KnownGpuTick(),
+            [&](auto& callback) noexcept {return Native::Rhi::TryEnqueueCompleted(*device,callback);});
+        if(sidecar->coordinator->PendingNodes()) {
+#if !defined(NDEBUG)
+        const auto parallel_wait_start=std::chrono::steady_clock::now();
+#endif
+
+        const bool drained=sidecar->coordinator->Drain(signal,
+            [&](Native::Rhi::CommandList* list,Native::Parallel::PassCoordinator::JobPtr,
+                Native::Parallel::PassCoordinator::PrefixPtr) noexcept {
+                const vk::CommandBuffer cmd{reinterpret_cast<VkCommandBuffer>(list->NativeHandle())};
+                r.scheduler.CommandBuffer().executeCommands(cmd);
+                device->MarkExecuted(list,{timeline.get(),signal});
+            });
+#if !defined(NDEBUG)
+        NATIVE_DIAGNOSTIC(sidecar->drain_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-parallel_wait_start).count());
+#endif
+
+        ASSERT_MSG(drained,"parallel node preflight or submission epoch failed");
+        }
+    }
     if (!wrapped) {
         const vk::CommandBuffer secondary = s.cmd;
         r.scheduler.CommandBuffer().executeCommands(secondary);
@@ -6830,6 +9909,13 @@ void NativeRenderer::Splice() {
     // immutable binding memo is still cleared above: only unused bytes survive.
     s.descriptor_reserve.Clear(); // never-written spares retire with their pools
     s.descriptor_sets.Clear(); // descriptor pools retire with this list
+    if(auto* sidecar=FindParallelRuntime(this);sidecar && sidecar->ahead_context && sidecar->ahead_live) {
+        const auto completed=r.scheduler.GetWorkSemaphore()->KnownGpuTick();
+        for(auto& flight:sidecar->ahead_flights)if(flight.release) {
+            if(!flight.tick) {ASSERT_MSG(flight.lease && flight.lease->lease->MarkUsed(boundary_signal),"ahead descriptor invalid signal");flight.tick=boundary_signal;}
+            if(flight.tick<=completed) {flight.lease.reset();if(!Native::Rhi::TryEnqueueCompleted(*device,flight.release))continue;flight.tick=0;--sidecar->ahead_live;}
+        }
+    }
     s.pools.clear();
     s.keep.clear(); // freed by the device once the GPU ran this list (NAT-107)
     device->Collect(); // objects the GPU finished with (staging buffers of uploads)
@@ -6837,7 +9923,86 @@ void NativeRenderer::Splice() {
     s.list = nullptr;
     s.cmd = vk::CommandBuffer{};
     s.rendering = false;
-    ++stats.splices;
+#if !defined(NDEBUG)
+    if(auto* sidecar=FindParallelRuntime(this);sidecar && sidecar->transfer_mode_controller && !sidecar->closing) {
+        const auto changed=sidecar->transfer_applied_mode.Apply(sidecar->transfer_mode_controller->Requested(),true);
+        if(changed || !sidecar->transfer_mode_initial_logged) {
+            sidecar->transfer_mode_initial_logged=true;
+            const bool available=sidecar->coordinator->TransferEnabled();
+#ifdef _WIN32
+            LARGE_INTEGER qpc{},frequency{};SYSTEMTIME utc{};QueryPerformanceCounter(&qpc);QueryPerformanceFrequency(&frequency);GetSystemTime(&utc);
+            LOG_INFO(Render_Vulkan,"PARALLEL-TRANSFER-MODE-APPLIED mode={} generation={} signal={} qpc={} frequency={} utc={:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z pool_available={}",
+                sidecar->transfer_applied_mode.Enabled() && available,changed?changed->generation:0,boundary_signal,qpc.QuadPart,frequency.QuadPart,
+                utc.wYear,utc.wMonth,utc.wDay,utc.wHour,utc.wMinute,utc.wSecond,utc.wMilliseconds,available);
+#else
+            LOG_INFO(Render_Vulkan,"PARALLEL-TRANSFER-MODE-APPLIED mode={} generation={} signal={} pool_available={}",sidecar->transfer_applied_mode.Enabled() && available,changed?changed->generation:0,boundary_signal,available);
+#endif
+        }
+    }
+    if(auto* sidecar=FindParallelRuntime(this);sidecar && sidecar->view_mode_controller && !sidecar->closing) {
+        const auto changed=sidecar->view_applied_mode.Apply(sidecar->view_mode_controller->Requested(),true);
+        if(changed || !sidecar->view_mode_initial_logged) {
+            sidecar->view_mode_initial_logged=true;
+#ifdef _WIN32
+            LARGE_INTEGER qpc{},frequency{};SYSTEMTIME utc{};
+            QueryPerformanceCounter(&qpc);QueryPerformanceFrequency(&frequency);GetSystemTime(&utc);
+            LOG_INFO(Render_Vulkan,"PARALLEL-VIEW-MODE-APPLIED mode={} generation={} signal={} qpc={} frequency={} utc={:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+                sidecar->view_applied_mode.Enabled(),changed?changed->generation:0,boundary_signal,qpc.QuadPart,frequency.QuadPart,
+                utc.wYear,utc.wMonth,utc.wDay,utc.wHour,utc.wMinute,utc.wSecond,utc.wMilliseconds);
+#else
+            LOG_INFO(Render_Vulkan,"PARALLEL-VIEW-MODE-APPLIED mode={} generation={} signal={}",sidecar->view_applied_mode.Enabled(),changed?changed->generation:0,boundary_signal);
+#endif
+        }
+    }
+    // A mode change takes effect only after this stream and all ordered nodes
+    // have been appended and owner pins have their submission signal.
+    if(auto* sidecar=FindParallelRuntime(this);sidecar && sidecar->mode_controller && !sidecar->closing) {
+        const u64 signal=boundary_signal;
+        const auto request=sidecar->mode_controller->Requested();
+        if(sidecar->ahead_context && !request.enabled) {
+            std::scoped_lock ahead_lock{ahead_context_mutex};
+            SetAheadMode(*sidecar->ahead_context,false);
+        }
+        if(sidecar->prepared_proof_context && !request.enabled)sidecar->prepared_proof_context->SetMode(false);
+        const auto changed=sidecar->applied_mode.Apply(request,true);
+        if(sidecar->ahead_context && sidecar->applied_mode.Enabled()) {
+            std::scoped_lock ahead_lock{ahead_context_mutex};
+            if(!sidecar->ahead_context->closing.load(std::memory_order_acquire))
+                SetAheadMode(*sidecar->ahead_context,true);
+        }
+        if(sidecar->prepared_proof_context && sidecar->applied_mode.Enabled())sidecar->prepared_proof_context->SetMode(true);
+        if((changed || !sidecar->mode_initial_logged) && sidecar->prepared_proof_context) {
+            const auto state=sidecar->prepared_proof_context->state.load(std::memory_order_seq_cst);
+            const auto active=sidecar->prepared_proof_context->active.load(std::memory_order_seq_cst);
+#ifdef _WIN32
+            LARGE_INTEGER qpc{},frequency{};SYSTEMTIME utc{};QueryPerformanceCounter(&qpc);QueryPerformanceFrequency(&frequency);GetSystemTime(&utc);
+            LOG_INFO(Render_Vulkan,"PARALLEL-PREPARED-VIEW-STATE mode={} generation={} active={} control_generation={} signal={} qpc={} frequency={} utc={:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+                bool(state&1),state>>1,active,changed?changed->generation:0,signal,qpc.QuadPart,frequency.QuadPart,
+                utc.wYear,utc.wMonth,utc.wDay,utc.wHour,utc.wMinute,utc.wSecond,utc.wMilliseconds);
+#else
+            LOG_INFO(Render_Vulkan,"PARALLEL-PREPARED-VIEW-STATE mode={} generation={} active={} control_generation={} signal={}",bool(state&1),state>>1,active,changed?changed->generation:0,signal);
+#endif
+        }
+        if((changed || !sidecar->mode_initial_logged) && sidecar->ahead_context) {
+            const auto& a=*sidecar->ahead_context;
+            LOG_INFO(Render_Vulkan,"PARALLEL-PRODUCER-MODE mode={} preparing={} pool_quiescent={}",
+                a.mode.load(std::memory_order_acquire),a.active.load(std::memory_order_acquire),a.pools.Quiescent());
+        }
+        if(changed || !sidecar->mode_initial_logged) {
+            sidecar->mode_initial_logged=true;
+#ifdef _WIN32
+            LARGE_INTEGER qpc{},frequency{};SYSTEMTIME utc{};
+            QueryPerformanceCounter(&qpc);QueryPerformanceFrequency(&frequency);GetSystemTime(&utc);
+            LOG_INFO(Render_Vulkan,"PARALLEL-MODE-APPLIED mode={} generation={} signal={} qpc={} frequency={} utc={:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+                sidecar->applied_mode.Enabled(),changed?changed->generation:0,signal,qpc.QuadPart,frequency.QuadPart,
+                utc.wYear,utc.wMonth,utc.wDay,utc.wHour,utc.wMinute,utc.wSecond,utc.wMilliseconds);
+#else
+            LOG_INFO(Render_Vulkan,"PARALLEL-MODE-APPLIED mode={} generation={} signal={}",sidecar->applied_mode.Enabled(),changed?changed->generation:0,signal);
+#endif
+        }
+    }
+#endif
+    NATIVE_DIAGNOSTIC(++stats.splices);
 }
 
 void NativeRenderer::CopyDisplayCrop(const Native::ImageEntry& source, Native::ImageEntry& crop,
@@ -6899,6 +10064,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
                                                                    vk::Format view_format,
                                                                    vk::Extent2D output_size) {
     std::scoped_lock lock{mutex};
+    (void)A82CaptureAfterRace(); // Observe race even when target shader does not run.
     if (InPlaceSampled()) {
         for (u32 i = 0; i < in_place.pages.size(); ++i) {
             in_place.total[i] += in_place.pages[i].TakePageCount();
@@ -6981,6 +10147,7 @@ u64 NativeRenderer::MirrorVerifyBudget() {
 }
 
 void NativeRenderer::VerifyMirrors() {
+#if !defined(NDEBUG)
     // FIX-176 (diagnosis, RYGT_NATIVE_MIRROR_VERIFY=<MB a frame>): guest memory under the mirrors,
     // a few MB a frame, hashed per 64 KB granule and compared with the hash taken the last time;
     // a change no CPU write fault or copy-in accounts for means the mirror went stale unseen (the
@@ -7042,7 +10209,7 @@ void NativeRenderer::VerifyMirrors() {
                     continue;
                 }
                 ++changed;
-                ++stats.mirror_untrapped;
+                NATIVE_DIAGNOSTIC(++stats.mirror_untrapped);
                 static std::atomic<u32> logged{};
                 if (Sample(logged)) {
                     LOG_WARNING(Render_Vulkan,
@@ -7069,9 +10236,11 @@ void NativeRenderer::VerifyMirrors() {
     if (changed != 0) {
         ++buffer_generation; // OPT-003: memos see the dirty pages
     }
+#endif
 }
 
 void NativeRenderer::ProbeDisplay(const Native::ImageEntry& entry) {
+#if !defined(NDEBUG)
     // FIX-175 (diagnosis, RYGT_NATIVE_WATCH_DISPLAY=x,y,w,h): a rectangle of each picture the
     // presenter shows, read back from the GPU: the mean brightness of its top, middle and bottom
     // thirds, one line per presented frame (single-frame glitches stand out against their
@@ -7163,15 +10332,18 @@ void NativeRenderer::ProbeDisplay(const Native::ImageEntry& entry) {
     display_probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1,
                               u64(rect[2]) * rect[3] * 4, frame, 0, rect[2], rect[3], true,
                               entry.info.guest_address});
+#endif
 }
 
 void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
+#if !defined(NDEBUG)
     std::scoped_lock lock{mutex};
     struct Readback {
         const Native::ImageEntry* entry;
         std::unique_ptr<Native::Rhi::Buffer> buffer;
         u64 size;
         u32 index;
+        u32 mip;
     };
     std::vector<Readback> readbacks;
     Stream& s = Begin();
@@ -7243,47 +10415,47 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
             std::fclose(file);
         }
     }
-    u32 index = 0;
-    for (const auto& [entry, name] : jobs) {
-        const u32 order = index++;
-        if (!entry->image) {
-            continue;
+    u64 extra_bytes=0, total_readback_bytes=0;
+    constexpr u64 TraceReadbackBudget=128ull<<20;
+    std::string mip_manifest="file,address,mip,width,height,depth,layers,unit_bytes,compressed,bytes,status,version,format,depth_aspect\n";
+    u32 index=0;
+    for(const auto& [entry,name]:jobs){
+        const u32 order=index++;
+        if(!entry->image)continue;
+        const auto& desc=entry->image->Desc();
+        const bool block=entry->info.props.is_block;
+        const u32 unit=entry->info.props.is_depth?(u32(desc.format)==u32(vk::Format::eD16Unorm)?2u:4u):std::max(entry->info.num_bits/8,1u);
+        const u32 layers=desc.dim==Native::Rhi::ImageDim::D3?1u:std::max(desc.layers,1u);
+        for(u32 mip=0;mip<std::min(desc.mips,32u);++mip){
+            const auto l=SceneTrace::Layout(desc.width,desc.height,desc.dim==Native::Rhi::ImageDim::D3?desc.depth:1u,layers,mip,unit,block);
+            const std::string file=mip==0?name:std::filesystem::path(name).stem().string()+fmt::format("_mip{}.bin",mip);
+            const char* status="queued";
+            if(desc.samples!=1)status="skipped_msaa";
+            else if(!(desc.usage & Native::Rhi::ImageUsageTransferSrc))status="skipped_no_transfer_src";
+            else if(!l.bytes)status="skipped_layout";
+            else if(mip==0 && entry->from_cpu)status="metadata_only_cpu_base";
+            else if(mip>0 && l.bytes>(64ull<<20)-extra_bytes)status="skipped_extra_mip_budget";
+            else if(l.bytes>TraceReadbackBudget-total_readback_bytes)status="skipped_total_readback_budget";
+            if(std::string_view(status)!="queued"){
+                mip_manifest+=fmt::format("{},{:#x},{},{},{},{},{},{},{},{},{},{},{},{}\n",file,entry->info.guest_address,mip,l.width,l.height,l.depth,l.layers,unit,block,l.bytes,status,entry->write_version.load(),u32(desc.format),bool(entry->info.props.is_depth));continue;
+            }
+            auto buffer=device->CreateBuffer({.size=l.bytes,.usage=Native::Rhi::BufferUsageTransferDst,.memory=Native::Rhi::MemoryKind::Readback,.name="scene trace mip"});
+            if(!buffer || !buffer->Mapped())status="allocation_failed";
+            else {
+                if(mip>0)extra_bytes+=l.bytes;
+                total_readback_bytes+=l.bytes;
+                s.cmd.copyImageToBuffer(vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())},vk::ImageLayout::eGeneral,
+                    vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},vk::BufferImageCopy{.bufferOffset=0,.bufferRowLength=l.row,.bufferImageHeight=l.rows,
+                    .imageSubresource{.aspectMask=entry->info.props.is_depth?vk::ImageAspectFlagBits::eDepth:vk::ImageAspectFlagBits::eColor,.mipLevel=mip,.baseArrayLayer=0,.layerCount=l.layers},
+                    .imageOffset={0,0,0},.imageExtent={l.width,l.height,l.depth}});
+                readbacks.push_back({entry,std::move(buffer),l.bytes,order,mip});
+            }
+            mip_manifest+=fmt::format("{},{:#x},{},{},{},{},{},{},{},{},{},{},{},{}\n",file,entry->info.guest_address,mip,l.width,l.height,l.depth,l.layers,unit,block,l.bytes,status,entry->write_version.load(),u32(desc.format),bool(entry->info.props.is_depth));
         }
-        const auto& desc = entry->image->Desc();
-        const u32 texel = entry->info.props.is_depth ? 4u : std::max(entry->info.num_bits / 8, 1u);
-        // NAT-125: every layer of the first mip (cube faces, layered targets), one after another.
-        const u32 layers = desc.dim == Native::Rhi::ImageDim::D3 ? 1u : std::max(desc.layers, 1u);
-        // FIX-152 (diagnosis): block-compressed images give their blocks (4x4 texels each).
-        const bool block = entry->info.props.is_block;
-        const u32 row = block ? Common::AlignUp(desc.width, 4u) : desc.width;
-        const u32 rows = block ? Common::AlignUp(desc.height, 4u) : desc.height;
-        const u64 size = block ? u64(row / 4) * (rows / 4) * texel * layers
-                               : u64(desc.width) * desc.height * texel * layers;
-        auto buffer = device->CreateBuffer({.size = size,
-                                            .usage = Native::Rhi::BufferUsageTransferDst,
-                                            .memory = Native::Rhi::MemoryKind::Readback,
-                                            .name = "native dump"});
-        if (!buffer || !buffer->Mapped() || desc.samples != 1) {
-            continue;
-        }
-        const vk::BufferImageCopy copy{
-            .bufferOffset = 0,
-            .bufferRowLength = row,
-            .bufferImageHeight = rows,
-            .imageSubresource{.aspectMask = entry->info.props.is_depth
-                                               ? vk::ImageAspectFlagBits::eDepth
-                                               : vk::ImageAspectFlagBits::eColor,
-                              .mipLevel = 0,
-                              .baseArrayLayer = 0,
-                              .layerCount = layers},
-            .imageOffset = {0, 0, 0},
-            .imageExtent = {desc.width, desc.height, 1},
-        };
-        s.cmd.copyImageToBuffer(vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())},
-                                vk::ImageLayout::eGeneral,
-                                vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())}, copy);
-        readbacks.push_back({entry, std::move(buffer), size, order});
     }
+    if(auto* f=std::fopen((dir/"mip-manifest.csv").string().c_str(),"w")){std::fwrite(mip_manifest.data(),1,mip_manifest.size(),f);std::fclose(f);}
+    const vk::MemoryBarrier2 trace_to_host{.srcStageMask=vk::PipelineStageFlagBits2::eAllTransfer,.srcAccessMask=vk::AccessFlagBits2::eTransferWrite,.dstStageMask=vk::PipelineStageFlagBits2::eHost,.dstAccessMask=vk::AccessFlagBits2::eHostRead};
+    s.cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount=1,.pMemoryBarriers=&trace_to_host});
     Splice();
     r.scheduler.Finish();
     if (!g_pixel_trace.hashes.empty()) {
@@ -7302,7 +10474,9 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
     for (const auto& readback : readbacks) {
         const auto& info = readback.entry->info;
         const auto& desc = readback.entry->image->Desc();
-        const auto path = dir / jobs[readback.index].second;
+        const auto& name=jobs[readback.index].second;
+        const auto path=dir/(readback.mip==0?name:std::filesystem::path(name).stem().string()+fmt::format("_mip{}.bin",readback.mip));
+        readback.buffer->Invalidate();
         if (std::FILE* file = std::fopen(path.string().c_str(), "wb")) {
             std::fwrite(readback.buffer->Mapped(), 1, readback.size, file);
             std::fclose(file);
@@ -7310,11 +10484,22 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
     }
     LOG_WARNING(Render_Vulkan, "NAT-116: {} render targets and textures of the frame dumped to {}",
                 readbacks.size(), dir.string());
+    if(scene_indirect_buffer){
+        scene_indirect_buffer->Invalidate();
+        if(auto* f=std::fopen((dir/"indirect-arguments.csv").string().c_str(),"w")){
+            std::fputs("id,guest_address,guest_offset,x,y,z\n",f);
+            for(size_t i=0;i<scene_indirect_args.size();++i){const auto& arg=scene_indirect_args[i];std::array<u32,3> xyz{};std::memcpy(xyz.data(),scene_indirect_buffer->Mapped()+i*16,12);std::fprintf(f,"%llu,0x%llx,%llu,%u,%u,%u\n",arg.id,arg.address,arg.offset,xyz[0],xyz[1],xyz[2]);}std::fclose(f);
+        }
+    }
+    scene_indirect_buffer.reset();scene_indirect_args.clear();
+    SceneTrace::Save(dir,r.instance.GetDevice());
     dump_entries.clear();
     dump_textures.clear();
+#endif
 }
 
 void NativeRenderer::Report() {
+#if !defined(NDEBUG)
     const auto now = std::chrono::steady_clock::now();
     if (now - last_report < std::chrono::seconds{10}) {
         return;
@@ -7443,6 +10628,20 @@ void NativeRenderer::Report() {
                  }
                  return text;
              }());
+    if(stats.mirror_cross_address_reuses)
+        LOG_INFO(Render_Vulkan,"NATIVE-MIRROR-REUSE copied_cross_address={} (complete destination copy recorded)",stats.mirror_cross_address_reuses);
+    if(MirrorDiagnosticEnabled()) {
+        const auto& d=mirror_diagnostic;
+        LOG_INFO(Render_Vulkan,"NATIVE-MIRROR-DIAG candidate_new_same_dynamic_queued_promotion_region_dynamic_budget_source_not_called_acquire_queued_busy_or_stopping_occupied_ready_reused_discard_size_generation_cpu_drop_unmap_drop_success_capacity_nodirect_invalid={} examples={} (unknown=0xffffffffffffffff; promotion original ranges are not retained; unmap examples use pre-unmap generation; examples capped at 16, one per reason)",fmt::join(d.counts,"/"),d.example_count);
+        LOG_INFO(Render_Vulkan,"NATIVE-MIRROR-SOURCE-PROBE missing_busy_invalid={} warm_attempts={} warm_queued={} (probe outcomes; original source_not_called includes later copy recheck failures)", fmt::join(d.source_outcomes,"/"), d.warm_attempts, d.warm_queued);
+        for(u32 i=0;i<d.example_count;++i) {const auto& e=d.examples[i];
+            int outside_current_request=-1;
+            if(e.reason==MirrorCandidateDynamic && e.granule!=~u64{0} && e.requested_end>=e.requested_begin)
+                outside_current_request=(e.granule>=e.requested_end || (e.granule<=e.requested_begin && e.requested_begin-e.granule>=65536));
+            LOG_INFO(Render_Vulkan,"NATIVE-MIRROR-EXAMPLE reason={} requested_begin={:#x} requested_end={:#x} expanded_begin={:#x} expanded_end={:#x} generation={} blocked_granule={:#x} blocked_age_frames={} outside_current_request={} (-1 unknown)",e.reason,e.requested_begin,e.requested_end,e.expanded_begin,e.expanded_end,e.generation,e.granule,e.age,outside_current_request);
+        }
+        mirror_diagnostic={};
+    }
     if (in_place.frames != 0) {
         const auto mb = [&](u32 i) { return in_place.total[i] * 64.0 / 1024.0 / in_place.frames; };
         LOG_INFO(Render_Vulkan,
@@ -7473,11 +10672,191 @@ void NativeRenderer::Report() {
                  stream.chunks.size(), free_chunks.size(), retiring_chunks.size(),
                  registry->Count(), registry_stats.evicted.load(), retired_views.size(), upload_free_bytes);
     }
-    LOG_INFO(Render_Vulkan, "NAT: flat uploads reused={} uploaded={} bytes_saved={}",
-             stats.flat_upload_hits, stats.flat_upload_misses, stats.flat_upload_bytes_saved);
+    LOG_INFO(Render_Vulkan, "NAT: flat uploads reused={} uploaded={} bytes_saved={} bytes_hashed={} reference_bytes_copied={} upload_bytes={} reuse_enabled={} retained_reference_bytes={}",
+             stats.flat_upload_hits, stats.flat_upload_misses, stats.flat_upload_bytes_saved,
+             stats.flat_upload_bytes_hashed, stats.flat_upload_reference_bytes, stats.flat_upload_bytes_uploaded,
+             FlatUploadReuseEnabled(), UploadMemoFor(this).RetainedBytes());
     stats.flat_upload_hits = stats.flat_upload_misses = stats.flat_upload_bytes_saved = 0;
+    stats.flat_upload_bytes_hashed = stats.flat_upload_reference_bytes = stats.flat_upload_bytes_uploaded = 0;
+    if (ParallelEligibilityEnabled() && parallel_eligibility_owner==this) {
+        auto& probe=parallel_eligibility_stats; probe.Flush();
+        LOG_INFO(Render_Vulkan, "PARALLEL-ELIGIBILITY-DIAG observed={} upper_bound={} run_counts_1_2_4_8_16_32_64plus={}/{}/{}/{}/{}/{}/{} draws_per_bucket={}/{}/{}/{}/{}/{}/{}; not proof of safe worker recording",
+            probe.observed,probe.eligible,probe.runs[0],probe.runs[1],probe.runs[2],probe.runs[3],probe.runs[4],probe.runs[5],probe.runs[6],
+            probe.eligible_draws_in_runs[0],probe.eligible_draws_in_runs[1],probe.eligible_draws_in_runs[2],probe.eligible_draws_in_runs[3],probe.eligible_draws_in_runs[4],probe.eligible_draws_in_runs[5],probe.eligible_draws_in_runs[6]);
+        LOG_INFO(Render_Vulkan,"PARALLEL-ELIGIBILITY-DIAG independent_filters race={} nonindexed={} single_color={} no_clear={} no_depth={} no_descriptors={} no_storage={} no_feedback={}",
+            probe.race,probe.nonindexed,probe.single_color,probe.no_clear,probe.no_depth,probe.no_descriptors,probe.no_storage,probe.no_feedback);
+        probe={};
+    }
+    if(auto* sidecar=FindParallelRuntime(this)) {
+        for(u32 mode=0;mode<sidecar->record_partition.size();++mode) {
+            const auto& p=sidecar->record_partition[mode];
+            LOG_INFO(Render_Vulkan,"PARALLEL-RECORD-PARTITION mode_at_entry={} nominal_sample_rate=1/16 admission_samples={} admission_ns={} tail_samples={} tail_ns={} chunk_samples={} chunk_ns={} report_samples={} report_ns={} end_calls={} end_ns={} (end is inclusive and overlaps other scopes; chunk may include Splice/Drain; report sample completes after this log)",mode,p[0].count,p[0].wall_ns,p[1].count,p[1].wall_ns,p[2].count,p[2].wall_ns,p[3].count,p[3].wall_ns,p[4].count,p[4].wall_ns);
+        }
+        sidecar->record_partition={};
+        LOG_INFO(Render_Vulkan,"PARALLEL-PRODUCER-CPU cumulative structure={} vertex={} snapshot={} actions={} upload_lookups={} stage_schemas={} stage_lookups={} clip_fast={} direct_table_cache_hits={}",sidecar->producer_structure_hits,sidecar->producer_vertex_hits,sidecar->producer_snapshot_hits,sidecar->producer_action_hits,sidecar->producer_upload_lookup_hits,sidecar->producer_stage_schema_hits,sidecar->producer_stage_lookup_hits,sidecar->clip_fast_hits,sidecar->direct_table_cache_hits);
+        const auto& batch=sidecar->descriptor_updates;
+        LOG_INFO(Render_Vulkan,"PARALLEL-DESCRIPTOR-BATCH cumulative logical_draws={} actual_calls={} staged_rows={} immediate_draws={} overflow_draws={} unsupported_draws={} high_rows={} pending_rows={} flush_end={} flush_serial={} flush_abandoned={} flush_capacity={} flush_unsupported={} flush_exception={}",
+            batch.logical_draws,batch.actual_calls,batch.staged_rows,batch.immediate_draws,batch.overflow_draws,batch.unsupported_draws,batch.high_rows,batch.nw,batch.flushes[PendingDescriptorUpdates::EndPass],batch.flushes[PendingDescriptorUpdates::Serial],batch.flushes[PendingDescriptorUpdates::Abandoned],batch.flushes[PendingDescriptorUpdates::Capacity],batch.flushes[PendingDescriptorUpdates::Unsupported],batch.flushes[PendingDescriptorUpdates::Exception]);
+        sidecar->FinishSerialEligibleRun();
+        LOG_INFO(Render_Vulkan,"PARALLEL-SERIAL-ELIGIBLE runs_1={} runs_2_3={} runs_4_7={} runs_8plus={} max={} (serial bypass excludes unexamined draws; report boundaries split runs)",
+            sidecar->serial_eligible_runs[0],sidecar->serial_eligible_runs[1],sidecar->serial_eligible_runs[2],sidecar->serial_eligible_runs[3],sidecar->serial_eligible_run_max);
+        sidecar->serial_eligible_runs={};sidecar->serial_eligible_run_max=0;
+        if(sidecar->whole_samples) {
+            LOG_INFO(Render_Vulkan,"PARALLEL-WHOLE-PREFLIGHT sampled={} wall_ns={} max_ns={} cpu_samples={} cpu_100ns={} (1/128, enabled mode only)",
+                sidecar->whole_samples,sidecar->whole_wall_ns,sidecar->whole_max_ns,sidecar->whole_cpu_samples,sidecar->whole_cpu_100ns);
+            sidecar->whole_samples=sidecar->whole_wall_ns=sidecar->whole_max_ns=sidecar->whole_cpu_samples=sidecar->whole_cpu_100ns=0;
+        }
+        if(PreparedSampledProofRequested()) {
+            LOG_INFO(Render_Vulkan,"PARALLEL-PREPARED-VIEW attempts={} accepted={} fallback={}",sidecar->prepared_view_attempts,sidecar->prepared_view_accepted,sidecar->prepared_view_fallbacks);
+            sidecar->prepared_view_attempts=sidecar->prepared_view_accepted=sidecar->prepared_view_fallbacks=0;
+            if(sidecar->prepared_proof_context){const auto state=sidecar->prepared_proof_context->state.load(std::memory_order_seq_cst);
+                LOG_INFO(Render_Vulkan,"PARALLEL-PREPARED-VIEW-STATE mode={} generation={} active={}",bool(state&1),state>>1,sidecar->prepared_proof_context->active.load(std::memory_order_seq_cst));}
+        }
+        if(ParallelGateDiagEnabled()) {
+#if !defined(NDEBUG)
+            const auto streaming=sidecar->coordinator->TakeStreamStats();
+            LOG_INFO(Render_Vulkan,"PARALLEL-DRAW-STREAM started={} published={} worker_started={} passes_with_early_work={} early_draws={} start_rejected={} (early work completed before stream seal)",
+                streaming.started,streaming.published,streaming.worker_started,streaming.passes_with_early_work,streaming.early_draws,streaming.start_rejected);
+#endif
+            const auto top=sidecar->gates.Top();u64 shown=0;
+            for(const auto& slot:top) if(slot.count) {shown+=slot.count;LOG_INFO(Render_Vulkan,"PARALLEL-GATE-DIAG mask={:#x} count={}",slot.mask,slot.count);}
+            const auto& gates=sidecar->gates;
+            LOG_INFO(Render_Vulkan,"PARALLEL-GATE-DIAG observed={} shown={} other={} overflow={} unstable={}",
+                gates.observed,shown,gates.observed-shown-gates.overflow-gates.unstable,gates.overflow,gates.unstable);
+            LOG_INFO(Render_Vulkan,"PARALLEL-GATE-LEGEND 0=race 1=shaderpatch 2=trace 3=native-view 4=alias 5=color-count 6=clear 7=depth 8=index-quad 9=composition 10=vertex-buffers 11=vertex-attributes 12=index-buffer 13=prepared-owner 14=stage-tess 15=attribute-known 16=resource-key-known 17=translation 18=fetch 19=direct-dma 20=fmask-storage-image 21=shader-clock 22=buffer-write 23=draw-write 24=descriptor-check 25=deep-unexamined 26=serial-scope-unexamined");
+            LOG_INFO(Render_Vulkan,"PARALLEL-CAPTURED-VERTEX counts_0_1_2to3_4to7_8to15_16to31_32={}/{}/{}/{}/{}/{}/{} sum={} (captured draws only)",
+                sidecar->captured_vertex_counts[0],sidecar->captured_vertex_counts[1],sidecar->captured_vertex_counts[2],sidecar->captured_vertex_counts[3],sidecar->captured_vertex_counts[4],sidecar->captured_vertex_counts[5],sidecar->captured_vertex_counts[6],sidecar->captured_vertex_sum);
+            sidecar->captured_vertex_counts={};sidecar->captured_vertex_sum=0;
+            const auto& vp=sidecar->view_proof_stats;
+            LOG_INFO(Render_Vulkan,"PARALLEL-VIEW-PROOF queries={} first_hits={} index_hits={} walks={} fallbacks={} overflows={} wanted_builds={} wanted_overflows={} filtered_views={} (enabled proof only)",vp.queries,vp.first_hits,vp.index_hits,vp.walks,vp.fallbacks,vp.overflows,vp.wanted_builds,vp.wanted_overflows,vp.filtered_views);
+            sidecar->view_proof_stats={};
+            sidecar->gates={};
+        }
+        if(sidecar->ahead_context) {const auto& a=*sidecar->ahead_context;const auto batch=a.pools.GetStats();
+            LOG_INFO(Render_Vulkan,"PARALLEL-PRODUCER-DESC mode={} preparing={} attempts={} ready={} used={} unused={} failures={} capacity={} allocation_calls={} allocated_sets={} spare_hits={} discarded_groups={} purged_spares={} used_sets={} unused_sets={} (cumulative; failures include busy/driver, capacity includes unsupported/cap)",
+                a.mode.load(std::memory_order_acquire),a.active.load(std::memory_order_acquire),a.attempts.load(),a.ready.load(),a.used.load(),a.unused.load(),a.failures.load(),a.capacity.load(),batch.calls,batch.sets_allocated,batch.spare_hits,batch.discarded,batch.purged,a.used_sets.load(),a.unused_sets.load());}
+        u64 sampler_entries=0;
+        if(ParallelGateDiagEnabled()){std::scoped_lock sampler_lock{sampler_mutex};sampler_entries=samplers.size();}
+        if(sidecar->view_sample.draws) {auto& v=sidecar->view_sample;const auto& q=v.proof;
+            LOG_INFO(Render_Vulkan,"PARALLEL-VIEW-SAMPLE draws={} queried_draws={} image_infos={} sampled_entries={} queries={} first_hits={} index_hits={} walks={} fallbacks={} late_fallbacks={} overflows={} wanted_builds={} wanted_overflows={} filtered_views={} entries_0_1_2_4_8_16_32_64_128_129plus={}/{}/{}/{}/{}/{}/{}/{}/{}/{} (1/128 descriptor-safe draws; entry cardinality weighted by existing map lookups)",
+                v.draws,v.queried_draws,v.image_infos,v.sampled_entries,q.queries,q.first_hits,q.index_hits,q.walks,q.fallbacks,q.fallbacks>=v.queried_draws?q.fallbacks-v.queried_draws:0,q.overflows,q.wanted_builds,q.wanted_overflows,q.filtered_views,
+                v.cardinality[0],v.cardinality[1],v.cardinality[2],v.cardinality[3],v.cardinality[4],v.cardinality[5],v.cardinality[6],v.cardinality[7],v.cardinality[8],v.cardinality[9]);
+            const auto sequence=v.sequence;v={};v.sequence=sequence;
+        }
+        static constexpr std::array whole_phase_names{"fast-screen","vertex","stage","attachments-alias-index","descriptor-schema-prefix","descriptor-row-final","push-snapshot","transition"};
+        for(u32 i=0;i<sidecar->whole_phases.size();++i) {const auto& t=sidecar->whole_phases[i];
+            if(t.count)LOG_INFO(Render_Vulkan,"PARALLEL-WHOLE-PHASE phase={} samples={} wall_ns={} wall_max_ns={} (1/128 considered; sequential slices nested in whole preflight, timer overhead included)",whole_phase_names[i],t.count,t.wall_ns,t.wall_max);
+        }
+        sidecar->whole_phases={};
+        if(ParallelProofPhaseEnabled()) {
+            LOG_INFO(Render_Vulkan,"PARALLEL-PROOF-PHASE-LEGEND 0=buffer-write-group 1=sampler-descriptor 2=sampled-view-descriptor 3=push-snapshot 4=upload-lookup 5=chunk-scan 6=direct-slot 7=readonly-slot 8=clip-slot; each subphase count is per invocation (including early clip probes), wall overlaps outer phases and includes timer overhead");
+            for(u32 i=0;i<sidecar->proof_phases.size();++i) {const auto& t=sidecar->proof_phases[i];
+                LOG_INFO(Render_Vulkan,"PARALLEL-PROOF-PHASE phase={} samples={} wall_ns={} wall_max_ns={}",i,t.count,t.wall_ns,t.wall_max);
+            }
+            sidecar->proof_phases={};
+        }
+        if(ParallelGateDiagEnabled()) {
+            const auto timing=sidecar->coordinator->TakeCoordinatorTimingProbes();
+            static constexpr std::array timing_names{"rotation","admission","queue-submit","drain","drain-wait","collect"};
+static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::PassCoordinator::TimingPhase::Count), "timing_names size mismatch");
+            for(std::size_t i=0;i<timing.phases.size();++i) {
+                const auto& t=timing.phases[i];
+                LOG_INFO(Render_Vulkan,"PARALLEL-COORD-TIMING phase={} count={} failed={} wall_ns={} window_s={:.3f} current_worker_mode={} (owner-thread; admission includes queue-submit; nested phases must not be added)",
+                    timing_names[i],t.count,t.failed,t.ns,seconds,sidecar->applied_mode.Enabled());
+            }
+            const auto cost=Native::Parallel::TakeRecordingCostProbes();
+            const u64 named=cost.validate_ns+cost.pipeline_bind_ns+cost.vertex_bind_ns+cost.descriptor_bind_ns+cost.draw_call_ns;
+            const u64 residual=cost.total_pass_ns>named?cost.total_pass_ns-named:0;
+            LOG_INFO(Render_Vulkan,"PARALLEL-RECORD-COST passes={} failed={} draws={} total_pass_ns_sum={} validate_ns={} pipeline_bind_ns={} vertex_bind_ns={} descriptor_bind_ns={} draw_call_ns={} residual_ns={} pipeline_changes={} vertex_changes={} set_bind_calls={} window_s={:.3f} (process-wide completed-pass wall sums; overlaps across threads; excludes merge lock; not critical-path or GPU time; clocks included)",
+                cost.pass_count,cost.failure_count,cost.draw_count,cost.total_pass_ns,cost.validate_ns,cost.pipeline_bind_ns,cost.vertex_bind_ns,cost.descriptor_bind_ns,cost.draw_call_ns,residual,cost.pipeline_change_count,cost.vertex_change_count,cost.descriptor_flush_count,seconds);
+        }
+        const auto admission=sidecar->coordinator->TakeAdmissionDiag();
+        const auto report_rejections=[&](const char* kind,const auto& v) {
+            LOG_INFO(Render_Vulkan,"PARALLEL-ADMISSION-REJECT kind={} failed={} zero_epoch={} epoch_mismatch={} node_cap={} validation={} invalid={} overflow={} charge={} budget_count={} budget_bytes={}",kind,v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8],v[9]);
+        };
+        report_rejections("small",admission.small_rejected);report_rejections("large",admission.large_rejected);report_rejections("prefix",admission.prefix_rejected);
+        LOG_INFO(Render_Vulkan,"PARALLEL-ADMISSION small_attempts={} small_accepted={} small_submit_failed={} small_exceptions={} large_attempts={} large_accepted={} large_submit_failed={} large_exceptions={} prefix_attempts={} prefix_accepted={} prefix_exceptions={} partial_drain={} partial_large={}",admission.small_attempts,admission.small_accepted,admission.small_submit_failed,sidecar->small_admission_exceptions,admission.large_attempts,admission.large_accepted,admission.large_submit_failed,sidecar->large_admission_exceptions,admission.prefix_attempts,admission.prefix_accepted,admission.prefix_exceptions,admission.partial_drain,admission.partial_large);
+        const auto& budget=admission.budget;
+        LOG_INFO(Render_Vulkan,"PARALLEL-BUDGET current_count={} current_bytes={} max_count={} max_bytes={} interval_peak_count={} interval_peak_bytes={}",budget.count,budget.bytes,budget.max_count,budget.max_bytes,budget.peak_count,budget.peak_bytes);
+        const auto& rotation=sidecar->rotation_diag;const auto& sizes=sidecar->pass_size_hist;
+        LOG_INFO(Render_Vulkan,"PARALLEL-ROTATION attempts={} success={} invalid={} preflight={} acquire={} command={} prefix={} exception={} pass_sizes_0_1_2_3_4_5_6_7_8plus={},{},{},{},{},{},{},{},{}",rotation.attempts,rotation.success,rotation.invalid,rotation.preflight,rotation.acquire,rotation.command,rotation.prefix,rotation.exception,sizes[0],sizes[1],sizes[2],sizes[3],sizes[4],sizes[5],sizes[6],sizes[7],sizes[8]);
+        sidecar->rotation_diag={};sidecar->pass_size_hist={};sidecar->small_admission_exceptions=sidecar->large_admission_exceptions=0;
+        const auto workers=sidecar->coordinator->TakeStats();
+        if(sidecar->coordinator->TransferEnabled()) {const auto transfer=sidecar->coordinator->TakeTransferStats();
+            LOG_INFO(Render_Vulkan,"PARALLEL-TRANSFER-PASSES attempts={} success={} fallback={}",transfer.success+transfer.fallback,transfer.success,transfer.fallback);}
+        const auto groups=sidecar->coordinator->TakeGroupStats();
+        LOG_INFO(Render_Vulkan,"PARALLEL-SERIAL-SPLIT attempts={} success={} first_draws={}",sidecar->serial_split_attempts,sidecar->serial_split_success,sidecar->serial_split_first_draws);
+        sidecar->serial_split_attempts=sidecar->serial_split_success=sidecar->serial_split_first_draws=0;
+        if(ParallelGateDiagEnabled()) for(unsigned reason=0;reason<3;++reason) {
+            const auto& p=groups.passes[reason];const auto& d=groups.draws[reason];
+            LOG_INFO(Render_Vulkan,"PARALLEL-BATCH-GROUP reason={} passes1to8={},{},{},{},{},{},{},{} draws1to8plus={},{},{},{},{},{},{},{} lead_samples={} lead_ns={} lead_max_ns={}",reason,p[1],p[2],p[3],p[4],p[5],p[6],p[7],p[8],d[1],d[2],d[3],d[4],d[5],d[6],d[7],d[8],groups.lead_samples,groups.lead_ns,groups.lead_max_ns);
+        }
+        {
+            const auto& f=sidecar->descriptor_fail_reasons;
+            LOG_INFO(Render_Vulkan,"PARALLEL-DESCRIPTOR-FAIL preloop={} pnext={} buffer_slice={} buffer_unproved={} image_slice={} sampler_invalid={} sampler_unknown={} image_invalid={} image_unknown={} snapshot={} batch_invalidated={} samples={}",
+                f[0],f[1],f[2],f[3],f[4],f[5],f[6],f[7],f[8],f[9],f[10],sidecar->descriptor_samples);
+            sidecar->descriptor_fail_reasons={};sidecar->descriptor_samples=0;
+        }
+        LOG_INFO(Render_Vulkan,"PARALLEL-BUFFER-PREFIX attempts={} accepted={} fallback={} coherence_miss={} invalidations={}",sidecar->buffer_prefix_attempts,sidecar->buffer_prefix_accepts,sidecar->buffer_prefix_fallbacks,sidecar->buffer_prefix_coherence_misses,sidecar->buffer_prefix_invalidations);
+        sidecar->buffer_prefix_attempts=sidecar->buffer_prefix_accepts=sidecar->buffer_prefix_fallbacks=sidecar->buffer_prefix_coherence_misses=sidecar->buffer_prefix_invalidations=0;
+        if(sidecar->native_upload_attempts)LOG_INFO(Render_Vulkan,"PARALLEL-NATIVE-UPLOAD attempts={} accepted={} fallback={} uploads_skipped={} (proof accepted after final validation, not queue admission)",sidecar->native_upload_attempts,sidecar->native_upload_accepts,sidecar->native_upload_fallbacks,sidecar->native_upload_skipped);
+        sidecar->native_upload_attempts=sidecar->native_upload_accepts=sidecar->native_upload_fallbacks=sidecar->native_upload_skipped=0;
+        if(sidecar->native_vi_attempts)LOG_INFO(Render_Vulkan,"PARALLEL-NATIVE-VI attempts={} accepted={} fallback={} vertex_bindings_skipped={} (proof accepted after final validation, not queue admission)",sidecar->native_vi_attempts,sidecar->native_vi_accepts,sidecar->native_vi_fallbacks,sidecar->native_vi_skipped);
+        sidecar->native_vi_attempts=sidecar->native_vi_accepts=sidecar->native_vi_fallbacks=sidecar->native_vi_skipped=0;
+        if(sidecar->image_bitmap_draws)LOG_INFO(Render_Vulkan,"PARALLEL-IMAGE-BITMAP draws={} sealed_rows={} (proof available before final validation)",sidecar->image_bitmap_draws,sidecar->image_bitmap_rows);
+        sidecar->image_bitmap_draws=sidecar->image_bitmap_rows=0;
+        LOG_INFO(Render_Vulkan,"PARALLEL-IMAGE-BATCH draws={} infos={} fallbacks={} invalidations={}",sidecar->image_batch_draws,sidecar->image_batch_infos,sidecar->image_batch_fallbacks,sidecar->image_batch_invalidations);
+        sidecar->image_batch_draws=sidecar->image_batch_infos=sidecar->image_batch_fallbacks=sidecar->image_batch_invalidations=0;
+        {
+            const auto& f=sidecar->readonly_guard_failures;
+            const auto& k=sidecar->readonly_special_kinds;
+            LOG_INFO(Render_Vulkan,"PARALLEL-READONLY-GUARDS missing_stage={} special={} written={} zero_base={} zero_size={} size_ge_1g={} address_limit={} special_guest={} special_flatbuf={} special_pagetable={} special_fault={} special_gds={} special_shared={} special_clip={} special_direct_table={} special_other={}",
+                f[0],f[1],f[2],f[3],f[4],f[5],f[6],k[0],k[1],k[2],k[3],k[4],k[5],k[6],k[7],k[8]);
+            sidecar->readonly_guard_failures={};sidecar->readonly_special_kinds={};
+        }
+        LOG_INFO(Render_Vulkan,"PARALLEL-RECORD-DIAG absent_sampled_attempts={} absent_sampled_accepted={} absent_sampled_rejected={} sampled_null_view={} sampled_nonnull_sampler={} sampled_nongeneral={} sampled_canonical_null={} absent_mode0_attempts={} absent_mode0_accepted={} absent_mode0_rejected={} natural_preclosed={} natural_captured={} natural_serial_fallback={} natural_binding_skip={} sampler_entries={} sampler_proof_hits={} sampler_proof_misses={} sampler_scan_steps={} sampler_scan_positives={} proof_table_builds={} proof_table_hits={} extended_clear_rejected={} fast_rejected={} no_pass_room_rejected={} serial_scope_bypassed={} owner_slot_pressure={} eligible_in_serial_scope_examined={} eligible_in_active_scope={} eligible_at_boundary={} vertex_candidates={} vertex_preflight={} vertex_backing_pass={} vertex_bad_structure={} vertex_bad_binding={} vertex_bad_pnext={} vertex_unknown_backing={} vertex_direct_ranges={} vertex_direct_attempts={} vertex_direct_matches={} descriptor_readonly_attempts={} descriptor_readonly_regions={} descriptor_readonly_imports={} descriptor_readonly_uncontained={} descriptor_readonly_unmatched={} descriptor_clip_nulls={} direct_slot_attempts={} direct_slot_accepted={} considered={} eligible={} resource_key_unknown={} buffer_present={} alias_rejected={} descriptor_rejected={} missing_sets={} preflight_samples={} preflight_wall_ns={} preflight_cpu_samples={} preflight_cpu_100ns={} passes={} draws={} queued={} synchronous={} worker_jobs={} worker_wall_ns_sum={} worker_cpu_100ns={} worker_cpu_samples={} peak_workers={} worker_recorded_passes={} worker_recorded_draws={} small_groups_submitted={} small_groups_synchronous={} small_passes={} small_submitted_draws={} drain_wall_ns={} coordinator_cpu_100ns={} coordinator_cpu_samples={} pending={} inflight={}",
+            sidecar->absent_sampled_attempts,sidecar->absent_sampled_accepted,sidecar->absent_sampled_rejected,sidecar->sampled_null_view,sidecar->sampled_nonnull_sampler,sidecar->sampled_nongeneral,sidecar->sampled_canonical_null,sidecar->absent_mode0_attempts,sidecar->absent_mode0_accepted,sidecar->absent_mode0_rejected,sidecar->natural_preclosed,sidecar->natural_captured,sidecar->natural_serial_fallback,sidecar->natural_binding_skip,sampler_entries,sidecar->sampler_proof_hits,sidecar->sampler_proof_misses,sidecar->sampler_scan_steps,sidecar->sampler_scan_positives,sidecar->proof_table_builds,sidecar->proof_table_hits,sidecar->extended_clear_rejected,sidecar->fast_rejected,sidecar->no_pass_room_rejected,sidecar->serial_scope_bypassed,sidecar->owner_slot_pressure,sidecar->eligible_in_serial_scope,sidecar->eligible_in_active_scope,sidecar->eligible_at_boundary,sidecar->vertex_candidates,sidecar->vertex_preflight_draws,sidecar->vertex_backing_pass,sidecar->vertex_bad_structure,sidecar->vertex_bad_binding,sidecar->vertex_bad_pnext,sidecar->vertex_unknown_backing,sidecar->vertex_direct_ranges,sidecar->vertex_direct_attempts,sidecar->vertex_direct_matches,sidecar->descriptor_readonly_attempts,sidecar->descriptor_readonly_regions,sidecar->descriptor_readonly_imports,sidecar->descriptor_readonly_uncontained,sidecar->descriptor_readonly_unmatched,sidecar->descriptor_clip_nulls,sidecar->direct_slot_attempts,sidecar->direct_slot_accepted,sidecar->considered,sidecar->eligible,sidecar->unknown_resource_key,sidecar->buffer_rejected,sidecar->alias_rejected,sidecar->descriptor_rejected,sidecar->missing_sets,sidecar->preflight_samples,sidecar->preflight_wall_ns,sidecar->preflight_cpu_samples,sidecar->preflight_cpu_100ns,sidecar->passes,sidecar->draws,sidecar->queued,sidecar->synchronous,workers.jobs,workers.wall_ns,workers.cpu_100ns,workers.cpu_samples,workers.peak,workers.recorded_passes,workers.recorded_draws,workers.small_groups_submitted,workers.small_groups_synchronous,workers.small_passes,workers.small_submitted_draws,sidecar->drain_ns,sidecar->coordinator_cpu_100ns,sidecar->coordinator_cpu_samples,
+            sidecar->coordinator->PendingNodes(),sidecar->coordinator->InFlightNodes());
+        if(sidecar->inline_continuations)LOG_INFO(Render_Vulkan,"PARALLEL-INLINE-CONTINUATION synchronous={}",sidecar->inline_continuations);
+        sidecar->inline_continuations=0;
+        constexpr std::array<const char*,3> closure_origins{"split","preclosed","other"};
+        constexpr std::array<const char*,2> closure_outcomes{"queued","synchronous"};
+        for(u32 origin=0;origin<3;++origin) {
+            const auto& c=sidecar->pass_closure;
+            for(u32 outcome=0;outcome<2;++outcome) {
+                const auto& buckets=c.sizes[origin][outcome];
+                if(std::ranges::any_of(buckets,[](u64 n){return n!=0;}))
+                    LOG_INFO(Render_Vulkan,"PARALLEL-PASS-CLOSURE origin={} outcome={} sizes_0_1_2to3_4to7_8to31_32to255_256={} (queued means coordinator accepted)",closure_origins[origin],closure_outcomes[outcome],fmt::join(buckets,"/"));
+            }
+            const auto& reasons=c.reasons[origin];
+            if(c.empty_aborts[origin] || std::ranges::any_of(reasons,[](u64 n){return n!=0;}))
+                LOG_INFO(Render_Vulkan,"PARALLEL-PASS-REASONS origin={} other_fast_ineligible_notrendering_target_full_missing={} empty_aborts={} (first short-circuit reason)",closure_origins[origin],fmt::join(reasons,"/"),c.empty_aborts[origin]);
+        }
+        sidecar->pass_closure.sizes={};sidecar->pass_closure.reasons={};sidecar->pass_closure.empty_aborts={};
+        LOG_INFO(Render_Vulkan,"PARALLEL-READONLY-HINT range_hits={} range_misses={} region_hits={} region_misses={}",
+            sidecar->readonly_range_hint_hits,sidecar->readonly_range_hint_misses,sidecar->readonly_region_hint_hits,sidecar->readonly_region_hint_misses);
+        sidecar->readonly_range_hint_hits=sidecar->readonly_range_hint_misses=sidecar->readonly_region_hint_hits=sidecar->readonly_region_hint_misses=0;
+        sidecar->absent_sampled_attempts=sidecar->absent_sampled_accepted=sidecar->absent_sampled_rejected=sidecar->sampled_null_view=sidecar->sampled_nonnull_sampler=sidecar->sampled_nongeneral=sidecar->sampled_canonical_null=sidecar->absent_mode0_attempts=sidecar->absent_mode0_accepted=sidecar->absent_mode0_rejected=sidecar->natural_preclosed=sidecar->natural_captured=sidecar->natural_serial_fallback=sidecar->natural_binding_skip=sidecar->sampler_proof_hits=sidecar->sampler_proof_misses=sidecar->sampler_scan_steps=sidecar->sampler_scan_positives=sidecar->proof_table_builds=sidecar->proof_table_hits=sidecar->extended_clear_rejected=sidecar->fast_rejected=sidecar->no_pass_room_rejected=sidecar->serial_scope_bypassed=sidecar->owner_slot_pressure=sidecar->eligible_in_serial_scope=sidecar->eligible_in_active_scope=sidecar->eligible_at_boundary=sidecar->vertex_candidates=sidecar->vertex_preflight_draws=sidecar->vertex_backing_pass=sidecar->vertex_bad_structure=sidecar->vertex_bad_binding=sidecar->vertex_bad_pnext=sidecar->vertex_unknown_backing=sidecar->vertex_direct_ranges=sidecar->vertex_direct_attempts=sidecar->vertex_direct_matches=sidecar->descriptor_readonly_attempts=sidecar->descriptor_readonly_regions=sidecar->descriptor_readonly_imports=sidecar->descriptor_readonly_uncontained=sidecar->descriptor_readonly_unmatched=sidecar->descriptor_clip_nulls=sidecar->direct_slot_attempts=sidecar->direct_slot_accepted=sidecar->passes=sidecar->draws=sidecar->queued=sidecar->synchronous=sidecar->considered=sidecar->eligible=sidecar->unknown_resource_key=sidecar->buffer_rejected=sidecar->alias_rejected=sidecar->descriptor_rejected=sidecar->missing_sets=sidecar->preflight_samples=sidecar->preflight_wall_ns=sidecar->preflight_cpu_100ns=sidecar->preflight_cpu_samples=sidecar->drain_ns=sidecar->coordinator_cpu_100ns=sidecar->coordinator_cpu_samples=0;
+    }
     LOG_INFO(Render_Vulkan, "NAT: descriptor allocation calls={} reserve hits={} unused={}",
              stats.descriptor_allocate_calls, stats.descriptor_reserve_hits, stream.descriptor_reserve.SpareCount());
+    if (DescriptorAllocDiagEnabled() && descriptor_alloc_owner == this) {
+        const auto& m=descriptor_alloc_metrics;
+        for (u32 kind=0;kind<2;++kind) LOG_INFO(Render_Vulkan,
+            "DESC-ALLOC-DIAG kind={} miss-hist-0/1/2/3/4/5/6plus={}/{}/{}/{}/{}/{}/{} cache_hits={} reserve_hits={}",
+            kind,m.misses[kind][0],m.misses[kind][1],m.misses[kind][2],m.misses[kind][3],m.misses[kind][4],m.misses[kind][5],m.misses[kind][6],m.cache_hits[kind],m.reserve_hits[kind]);
+        for (u32 batch=0;batch<2;++batch) for(u32 attempt=0;attempt<3;++attempt) {
+            const auto& t=m.timing[batch][attempt];
+            LOG_INFO(Render_Vulkan,"DESC-ALLOC-DIAG batch={} attempt={} success={} capacity={} other={} samples={} wall_ns_sum={} wall_ns_max={} cpu_samples={} cpu_100ns_sum={} cpu_100ns_max={}",
+                batch,attempt,m.results[batch][attempt][0],m.results[batch][attempt][1],m.results[batch][attempt][2],t.samples,t.wall_ns,t.wall_max_ns,t.cpu_samples,t.cpu_100ns,t.cpu_max_100ns);
+        }
+        LOG_INFO(Render_Vulkan,"DESC-ALLOC-DIAG pool_initial={} pool_rotation={} spare={}",m.pool_initial,m.pool_rotate,stream.descriptor_reserve.SpareCount());
+        for (u32 kind=0;kind<2;++kind) LOG_INFO(Render_Vulkan,
+            "DESC-BIND-DIAG kind={} sets={} runs={} multi_runs={}",
+            kind,descriptor_bind_sets[kind],descriptor_bind_runs[kind],descriptor_bind_multi[kind]);
+        std::fill_n(descriptor_bind_sets, 2, 0); std::fill_n(descriptor_bind_runs, 2, 0); std::fill_n(descriptor_bind_multi, 2, 0);
+        descriptor_alloc_metrics={};
+    }
     stats.descriptor_allocate_calls = stats.descriptor_reserve_hits = 0;
     stats.descriptor_reuses = stats.descriptor_allocations = 0;
     LOG_INFO(Render_Vulkan, "DESC-HASH: {} prepared hashes reused, {} refreshed after buffer changes",
@@ -7509,10 +10888,19 @@ void NativeRenderer::Report() {
     stats.region_refresh_pages = stats.region_refresh_ns = 0;
     stats.guest_buffer_calls = stats.guest_buffer_ns = 0;
     stats.mirror_binds = stats.mirrors_made = stats.mirror_made_bytes = stats.mirrors_dropped = 0;
+    stats.mirror_cross_address_reuses = 0;
     stats.mirrors_evicted = stats.mirror_over_budget = stats.mirror_refresh_pages = 0;
     stats.null_reasons = {};
     stats.phase_ns = {};
     (void)cpu_writes;
+#endif
 }
 
 } // namespace Vulkan
+
+#undef NATIVE_DIAGNOSTIC
+
+#ifndef NDEBUG
+#include "video_core/renderer_vulkan/prt_view_selftest.h"
+#include "video_core/renderer_vulkan/prt_view_gpu_test.h"
+#endif

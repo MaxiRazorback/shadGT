@@ -248,6 +248,24 @@ if (ENABLE_SYSTEM_LIBRARIES)
 endif()
 
 add_subdirectory(externals)
+# Respect an explicitly selected MSVC runtime even when a dependency changes
+# its local default. This keeps all compiled targets on the same CRT/STL ABI.
+if (MSVC AND DEFINED CMAKE_MSVC_RUNTIME_LIBRARY AND NOT CMAKE_MSVC_RUNTIME_LIBRARY STREQUAL "")
+    function(shadgt_apply_msvc_runtime directory)
+        get_property(targets DIRECTORY "${directory}" PROPERTY BUILDSYSTEM_TARGETS)
+        foreach(target IN LISTS targets)
+            get_target_property(type "${target}" TYPE)
+            if (type MATCHES "^(EXECUTABLE|STATIC_LIBRARY|SHARED_LIBRARY|MODULE_LIBRARY|OBJECT_LIBRARY)$")
+                set_property(TARGET "${target}" PROPERTY MSVC_RUNTIME_LIBRARY "${CMAKE_MSVC_RUNTIME_LIBRARY}")
+            endif()
+        endforeach()
+        get_property(subdirectories DIRECTORY "${directory}" PROPERTY SUBDIRECTORIES)
+        foreach(subdirectory IN LISTS subdirectories)
+            shadgt_apply_msvc_runtime("${subdirectory}")
+        endforeach()
+    endfunction()
+    shadgt_apply_msvc_runtime("${CMAKE_CURRENT_SOURCE_DIR}/externals")
+endif()
 include_directories(src)
 
 set(AJM_LIB src/core/libraries/ajm/ajm.cpp
@@ -824,6 +842,8 @@ set(COMMON src/common/logging/classes.cpp
            src/common/read_capture.cpp
            src/common/read_capture.h
            src/common/sampling_profiler.h
+           src/common/frame_queue_trace.cpp
+           src/common/frame_queue_trace.h
            src/common/perf_monitor.cpp
            src/common/perf_monitor.h
            src/common/thread.cpp
