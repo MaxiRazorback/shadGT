@@ -3997,6 +3997,13 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
             s.written.push_back(entry);
         }
     };
+    // NAT-112: small pictures go back to guest memory. FIX-GTS-001: untiled ones up to 256 KB,
+    // as in the old renderer (TextureCache::ShouldReadBack): GT Sport draws a new save's car
+    // thumbnail into a 448x126 linear target (225 KB) that its CPU PNG-encodes; with 64 KB the
+    // encoder saw empty memory and the thumbnail was saved black for good.
+    const auto writeback_size = [](const Native::ImageEntry& entry) -> u64 {
+        return entry.info.props.is_tiled ? 64_KB : 256_KB;
+    };
     for (const auto* entry : b.sampled) {
         if (entry && std::ranges::find(s.read, entry) == s.read.end()) {
             s.read.push_back(entry); // NAT-140
@@ -4014,9 +4021,8 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
         attached(targets->depth);
         for (const auto* entry : targets->colors) {
             note(entry);
-            // NAT-112: small pictures go back to guest memory.
-            constexpr u64 WritebackSize = 64_KB;
-            if (entry && entry->info.guest_size <= WritebackSize && entry->info.num_samples == 1 &&
+            if (entry && entry->info.guest_size <= writeback_size(*entry) &&
+                entry->info.num_samples == 1 &&
                 std::ranges::find(writebacks, entry) == writebacks.end()) {
                 writebacks.push_back(const_cast<Native::ImageEntry*>(entry));
             }
@@ -4025,8 +4031,7 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
     }
     for (const auto* entry : b.stored) {
         note(entry);
-        constexpr u64 WritebackSize = 64_KB; // NAT-112, as for render targets
-        if (entry->info.guest_size <= WritebackSize && entry->info.num_samples == 1 &&
+        if (entry->info.guest_size <= writeback_size(*entry) && entry->info.num_samples == 1 &&
             !entry->info.props.is_depth &&
             std::ranges::find(writebacks, entry) == writebacks.end()) {
             writebacks.push_back(const_cast<Native::ImageEntry*>(entry));
