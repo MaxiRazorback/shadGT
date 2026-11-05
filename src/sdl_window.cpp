@@ -10,6 +10,13 @@
 #include <cmrc/cmrc.hpp>
 #include <stb_image.h>
 
+#if defined(_WIN32) && !defined(NDEBUG)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
@@ -234,6 +241,19 @@ void WindowSDL::WaitEvent() {
         return;
     }
 
+#ifndef NDEBUG
+    if ((event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) &&
+        event.key.scancode == SDL_SCANCODE_F8 && SDL_GetKeyboardFocus() == window) {
+        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
+            VideoCore::RequestDebugFrameDump()) {
+            LOG_INFO(Frontend, "F8 capture queued");
+#ifdef _WIN32
+            MessageBeep(MB_OK);
+#endif
+        }
+        return;
+    }
+#endif
 #ifdef RYTY_GPU
     if ((event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) &&
         event.key.scancode == SDL_SCANCODE_F4) {

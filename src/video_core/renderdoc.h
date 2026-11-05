@@ -11,6 +11,11 @@
 namespace VideoCore {
 
 #ifndef NDEBUG
+/// One debug frame dump may be pending or in progress at a time.
+bool RequestDebugFrameDump();
+bool BeginDebugFrameDump();
+void FinishDebugFrameDump();
+
 /// Loads renderdoc dynamic library module.
 void LoadRenderDoc();
 

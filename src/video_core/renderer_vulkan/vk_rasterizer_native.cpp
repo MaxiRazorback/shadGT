@@ -10433,7 +10433,6 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
             if(desc.samples!=1)status="skipped_msaa";
             else if(!(desc.usage & Native::Rhi::ImageUsageTransferSrc))status="skipped_no_transfer_src";
             else if(!l.bytes)status="skipped_layout";
-            else if(mip==0 && entry->from_cpu)status="metadata_only_cpu_base";
             else if(mip>0 && l.bytes>(64ull<<20)-extra_bytes)status="skipped_extra_mip_budget";
             else if(l.bytes>TraceReadbackBudget-total_readback_bytes)status="skipped_total_readback_budget";
             if(std::string_view(status)!="queued"){
