@@ -43,3 +43,68 @@ runtime comparison, not a resolved defect.
   linear/tiled layouts and mip roundtrips; execution is pending the integrated build.
 - Full Debug/Release builds, isolated GPU checks, gameplay and transition checks
   are still required. No installed game or shader cache has changed.
+
+## Additional integrated groups
+
+- `PERF-245`, `PERF-251`: serialized recorder-idle ownership and queue/decode
+  yielding. Register-delta tests retain the target's coalesced-run contract.
+- `PERF-247`, `FIX-267`: tessellation LDS writer/reader emulation and deferred
+  writer barriers, with partial sample masks excluded from the optimization.
+- `FIX-248`, `FIX-252`, `FIX-253`, `FIX-254`: FMask specialization, wave64 lowering,
+  floating-point atomic classification, pinned vertex information, asymmetric
+  empty-buffer matching and AMD translation behavior.
+- `FIX-255`, `FIX-263`, `FIX-264`, `FIX-265`, `FIX-270`: tiny and sixteen-sample
+  macrotiles, stable buffer rebinding, and region replacement. Reject failed
+  replacements without discarding authoritative GPU bytes or claiming a clear
+  that was never written.
+- `PERF-250`, `PERF-256`: generation-qualified target and sampler reuse,
+  canonical Vulkan samplers, and exact-value descriptor/push-constant command
+  reuse. Worker snapshots still receive their full bindings.
+- `PERF-259`: guarded compiler CPU placement, source worker priorities and
+  recorder-core ownership. External CPU selections are respected; unsupported
+  ownership combinations leave placement alone. The heavy driver-build limit
+  remains in force.
+- `FIX-268`, `FIX-271`, `FIX-277`: lifetime-guarded close-time cache saving and
+  non-destructive compatible shader-store selection. Old stores, archives,
+  pack stamps and incompatible retranslation marks are retained. An unreadable
+  archive falls back to a writable directory store.
+- `PERF-269`, `PERF-260`: bounded metadata readers, optional SPIR-V prefetch,
+  and compute recipes warmed under the shared heavy-build gate. Recipes use
+  explicit translation-policy compatibility, not executable, driver or SCM
+  identity. Existing incompatible files are skipped and preserved.
+- `FIX-272`, `PERF-262`, `FIX-275`, `PERF-274`: own queued callable values,
+  record native command buffers on the scheduler ring, keep replay state on its
+  owning thread, and start a list during serialized recorder idle. The ring is
+  excluded when recorder workers, Intel direct recording, raw checkpoints or
+  unsupported timing paths require direct command handles. Explicit
+  `RYGT_NATIVE_RING=0` remains available in Release; periodic A/B diagnostics
+  are Debug-only.
+- `PERF-273`: early submission when the preceding tick is complete, bounded
+  read-only storage mirrors, and display-awake requests on the present thread.
+- `FIX-276`: reclaim GPU-completed upload allocations before an allocation
+  retry; never wait for or free the current unsubmitted tick.
+
+These groups include source defaults where their lifetime and API contracts can
+be retained. GT7-only addresses, game patch offsets and branding require a GTS
+adaptation; they are not evidence of equivalent behavior in GT Sport.
+
+## Remaining work
+
+The all-author inventory is not complete. Packed-specialization adaptation,
+on-screen build pacing/catch-up, precise page writeback/fault-ahead ownership,
+and the shader-object dependency chain remain under integration and review.
+Graphics pipeline libraries and Vulkan shader objects are separate features.
+Do not describe the existing library path as shader-object support.
+
+One integrated Debug checkpoint has built. The latest ring/prewarm assembly
+requires a fresh build and GPU validation. Twenty CPU cases covering upload
+recovery, store selection/readers, callable ownership and exit-save lifetime
+passed; the compute recipe and ring suites are additional checks. The real
+wave64 lowering tool passed 1,536 cases. The emitted tessellation shader passed
+SPIR-V validation and a standalone NVIDIA two-draw writer/reader fixture with
+both separate and shared barriers. That fixture does not prove NativeRenderer
+batch lifetime or game output. Full Release, latest Debug, import/symbol checks,
+NVIDIA regression tests and two-race menu/Brand Central checks remain required.
+
+No runtime speedup, stutter reduction or 16.6 ms target is established by these
+component tests. Nothing in this port has been installed or merged.
