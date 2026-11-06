@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include <algorithm>
+#include <semaphore>
 namespace Vulkan {
+std::counting_semaphore<64>& HeavyPipelineGate();
 struct CompilerWorkerBudget {
     // Concurrent tessellation compiles exhausted system commit in NVIDIA LLVM.
     // Share one admission limit between dispatch and direct driver calls.

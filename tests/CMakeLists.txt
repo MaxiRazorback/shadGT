@@ -112,6 +112,12 @@ target_link_libraries(shadps4_shader_program_test PRIVATE
     magic_enum::magic_enum)
 gtest_discover_tests(shadps4_shader_program_test)
 
+add_executable(shadps4_compute_warm_recipe_test test_compute_warm_recipe.cpp)
+target_include_directories(shadps4_compute_warm_recipe_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_compute_warm_recipe_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_compute_warm_recipe_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_compute_warm_recipe_test)
+
 add_executable(shadps4_shader_store_policy_test test_shader_store_policy.cpp)
 target_include_directories(shadps4_shader_store_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(shadps4_shader_store_policy_test PRIVATE cxx_std_23)

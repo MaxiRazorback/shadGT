@@ -44,6 +44,10 @@
 #endif
 
 namespace Vulkan {
+std::counting_semaphore<64>& HeavyPipelineGate() {
+    static std::counting_semaphore<64> semaphore{CompilerWorkerBudget::HeavyPipelineLimit};
+    return semaphore;
+}
 #ifdef RYTY_GPU
 bool NativeModeRequested();
 #endif
@@ -230,8 +234,7 @@ public:
 
 private:
     static std::counting_semaphore<64>& Semaphore() {
-        static std::counting_semaphore<64> semaphore{CompilerWorkerBudget::HeavyPipelineLimit};
-        return semaphore;
+        return HeavyPipelineGate();
     }
     bool held = false;
 };

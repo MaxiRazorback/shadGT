@@ -405,6 +405,9 @@ private:
     void SaveDriverCache(bool wait);
     void MaybeSaveDriverCache();
     std::filesystem::path driver_cache_path;
+    static std::filesystem::path WarmComputeDir();
+    void WarmComputePipelines(std::stop_token stop);
+    std::jthread warm_compute_thread;
     u32 pipelines_at_driver_save{};
     std::chrono::steady_clock::time_point driver_cache_saved_at{};
     std::atomic<bool> driver_cache_writing{}; // PERF-036

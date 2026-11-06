@@ -72,6 +72,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/exit_save_registry.h"
+#include "video_core/renderer_vulkan/compute_warm_recipe.h"
 #include "video_core/renderer_vulkan/shader_store_readers.h"
 #include "video_core/shader_store_policy.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -934,6 +935,33 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
     return info;
 }
 
+static bool WarmComputeOn() {
+    static const bool on = [] { const char* p = std::getenv("RYGT_WARM_COMPUTE");
+                                return !(p && p[0] == '0'); }();
+    return on;
+}
+
+std::filesystem::path PipelineCache::WarmComputeDir() {
+    const auto& serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
+    return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+           fmt::format("{}.warm_compute", serial);
+}
+
+void PipelineCache::WarmComputePipelines(std::stop_token stop) {
+    Common::SetCurrentThreadName("shadGT:WarmCompute");
+    Common::PreferCompileCores();
+    SCOPE_EXIT { Common::ReleaseCompileCores(); };
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+    const auto policy_suffix = fmt::format("-{:#018x}", ComputePipeline::RecipePolicy(instance, profile));
+    const auto files = ListComputeWarmRecipes(WarmComputeDir(), policy_suffix);
+    u32 warmed = 0;
+    for (const auto& file : files) {
+        if (stop.stop_requested()) return;
+        if (ComputePipeline::WarmFromRecipe(instance, profile, *pipeline_cache, file, stop)) ++warmed;
+    }
+    LOG_INFO(Render_Vulkan, "PERF-GT7-037: warmed {} of {} compute recipes", warmed, files.size());
+}
+
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_, u32 sparse_page_shift)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
@@ -1046,6 +1074,17 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         instance.GetVendorID(), profile.supports_fragment_shader_barycentric, 1,
         !barycentric_env || std::strcmp(barycentric_env, "0") != 0));
     CreateDriverCache();
+    if (WarmComputeOn()) {
+        try {
+            warm_compute_thread = std::jthread([this](std::stop_token stop) {
+                try { WarmComputePipelines(stop); }
+                catch (const std::exception& e) { LOG_WARNING(Render_Vulkan, "Warm compute stopped: {}", e.what()); }
+                catch (...) { LOG_WARNING(Render_Vulkan, "Warm compute stopped unexpectedly"); }
+            });
+        } catch (const std::exception& e) {
+            LOG_WARNING(Render_Vulkan, "Warm compute unavailable: {}", e.what());
+        }
+    }
     // PERF-032: the shader store is used again, without the startup precompile Lance had removed:
     // a program's stored translations are read when a draw first uses it, and new translations
     // are stored. -DisablePerf 47 leaves the store closed.
@@ -1157,7 +1196,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 
 PipelineCache::~PipelineCache() {
     ExitCacheRegistry().Unregister(this); // Wait for an in-flight close save before teardown.
-    store_readers.reset();
+    if (warm_compute_thread.joinable()) {
+        warm_compute_thread.request_stop();
+        warm_compute_thread.join();
+    }
+    store_readers.reset(); // Join reads before the shader store and pipeline cache teardown.
     if (liverpool) {
         liverpool->on_command_buffer_start = nullptr;
     }
@@ -3092,6 +3135,25 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         build_workers->Push([job] { (*job)(); }, BuildQueue::Kind::Urgent);
         it.value() = completion.get();
         it.value()->SetStageInfo(*S().infos[0]);
+        if (const Shader::Info* info = S().infos[0]; WarmComputeOn() && info) {
+            const auto dir = WarmComputeDir();
+            const auto file = dir / fmt::format("{:#018x}-{:#018x}.bin", pipeline_hash,
+                                                  ComputePipeline::RecipePolicy(instance, profile));
+            std::error_code ec;
+            if (!std::filesystem::exists(file, ec)) {
+                std::optional<size_t> perm;
+                if (const auto prog = program_cache.find(info->pgm_hash); prog != program_cache.end()) {
+                    const auto& modules = prog->second->modules;
+                    for (size_t i = 0; i < modules.size(); ++i)
+                        if (modules[i].module == S().modules[0]) { perm = i; break; }
+                }
+                std::vector<u32> spirv;
+                if (perm) Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
+                    fmt::format("{:#018x}_{}", info->pgm_hash, *perm), spirv);
+                std::filesystem::create_directories(dir, ec);
+                if (IsCompleteSpirv(spirv)) it.value()->SaveRecipe(file, spirv);
+            }
+        }
         sdata = inputs->sdata;
         if (!S().key_uses_legacy) { // D10
             RegisterPipelineData(compute_key, sdata);
