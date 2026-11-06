@@ -75,6 +75,7 @@
 #include "video_core/renderer_vulkan/spirv_check.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
+#include "video_core/renderer_vulkan/shader_usage_serde.h"
 #include "video_core/renderer_vulkan/exit_save_registry.h"
 #include "video_core/renderer_vulkan/compute_warm_recipe.h"
 #include "video_core/renderer_vulkan/shader_store_readers.h"
@@ -1117,6 +1118,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         VideoCore::DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported();
 #ifdef RYTY_GPU
     profile.native_cube_sampling = NativeModeRequested() && instance.IsImageCubeArraySupported();
+    SetNativeCubeCacheEnabled(profile.native_cube_sampling);
 #endif
     const char* barycentric_env = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC");
     SetVertexOrderCheckCacheEnabled(profile.vertex_order_check); // AMD-307
@@ -3845,6 +3847,19 @@ PipelineCache::StoredListing PipelineCache::ReadStoredListing(u64 pgm_hash) {
     return ReadStoredListing(pgm_hash, Storage::DataBase::Instance());
 }
 
+static size_t UnoccupiedShaderSlot(u64 pgm_hash, size_t candidate) {
+    auto& store = Storage::DataBase::Instance();
+    if (!store.IsOpened()) return candidate;
+    // Listings intentionally stop after gaps; probe the actual proposed slot
+    // so a sparse foreign-engine entry cannot be overwritten.
+    return FindUnusedStoredSlot(candidate, [&](size_t index) {
+        return store.Exists(Storage::BlobType::ShaderMeta,
+                            fmt::format("{:#018x}", HashCombine(pgm_hash, index))) ||
+               store.Exists(Storage::BlobType::ShaderBinary,
+                            fmt::format("{:#018x}_{}", pgm_hash, index));
+    });
+}
+
 PipelineCache::StoredListing PipelineCache::ReadStoredListing(u64 pgm_hash,
                                                               Storage::DataBase& store) {
     // Each permutation is stored as <perm hash>.meta (key and shader info) and
@@ -3876,6 +3891,10 @@ void PipelineCache::ApplyStoredListing(StoredListing&& listing, Program& program
     const u64 pgm_hash = listing.pgm_hash;
     for (auto& entry : listing.entries) {
         const size_t perm_idx = entry.perm_idx;
+        // A metadata slot belongs to the store even if this renderer cannot
+        // read its version or profile. Never overwrite the other engine's data.
+        auto& occupied_end = stored_perm_end[pgm_hash];
+        occupied_end = NextUnusedStoredSlot(occupied_end, perm_idx);
         auto info = std::make_unique<Shader::Info>();
         Shader::StageSpecialization spec{};
         spec.info = info.get();
@@ -5034,6 +5053,7 @@ bool PipelineCache::TakeReadyTranslation(HwStage hw_stage, SwStage sw_stage, u64
         if (const auto end = stored_perm_end.find(hash); end != stored_perm_end.end()) {
             perm_idx = std::max(perm_idx, end->second);
         }
+        perm_idx = UnoccupiedShaderSlot(hash, perm_idx);
         const u64 perm_hash = HashCombine(hash, perm_idx);
         RegisterShaderMeta(info, job->spec.fetch_shader_data, job->spec, perm_hash, perm_idx);
         const u64 spv_hash = XXH3_64bits(job->spv.data(), job->spv.size() * sizeof(u32));
@@ -5777,6 +5797,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
     if (const auto it = stored_perm_end.find(params.hash); it != stored_perm_end.end()) {
         perm_idx = std::max(perm_idx, it->second);
     }
+    perm_idx = UnoccupiedShaderSlot(params.hash, perm_idx);
     const u64 perm_hash = HashCombine(params.hash, perm_idx);
     if (!mismatch_reasons.empty()) {
         static u64 runaway_events = 0;

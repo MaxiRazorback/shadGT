@@ -85,6 +85,10 @@ static std::atomic<bool> single_sample_barycentric_cache_enabled{false};
 // except AMD's older compiler) it is cleared on load, so old stores keep matching; where it is on,
 // the shader store has its own version (cache_storage.cpp) and holds no older entries.
 static std::atomic<bool> vertex_order_check_cache_enabled{false};
+static std::atomic<bool> native_cube_cache_enabled{false};
+void SetNativeCubeCacheEnabled(bool enabled) {
+    native_cube_cache_enabled.store(enabled, std::memory_order_relaxed);
+}
 void SetVertexOrderCheckCacheEnabled(bool enabled) {
     vertex_order_check_cache_enabled.store(enabled, std::memory_order_relaxed);
 }
@@ -119,22 +123,21 @@ static u32 ShaderBinaryVersionFor(const Shader::StageSpecialization& spec,
         spec.runtime_info.sw_stage == Shader::SwStage::TessellationEval) {
         return Serialization::ShaderBinaryVersionTessellationLayout;
     }
-    if (spec.runtime_info.hw_stage == Shader::HwStage::Fragment &&
-        discard_kill_cache_enabled.load(std::memory_order_relaxed)) {
-        return Serialization::ShaderBinaryVersionDiscardKill;
-    }
-    if (spec.runtime_info.hw_stage == Shader::HwStage::Fragment &&
-        spec.runtime_info.hw.fs.single_sample_barycentric) {
-        return Serialization::ShaderBinaryVersionSingleSampleBarycentric;
-    }
+    if (spec.runtime_info.hw_stage == Shader::HwStage::Fragment) {
+        bool native_cube = false;
 #ifdef RYTY_GPU
-    if (NativeModeRequested() && spec.runtime_info.hw_stage == Shader::HwStage::Fragment &&
-        std::ranges::any_of(spec.images, [](const auto& image) {
+        native_cube = native_cube_cache_enabled.load(std::memory_order_relaxed) && std::ranges::any_of(spec.images, [](const auto& image) {
             return image.type == AmdGpu::ImageType::Cube;
-        })) {
-        return Serialization::ShaderBinaryVersionNativeCube;
-    }
+        });
 #endif
+        const u32 fragment = FragmentBinaryVersion(
+            discard_kill_cache_enabled.load(std::memory_order_relaxed),
+            spec.runtime_info.hw.fs.single_sample_barycentric, native_cube,
+            Serialization::ShaderBinaryVersionDiscardKill,
+            Serialization::ShaderBinaryVersionSingleSampleBarycentric,
+            Serialization::ShaderBinaryVersionNativeCube);
+        if (fragment) return fragment;
+    }
     if (!spec.fetch_shader_data.Empty()) {
         return Serialization::ShaderBinaryVersionVertexFetch;
     }
@@ -155,6 +158,7 @@ static u32 ShaderBinaryVersionFor(const Shader::StageSpecialization& spec,
 static bool IsKnownShaderBinaryVersion(u32 version) {
     // Recognize old metadata for prewarm discovery, but LoadShaderMeta below rejects its
     // binary revision and retranslates it. Never relabel an old binary as corrected.
+    version = UntagCubeVersion(version);
     version |= 0x100u;
     if (version == Serialization::ShaderBinaryVersionTessellationMip ||
         version == Serialization::ShaderBinaryVersionTessellationNoMip) return true;
@@ -385,7 +389,8 @@ void RegisterShaderMeta(const Shader::Info& info,
     Serialization::Writer meta{ar};
 
     meta.Write(Serialization::ShaderMetaVersion);
-    meta.Write(ShaderBinaryVersionFor(spec, Serialization::UsesScalarPrefix(info)));
+    meta.Write(CubeVersionFor(ShaderBinaryVersionFor(spec, Serialization::UsesScalarPrefix(info)),
+                              spec, native_cube_cache_enabled.load(std::memory_order_relaxed)));
 
     meta.Write(perm_hash);
     meta.Write(perm_idx);
@@ -420,6 +425,8 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 binary_version{};
     meta.Read(binary_version);
+    const bool face_cubes = (binary_version & ClassicCubeTag) != 0;
+    binary_version = UntagCubeVersion(binary_version);
     if (!IsKnownShaderBinaryVersion(binary_version)) {
         return false;
     }
@@ -445,6 +452,8 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     }
     info.Deserialize(ar, perm_hash_ar,
                      meta_version != Serialization::ShaderMetaVersionWithoutAttributeFlags);
+    if (!StoredCubesFit(spec, info, face_cubes,
+                        native_cube_cache_enabled.load(std::memory_order_relaxed))) return false;
     if (binary_version != ShaderBinaryVersionFor(spec, Serialization::UsesScalarPrefix(info))) {
         return false;
     }
