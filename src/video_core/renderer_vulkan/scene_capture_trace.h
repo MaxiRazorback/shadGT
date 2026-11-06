@@ -9,6 +9,7 @@
 #include <vector>
 #include <vulkan/vulkan.hpp>
 #include "common/types.h"
+#include "video_core/renderer_vulkan/vk_command_stream.h"
 
 namespace Vulkan::SceneTrace {
 #ifndef NDEBUG
@@ -78,7 +79,7 @@ private:
     std::chrono::steady_clock::time_point start;
 };
 // Caller must be outside rendering. Reset once, before any captured timestamp.
-inline void Prepare(vk::Device device,vk::CommandBuffer cmd,u32 bits,double period) {
+inline void Prepare(vk::Device device,CmdBuf cmd,u32 bits,double period) {
     if (!Id() || state.attempted) return;
     state.attempted=true;state.bits=bits;state.period=period;
     if(!bits || period<=0) return;
@@ -87,14 +88,14 @@ inline void Prepare(vk::Device device,vk::CommandBuffer cmd,u32 bits,double peri
     if(result!=vk::Result::eSuccess)return;
     state.pool=pool;cmd.resetQueryPool(pool,0,u32(Limit*2));
 }
-inline void GpuBegin(vk::CommandBuffer cmd) {
+inline void GpuBegin(CmdBuf cmd) {
     if(!Id() || !state.pool)return;
     auto& row=state.rows[current];
     if(state.queries+2>Limit*2)return;
     row.first_query=state.queries;state.queries+=2;
     cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe,state.pool,row.first_query);
 }
-inline void GpuEnd(vk::CommandBuffer cmd) {
+inline void GpuEnd(CmdBuf cmd) {
     if(Id() && state.pool && state.rows[current].first_query!=NoQuery)
         cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe,state.pool,state.rows[current].first_query+1);
 }
@@ -137,9 +138,9 @@ public:
     CpuScope(bool, u64, const char*, std::span<const u64> = {}, std::span<const u64> = {}, const u64* = nullptr) noexcept {}
     void Programs(u64, u64 = 0) noexcept {}
 };
-inline void Prepare(vk::Device, vk::CommandBuffer, u32, double) noexcept {}
-inline void GpuBegin(vk::CommandBuffer) noexcept {}
-inline void GpuEnd(vk::CommandBuffer) noexcept {}
+inline void Prepare(vk::Device, CmdBuf, u32, double) noexcept {}
+inline void GpuBegin(CmdBuf) noexcept {}
+inline void GpuEnd(CmdBuf) noexcept {}
 inline void Save(const std::filesystem::path&, vk::Device) noexcept {}
 #endif
 

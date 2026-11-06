@@ -32,6 +32,11 @@ target_include_directories(shadgt_unique_function_test PRIVATE ${CMAKE_SOURCE_DI
 target_compile_features(shadgt_unique_function_test PRIVATE cxx_std_23)
 target_link_libraries(shadgt_unique_function_test PRIVATE GTest::gtest_main Threads::Threads)
 gtest_discover_tests(shadgt_unique_function_test)
+add_executable(shadgt_native_command_ring_test test_native_command_ring.cpp)
+target_include_directories(shadgt_native_command_ring_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadgt_native_command_ring_test PRIVATE cxx_std_23)
+target_link_libraries(shadgt_native_command_ring_test PRIVATE GTest::gtest_main fmt::fmt Boost::headers Vulkan::Headers)
+gtest_discover_tests(shadgt_native_command_ring_test)
 # PERF-GT7-057, FIX-GT7-080/081/087: probe-filter subresource proof.
 add_executable(shadps4_same_texel_test test_same_texel.cpp)
 target_include_directories(shadps4_same_texel_test PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})

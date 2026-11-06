@@ -1282,7 +1282,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
         if (!gathered) {
             return source;
         }
-        const vk::CommandBuffer cmd{Handle<VkCommandBuffer_T>(list.NativeHandle())};
+        const CmdBuf cmd = CmdOf(list);
         const vk::Buffer dst{Handle<VkBuffer_T>(gathered->NativeHandle())};
         trace.Next(6);
         const bool all = direct->ForEachPart(
@@ -1378,6 +1378,12 @@ NativeRenderer::~NativeRenderer() {
     if(PreparedSampledProofRequested())prepared_proof_contexts.Close(this);
     auto ahead_shutdown=BeginAheadShutdown(this);
     if(ahead_shutdown)while(ahead_shutdown->active.load(std::memory_order_acquire) || !ahead_shutdown->pools.Quiescent())std::this_thread::yield();
+    // Finish all deferred recording before resources referenced by replay are destroyed.
+    if (!ParallelRecordingRequested()) {
+        Splice();
+        r.scheduler.Finish();
+        r.scheduler.SyncCommandThread();
+    }
     scene_indirect_buffer.reset();scene_indirect_args.clear();
     if(SceneTrace::state.pool){const auto pool=SceneTrace::state.pool;const auto device=r.instance.GetDevice();r.scheduler.DeferOperation([device,pool]{device.destroyQueryPool(pool);});SceneTrace::state={};}
     mirror_preparation.reset(); // Join before any device or direct-memory teardown.
@@ -1781,6 +1787,41 @@ vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
 }
 
 
+void NativeRenderer::AcquireList(Stream& s) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("RYGT_NATIVE_RING");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    static const bool logged = [] {
+        if (enabled && ParallelRecordingRequested())
+            LOG_INFO(Render_Vulkan, "Native command ring disabled while parallel recording is requested");
+        return true;
+    }();
+    (void)logged;
+    // ImageRegistry's optional checkpoint path records a raw Vulkan handle.
+    // Keep that diagnostic on the direct path until it can enqueue its markers.
+    if (enabled && !ParallelRecordingRequested() && !Native::GpuCheckpoints::Requested() &&
+        !Scheduler::ThreadRing()) {
+        if (CommandRing* ring = r.scheduler.CommandThreadRing()) {
+            if (auto* list = device->AcquireDeferredCommandList(ring)) {
+                s.list = list;
+                list->Begin();
+                s.cmd = CmdBuf{ring, reinterpret_cast<const vk::CommandBuffer*>(list->NativeHandleSlot())};
+                return;
+            }
+        }
+    }
+    s.list = device->AcquireCommandList(Native::Rhi::CommandListLevel::Secondary);
+    s.list->Begin();
+    s.cmd = CmdBuf{vk::CommandBuffer{Handle<VkCommandBuffer_T>(s.list->NativeHandle())}};
+}
+
+CmdBuf NativeRenderer::CmdOf(Native::Rhi::CommandList& list) const {
+    if (stream.list == &list) return stream.cmd;
+    ASSERT_MSG(list.NativeHandleSlot() == nullptr, "Deferred list is not the active stream");
+    return CmdBuf{vk::CommandBuffer{Handle<VkCommandBuffer_T>(list.NativeHandle())}};
+}
+
 NativeRenderer::Stream& NativeRenderer::Begin() {
     Stream& s = stream;
     if (s.list) {
@@ -1793,14 +1834,13 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     if (r.instance.IsIntel()) {
         // FIX-188: Intel Arc (#65) records into the scheduler's own command buffer.
         r.scheduler.EndRendering();
-        s.cmd = r.scheduler.DirectCommandBuffer();
+        const vk::CommandBuffer direct = r.scheduler.DirectCommandBuffer();
+        s.cmd = CmdBuf{direct};
         s.wrapped_list = device->WrapCommandBuffer(
-            reinterpret_cast<u64>(static_cast<VkCommandBuffer>(s.cmd)));
+            reinterpret_cast<u64>(static_cast<VkCommandBuffer>(direct)));
         s.list = s.wrapped_list.get();
     } else {
-        s.list = device->AcquireCommandList(Native::Rhi::CommandListLevel::Secondary);
-        s.list->Begin();
-        s.cmd = vk::CommandBuffer{Handle<VkCommandBuffer_T>(s.list->NativeHandle())};
+        AcquireList(s); // PERF-GT7-018
     }
     s.rendering = false;
     s.dynamic.Invalidate();
@@ -1923,7 +1963,7 @@ void NativeRenderer::EndRendering(u32 reason) {
             sidecar->coordinator->FinishStream(ticket);
             stream.list=sidecar->coordinator->StreamReplacement(ticket);
             ASSERT_MSG(stream.list,"stream replacement command list missing");
-            stream.cmd=vk::CommandBuffer{reinterpret_cast<VkCommandBuffer>(stream.list->NativeHandle())};
+            stream.cmd=CmdBuf{vk::CommandBuffer{reinterpret_cast<VkCommandBuffer>(stream.list->NativeHandle())}};
             stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;
             sidecar->sync_pins.Queued(sidecar->pin_slot);
             NATIVE_DIAGNOSTIC(++sidecar->queued);
@@ -1940,14 +1980,16 @@ void NativeRenderer::EndRendering(u32 reason) {
         bool queued=false;
         if((pass.draws.size()>=8 || ParallelSmallPassBatchEnabled()) && !sidecar->closing) {
             const auto reset=[&]() noexcept {stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;};
+            auto direct_cmd = stream.cmd.Direct();
             if(Native::Parallel::RotateSegment(*sidecar->coordinator,*device,sidecar->epoch,
-                    stream.list,stream.cmd,sidecar->lease,64*1024,reset,
+                    stream.list,direct_cmd,sidecar->lease,64*1024,reset,
 #if !defined(NDEBUG)
                     &sidecar->rotation_diag
 #else
                     nullptr
 #endif
                     )) {
+                stream.cmd = CmdBuf{direct_cmd};
                 std::size_t bytes=sizeof(pass)+pass.draws.capacity()*sizeof(Native::Parallel::Draw);
                 for(const auto& draw:pass.draws) bytes+=draw.descriptor_bytes;
                 try {queued=pass.draws.size()>=8 ? (sidecar->transfer_applied_mode.Enabled() ? sidecar->coordinator->TryPassTransfer(sidecar->epoch,pass,bytes) : sidecar->coordinator->TryPass(sidecar->epoch,pass,bytes)) : sidecar->coordinator->TrySmallPass(sidecar->epoch,pass,bytes);}
@@ -1956,7 +1998,7 @@ void NativeRenderer::EndRendering(u32 reason) {
         }
         if(queued) {NATIVE_DIAGNOSTIC(++sidecar->queued);sidecar->sync_pins.Queued(sidecar->pin_slot);} else {
             NATIVE_DIAGNOSTIC(++sidecar->synchronous);
-            ASSERT_MSG(Native::Parallel::RecordPass(stream.cmd,r.instance,pass),"parallel pass synchronous fallback failed");
+            ASSERT_MSG(Native::Parallel::RecordPass(stream.cmd.Direct(),r.instance,pass),"parallel pass synchronous fallback failed");
             ASSERT_MSG(sidecar->sync_pins.Tag(sidecar->pin_slot,sidecar->epoch),"parallel synchronous owner pin failed");
             stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;
         }
@@ -1981,7 +2023,7 @@ bool NativeRenderer::ContinueSmallParallelPass(const RenderState& target,u32 rea
     auto& pass=*sidecar->active;
     if(!CanInlineContinuation(pass.draws.size(),ParallelSmallPassBatchEnabled(),sidecar->closing,
             stream.rendering,stream.render==target && pass.target==target,
-            stream.list==sidecar->active_list,stream.cmd==sidecar->active_cmd,
+            stream.list==sidecar->active_list,stream.cmd.Direct()==sidecar->active_cmd,
             r.scheduler.CurrentTick()==sidecar->epoch,safe))return false;
     // Trace state can change during preflight; an open scope would suppress
     // SceneTrace::Prepare at the common serial tail.
@@ -1993,7 +2035,7 @@ bool NativeRenderer::ContinueSmallParallelPass(const RenderState& target,u32 rea
     NATIVE_DIAGNOSTIC(++sidecar->pass_size_hist[std::min<std::size_t>(8,draws)]);
     u64 begin=0,end=0;const bool timed=ParallelGateDiagEnabled() && DescriptorThreadCpu100ns(begin);
     vk::Pipeline last{};
-    ASSERT_MSG(Native::Parallel::RecordPassInline(stream.cmd,r.instance,pass,stream.dynamic,last),
+    ASSERT_MSG(Native::Parallel::RecordPassInline(stream.cmd.Direct(),r.instance,pass,stream.dynamic,last),
                "parallel pass inline continuation failed");
     ASSERT_MSG(sidecar->sync_pins.Tag(sidecar->pin_slot,sidecar->epoch),"parallel synchronous owner pin failed");
     NATIVE_DIAGNOSTIC(++sidecar->synchronous);NATIVE_DIAGNOSTIC(++sidecar->inline_continuations);
@@ -7493,7 +7535,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                     bool prebind_ok=true;
                     if(split_now) {
                         const auto* prebind_list=s.list;
-                        const auto prebind_cmd=s.cmd;
+                        const auto prebind_cmd=s.cmd.Direct();
                         parallel_bindings.write_structure_proven=true;
                         set_count_proof();
                         {ScopedParallelBindingCapture capture{parallel_bindings};PushBindings(*pipeline,vk::PipelineBindPoint::eGraphics,b);}
@@ -7503,7 +7545,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                             if(!parallel_bindings.sets[i])prebind_ok=false;
                         }
                         prebind_ok=prebind_ok && s.rendering && !parallel->active && s.render==targets.state &&
-                            s.list==prebind_list && s.cmd==prebind_cmd && r.scheduler.CurrentTick()==epoch;
+                            s.list==prebind_list && s.cmd.Direct()==prebind_cmd && r.scheduler.CurrentTick()==epoch;
                         if(!prebind_ok)parallel->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::Abandoned);
                     }
                     if(prebind_ok) {
@@ -7513,7 +7555,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                         if(split_now) {EndRendering();PassBarrier();serial_split_started=true;NATIVE_DIAGNOSTIC(++parallel->serial_split_success);serial_split_prebound=true;}
                         parallel->epoch=epoch;parallel->lease=std::move(lease);parallel->active=std::move(active);
                         parallel->stream_attempted=false;
-                        parallel->active_list=s.list;parallel->active_cmd=s.cmd;
+                        parallel->active_list=s.list;parallel->active_cmd=s.cmd.Direct();
                         NATIVE_DIAGNOSTIC(parallel->pass_closure.origin=split_now?0:preclosed_serial_scope?1:2);
                         reserved_pin.committed=true;
                         s.rendering=true;s.render=targets.state;NATIVE_DIAGNOSTIC(++stats.passes);NATIVE_DIAGNOSTIC(++parallel->passes);
@@ -7783,8 +7825,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             }
         } else {
         SceneTrace::GpuBegin(s.cmd);
-        Native::GpuCheckpoints::Record(static_cast<VkCommandBuffer>(s.cmd), 1, frame,
-            vs_info.pgm_hash, fs ? fs->pgm_hash : 0, regs.num_indices);
+        if (Native::GpuCheckpoints::Requested()) {
+            const auto vs_hash = vs_info.pgm_hash, fs_hash = fs ? fs->pgm_hash : 0;
+            const auto count = regs.num_indices;
+            s.cmd.Invoke([=](vk::CommandBuffer cmd) {
+                Native::GpuCheckpoints::Record(static_cast<VkCommandBuffer>(cmd), 1, frame,
+                                               vs_hash, fs_hash, count);
+            });
+        }
         const auto record_draw = [&] {
         if (quad_triangles) {
             if (index_count != 0) {
@@ -9493,8 +9541,9 @@ bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 ro
         });
     }
     s.cmd.copyBufferToImage(buffer, vk::Image{Handle<VkImage_T>(entry.image->NativeHandle())},
-                            vk::ImageLayout::eGeneral, static_cast<u32>(copies.size()),
-                            copies.data());
+                            vk::ImageLayout::eGeneral,
+                            vk::ArrayProxy<const vk::BufferImageCopy>(
+                                static_cast<u32>(copies.size()), copies.data()));
     Written(&entry, entry.rewrite_clock); // NAT-148
     s.buffers_written = true; // the next work waits for the fill
     ++s.commands;
@@ -10003,8 +10052,13 @@ void NativeRenderer::DispatchDirect() {
         }
     #endif
     PushBindings(*pipeline, vk::PipelineBindPoint::eCompute, b);
-        Native::GpuCheckpoints::Record(static_cast<VkCommandBuffer>(s.cmd), 2, frame,
-            cs.pgm_hash, cs_program.dim_x, u64(cs_program.dim_y) << 32 | cs_program.dim_z);
+        if (Native::GpuCheckpoints::Requested()) {
+            const auto hash = cs.pgm_hash, x = u64(cs_program.dim_x);
+            const auto yz = u64(cs_program.dim_y) << 32 | cs_program.dim_z;
+            s.cmd.Invoke([=](vk::CommandBuffer cmd) {
+                Native::GpuCheckpoints::Record(static_cast<VkCommandBuffer>(cmd), 2, frame, hash, x, yz);
+            });
+        }
         cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     }
     SceneTrace::GpuEnd(s.cmd);
@@ -11000,8 +11054,7 @@ void NativeRenderer::Splice() {
         }
     }
     if (!wrapped) {
-        const vk::CommandBuffer secondary = s.cmd;
-        r.scheduler.CommandBuffer().executeCommands(secondary);
+        r.scheduler.CommandBuffer().executeCommands(s.cmd);
     }
     const u64 tick = r.scheduler.CurrentTick();
     if (!wrapped) {
@@ -11036,7 +11089,7 @@ void NativeRenderer::Splice() {
     device->Collect(); // objects the GPU finished with (staging buffers of uploads)
     s.wrapped_list.reset();
     s.list = nullptr;
-    s.cmd = vk::CommandBuffer{};
+    s.cmd = CmdBuf{};
     s.rendering = false;
 #if !defined(NDEBUG)
     if(auto* sidecar=FindParallelRuntime(this);sidecar && sidecar->transfer_mode_controller && !sidecar->closing) {

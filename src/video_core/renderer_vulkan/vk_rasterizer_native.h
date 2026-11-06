@@ -200,7 +200,8 @@ private:
     struct Stream {
         std::unique_ptr<Native::Rhi::CommandList> wrapped_list;
         Native::Rhi::CommandList* list = nullptr;
-        vk::CommandBuffer cmd{};
+        /// PERF-GT7-018: into the command thread's ring for a list it records (RingOn).
+        CmdBuf cmd{};
         bool rendering = false;
         RenderState render{};
         DynamicState dynamic{};
@@ -284,6 +285,8 @@ private:
                             bool is_depth);
     size_t TextureMemoSlot(const std::array<u64, 4>& raw_sharp, u32 flags) const;
 
+    void AcquireList(Stream& s);
+    CmdBuf CmdOf(Native::Rhi::CommandList& list) const;
     Stream& Begin();
     void EndRendering(u32 reason = 0);
     bool ContinueSmallParallelPass(const RenderState& target, u32 reason, bool safe);
