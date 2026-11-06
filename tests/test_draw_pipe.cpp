@@ -6,6 +6,7 @@
 #include <semaphore>
 #include <thread>
 #include <random>
+#include <utility>
 #include <vector>
 #include <gtest/gtest.h>
 
@@ -116,6 +117,36 @@ TEST(DrawPipe, DrainWaitsForWorkAlreadyRunning) {
     });
     pipe.Drain();
     EXPECT_EQ(done.load(), 9);
+}
+
+TEST(DrawPipe, DrainWaitsForAnIdleHookAlreadyUsingTheCaches) {
+    using namespace std::chrono_literals;
+    std::binary_semaphore entered{0}, release{0}, drained{0};
+    bool armed = false;
+    AmdGpu::DrawPipe pipe{nullptr, AmdGpu::DrawPipe::DefaultMaxPending, [&] {
+        if (std::exchange(armed, false)) { entered.release(); release.acquire(); }
+    }};
+    pipe.Push([&] { armed = true; });
+    entered.acquire();
+    EXPECT_FALSE(pipe.QueueIdle());
+    std::jthread caller{[&] { pipe.Drain(); drained.release(); }};
+    EXPECT_FALSE(drained.try_acquire_for(100ms));
+    release.release();
+}
+
+TEST(DrawPipe, IdleWorkCompletesAfterReleaseWithoutAnotherPush) {
+    using namespace std::chrono_literals;
+    bool pending = false;
+    std::binary_semaphore done{0};
+    AmdGpu::DrawPipe pipe{nullptr, AmdGpu::DrawPipe::DefaultMaxPending, [&] {
+        if (std::exchange(pending, false)) done.release();
+    }};
+    for (int i = 0; i < 100; ++i) {
+        pipe.Push([&] { pending = true; });
+        pipe.Drain();
+        pipe.ReleaseExclusive();
+        ASSERT_TRUE(done.try_acquire_for(2s));
+    }
 }
 
 TEST(DrawPipe, BoundsTheQueueAndKeepsOrderUnderBackpressure) {

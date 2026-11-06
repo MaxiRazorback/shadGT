@@ -96,6 +96,7 @@ public:
 
     /// Command thread: gives up ownership of the caches taken by Drain (before it goes idle).
     void ReleaseExclusive();
+    bool QueueIdle(); // PERF-GT7-046: includes urgent or idle callbacks.
 
     /// Command thread: whether it owns the caches after a drain.
     bool IsExclusive() {
