@@ -9,6 +9,7 @@
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
+#include "common/path_util.h"
 #include "common/debug.h"
 #include "common/perf_monitor.h"
 #include "common/types.h"
@@ -17,6 +18,7 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/image_allocation.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #ifdef RYTY_GPU
@@ -263,6 +265,11 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
 }
 
 Instance::~Instance() {
+    // Pipeline producers must already be stopped by the renderer. Ensure no
+    // queue still executes these shared shader objects before destroying them.
+    if (shader_object && device) std::ignore = device->waitIdle();
+    shader_object_builds.Drain([](const auto&) {});
+    if (device) ClearModuleCode(*device);
     ImGui::Core::Shutdown(GetDevice());
     VideoCore::ClearRecycledImages(allocator);
     DestroySmallImageAllocationPools(allocator);
@@ -302,8 +309,15 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceMemoryPriorityFeaturesEXT,
         vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT,
         vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR,
-        vk::PhysicalDeviceShaderQuadControlFeaturesKHR>();
+        vk::PhysicalDeviceShaderQuadControlFeaturesKHR,
+        vk::PhysicalDeviceShaderObjectFeaturesEXT,
+        vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT>();
     features = feature_chain.get().features;
+    struct Maintenance11Features {
+        VkStructureType sType;
+        void* pNext;
+        VkBool32 maintenance11;
+    } maintenance11_features{static_cast<VkStructureType>(1000657000), nullptr, VK_FALSE};
     // AMD-300: the features an older Radeon's driver turns off.
     if (const auto simulated = GetSimulatedGpu(); simulated != SimulatedGpu::None) {
         auto& vk11 = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
@@ -440,6 +454,77 @@ bool Instance::CreateDevice() {
     depth_clip_control = add_extension(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
     depth_clip_enable = add_extension(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
     vertex_input_dynamic_state = add_extension(VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
+    // SO-001 (RYGT_SHADER_OBJECT=1): VK_EXT_shader_object. Plain pipelines (no tessellation or
+    // geometry shader) are drawn with vertex and fragment shader objects and dynamic state
+    // instead of a compiled pipeline: no driver pipeline compile for them. Needs the dynamic
+    // states of extended_dynamic_state3 that those pipelines otherwise fix.
+    // SO-011: on by default; RYGT_SHADER_OBJECT=0 builds pipelines as before.
+    // SO-012: a start after a lost device with shader objects on uses pipelines once (the marker
+    // is removed, so the start after that tries shader objects again).
+    const auto lost_marker = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+                             "shader_objects" / "device_lost.txt";
+    bool after_loss = false;
+    {
+        std::error_code ec;
+        if (std::filesystem::exists(lost_marker, ec)) {
+            after_loss = true;
+            std::filesystem::remove(lost_marker, ec);
+            LOG_WARNING(Render_Vulkan, "SO-012: the GPU device was lost in the last run with shader "
+                                       "objects: this run builds pipelines");
+        }
+    }
+    if (const char* env = std::getenv("RYGT_SHADER_OBJECT");
+        !after_loss && !(env && env[0] == '0')) {
+        const auto& d3 = dynamic_state_3_features;
+        const bool states = dynamic_state_3 && d3.extendedDynamicState3DepthClampEnable &&
+                            d3.extendedDynamicState3PolygonMode &&
+                            d3.extendedDynamicState3RasterizationSamples &&
+                            d3.extendedDynamicState3SampleMask &&
+                            d3.extendedDynamicState3AlphaToCoverageEnable &&
+                            d3.extendedDynamicState3LogicOpEnable &&
+                            d3.extendedDynamicState3ColorBlendEnable &&
+                            d3.extendedDynamicState3ColorBlendEquation &&
+                            d3.extendedDynamicState3ColorWriteMask &&
+                            d3.extendedDynamicState3DepthClipEnable &&
+                            d3.extendedDynamicState3DepthClipNegativeOneToOne &&
+                            d3.extendedDynamicState3ProvokingVertexMode;
+        if (states && feature_chain.get<vk::PhysicalDeviceShaderObjectFeaturesEXT>().shaderObject &&
+            vertex_input_dynamic_state && graphics_pipeline_library) {
+            shader_object = add_extension(VK_EXT_SHADER_OBJECT_EXTENSION_NAME);
+        }
+        // SO-003: tessellated pipelines too. VK_EXT_shader_object itself provides the patch
+        // control point and domain origin commands its shaders need (AMD's driver reports no
+        // extendedDynamicState2PatchControlPoints feature, which only pipelines need).
+        // SO-011: on every GPU again, AMD included, now that shader objects are linked, cached on
+        // disk and set only changed state. RYGT_SHADER_OBJECT_TESS=0 keeps them pipelines.
+        // SO-006: VK_KHR_maintenance11's VK_SHADER_CREATE_INDEPENDENT_SETS_BIT_KHR lets shader
+        // objects use the independent-sets layouts the pipelines bind their sets with (newer
+        // than these headers: enabled by its name, feature structure type and flag value).
+        if (shader_object) {
+            if (add_extension("VK_KHR_maintenance11")) {
+                VkPhysicalDeviceFeatures2 maintenance_features{
+                    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                    .pNext = &maintenance11_features,
+                };
+                VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceFeatures2(
+                    static_cast<VkPhysicalDevice>(physical_device), &maintenance_features);
+                shader_independent_sets = maintenance11_features.maintenance11 != VK_FALSE;
+            }
+            shader_object = shader_independent_sets;
+        }
+        const char* tess = std::getenv("RYGT_SHADER_OBJECT_TESS");
+        shader_object_tessellation = shader_object && !(tess && tess[0] == '0');
+        if (shader_object) {
+            const auto properties = physical_device.getProperties2<
+                vk::PhysicalDeviceProperties2, vk::PhysicalDeviceShaderObjectPropertiesEXT>();
+            shader_object_properties = properties.get<vk::PhysicalDeviceShaderObjectPropertiesEXT>();
+        }
+        LOG_WARNING(Render_Vulkan, "SO-006: shader objects with independent sets: {}",
+                    shader_independent_sets ? "yes" : "no (using pipelines)");
+        LOG_WARNING(Render_Vulkan, "SO-001: shader objects {}; tessellated pipelines {}",
+                    shader_object ? "on" : "not available (driver lacks a needed feature)",
+                    shader_object_tessellation ? "too (SO-003)" : "as pipelines");
+    }
     // Games excessively leave restart enabled with lists when it isn't actually needed, and it
     // slows down KosmicKrisp due to unrolling. Revisit if KosmicKrisp moves this to mesh shaders.
     list_restart = driver_id != vk::DriverId::eMesaKosmickrisp &&
@@ -760,8 +845,22 @@ bool Instance::CreateDevice() {
             .customBorderColorWithoutFormat = true,
         },
         vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT{
+            .extendedDynamicState3DepthClampEnable = shader_object,
+            .extendedDynamicState3PolygonMode = shader_object,
+            .extendedDynamicState3RasterizationSamples = shader_object,
+            .extendedDynamicState3SampleMask = shader_object,
+            .extendedDynamicState3AlphaToCoverageEnable = shader_object,
+            .extendedDynamicState3LogicOpEnable = shader_object,
+            .extendedDynamicState3ColorBlendEnable = shader_object,
+            .extendedDynamicState3ColorBlendEquation = shader_object,
             .extendedDynamicState3ColorWriteMask =
                 dynamic_state_3_features.extendedDynamicState3ColorWriteMask,
+            .extendedDynamicState3DepthClipEnable = shader_object,
+            .extendedDynamicState3DepthClipNegativeOneToOne = shader_object,
+            .extendedDynamicState3ProvokingVertexMode = shader_object,
+        },
+        vk::PhysicalDeviceShaderObjectFeaturesEXT{
+            .shaderObject = true, // SO-001
         },
         vk::PhysicalDeviceDepthClipControlFeaturesEXT{
             .depthClipControl = true,
@@ -877,6 +976,9 @@ bool Instance::CreateDevice() {
     if (!custom_border_color) {
         device_chain.unlink<vk::PhysicalDeviceCustomBorderColorFeaturesEXT>();
     }
+    if (!shader_object) {
+        device_chain.unlink<vk::PhysicalDeviceShaderObjectFeaturesEXT>();
+    }
     if (!dynamic_state_3) {
         device_chain.unlink<vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT>();
     }
@@ -924,6 +1026,11 @@ bool Instance::CreateDevice() {
         device_chain.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
     }
 
+    if (shader_independent_sets) {
+        auto& create_info = device_chain.get<vk::DeviceCreateInfo>();
+        maintenance11_features.pNext = const_cast<void*>(create_info.pNext);
+        create_info.pNext = &maintenance11_features;
+    }
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {
         // ryGT: on some NVIDIA driver and setup combinations the driver rejects the device once
@@ -1232,6 +1339,15 @@ void Instance::LogDeviceFault() const {
     static std::atomic_flag logged = ATOMIC_FLAG_INIT;
     if (logged.test_and_set()) {
         return;
+    }
+    if (shader_object) {
+        std::error_code ec;
+        const auto folder = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / "shader_objects";
+        std::filesystem::create_directories(folder, ec);
+        if (std::FILE* file = std::fopen((folder / "device_lost.txt").string().c_str(), "w")) {
+            std::fputs("GPU device lost with shader objects on; next start uses pipelines\n", file);
+            std::fclose(file);
+        }
     }
 #ifdef RYTY_GPU
     Native::GpuCheckpoints::Log(static_cast<VkQueue>(graphics_queue));

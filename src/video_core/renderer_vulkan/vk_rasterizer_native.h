@@ -47,6 +47,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
+#include "video_core/renderer_vulkan/vk_graphics_pipeline.h" // SO-010
 
 namespace AmdGpu {
 union Regs;
@@ -209,6 +210,10 @@ private:
         RenderState render{};
         DynamicState dynamic{};
         PipelineBindingState<vk::Pipeline> pipelines;
+        bool so_known{};
+        u64 so_epoch{};
+        GraphicsPipeline::ShaderObjectState so_state{};
+        std::array<vk::ShaderEXT, 4> so_shaders{};
         BindingCommandMemo<vk::PipelineLayout, vk::DescriptorSet, Shader::PushData,
                            Shader::Backend::MaxDescriptorSets> binding_commands;
         /// OPT-005: the vertex input layout, vertex buffers and index buffer last recorded in

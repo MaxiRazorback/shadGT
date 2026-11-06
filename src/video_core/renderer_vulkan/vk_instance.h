@@ -8,6 +8,7 @@
 #include <unordered_map>
 
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/shared_build_map.h"
 
 #define TRACY_VK_USE_SYMBOL_TABLE
 #include <tracy/TracyVulkan.hpp>
@@ -20,12 +21,31 @@ VK_DEFINE_HANDLE(VmaAllocator)
 
 namespace Vulkan {
 
+struct SharedShaderObjects {
+    SharedShaderObjects() = default;
+    SharedShaderObjects(const SharedShaderObjects&) = delete;
+    SharedShaderObjects& operator=(const SharedShaderObjects&) = delete;
+    vk::Device device{};
+    std::array<vk::ShaderEXT, 4> objects{};
+    ~SharedShaderObjects() {
+        for (const auto shader : objects)
+            if (shader) VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyShaderEXT(device, shader, nullptr);
+    }
+};
+
 class Instance {
 public:
     explicit Instance(bool validation = false, bool crash_diagnostic = false);
     explicit Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                       bool enable_validation = false, bool enable_crash_diagnostic = false);
     ~Instance();
+
+    SharedBuildMap<std::shared_ptr<SharedShaderObjects>>& ShaderObjectBuilds() const {
+        return shader_object_builds;
+    }
+    const vk::PhysicalDeviceShaderObjectPropertiesEXT& ShaderObjectProperties() const {
+        return shader_object_properties;
+    }
 
     /// Returns a formatted string for the driver version
     std::string GetDriverVersionName();
@@ -169,6 +189,19 @@ public:
     /// Returns true when VK_EXT_depth_range_unrestricted is supported
     bool IsDepthRangeUnrestrictedSupported() const {
         return depth_range_unrestricted;
+    }
+
+    /// SO-001: plain pipelines are drawn with shader objects (RYGT_SHADER_OBJECT=1).
+    bool IsShaderObjectEnabled() const {
+        return shader_object;
+    }
+    /// SO-006: shader objects can be made for independent-sets layouts (VK_KHR_maintenance11).
+    bool IsShaderIndependentSetsSupported() const {
+        return shader_independent_sets;
+    }
+    /// SO-003: tessellated pipelines are drawn with shader objects too.
+    bool IsShaderObjectTessellationEnabled() const {
+        return shader_object_tessellation;
     }
 
     /// Returns true when VK_EXT_extended_dynamic_state3 is supported
@@ -498,6 +531,14 @@ public:
         return features.logicOp;
     }
 
+    /// SO-001: stages a shader object bind must name (null when unused).
+    bool IsGeometryShaderEnabled() const {
+        return features.geometryShader;
+    }
+    bool IsTessellationShaderEnabled() const {
+        return features.tessellationShader;
+    }
+
     bool IsDualSourceBlendSupported() const {
         return features.dualSrcBlend;
     }
@@ -560,6 +601,8 @@ private:
     vk::UniqueInstance instance;
     vk::PhysicalDevice physical_device;
     vk::UniqueDevice device;
+    mutable SharedBuildMap<std::shared_ptr<SharedShaderObjects>> shader_object_builds;
+    vk::PhysicalDeviceShaderObjectPropertiesEXT shader_object_properties{};
     vk::PhysicalDeviceProperties properties;
     vk::PhysicalDeviceMemoryProperties memory_properties;
     vk::PhysicalDeviceVulkan11Properties vk11_props;
@@ -597,6 +640,9 @@ private:
     bool depth_clip_control{};
     bool depth_clip_enable{};
     bool dynamic_state_3{};
+    bool shader_object{}; ///< SO-001
+    bool shader_object_tessellation{}; ///< SO-003
+    bool shader_independent_sets{};     ///< SO-006
     bool graphics_pipeline_library{};
     bool depth_range_unrestricted{};
     bool vertex_input_dynamic_state{};

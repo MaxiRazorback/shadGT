@@ -266,8 +266,8 @@ extern "C" __declspec(dllexport) int RytyTestOwnedTranslationInputs() {
 
 class PipelineCache::TranslateWorkers {
 public:
-    TranslateWorkers(const Shader::Profile& profile_, vk::Device device_, u32 count)
-        : profile{profile_}, device{device_} {
+    TranslateWorkers(const Shader::Profile& profile_, vk::Device device_, u32 count, bool keep_code_)
+        : profile{profile_}, device{device_}, keep_code{keep_code_} {
         for (u32 i = 0; i < count; ++i) {
             threads.emplace_back([this, i](std::stop_token stop) { Run(stop, i); });
         }
@@ -366,7 +366,7 @@ private:
         if (!Common::PerfFeatureEnabled(44)) {
             info->resource_usage_known = false;
         }
-        job.module = CompileSPV(job.spv, device);
+        job.module = CompileSPV(job.spv, device, keep_code);
 #ifndef NDEBUG
         job.translate_ms +=
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
@@ -376,6 +376,7 @@ private:
 
     const Shader::Profile& profile;
     vk::Device device;
+    const bool keep_code;
     std::mutex mutex;
     std::condition_variable_any cv;
     std::deque<std::shared_ptr<TranslateJob>> queue;
@@ -1185,7 +1186,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     if (const u32 count = std::clamp(std::thread::hardware_concurrency() / 2, 2u, 8u);
         Common::PerfFeatureEnabled(102)) {
         translate_workers =
-            std::make_unique<TranslateWorkers>(profile, instance.GetDevice(), count);
+            std::make_unique<TranslateWorkers>(profile, instance.GetDevice(), count,
+                                               instance.IsShaderObjectEnabled());
 #ifndef NDEBUG
         translate_stats.since = std::chrono::steady_clock::now();
 #endif
@@ -3660,9 +3662,9 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     const bool is_patched = patch && EmulatorSettings.IsPatchShaders();
     if (is_patched) {
         LOG_INFO(Loader, "Loaded patch for {} shader {:#x}", info.hw_stage, info.pgm_hash);
-        module = CompileSPV(*patch, instance.GetDevice());
+        module = CompileSPV(*patch, instance.GetDevice(), instance.IsShaderObjectEnabled());
     } else {
-        module = CompileSPV(spv, instance.GetDevice());
+        module = CompileSPV(spv, instance.GetDevice(), instance.IsShaderObjectEnabled());
     }
 #ifndef NDEBUG
     // PERF-DIAG-013: where runtime shader compile time goes.
@@ -4047,7 +4049,7 @@ bool PipelineCache::InstallPrewarmRecord(PrewarmRecord& record) {
             if (!record.spv[stage] || !IsCompleteSpirv(*record.spv[stage])) {
                 return false;
             }
-            permutation.module = CompileSPV(*record.spv[stage], instance.GetDevice());
+            permutation.module = CompileSPV(*record.spv[stage], instance.GetDevice(), instance.IsShaderObjectEnabled());
             permutation.stored = false;
         }
         if (!permutation.module) {
@@ -4252,7 +4254,7 @@ vk::ShaderModule PipelineCache::LoadStoredModule(u64 pgm_hash, size_t perm_idx,
                     "PERF-032: {} shader S().modules loaded from the store instead of translated",
                     loaded);
     }
-    return CompileSPV(spv, instance.GetDevice());
+    return CompileSPV(spv, instance.GetDevice(), instance.IsShaderObjectEnabled());
 }
 
 void PipelineCache::DumpFailedShader(std::span<const u32> code, u64 hash, Shader::HwStage stage) {
@@ -4970,6 +4972,7 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
         if (now - job->ready_since < std::chrono::seconds{30} && ready.size() <= 32) {
             return false;
         }
+        ForgetModuleCode(instance.GetDevice(), job->module);
         instance.GetDevice().destroyShaderModule(job->module);
 #ifndef NDEBUG
         ++translate_stats.expired;
@@ -5681,8 +5684,9 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
         for (auto& m : program->modules) {
             if (m.module == module) {
                 const auto& d = instance.GetDevice();
+                ForgetModuleCode(d, m.module);
                 d.destroyShaderModule(m.module);
-                m.module = CompileSPV(spv_code, d);
+                m.module = CompileSPV(spv_code, d, instance.IsShaderObjectEnabled());
                 new_module = m.module;
             }
         }

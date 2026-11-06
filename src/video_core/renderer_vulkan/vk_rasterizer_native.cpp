@@ -7550,7 +7550,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         }
         // A streaming reservation covers each descriptor snapshot before its
         // immutable slot becomes visible to the recording worker.
-        const bool eligible=descriptor_safe && parallel_descriptor_bytes<=
+        const bool eligible=!pipeline->UsesShaderObjects() && descriptor_safe && parallel_descriptor_bytes<=
             Native::Parallel::PassCoordinator::StreamDescriptorBytesPerDraw;
         if(eligible) {NATIVE_DIAGNOSTIC(++parallel->eligible);
             if(parallel->active)NATIVE_DIAGNOSTIC(++parallel->eligible_in_active_scope);
@@ -7686,7 +7686,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         !r.FrameDumpActive() && !SceneTrace::Id() && !Native::GpuCheckpoints::Requested() &&
         !scale_composition && !native_fsr_composition &&
         b.push.quad_sample_mask[0] == ~0u && b.push.quad_sample_mask[1] == ~0u;
-    const bool lds_batch_candidate = lds_proposed_size && LdsBatchOn() && lds_safe_draw;
+    const bool lds_batch_candidate = lds_proposed_size && LdsBatchOn() && lds_safe_draw &&
+                                     !pipeline->UsesShaderObjects();
     if (!s.lds_readers.empty() && (!lds_batch_candidate || s.lds_readers.size() >= 1024 ||
         s.lds_bytes + *lds_proposed_size > (32ull << 20))) FlushLdsReaders(0);
     {
@@ -7750,9 +7751,31 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     const CmdBuf cmdbuf{s.cmd};
     {
         PhaseClock part{stats.record_ns[4]};
-        if(!parallel_draw) s.pipelines.Graphics(pipeline->Handle(), [&] {
-            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
-        });
+        if (!parallel_draw && pipeline->UsesShaderObjects()) {
+            auto owner = r.pipeline_cache.KeepAlive(pipeline);
+            ASSERT_MSG(owner, "Shader object pipeline must outlive deferred recording");
+            static const bool delta = [] {
+                const char* env = std::getenv("RYGT_SO_DELTA");
+                std::error_code ec;
+                return !(env && env[0] == '0') && !std::filesystem::exists("so_delta.off", ec) && !ec;
+            }();
+            const bool known = delta && s.so_known && s.so_epoch == s.pipelines.InvalidationEpoch();
+            const auto previous = s.so_state;
+            const auto shaders = s.so_shaders;
+            cmdbuf.Run([pipeline, owner = std::move(owner), known, previous, shaders](vk::CommandBuffer cmd) {
+                pipeline->BindShaderObjects(cmd, known ? &previous : nullptr, known ? &shaders : nullptr);
+            });
+            if (!known) s.pipelines.Invalidate();
+            s.so_epoch = s.pipelines.InvalidationEpoch();
+            s.so_known = true;
+            s.so_state = pipeline->GetShaderObjectState();
+            s.so_shaders = pipeline->ShaderObjects();
+        } else if (!parallel_draw) {
+            s.so_known = false;
+            s.pipelines.Graphics(pipeline->Handle(), [&] {
+                cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+            });
+        }
     }
     {
         PhaseClock part{stats.record_ns[5]};

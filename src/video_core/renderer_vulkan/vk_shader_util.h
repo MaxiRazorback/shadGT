@@ -4,6 +4,7 @@
 #pragma once
 
 #include <span>
+#include <vector>
 
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -15,6 +16,10 @@ namespace Vulkan {
  * @param code The SPIR-V bytecode data.
  * @param device The vulkan device handle
  */
-vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device);
+vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device, bool keep_code = false);
+
+std::vector<u32> ModuleCode(vk::Device device, vk::ShaderModule module);
+void ForgetModuleCode(vk::Device device, vk::ShaderModule module);
+void ClearModuleCode(vk::Device device);
 
 } // namespace Vulkan
