@@ -67,6 +67,7 @@ void DataBase::Open() {
     if (opened) {
         return;
     }
+    compatible_sibling = false;
 
     const auto& game_info = Common::ElfInfo::Instance();
 
