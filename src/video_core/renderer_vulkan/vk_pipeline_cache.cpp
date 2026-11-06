@@ -7,6 +7,7 @@
 #include "video_core/renderer_vulkan/draw_preparation_options.h"
 #include "video_core/renderer_vulkan/compile_cpu_batch.h"
 #include "video_core/renderer_vulkan/stale_pipeline_builds.h"
+#include "video_core/renderer_vulkan/read_ahead_budget.h"
 #include "video_core/renderer_vulkan/speculative_key.h"
 #include "shader_recompiler/lane_read_policy.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
@@ -2623,7 +2624,13 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
     u32 evaluated = 0;
     u32 started = 0;
     // Check time and the required build between states. One key evaluation cannot be preempted.
-    const auto budget = start + std::chrono::milliseconds{2};
+    static thread_local ReadAheadBudget read_ahead_budget;
+    const bool waiting = restore || Common::CompileCoresWide();
+    const auto budget = read_ahead_budget.Deadline(start, waiting);
+    if (!budget) return;
+    SCOPE_EXIT {
+        if (!waiting) read_ahead_budget.Charge(start, std::chrono::steady_clock::now(), false);
+    };
     std::exception_ptr restore_error;
     {
     SCOPE_EXIT {
@@ -2641,7 +2648,7 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
             restore_error = std::current_exception();
         }
     };
-    while (std::chrono::steady_clock::now() < budget && (!restore || evaluated < 64) &&
+    while (std::chrono::steady_clock::now() < *budget && (!restore || evaluated < 64) &&
            (!restore || !t_required_pipeline_build ||
             t_required_pipeline_build->wait_for(std::chrono::microseconds{0}) != std::future_status::ready) &&
            states->Take(queued_state_regs->reg_array)) {

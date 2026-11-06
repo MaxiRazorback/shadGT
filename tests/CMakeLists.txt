@@ -255,6 +255,12 @@ target_compile_features(shadps4_speculative_key_test PRIVATE cxx_std_23)
 target_link_libraries(shadps4_speculative_key_test PRIVATE GTest::gtest_main)
 gtest_discover_tests(shadps4_speculative_key_test)
 
+add_executable(shadps4_read_ahead_budget_test test_read_ahead_budget.cpp)
+target_include_directories(shadps4_read_ahead_budget_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_read_ahead_budget_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_read_ahead_budget_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_read_ahead_budget_test)
+
 add_executable(shadps4_translation_age_test test_translation_age.cpp)
 target_include_directories(shadps4_translation_age_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(shadps4_translation_age_test PRIVATE cxx_std_23)
