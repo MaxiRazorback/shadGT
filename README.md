@@ -3,14 +3,6 @@ SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
-<h1 align="center">
-  <img src="assets/GranTurismoSportBanner.png" width="800" alt="Gran Turismo Sport banner">
-  <br>
-  <b>shadGT</b>
-  <br>
-  <sub>Gran Turismo Sport on PC, built on the shadPS4 emulator</sub>
-</h1>
-
 # About
 
 shadGT is a Windows-only fork of the [shadPS4](https://github.com/shadps4-emu/shadPS4)
@@ -144,6 +136,3 @@ information, so check them before sharing.
 
 Licensed under [GPL-2.0-or-later](LICENSE), like shadPS4.
 
-<p align="center">
-  <img src="assets/GranTurismoSportBanner2.webp" width="800" alt="Gran Turismo Sport banner">
-</p>
