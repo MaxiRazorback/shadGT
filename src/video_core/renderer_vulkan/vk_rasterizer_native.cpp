@@ -1,6 +1,7 @@
 #include <exception>
 #include "ryty_gpu/native/cpu_stack_registry.h"
 #include "ryty_gpu/native/cube_view_policy.h"
+#include "ryty_gpu/native/readable_binding.h"
 #include "ryty_gpu/native/ahead_descriptor_pools.h"
 #include "ryty_gpu/native/per_draw_view_proof.h"
 #include "ryty_gpu/native/adaptive_xxh3.h"
@@ -5004,8 +5005,19 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                  (sharp_size >= 1_GB && base != 0 && !r.memory->IsValidMapping(base)));
             const bool unmapped =
                 !impossible && base != 0 && sharp_size != 0 && !r.IsMappedStart(base);
-            if (base != 0 && sharp_size != 0 && !impossible && !unmapped) {
-                const u64 size = r.memory->ClampRangeSize(base, sharp_size);
+            const bool bindable = base != 0 && sharp_size != 0 && !impossible && !unmapped;
+            u64 size = bindable ? r.memory->ClampRangeSize(base, sharp_size) : 0;
+            static const bool readable_cut = [] {
+                const char* env = std::getenv("RYGT_NATIVE_READABLE_CUT");
+                return !(env && env[0] == '0');
+            }();
+            auto* readable_direct = r.buffer_cache.GetDirectMemory();
+            if (bindable) size = Native::ReadableBindingSize(base, size, desc.is_written,
+                readable_cut, readable_direct != nullptr,
+                [&](u64 a, u64 n) { std::shared_lock lock{buffer_map_mutex}; return RegionOver(a, n) != nullptr; },
+                [&](u64 a, u64 n) { return readable_direct->EnsureImported(a, n); },
+                [&](u64 a, u64 n) { return Native::ReadablePrefix(reinterpret_cast<const void*>(a), n); });
+            if (bindable && size != 0) {
 #if !defined(NDEBUG)
                 // FIX-174 (diagnosis, RYGT_NATIVE_WATCH_BUFFER=<hex address>+<hex size>): the
                 // shaders that bind a buffer over that range (the first ones, then now and then).
@@ -9494,8 +9506,24 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
                  (sharp_size >= 1_GB && base != 0 && !r.memory->IsValidMapping(base)));
             const bool unmapped =
                 !impossible && base != 0 && sharp_size != 0 && !r.IsMappedStart(base);
-            if (base != 0 && sharp_size != 0 && !impossible && !unmapped) {
-                const u64 size = r.memory->ClampRangeSize(base, sharp_size);
+            const bool bindable = base != 0 && sharp_size != 0 && !impossible && !unmapped;
+            u64 size = bindable ? r.memory->ClampRangeSize(base, sharp_size) : 0;
+            const u64 original_size = size;
+            static const bool readable_cut = [] {
+                const char* env = std::getenv("RYGT_NATIVE_READABLE_CUT");
+                return !(env && env[0] == '0');
+            }();
+            auto* readable_direct = r.buffer_cache.GetDirectMemory();
+            if (bindable) size = Native::ReadableBindingSize(base, size, desc.is_written,
+                readable_cut, readable_direct != nullptr,
+                [&](u64 a, u64 n) { std::shared_lock lock{buffer_map_mutex}; return RegionOver(a, n) != nullptr; },
+                [&](u64 a, u64 n) { return readable_direct->EnsureImported(a, n); },
+                [&](u64 a, u64 n) { return Native::ReadablePrefix(reinterpret_cast<const void*>(a), n); });
+            // A region can appear after a worker's overlap check. Recheck any
+            // truncated/empty range on the serialized recorder rather than
+            // publishing an untracked truncated descriptor.
+            if (size != original_size) return false;
+            if (bindable && size != 0) {
                 bool region_over;
                 {
                     std::shared_lock map_lock{buffer_map_mutex};
