@@ -1489,7 +1489,10 @@ void InstallExperimentalSceneViewport(u8* base) {
         reinterpret_cast<void*>(&MatchExperimentalSceneViewport), "experimental scene viewport scale"));
 }
 
+void InstallPhotoExport(); // GTS-010, gts_photo_export.cpp
+
 void RytyApplyGamePatches() {
+    InstallPhotoExport();
     InstallExperimentalSceneViewport(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallMenuSnapshotSessionGuard(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallIdleKeyboardClose(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
