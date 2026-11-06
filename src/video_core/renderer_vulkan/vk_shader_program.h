@@ -52,6 +52,11 @@ struct Program {
     } match_memo;
     /// R7: the permutation the last search found; tried first next time.
     size_t last_match{~size_t{0}};
+    MatchMemo ahead_memo;
+    size_t ahead_last_match{~size_t{0}};
+
+    MatchMemo& SearchMemo(bool ahead) { return ahead ? ahead_memo : match_memo; }
+    size_t& SearchLastMatch(bool ahead) { return ahead ? ahead_last_match : last_match; }
 
     void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
                    std::unique_ptr<Shader::Info> info) {

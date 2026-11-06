@@ -251,6 +251,33 @@ TEST(ShaderSpecialization, EmptyBoundBufferIgnoresUnusedAddressing) {
     EXPECT_TRUE(first == KeyFor(info));
 }
 
+TEST(ShaderSpecialization, AmbiguousAheadMatchKeepsDrawSearchState) {
+    auto info = TranslatedFragmentWithBuffer(true);
+    info.buffer_stride_used.set(0);
+    Bind(info.buffers[0], BoundBuffer(16));
+    const auto first = KeyFor(info);
+    Bind(info.buffers[0], BoundBuffer(48));
+    const auto second = KeyFor(info);
+    auto empty = BoundBuffer(16);
+    empty.base_address = 0;
+    Bind(info.buffers[0], empty);
+    const auto lookup = KeyFor(info);
+    ASSERT_TRUE(first == lookup);
+    ASSERT_TRUE(second == lookup);
+
+    Vulkan::Program program;
+    program.SearchLastMatch(false) = 0;
+    program.SearchMemo(false).valid = true;
+    program.SearchMemo(false).perm = 0;
+    program.SearchLastMatch(true) = 1;
+    program.SearchMemo(true).valid = true;
+    program.SearchMemo(true).perm = 1;
+    EXPECT_EQ(program.SearchLastMatch(false), 0u);
+    EXPECT_EQ(program.SearchMemo(false).perm, 0u);
+    EXPECT_EQ(program.SearchLastMatch(true), 1u);
+    EXPECT_EQ(program.SearchMemo(true).perm, 1u);
+}
+
 TEST(ShaderSpecialization, KeepsEveryBufferPropertyWhenTranslationUsageIsUnknown) {
     // A shader loaded from storage carries no usage flags.
     auto info = TranslatedFragmentWithBuffer(false);

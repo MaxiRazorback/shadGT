@@ -5522,7 +5522,13 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
     std::string mismatch_reasons;
     // PERF-044: replay the last search when its inputs are the same. -DisablePerf 56.
     static const bool memo_enabled = Common::PerfFeatureEnabled(56);
-    auto& memo = program->match_memo;
+    static const bool own_ahead_match = [] {
+        const char* value = std::getenv("RYGT_READ_AHEAD_OWN_MATCH");
+        return !(value && value[0] == '0');
+    }();
+    const bool ahead = own_ahead_match && regs_override != nullptr;
+    auto& memo = program->SearchMemo(ahead);
+    auto& last_match = program->SearchLastMatch(ahead);
     const bool memo_stage = memo_enabled && (hw_stage == HwStage::Fragment ||
                                              hw_stage == HwStage::Compute);
     bool memo_usable = memo_stage && memo.valid &&
@@ -5544,8 +5550,8 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
     // -DisablePerf 133 searches from the first every time.
     static const bool last_first = Common::PerfFeatureEnabled(133);
     if (last_first && !memo_usable && hw_stage != HwStage::Hull &&
-        program->last_match < program->modules.size()) {
-        auto& permutation = program->modules[program->last_match];
+        last_match < program->modules.size()) {
+        auto& permutation = program->modules[last_match];
         if (permutation.info && !permutation.stored) {
             auto& info = *permutation.info;
             info.pgm_base = params.Base();
@@ -5577,14 +5583,14 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
                 !(AsyncTranslation() && !info.attribute_flags_known && IsTessEmulatedDraw())) {
                 if (!info.attribute_flags_known && IsTessEmulatedDraw()) {
                     RecoverAttributeFlags(info, permutation.spec, params, runtime_info,
-                                          program->last_match);
+                                          last_match);
                 }
                 info.AddBindings(binding);
                 if (auto& fetch = permutation.spec.fetch_shader_data; !fetch.Empty()) {
                     S().fetch_shader = &fetch;
                 }
                 return std::make_tuple(&info, permutation.module,
-                                       HashCombine(params.hash, program->last_match));
+                                       HashCombine(params.hash, last_match));
             }
         }
     }
@@ -5666,7 +5672,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
             memo.user_data.assign(params.user_data.begin(), params.user_data.end());
             memo.flats.assign(flats.begin(), flats.end());
         }
-        program->last_match = perm_idx; // R7
+        last_match = perm_idx; // R7
         if (!memo_usable && SpecFastMode()) RecordSpecInputs(permutation, info, runtime_info, binding);
         if (!info.attribute_flags_known && IsTessEmulatedDraw()) {
             RecoverAttributeFlags(info, permutation.spec, params, runtime_info, perm_idx);
