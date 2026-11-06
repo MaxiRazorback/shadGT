@@ -79,6 +79,15 @@ constexpr MipTarget Targets[] = {
 };
 } // namespace
 
+TEST(ImageMips, TinyMacroTilesUseModeZero) {
+    for (u32 bits : {1u, 2u, 4u, 8u}) {
+        EXPECT_EQ(AmdGpu::CalculateMacrotileMode(Macro, bits, 1),
+                  AmdGpu::MacroTileMode::Mode_1x4_16);
+    }
+    EXPECT_EQ(AmdGpu::CalculateMacrotileMode(Macro, 16, 1),
+              AmdGpu::MacroTileMode::Mode_1x2_16);
+}
+
 TEST(ImageMips, LayoutMatchesTheGameMipAddresses) {
     const auto texture = Color2D(EnvMap, 2048, 1024, 12, Macro);
     for (u32 mip = 1; mip < 12; ++mip) {
