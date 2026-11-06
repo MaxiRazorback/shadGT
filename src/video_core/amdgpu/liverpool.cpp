@@ -1394,6 +1394,7 @@ void Liverpool::ProcessCommands() {
 }
 
 void Liverpool::Process(std::stop_token stoken) {
+    SCOPE_EXIT { Common::UpdateCoreOwner(0, false); };
     Common::SetCurrentThreadName("shadGT:GpuCommandProcessor");
     Common::PreferPerformanceCores(); // PERF-088
     Common::GuestClock::MarkGpuCommandThread(); // FIX-044
@@ -1407,6 +1408,7 @@ void Liverpool::Process(std::stop_token stoken) {
         if (draw_pipe) {
             draw_pipe->ReleaseExclusive(); // PERF-050: idle; urgent work may run on the recorder
         }
+        Common::UpdateCoreOwner(0, true); // PERF-GT7-048
         {
             std::unique_lock lk{submit_mutex};
             const auto has_work = [this] { return num_commands || num_tasks || submit_done; };

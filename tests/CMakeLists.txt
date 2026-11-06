@@ -102,6 +102,17 @@ target_link_libraries(shadps4_shader_program_test PRIVATE
     magic_enum::magic_enum)
 gtest_discover_tests(shadps4_shader_program_test)
 
+if(WIN32)
+    add_executable(shadps4_compile_thread_policy_test test_compile_thread_policy.cpp
+        test_compile_thread_stubs.cpp ${CMAKE_SOURCE_DIR}/src/common/thread.cpp)
+    target_include_directories(shadps4_compile_thread_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_features(shadps4_compile_thread_policy_test PRIVATE cxx_std_23)
+    target_link_libraries(shadps4_compile_thread_policy_test PRIVATE fmt::fmt)
+    add_test(NAME compile_thread_policy_existing COMMAND shadps4_compile_thread_policy_test)
+    add_test(NAME compile_thread_policy_late COMMAND ${CMAKE_COMMAND} -E env RYGT_POLICY_TEST_LATE=1
+        $<TARGET_FILE:shadps4_compile_thread_policy_test>)
+endif()
+
 add_executable(shadps4_image_aliasing_test test_image_aliasing.cpp)
 target_include_directories(shadps4_image_aliasing_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(shadps4_image_aliasing_test PRIVATE

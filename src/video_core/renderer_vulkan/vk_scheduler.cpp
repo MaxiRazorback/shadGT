@@ -13,6 +13,7 @@
 #include "common/diagnostics.h"
 #include "common/logging/log.h"
 #include "common/perf_monitor.h"
+#include "common/scope_exit.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -74,6 +75,22 @@ Scheduler::Scheduler(const Instance& instance)
 }
 
 void Scheduler::StartPerfMonitor() {
+    // PERF-GT7-024/054: compilation affinity is functional in Release too;
+    // do not couple it to the Debug-only performance counters.
+    try { compile_monitor_thread = std::jthread([](std::stop_token stop) {
+        Common::SetCurrentThreadName("shadGT:CompileMonitor");
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+        std::mutex mutex;
+        std::condition_variable_any cv;
+        std::unique_lock lock{mutex};
+        while (!stop.stop_requested()) {
+            cv.wait_for(lock, stop, std::chrono::seconds{10}, [] { return false; });
+            if (!stop.stop_requested()) Common::ConfineDriverCompileThreads();
+        }
+        Common::ReleaseDriverCompileThreads();
+    }); } catch (const std::exception& e) {
+        LOG_WARNING(Render_Vulkan, "Compile monitor unavailable: {}", e.what());
+    }
 #ifndef NDEBUG
     perf_monitor_thread = std::jthread(std::bind_front(&Scheduler::PerfMonitorThread, this));
 #endif
@@ -225,6 +242,7 @@ vk::CommandBuffer Scheduler::DirectCommandBuffer() {
 }
 
 void Scheduler::CommandThread(std::stop_token stoken) {
+    SCOPE_EXIT { Common::UpdateCoreOwner(2, false); };
     Common::SetCurrentThreadName("shadGT:VkCommands");
     Common::PreferPerformanceCores(); // PERF-088
     auto& commands = *ring;
@@ -258,6 +276,7 @@ void Scheduler::CommandThread(std::stop_token stoken) {
             commands.WaitForWork(position, stoken);
             continue;
         }
+        Common::UpdateCoreOwner(2, true); // PERF-GT7-048
 #ifndef NDEBUG
         const auto start = std::chrono::steady_clock::now();
 #endif

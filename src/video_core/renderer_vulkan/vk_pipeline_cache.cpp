@@ -285,8 +285,10 @@ public:
 private:
     void Run(std::stop_token stop, u32 index) {
         Common::SetCurrentThreadName(fmt::format("shadGT:ShaderTranslate{}", index).c_str());
-        Common::AllowAllCores();
-        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+        if (Common::HybridCpu()) Common::PreferCompileCores();
+        SCOPE_EXIT { Common::ReleaseCompileCores(); };
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Normal);
+        bool low_priority = false;
         while (!stop.stop_requested()) {
             std::shared_ptr<TranslateJob> job;
             {
@@ -297,6 +299,12 @@ private:
                 }
                 job = std::move(queue.front());
                 queue.pop_front();
+            }
+            const bool want_low = Common::CompileThreadsLow();
+            if (want_low != low_priority) {
+                low_priority = want_low;
+                Common::SetCurrentThreadPriority(want_low ? Common::ThreadPriority::Low
+                                                          : Common::ThreadPriority::Normal);
             }
             try {
                 // Release temporary IR allocations after each job, including failed jobs.
@@ -522,20 +530,34 @@ private:
 
     void Work(std::stop_token stop) {
         Common::SetCurrentThreadName("shadGT:PipelineBuild");
-        Common::AllowAllCores();
-        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
-        bool startup_priority = false;
+        Common::PreferCompileCores();
+        SCOPE_EXIT { Common::ReleaseCompileCores(); };
+        bool all_cores = false;
+        bool low_priority = false;
+        bool backlog = false;
+        static const bool backlog_cores = Common::PerfFeatureEnabled(160);
         while (true) {
             BuildQueue::Job job;
             bool background = false, heavy = false;
             if (!queue.Pop(job, background, stop, &heavy)) {
                 return;
             }
-            const bool startup = queue.Boosted();
-            if (startup != startup_priority) {
-                Common::SetCurrentThreadPriority(startup ? Common::ThreadPriority::Normal
-                                                        : Common::ThreadPriority::Low);
-                startup_priority = startup;
+            if (backlog_cores) {
+                const size_t pending = queue.Pending();
+                if (pending >= 16) backlog = true;
+                else if (pending <= 2) backlog = false;
+            }
+            const bool want_all = (backlog && Common::HybridCpu()) || Common::CompileCoresWide();
+            if (want_all != all_cores) {
+                all_cores = want_all;
+                if (all_cores) Common::ReleaseCompileCores();
+                else Common::PreferCompileCores();
+            }
+            const bool want_low = backlog || Common::CompileThreadsLow();
+            if (want_low != low_priority) {
+                low_priority = want_low;
+                Common::SetCurrentThreadPriority(want_low ? Common::ThreadPriority::Low
+                                                          : Common::ThreadPriority::Normal);
             }
             job();
             if (background) {
@@ -565,7 +587,7 @@ struct PipelineCache::PipelineBuild {
     std::promise<void> promise;
     std::shared_future<void> done;
     std::chrono::steady_clock::time_point queued;
-    bool urgent{};
+    std::atomic<bool> urgent{};
     // PERF-038: a stored pipeline built in the background (no runtime shader state needed).
     bool preloading{};
     // PERF-076: a new pipeline its draws skip until a worker has built it.
@@ -1082,10 +1104,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         static std::jthread dump_store{[this, d = std::string{dir}] { DumpStore(d); }};
     }
 #endif
-    // Reserve translation capacity within the combined compiler budget.
-    if (const u32 count = CompilerWorkerBudget::ForLogicalThreads(
-            std::thread::hardware_concurrency()).translation;
-        Common::PerfFeatureEnabled(102) && count != 0) {
+    // PERF-GT7-028: up to half the logical CPUs translate shaders; the
+    // independent heavy-driver-compile admission limit remains in force.
+    if (const u32 count = std::clamp(std::thread::hardware_concurrency() / 2, 2u, 8u);
+        Common::PerfFeatureEnabled(102)) {
         translate_workers =
             std::make_unique<TranslateWorkers>(profile, instance.GetDevice(), count);
 #ifndef NDEBUG
@@ -1474,6 +1496,9 @@ std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::MakePipelineBuild()
 
 void PipelineCache::FinishBuild(PipelineBuild& build) {
     if (!build.started.exchange(true)) {
+      const bool foreground = build.urgent.load(std::memory_order_acquire);
+      if (foreground) Common::BeginForegroundCompile();
+      SCOPE_EXIT { if (foreground) Common::EndForegroundCompile(); };
       try {
         build.pipeline = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, build.key, *pipeline_cache, build.infos,
@@ -2901,8 +2926,13 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             // Queueing a cosmetic job must not freeze input/audio clocks. Hold
             // them only while this command actually needs an unfinished build.
             std::optional<Common::GuestClock::CompilePause> hold;
-            if (build->done.wait_for(std::chrono::microseconds{0}) != std::future_status::ready)
+            const bool widen_compile = build->done.wait_for(std::chrono::microseconds{0}) !=
+                                       std::future_status::ready;
+            if (widen_compile) {
                 hold.emplace();
+                Common::SetCompileCoresWide(true);
+            }
+            SCOPE_EXIT { if (widen_compile) Common::SetCompileCoresWide(false); };
             if (queued_states) {
                 Common::Nvtx::Scope nvtx{"wait for pipeline build"}; // DIAG-056
                 WaitForBuild(*build, params);
@@ -3011,6 +3041,8 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         const auto module = S().modules[0];
         auto job = std::make_shared<std::packaged_task<std::unique_ptr<ComputePipeline>()>>(
             [this, inputs, key, module] {
+                Common::BeginForegroundCompile();
+                SCOPE_EXIT { Common::EndForegroundCompile(); };
                 return std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
                     *pipeline_cache, key, inputs->info, module, inputs->sdata);
             });

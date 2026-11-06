@@ -11,6 +11,7 @@
 #include "common/logging/log.h"
 #include "common/nvtx.h"
 #include "common/perf_monitor.h"
+#include "common/scope_exit.h"
 #include "common/thread.h"
 #include "video_core/buffer_cache/direct_memory.h"
 #include "video_core/amdgpu/draw_pipe.h"
@@ -464,6 +465,7 @@ DrawPipe::Stats DrawPipe::TakeStats() {
 }
 
 void DrawPipe::Run(std::stop_token stop) {
+    SCOPE_EXIT { Common::UpdateCoreOwner(1, false); };
     if (thread_init) {
         thread_init();
     }
@@ -519,6 +521,7 @@ void DrawPipe::Run(std::stop_token stop) {
                 done_cv.notify_all(); // A producer may wait for space.
             }
         }
+        Common::UpdateCoreOwner(1, true); // PERF-GT7-048
         const auto start = std::chrono::steady_clock::now();
         u64 ran = 0;
         Common::Nvtx::Scope nvtx{"recording"}; // DIAG-056
