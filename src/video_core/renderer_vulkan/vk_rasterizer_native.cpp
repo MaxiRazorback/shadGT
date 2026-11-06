@@ -1374,6 +1374,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
     }
     LOG_INFO(Render_Vulkan, "NAT-100: native mode: draws, dispatches and copies are recorded with "
                             "native images and guest memory read in place");
+    if (auto* direct = r.buffer_cache.GetDirectMemory()) direct->HoldNativeReleases();
 }
 
 NativeRenderer::~NativeRenderer() {
@@ -1415,6 +1416,14 @@ NativeRenderer::~NativeRenderer() {
         r.scheduler.Finish();
         while(!ahead_shutdown->pools.DestroyReady(timeline->Completed()))std::this_thread::yield();
 
+    }
+    if (stream.list) Splice();
+    if (auto* direct = r.buffer_cache.GetDirectMemory()) {
+        // Teardown must also cover an earlier enqueue failure and any pending scheduler
+        // callback that has not yet run, before either device or imported backing dies.
+        r.scheduler.Finish();
+        stream.imported_view_leases.clear();
+        direct->ReleaseHeldAfterGpuIdle();
     }
     const vk::Device vk_device = r.instance.GetDevice();
     for (const auto pool : free_pools) {
@@ -11147,6 +11156,11 @@ void NativeRenderer::Splice() {
     const u64 tick = r.scheduler.CurrentTick();
     if (!wrapped) {
         device->MarkExecuted(s.list, {timeline.get(), tick});
+    }
+    if (auto* direct = r.buffer_cache.GetDirectMemory()) {
+        const u64 retire_tick = std::max(tick, boundary_signal);
+        direct->RetireLeasesAfterSplice(s.imported_view_leases, retire_tick);
+        direct->ReleaseHeldAfterSplice(retire_tick);
     }
     {
         std::scoped_lock chunk_lock{chunk_mutex};

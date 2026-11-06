@@ -273,6 +273,7 @@ private:
         DescriptorSetReserve<u64, vk::DescriptorSet> descriptor_reserve;
         std::vector<vk::DescriptorPool> pools; ///< for pipelines without push descriptors
         std::vector<std::unique_ptr<Native::Rhi::Buffer>> keep; ///< alive until the list ran
+        std::vector<std::shared_ptr<void>> imported_view_leases;
         std::vector<LdsReader> lds_readers;
         u64 lds_bytes = 0;
         u32 commands = 0;
