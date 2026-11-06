@@ -1366,10 +1366,12 @@ bool GraphicsPipeline::CreateShaderObjects(
                 }
                 if (!binaries.empty()) {
                     auto binary_infos = create_infos;
+                    std::vector<std::vector<ShaderBinaryBlock>> aligned_binaries(binary_infos.size());
                     for (size_t i = 0; i < binary_infos.size(); ++i) {
+                        aligned_binaries[i] = AlignShaderBinary(binaries[i]);
                         binary_infos[i].codeType = vk::ShaderCodeTypeEXT::eBinary;
                         binary_infos[i].codeSize = binaries[i].size();
-                        binary_infos[i].pCode = binaries[i].data();
+                        binary_infos[i].pCode = aligned_binaries[i].data();
                     }
                     result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateShadersEXT(
                         instance.GetDevice(), static_cast<u32>(binary_infos.size()),

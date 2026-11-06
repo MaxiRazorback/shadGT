@@ -63,7 +63,9 @@ int main(int argc, char** argv) {
     size_t size = 0; CHECK(vkGetShaderBinaryDataEXT(device, shader, &size, nullptr));
     std::vector<unsigned char> binary(size); CHECK(vkGetShaderBinaryDataEXT(device, shader, &size, binary.data()));
     vkDestroyShaderEXT(device, shader, nullptr); shader = VK_NULL_HANDLE;
-    sci.codeType = VK_SHADER_CODE_TYPE_BINARY_EXT; sci.codeSize = size; sci.pCode = binary.data();
+    struct alignas(16) BinaryBlock { unsigned char bytes[16]; };
+    std::vector<BinaryBlock> aligned((size + 15) / 16); std::memcpy(aligned.data(), binary.data(), size);
+    sci.codeType = VK_SHADER_CODE_TYPE_BINARY_EXT; sci.codeSize = size; sci.pCode = aligned.data();
     CHECK(vkCreateShadersEXT(device, 1, &sci, nullptr, &shader));
     vkDestroyShaderEXT(device, shader, nullptr); vkDestroyDevice(device, nullptr); vkDestroyInstance(instance, nullptr);
     std::printf("PASS: %s SPIR-V and %zu-byte binary shader objects\n", props.deviceName, size);

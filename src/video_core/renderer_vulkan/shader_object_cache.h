@@ -3,11 +3,21 @@
 #include <cstdio>
 #include <cstdint>
 #include <vector>
+#include <array>
+#include <cstring>
+#include <span>
 #include <xxhash.h>
 
 namespace Vulkan {
 
 inline constexpr std::uint32_t ShaderObjectCacheMagic = 0x32424F53;
+
+struct alignas(16) ShaderBinaryBlock { std::array<std::uint8_t, 16> bytes; };
+inline std::vector<ShaderBinaryBlock> AlignShaderBinary(std::span<const std::uint8_t> binary) {
+    std::vector<ShaderBinaryBlock> result((binary.size() + 15) / 16);
+    if (!binary.empty()) std::memcpy(result.data(), binary.data(), binary.size());
+    return result;
+}
 
 inline std::vector<std::vector<std::uint8_t>> ReadShaderObjectBinaries(
     std::FILE* file, std::uint32_t expected_count) {

@@ -45,6 +45,17 @@ TEST(ShaderObjectCache, ReadsIntactCheckedBinary) {
     EXPECT_EQ(binaries[0], (std::vector<std::uint8_t>{10, 20, 30, 40}));
 }
 
+TEST(ShaderObjectCache, BinaryStagingAlignsEveryUnalignedSourceOffset) {
+    std::vector<std::uint8_t> source(80);
+    for (size_t i = 0; i < source.size(); ++i) source[i] = static_cast<std::uint8_t>(i);
+    for (size_t offset = 0; offset < 16; ++offset) {
+        const std::span<const std::uint8_t> input{source.data() + offset, 33};
+        const auto blocks = Vulkan::AlignShaderBinary(input);
+        ASSERT_EQ(reinterpret_cast<std::uintptr_t>(blocks.data()) % 16, 0u);
+        EXPECT_EQ(std::memcmp(blocks.data(), input.data(), input.size()), 0);
+    }
+}
+
 TEST(ShaderObjectCache, BlendedHudAndLdsEmulationDefaultToPipelines) {
     using Vulkan::ShaderObjectPolicyAllows;
     EXPECT_FALSE(ShaderObjectPolicyAllows(true, 0, 1, 1));
