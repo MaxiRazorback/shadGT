@@ -1468,6 +1468,8 @@ static std::vector<u8> ReadDriverCacheSnapshot(vk::Device device, vk::PipelineCa
 
 
 void PipelineCache::SaveDriverCache(bool wait) {
+    // FIX-GT7-050: wait even when a rejected cache or empty path prevents a new save.
+    if (wait && driver_cache_writer.joinable()) driver_cache_writer.join();
     if (rejected_driver_cache.load() || driver_cache_path.empty() || !pipeline_cache) {
         return;
     }
