@@ -13,6 +13,7 @@ namespace Vulkan {
 // Set before cache readers/workers start; candidate blobs are ignored on other profiles.
 void SetSingleSampleBarycentricCacheEnabled(bool enabled);
 void SetVertexOrderCheckCacheEnabled(bool enabled); // AMD-307
+void SetDiscardKillCacheEnabled(bool enabled);      // FIX-223
 
 void RegisterPipelineData(const ComputePipelineKey& key,
                           ComputePipeline::SerializationSupport& sdata);

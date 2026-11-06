@@ -27,6 +27,7 @@ struct Profile {
     bool support_fp16_denorm_flush{};
     bool support_fp16_round_to_zero{};
     bool support_fp32_denorm_preserve{};
+    bool discard_kills{}; ///< FIX-223
     bool support_fp32_denorm_flush{};
     bool support_fp32_round_to_zero{};
     bool support_fp64_denorm_preserve{};

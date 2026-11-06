@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/ir/debug_print.h"
@@ -149,7 +151,35 @@ void EmitEpilogue(EmitContext& ctx) {
     }
 }
 
+// FIX-GTS-011: shaders FIX-223 leaves as they were. GT Sport's photo mode filters (Cross
+// Processing and others) need their discarded pixels to stay helpers: ended at once, the filter
+// washed the picture out to purple and white. A change to this list needs a new
+// ShaderBinaryVersionDiscardKill (vk_pipeline_serialization.cpp), or stored shaders keep the old.
+static bool DiscardKills(EmitContext& ctx) {
+    if (!ctx.profile.discard_kills) {
+        return false;
+    }
+    static constexpr std::array<u64, 2> keep{
+        0x0e8aec17, // full-screen pass reading the depth buffer (photo mode filters)
+        0x226b9c89, // text drawn into a 512x512 picture
+    };
+    const u64 hash = ctx.info.pgm_hash & 0xffffffff;
+    return std::ranges::find(keep, hash) == keep.end();
+}
+
+// FIX-223: on AMD, pixels demoted to helpers left junk colours on discard edges
+// (magenta HUD and cockpit lights, green and purple dots on thin geometry).
 void EmitDiscard(EmitContext& ctx) {
+    if (DiscardKills(ctx)) {
+        const Id kill_label{ctx.OpLabel()};
+        const Id merge_label{ctx.OpLabel()};
+        ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+        ctx.OpBranchConditional(ctx.true_value, kill_label, merge_label);
+        ctx.AddLabel(kill_label);
+        ctx.OpKill();
+        ctx.AddLabel(merge_label);
+        return;
+    }
     ctx.OpDemoteToHelperInvocationEXT();
 }
 
@@ -159,8 +189,12 @@ void EmitDiscardCond(EmitContext& ctx, Id condition) {
     ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
     ctx.OpBranchConditional(condition, kill_label, merge_label);
     ctx.AddLabel(kill_label);
-    ctx.OpDemoteToHelperInvocationEXT();
-    ctx.OpBranch(merge_label);
+    if (DiscardKills(ctx)) {
+        ctx.OpKill();
+    } else {
+        ctx.OpDemoteToHelperInvocationEXT();
+        ctx.OpBranch(merge_label);
+    }
     ctx.AddLabel(merge_label);
 }
 
