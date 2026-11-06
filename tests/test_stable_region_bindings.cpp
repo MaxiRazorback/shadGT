@@ -20,7 +20,7 @@ TEST(StableRegionBindings, RefusedReadsPreserveRegionsAndWritesInvalidateThem) {
     using Native::RegionMergePolicy;
     EXPECT_EQ(RegionMergePolicy(true, false, 4, 16), RegionMergeDisposition::Replace);
     EXPECT_EQ(RegionMergePolicy(false, false, 4, 16), RegionMergeDisposition::Preserve);
-    EXPECT_EQ(RegionMergePolicy(false, true, 4, 16), RegionMergeDisposition::Invalidate);
+    EXPECT_EQ(RegionMergePolicy(false, true, 4, 16), RegionMergeDisposition::Preserve);
     EXPECT_EQ(RegionMergePolicy(false, true, 17, 16), RegionMergeDisposition::Preserve);
 }
 
@@ -41,11 +41,13 @@ TEST(StableRegionBindings, RegionReplacementIsTransactionalOnAdmissionAndAllocat
     EXPECT_EQ(regions.at(0).contents, 7);
     EXPECT_EQ(regions.at(8).contents, 9);
     EXPECT_TRUE(retired.empty());
-    EXPECT_EQ(try_replace(false, true, true), Native::RegionMergeDisposition::Invalidate);
-    EXPECT_TRUE(regions.empty());
-    ASSERT_EQ(retired.size(), 2u);
-    EXPECT_EQ(retired[0].contents, 7);
-    EXPECT_EQ(retired[1].contents, 9);
+    EXPECT_EQ(try_replace(false, true, true), Native::RegionMergeDisposition::Preserve);
+    EXPECT_EQ(regions.size(), 2u);
+    EXPECT_TRUE(retired.empty());
+    std::uint64_t begin = 4, end = 12;
+    EXPECT_THROW(Native::ReplaceOverlappingRegions(regions, begin, end, true, 8, 16,
+        [](auto, auto) { return true; }, [](auto, auto) -> bool { throw 1; }, remove), int);
+    EXPECT_EQ(regions.size(), 2u);
 }
 
 TEST(StableRegionBindings, RejectsUnstableOrFailedBindings) {

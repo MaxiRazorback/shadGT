@@ -2485,8 +2485,15 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
     VAddr begin = Common::AlignDown(address, 4096);
     VAddr end = Common::AlignUp(address + size, 4096);
     std::vector<Region> merged;
-    bool refused = false;
+    static_assert(std::is_nothrow_move_constructible_v<Region>);
     Region region;
+    size_t region_count;
+    {
+        std::shared_lock map_lock{buffer_map_mutex};
+        region_count = regions.size();
+    }
+    merged.reserve(region_count);
+    retired_watch_ranges.reserve(retired_watch_ranges.size() + region_count);
     {
         std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
         const auto action = Native::ReplaceOverlappingRegions(
@@ -2497,11 +2504,15 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
             }, [&](VAddr from, VAddr to) {
             region.begin = from;
             region.end = to;
+            // NativeRenderer::mutex serializes region map writers; only hold the
+            // map lock for planning and the non-throwing removal pass.
+            map_lock.unlock();
             region.buffer = device->CreateBuffer({.size = to - from,
                 .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageVertex |
                          Native::Rhi::BufferUsageIndex | Native::Rhi::BufferUsageIndirect |
                          Native::Rhi::BufferUsageTransferSrc | Native::Rhi::BufferUsageTransferDst,
                 .memory = Native::Rhi::MemoryKind::DeviceLocal, .name = "native region"});
+            map_lock.lock();
             return bool(region.buffer);
         }, [&](Region&& old) {
                 retired_watch_ranges.emplace_back(old.begin, old.end);
@@ -2509,16 +2520,9 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
                 ++regions_taken_in;
         });
         if (action == Native::RegionMergeDisposition::Preserve) return nullptr;
-        refused = action == Native::RegionMergeDisposition::Invalidate;
     }
     ++buffer_generation;
     buffer_log.Note(begin, end); // OPT-010
-    if (refused) {
-        // A refused write must not leave overlapping stale regions available for reuse.
-        Stream& s = Begin();
-        for (auto& old : merged) s.keep.push_back(std::move(old.buffer));
-        return nullptr;
-    }
     // GPU-only guest allocations need not have CPU-importable backing. They still need
     // storage for shader writes (including the terrain's persistent shadow map).
     std::vector<Native::RegionInitRange> covered;
@@ -3347,6 +3351,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     if (Region* region = RegionOver(address, size)) {
         if (address < region->begin || address + size > region->end) {
             region = MakeRegion(address, size, write);
+            if (!region && RegionOver(address, size)) return std::nullopt;
         }
         if (region) {
             RefreshRegion(*region, address, size);
@@ -4413,6 +4418,10 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                     if (desc.is_written) {
                         b.gpu_writes.emplace_back(base, size); // NAT-119
                     }
+                } else if (RegionOver(base, size)) {
+                    // A failed overlapping merge cannot fall back to a null descriptor:
+                    // the work must not read stale guest bytes or silently drop its writes.
+                    b.failed = true;
                 }
             }
         }
@@ -10120,10 +10129,6 @@ void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is
         return;
     }
     const bool meta = known_meta.contains(address);
-    if (meta) {
-        cleared_meta.insert(address); // a CMASK/HTILE cleared by the CP
-        NATIVE_DIAGNOSTIC(++stats.meta_clears);
-    }
     if (r.FrameDumpActive()) {
         r.FrameDumpEvent(fmt::format("fill {:#x}+{:#x} = {:#x}{}", address, num_bytes, value,
                                      meta ? " (metadata clear)" : "")); // NAT-117
@@ -10136,10 +10141,15 @@ void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is
         s.buffers_written = true;
         ++s.commands;
     } else {
+        if (RegionOver(address, num_bytes)) return;
         // Not GPU-visible as one range: written now (before the GPU runs what precedes it).
         if (r.memory->IsValidMapping(address, num_bytes)) {
             std::fill_n(reinterpret_cast<u32*>(address), num_bytes / 4, value);
         }
+    }
+    if (meta) {
+        cleared_meta.insert(address); // a CMASK/HTILE cleared by the CP
+        NATIVE_DIAGNOSTIC(++stats.meta_clears);
     }
     const std::array<u32, 2> pattern{value, value};
     GpuWrote(address, num_bytes, &pattern, true); // NAT-119/120
@@ -10166,10 +10176,12 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
     if (!src_gds) WritebacksBefore(src, num_bytes);
     if (!dst_gds) WritebacksBefore(dst, num_bytes);
     const vk::Buffer gds_buffer{Handle<VkBuffer_T>(gds->NativeHandle())};
-    const auto source = src_gds ? std::optional{std::pair{gds_buffer, u64(src)}}
+    auto source = src_gds ? std::optional{std::pair{gds_buffer, u64(src)}}
                                 : GuestBuffer(src, num_bytes, false);
+    const u64 before_destination = regions_taken_in;
     const auto dest = dst_gds ? std::optional{std::pair{gds_buffer, u64(dst)}}
                               : GuestBuffer(dst, num_bytes, true);
+    if (!src_gds && regions_taken_in != before_destination) source = GuestBuffer(src, num_bytes, false);
     if (source && dest) {
         GlobalBarrier();
         CmdBuf{s.cmd}.copyBuffer(source->first, dest->first,
@@ -10179,6 +10191,7 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
         s.buffers_written = true;
         ++s.commands;
     } else if (!dst_gds && !src_gds) {
+        if ((!source && RegionOver(src, num_bytes)) || (!dest && RegionOver(dst, num_bytes))) return;
         if (r.memory->IsValidMapping(dst, num_bytes) &&
             Native::Readable(reinterpret_cast<const void*>(src), num_bytes)) {
             std::memcpy(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src),

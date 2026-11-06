@@ -6,12 +6,11 @@
 #include <vector>
 namespace Native {
 struct RegionInitRange { std::uint64_t begin{}, end{}; };
-enum class RegionMergeDisposition { Replace, Preserve, Invalidate };
-inline RegionMergeDisposition RegionMergePolicy(bool valid, bool write, std::uint64_t write_size,
-                                                 std::uint64_t max_size) {
+enum class RegionMergeDisposition { Replace, Preserve };
+inline RegionMergeDisposition RegionMergePolicy(bool valid, bool, std::uint64_t, std::uint64_t) {
     if (valid) return RegionMergeDisposition::Replace;
-    return write && write_size <= max_size ? RegionMergeDisposition::Invalidate
-                                           : RegionMergeDisposition::Preserve;
+    // Refuse an overlapping write rather than discard unaffected GPU-only bytes.
+    return RegionMergeDisposition::Preserve;
 }
 // The allocation callback runs before any region is removed, so failure leaves the map intact.
 template <class Map, class Validate, class Allocate, class Removed>
