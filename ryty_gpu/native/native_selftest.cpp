@@ -1,6 +1,11 @@
 #ifndef NDEBUG
 #include "ryty_gpu/native/cpu_texture_staging.h"
 #include "ryty_gpu/native/region_init_gaps.h"
+#include "ryty_gpu/native/retired_snapshot_pool.h"
+#include "ryty_gpu/native/writeback_plan.h"
+#include "video_core/buffer_cache/imported_part_plan.h"
+#include "video_core/buffer_cache/imported_view_lease.h"
+#include "video_core/host_shaders/native_region_writeback_comp.h"
 #include "ryty_gpu/native/local_tiled_source.h"
 #include "video_core/renderer_vulkan/async_mirror_buffer.h"
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
@@ -12,6 +17,7 @@
 // (RecordUploads untiles it) and compared texel by texel.
 
 #include <cstring>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -451,6 +457,193 @@ bool RunLargeGatherScratchCase(Rhi::Device& device, Rhi::Fence& fence, u64& tick
     return ok;
 }
 
+bool RunRegionWritebackReplay(Rhi::Device& device, Rhi::Fence& fence, u64& tick,
+                              std::string& log) {
+    constexpr u64 bytes = 8192;
+    constexpr u32 usage = Rhi::BufferUsageStorage | Rhi::BufferUsageTransferSrc |
+                          Rhi::BufferUsageTransferDst;
+    auto initial = device.CreateBuffer({.size = bytes, .usage = usage, .memory = Rhi::MemoryKind::Upload});
+    auto changes = device.CreateBuffer({.size = bytes, .usage = usage, .memory = Rhi::MemoryKind::Upload});
+    auto guest = device.CreateBuffer({.size = bytes, .usage = usage, .memory = Rhi::MemoryKind::Upload});
+    auto region = device.CreateBuffer({.size = bytes, .usage = usage, .memory = Rhi::MemoryKind::DeviceLocal});
+    auto before = device.CreateBuffer({.size = bytes, .usage = usage, .memory = Rhi::MemoryKind::DeviceLocal});
+    auto read = device.CreateBuffer({.size = bytes, .usage = usage, .memory = Rhi::MemoryKind::Readback});
+    if (!initial || !changes || !guest || !region || !before || !read ||
+        !initial->Mapped() || !changes->Mapped() || !guest->Mapped() || !read->Mapped()) return false;
+    const std::array<Rhi::BindingSlot, 3> slots{{
+        {0, Rhi::BindingType::StorageBuffer, Rhi::StageCompute},
+        {1, Rhi::BindingType::StorageBuffer, Rhi::StageCompute},
+        {2, Rhi::BindingType::StorageBuffer, Rhi::StageCompute}}};
+    auto layout = device.CreatePipelineLayout({.bindings = slots, .push_constant_bytes = sizeof(u32),
+                                                .push_constant_stages = Rhi::StageCompute});
+    auto pipeline = layout ? device.CreateComputePipeline({.layout = layout.get(),
+        .shader = {Rhi::ShaderStage::Compute, NATIVE_REGION_WRITEBACK_COMP}}) : nullptr;
+    if (!pipeline) return false;
+    for (u64 i = 0; i < bytes; ++i) initial->Mapped()[i] = u8(i * 17 + 3);
+    std::memset(changes->Mapped(), 0, bytes);
+    const u32 gpu_word = 0x12345678, cpu_word = 0xaabbccdd;
+    std::memcpy(changes->Mapped() + 4092, &gpu_word, 4);
+    std::memcpy(changes->Mapped() + 4096, &cpu_word, 4);
+    std::vector<u8> expected(initial->Mapped(), initial->Mapped() + bytes);
+    std::memcpy(expected.data() + 4092, &gpu_word, 4);
+    std::memcpy(expected.data() + 4096, &cpu_word, 4);
+    auto* list = device.AcquireCommandList();
+    list->Begin();
+    list->Barrier(Rhi::ScopeHost, Rhi::ScopeTransfer);
+    list->CopyBuffer(initial.get(), 0, guest.get(), 0, bytes);
+    list->CopyBuffer(initial.get(), 0, region.get(), 0, bytes);
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+    list->CopyBuffer(region.get(), 0, before.get(), 0, bytes);
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+    // GPU changes the last word of page one; a later CPU write changes page two.
+    list->CopyBuffer(changes.get(), 4092, region.get(), 4092, 4);
+    list->CopyBuffer(changes.get(), 4096, guest.get(), 4096, 4);
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeCompute);
+    const std::array<Rhi::Binding, 3> bindings{{
+        {.slot=0, .type=Rhi::BindingType::StorageBuffer, .buffer=region.get(), .size=bytes},
+        {.slot=1, .type=Rhi::BindingType::StorageBuffer, .buffer=before.get(), .size=bytes},
+        {.slot=2, .type=Rhi::BindingType::StorageBuffer, .buffer=guest.get(), .size=bytes}}};
+    const u32 count = u32(bytes / 16);
+    list->BindPipeline(pipeline.get());
+    list->PushBindings(bindings);
+    list->PushConstants(0, {reinterpret_cast<const u8*>(&count), sizeof(count)});
+    list->Dispatch((count + 63) / 64, 1, 1);
+    list->Barrier(Rhi::ScopeCompute, Rhi::ScopeTransfer);
+    list->CopyBuffer(guest.get(), 0, read.get(), 0, bytes);
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeHost);
+    list->End();
+    Rhi::CommandList* lists[]{list};
+    Native::RetiredSnapshotPool<Rhi::Buffer> pool;
+    const auto before_handle = before->NativeHandle();
+    bool lifetime_ok = pool.Retire(before, tick + 1) && !pool.Take(bytes, tick);
+    device.GraphicsQueue().Submit(lists, {}, {&fence, ++tick});
+    bool ok = fence.Wait(tick, 5'000'000'000ULL);
+    if (ok) { read->Invalidate(0, bytes); ok = std::memcmp(read->Mapped(), expected.data(), bytes) == 0; }
+    auto reused = pool.Take(bytes, tick);
+    lifetime_ok = lifetime_ok && reused && reused->NativeHandle() == before_handle;
+    ok = ok && lifetime_ok;
+    log += fmt::format("region changed-word CPU/GPU/page-boundary replay: {}\n", ok ? "passed" : "FAILED");
+    log += fmt::format("region snapshot held until completion: {}\n", lifetime_ok ? "passed" : "FAILED");
+    // After writeback completion, a real host write must survive later reads.
+    const u32 cpu_after = 0x8192abcdu;
+    std::memcpy(guest->Mapped() + 128, &cpu_after, 4);
+    list = device.AcquireCommandList(); list->Begin();
+    list->Barrier(Rhi::ScopeHost, Rhi::ScopeTransfer);
+    list->CopyBuffer(guest.get(), 0, read.get(), 0, bytes);
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeHost); list->End();
+    Rhi::CommandList* after_lists[]{list};
+    device.GraphicsQueue().Submit(after_lists, {}, {&fence, ++tick});
+    bool after_ok = fence.Wait(tick, 5'000'000'000ULL);
+    u32 actual_after = 0, actual_gpu = 0;
+    if (after_ok) {
+        read->Invalidate(0, bytes);
+        std::memcpy(&actual_after, read->Mapped() + 128, 4);
+        std::memcpy(&actual_gpu, read->Mapped() + 4092, 4);
+    }
+    after_ok = after_ok && actual_after == cpu_after && actual_gpu == gpu_word;
+    log += fmt::format("region CPU write after completed GPU writeback: {}\n", after_ok ? "passed" : "FAILED");
+    ok = ok && after_ok;
+    // Model a delayed image download spanning a page boundary. A stale full-page CPU upload
+    // is followed by precisely the downloaded bytes, preserving both surrounding neighbors.
+    std::memset(changes->Mapped(), 0x6b, bytes);
+    std::memcpy(expected.data(), initial->Mapped(), bytes);
+    std::memset(expected.data() + 4080, 0x6b, 32);
+    list = device.AcquireCommandList();
+    list->Begin();
+    list->Barrier(Rhi::ScopeHost, Rhi::ScopeTransfer);
+    list->CopyBuffer(initial.get(), 0, guest.get(), 0, bytes);
+    list->CopyBuffer(changes.get(), 4080, guest.get(), 4080, 32);
+    list->CopyBuffer(initial.get(), 0, region.get(), 0, bytes);
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+    list->CopyBuffer(guest.get(), 4080, region.get(), 4080, 32);
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+    list->CopyBuffer(region.get(), 0, read.get(), 0, bytes);
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeHost);
+    list->End();
+    Rhi::CommandList* download_lists[]{list};
+    device.GraphicsQueue().Submit(download_lists, {}, {&fence, ++tick});
+    const bool completed = fence.Wait(tick, 5'000'000'000ULL);
+    if (completed) read->Invalidate(0, bytes);
+    const bool download_ok = completed && std::memcmp(read->Mapped(), expected.data(), bytes) == 0;
+    log += fmt::format("region exact downloaded range crossing page: {}\n", download_ok ? "passed" : "FAILED");
+    ok = ok && download_ok;
+    auto piece_a = device.CreateBuffer({.size = 4096, .usage = usage, .memory = Rhi::MemoryKind::DeviceLocal});
+    auto piece_b = device.CreateBuffer({.size = 4096, .usage = usage, .memory = Rhi::MemoryKind::DeviceLocal});
+    if (!piece_a || !piece_b) return false;
+    list = device.AcquireCommandList(); list->Begin();
+    list->FillBuffer(piece_a.get(), 0, 4096, 0xccccccccu);
+    list->FillBuffer(piece_b.get(), 0, 4096, 0xddddddddu);
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+    list->CopyBuffer(piece_a.get(), 0, region.get(), 0, 4096);
+    list->CopyBuffer(piece_b.get(), 0, region.get(), 4096, 4096);
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+    // Simulate a download that writes only texels; untouched scratch bytes must retain padding.
+    list->CopyBuffer(changes.get(), 4080, region.get(), 4080, 32);
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+    list->CopyBuffer(region.get(), 0, piece_a.get(), 0, 4096);
+    list->CopyBuffer(region.get(), 4096, piece_b.get(), 0, 4096);
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+    list->CopyBuffer(piece_a.get(), 0, read.get(), 0, 4096);
+    list->CopyBuffer(piece_b.get(), 0, read.get(), 4096, 4096);
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeHost); list->End();
+    Rhi::CommandList* scatter_lists[]{list};
+    device.GraphicsQueue().Submit(scatter_lists, {}, {&fence, ++tick});
+    bool scatter_ok = fence.Wait(tick, 5'000'000'000ULL);
+    if (scatter_ok) {
+        read->Invalidate(0, bytes);
+        std::vector<u8> padded(bytes, 0xcc);
+        std::fill(padded.begin() + 4096, padded.end(), 0xdd);
+        std::fill(padded.begin() + 4080, padded.begin() + 4112, 0x6b);
+        scatter_ok = std::memcmp(read->Mapped(), padded.data(), bytes) == 0;
+    }
+    log += fmt::format("region multipart image scatter preserves padding: {}\n", scatter_ok ? "passed" : "FAILED");
+    ok = ok && scatter_ok;
+    std::shared_ptr<Rhi::Buffer> leased(device.CreateBuffer({.size = 4096, .usage = usage,
+                                                            .memory = Rhi::MemoryKind::DeviceLocal}));
+    if (!leased) return false;
+    std::weak_ptr<Rhi::Buffer> weak_lease = leased;
+    list = device.AcquireCommandList(); list->Begin();
+    list->FillBuffer(leased.get(), 0, 4096, 0x12345678u);
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+    list->CopyBuffer(leased.get(), 0, read.get(), 0, 4096);
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeHost); list->End();
+    std::vector<std::shared_ptr<void>> pending_owners{leased};
+    leased.reset();
+    Native::RetiredWritebackPlans retirements;
+    bool owner_ok = retirements.Retire(pending_owners, tick + 1);
+    retirements.Collect(tick);
+    Rhi::CommandList* lifetime_lists[]{list};
+    device.GraphicsQueue().Submit(lifetime_lists, {}, {&fence, ++tick});
+    owner_ok = owner_ok && !weak_lease.expired() && fence.Wait(tick, 5'000'000'000ULL);
+    if (owner_ok) {
+        read->Invalidate(0, 4096);
+        u32 value = 0; std::memcpy(&value, read->Mapped(), sizeof(value));
+        owner_ok = value == 0x12345678u;
+    }
+    retirements.Collect(tick);
+    owner_ok = owner_ok && weak_lease.expired();
+    log += fmt::format("region GPU submission retains shared plan until completion: {}\n", owner_ok ? "passed" : "FAILED");
+    ok = ok && owner_ok;
+    // Exercise the same planner as DirectMemory::PlanLeasedParts, without submitting invalid
+    // Vulkan copies. No command is recorded when the second view is missing or misaligned.
+    struct FakeView { u64 begin, end; std::shared_ptr<int> wrapper, lease; };
+    struct FakePart { u64 offset, range_offset, size; };
+    auto held = std::make_shared<int>(1);
+    std::map<u64, FakeView> fake{{0, {0, 4096, held, held}}, {8192, {8192, 12288, held, held}}};
+    unsigned recorded = 0;
+    const auto plan = [&](u64 address, u64 length) {
+        return VideoCore::PlanImportedParts<FakePart>(fake, address, length, 16, 16,
+            [](const FakeView&, u64 offset, u64 pos, u64 size) { return FakePart{offset, pos, size}; });
+    };
+    if (auto parts = plan(0, 12288)) recorded += u32(parts->size());
+    if (auto parts = plan(1, 16)) recorded += u32(parts->size());
+    const bool rejected = recorded == 0;
+    log += fmt::format("region missing-part/unaligned planner preflight: {}\n", rejected ? "passed" : "FAILED");
+    // This exercises the shared part planner, not NativeRenderer's complete operation path.
+    ok = ok && rejected;
+    return ok;
+}
+
 bool RunRegionMergeOrderCase(Rhi::Device& device, Rhi::Fence& fence, u64& tick,
                             std::string& log) {
     constexpr u64 bytes = 4 * 1024 * 1024;
@@ -815,6 +1008,7 @@ bool RunImageSelfTest(std::string& log) {
     ok = RunUploadChunkCacheCase(*device,*fence,tick,log) && ok;
     ok = RunLargeGatherScratchCase(*device,*fence,tick,log) && ok;
     ok = RunRegionMergeOrderCase(*device,*fence,tick,log) && ok;
+    ok = RunRegionWritebackReplay(*device,*fence,tick,log) && ok;
     ok = RunCpuRefreshOwnershipCase(*device,*fence,tick,log) && ok;
     {
         ImageRegistry registry{*device};

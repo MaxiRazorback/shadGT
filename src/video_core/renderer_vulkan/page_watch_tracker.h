@@ -20,11 +20,60 @@ public:
     template<class Apply> std::uint64_t Untrack(std::uint64_t begin, std::uint64_t end, Apply&& apply) {
         return Change<false>(begin,end,apply);
     }
+    // Snapshot while the native watch is still held; another fault cannot open the page
+    // through this tracker before capture has completed.
+    template<class Capture, class Apply>
+    bool CaptureAndUntrack(std::uint64_t page, Capture&& capture, Apply&& apply) {
+        if (page % PageSize != 0) return false;
+        auto& shard = shards[(page / RangeSize) % ShardCount];
+        std::scoped_lock lock{shard.mutex};
+        const auto found = shard.ranges.find(page / RangeSize);
+        if (found == shard.ranges.end()) return false;
+        auto& words = found->second;
+        const auto index = (page % RangeSize) / PageSize;
+        auto& word = words[index / 64];
+        const auto bit = std::uint64_t{1} << (index % 64);
+        if (const auto excluded = shard.exclusions.find(page / RangeSize);
+            excluded != shard.exclusions.end() && (excluded->second[index / 64] & bit)) return false;
+        if (!(word & bit) || !capture()) return false;
+        word &= ~bit;
+        apply(page, PageSize);
+        if (std::all_of(words.begin(), words.end(), [](auto value) { return value == 0; }))
+            shard.ranges.erase(found);
+        return true;
+    }
+    template<class Apply>
+    void ExcludeAndTrack(std::uint64_t begin, std::uint64_t end, Apply&& apply) {
+        for (auto page = begin; page < end; page += PageSize) {
+            auto& shard = shards[(page / RangeSize) % ShardCount];
+            std::scoped_lock lock{shard.mutex};
+            const auto block = page / RangeSize, index = (page % RangeSize) / PageSize;
+            const auto bit = std::uint64_t{1} << (index % 64);
+            shard.exclusions[block][index / 64] |= bit;
+            auto& word = shard.ranges[block][index / 64];
+            if (!(word & bit)) {
+                word |= bit;
+                apply(page, PageSize);
+            }
+        }
+    }
+    void ClearExclusions(std::uint64_t begin, std::uint64_t end) {
+        for (auto page = begin; page < end; page += PageSize) {
+            auto& shard = shards[(page / RangeSize) % ShardCount];
+            std::scoped_lock lock{shard.mutex};
+            const auto found = shard.exclusions.find(page / RangeSize);
+            if (found == shard.exclusions.end()) continue;
+            const auto index = (page % RangeSize) / PageSize;
+            found->second[index / 64] &= ~(std::uint64_t{1} << (index % 64));
+            if (std::all_of(found->second.begin(), found->second.end(), [](auto v) { return v == 0; }))
+                shard.exclusions.erase(found);
+        }
+    }
 private:
     // One allocation and four words per populated MiB, rather than 256 hash
     // nodes for its 4 KiB pages. Empty blocks are removed on untracking.
     using Words = std::array<std::uint64_t, RangeSize / PageSize / 64>;
-    struct Shard { std::mutex mutex; std::unordered_map<std::uint64_t, Words> ranges; };
+    struct Shard { std::mutex mutex; std::unordered_map<std::uint64_t, Words> ranges, exclusions; };
     std::array<Shard,ShardCount> shards;
     template<bool Track, class Apply>
     std::uint64_t Change(std::uint64_t begin, std::uint64_t end, Apply& apply) {

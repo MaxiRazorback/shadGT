@@ -28,6 +28,9 @@
 #include "ryty_gpu/native/descriptor_update_batch.h"
 #include "ryty_gpu/native/upload_phase_trace.h"
 #include "ryty_gpu/native/region_init_gaps.h"
+#include "ryty_gpu/native/writeback_plan.h"
+#include "ryty_gpu/native/page_download_ranges.h"
+#include "ryty_gpu/native/safe_page_snapshot.h"
 #include "ryty_gpu/native/upload_cause.h"
 #include "ryty_gpu/native/local_tiled_source.h"
 #include "video_core/renderer_vulkan/async_mirror_buffer.h"
@@ -53,6 +56,7 @@
 
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
 #include "video_core/renderer_vulkan/upload_memory_recovery.h"
+#include "video_core/host_shaders/native_region_writeback_comp.h"
 #include "video_core/renderer_vulkan/stable_region_bindings.h"
 #include "video_core/renderer_vulkan/scene_region_scale.h"
 #include "video_core/renderer_vulkan/upload_chunk_tail.h"
@@ -920,6 +924,7 @@ void NativeRenderer::DrawBindings::Clear() {
     stored.clear();
     image_entries.clear();
     gpu_writes.clear();
+    region_writeback.reset();
     fill_pattern.reset();
     fill_arguments_snapshot.reset();
     fill_address = 0;
@@ -1124,6 +1129,20 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
     device->UseExternalTimeline(timeline.get(), [this] { return r.scheduler.CurrentTick(); });
     LOG_INFO(Render_Vulkan, "DRAW-PREP: mask {} (1 range union, 2 region dedup, 4 thread-local stats, 8 batched diagnostic polling)", DrawPreparationMask());
     registry = std::make_unique<Native::ImageRegistry>(*device);
+    {
+        const std::array<Native::Rhi::BindingSlot, 3> slots{{
+            {0, Native::Rhi::BindingType::StorageBuffer, Native::Rhi::StageCompute},
+            {1, Native::Rhi::BindingType::StorageBuffer, Native::Rhi::StageCompute},
+            {2, Native::Rhi::BindingType::StorageBuffer, Native::Rhi::StageCompute},
+        }};
+        writeback_layout = device->CreatePipelineLayout({.bindings = slots,
+            .push_constant_bytes = sizeof(u32), .push_constant_stages = Native::Rhi::StageCompute});
+        if (writeback_layout) {
+            writeback_pipeline = device->CreateComputePipeline({.layout = writeback_layout.get(),
+                .shader = {Native::Rhi::ShaderStage::Compute, NATIVE_REGION_WRITEBACK_COMP},
+                .name = "native region write-back"});
+        }
+    }
     registry->SetImageFactory([this](const VideoCore::ImageInfo& info, bool render_target) {
         return MakeImage(info, render_target);
     });
@@ -1423,6 +1442,8 @@ NativeRenderer::~NativeRenderer() {
         // callback that has not yet run, before either device or imported backing dies.
         r.scheduler.Finish();
         stream.imported_view_leases.clear();
+        stream.writeback_plan_leases.clear();
+        retired_writeback_plans.ClearAfterGpuIdle();
         direct->ReleaseHeldAfterGpuIdle();
     }
     const vk::Device vk_device = r.instance.GetDevice();
@@ -1439,7 +1460,24 @@ NativeRenderer::~NativeRenderer() {
     samplers.clear();
 }
 
+static bool FaultAheadEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_FAULT_AHEAD");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+
 Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bool) {
+    constexpr u64 GuestLimit = u64{1} << 40;
+    if (FaultAheadEnabled() && info.guest_size && info.guest_address < GuestLimit &&
+        info.guest_size <= GuestLimit - info.guest_address) {
+        const auto begin = VideoCore::PageManager::GetPageAddr(info.guest_address);
+        const auto end = VideoCore::PageManager::GetNextPageAddr(info.guest_address + info.guest_size - 1);
+        page_watches.ExcludeAndTrack(begin, end, [&](VAddr page, u64 size) {
+            r.page_manager.UpdatePageWatchers(page, size, VideoCore::PageOp::Track);
+        });
+    }
     Native::MadeImage made{};
     if (info.pixel_format == vk::Format::eUndefined) {
         return made;
@@ -2261,7 +2299,59 @@ void NativeRenderer::WritebacksBefore(VAddr address, u64 size) {
     });
 }
 
-void NativeRenderer::WritebacksBefore(const DrawBindings& b) {
+static bool NativeRegionWritebackEnabled();
+static bool NativeInplaceWritebackEnabled();
+static const std::vector<std::pair<VAddr, VAddr>>& NativeInplaceRanges();
+
+void NativeRenderer::WritebacksBefore(DrawBindings& b) {
+    if (b.failed) return;
+    if (b.gpu_writes.empty()) return;
+    bool needs_region_writeback = false;
+    if (NativeRegionWritebackEnabled()) for (const auto [address, size] : b.gpu_writes) {
+        if (!size) continue;
+        if (address > UINT64_MAX - size) {
+            ASSERT_MSG(false, "native writeback range overflow");
+            b.failed = true;
+            return;
+        }
+        const VAddr end = address + size;
+        auto it = regions.upper_bound(address);
+        if (it != regions.begin() && std::prev(it)->second.end > address) --it;
+        for (; it != regions.end() && it->second.begin < end && !needs_region_writeback; ++it) {
+            const Region& region = it->second;
+            const VAddr from = std::max(address, region.begin), to = std::min(end, region.end);
+            if (from >= to) continue;
+            if (NativeInplaceWritebackEnabled() && std::ranges::any_of(NativeInplaceRanges(),
+                    [&](const auto& range) { return from < range.second && range.first < to; })) {
+                needs_region_writeback = true;
+                break;
+            }
+            const VAddr first_page = Common::AlignDown(from, 4096);
+            if ((to - first_page) / 4096 > region.cpu_pages->size()) {
+                needs_region_writeback = std::ranges::any_of(*region.cpu_pages, [&](const auto& entry) {
+                    return entry.first < to && entry.first + 4096 > from && frame >= entry.second &&
+                           frame - entry.second <= 600;
+                });
+                continue;
+            }
+            for (VAddr page = Common::AlignDown(from, 4096); from < to && page < to; page += 4096) {
+                const auto known = region.cpu_pages->find(page);
+                const bool recent = known != region.cpu_pages->end() && frame >= known->second &&
+                                    frame - known->second <= 600;
+                if (recent) { needs_region_writeback = true; break; }
+            }
+        }
+        if (needs_region_writeback) break;
+    }
+    if (needs_region_writeback) {
+      b.region_writeback = std::make_shared<WritebackPlan>();
+      if (!PrepareRegionWriteback(*b.region_writeback,
+            std::span<const std::pair<VAddr, u64>>{b.gpu_writes.data(), b.gpu_writes.size()}, true)) {
+        ASSERT_MSG(false, "native region writeback preflight failed before draw/dispatch");
+        b.failed = true;
+        return;
+      }
+    }
     for (const auto& [address, size] : b.gpu_writes) {
         WritebacksBefore(address, size);
     }
@@ -2274,12 +2364,83 @@ void NativeRenderer::FlushWritebacks() {
     Stream& s = stream;
     auto* direct = r.buffer_cache.GetDirectMemory();
     const u64 alignment = r.instance.StorageMinAlignment();
+    struct DownloadCopy { vk::Buffer destination; u64 source_offset, destination_offset, size; };
+    struct DownloadPlan {
+        Native::ImageEntry* entry;
+        std::unique_ptr<Native::Rhi::Buffer> out;
+        std::vector<VideoCore::DirectMemory::LeasedPart> imports;
+        u64 offset;
+        std::vector<DownloadCopy> scatter;
+        std::vector<DownloadCopy> copies;
+    };
+    std::vector<DownloadPlan> plans;
+    try {
+        plans.reserve(writebacks.size());
+        for (auto* entry : writebacks) {
+            const VAddr address = entry->info.guest_address;
+            const u64 size = entry->info.guest_size;
+            if (!size || address > UINT64_MAX - size) {
+                UNREACHABLE_MSG("native image download range overflow");
+                return;
+            }
+            if (!direct || !direct->EnsureImported(address, size)) {
+                UNREACHABLE_MSG("native image download import failed");
+                return;
+            }
+            auto parts = direct->PlanLeasedParts(address, size, alignment, 1);
+            const bool direct_output = parts && parts->size() == 1;
+            if (!direct_output) parts = direct->PlanLeasedParts(address, size, 4, 4);
+            if (!parts) {
+                UNREACHABLE_MSG("native image download import coverage or alignment failed");
+                return;
+            }
+            auto out = direct_output ? device->WrapBuffer(
+                reinterpret_cast<u64>(static_cast<VkBuffer>(parts->front().buffer)), parts->front().view_size)
+                : device->CreateBuffer({.size = size,
+                    .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageTransferSrc |
+                             Native::Rhi::BufferUsageTransferDst,
+                    .memory = Native::Rhi::MemoryKind::DeviceLocal, .name = "native image download scatter"});
+            if (!out) {
+                UNREACHABLE_MSG("native image download wrapper allocation failed");
+                return;
+            }
+            const u64 offset = direct_output ? parts->front().view_offset : 0;
+            DownloadPlan plan{entry, std::move(out), std::move(*parts), offset, {}, {}};
+            if (!direct_output) {
+                for (const auto& part : plan.imports)
+                    plan.scatter.push_back({part.buffer, part.range_offset, part.view_offset, part.size});
+            }
+            for (auto& [base, region] : regions) {
+                const VAddr begin = std::max(address, region.begin);
+                const VAddr end = std::min(address + size, region.end);
+                if (begin >= end) continue;
+                const u64 src = offset + begin - address;
+                const u64 dst = begin - region.begin;
+                if (src % 4 || dst % 4 || (end - begin) % 4) {
+                    UNREACHABLE_MSG("native image download region copy is unaligned");
+                    return;
+                }
+                plan.copies.push_back({vk::Buffer{Handle<VkBuffer_T>(region.buffer->NativeHandle())},
+                                       src, dst, end - begin});
+            }
+            plans.push_back(std::move(plan));
+        }
+        Native::ReserveAdditional(s.keep, plans.size());
+        size_t lease_count = 0;
+        for (const auto& plan : plans) lease_count += plan.imports.size();
+        Native::ReserveAdditional(s.imported_view_leases, lease_count);
+    } catch (...) {
+        UNREACHABLE_MSG("native image download preflight allocation failed");
+        return;
+    }
     static const bool batched = [] {
         const char* env = std::getenv("RYGT_NATIVE_WRITEBACK_BATCH");
         return !(env && env[0] == '0');
     }();
     Native::DownloadBatch batch;
     std::vector<std::pair<VAddr, VAddr>> batch_ranges;
+    try { batch_ranges.reserve(plans.size()); }
+    catch (...) { UNREACHABLE_MSG("native image download batch planning failed"); }
     bool use_batch = false;
     if (batched) {
         const u64 step_alignment = std::max<u64>(alignment, 256);
@@ -2289,30 +2450,34 @@ void NativeRenderer::FlushWritebacks() {
         }
         use_batch = bytes != 0 && registry->BeginDownloads(batch, bytes, alignment);
     }
-    for (auto* entry : writebacks) {
+    for (auto& plan : plans) {
+        auto* entry = plan.entry;
         const VAddr address = entry->info.guest_address;
         const u64 size = entry->info.guest_size;
-        if (!direct || !direct->EnsureImported(address, size)) {
-            continue;
-        }
         if (use_batch && std::ranges::any_of(batch_ranges, [&](const auto& range) {
                 return address < range.second && range.first < address + size;
             })) {
             registry->FinishDownloads(*s.list, batch);
             batch_ranges.clear();
         }
-        const auto found = direct->FindBuffer(address, size);
-        if (!found || found->second % alignment != 0) {
-            continue;
+        if (!plan.scatter.empty()) {
+            const vk::Buffer scratch{Handle<VkBuffer_T>(plan.out->NativeHandle())};
+            for (const auto& part : plan.imports)
+                s.cmd.copyBuffer(part.buffer, scratch,
+                    vk::BufferCopy{.srcOffset = part.view_offset, .dstOffset = part.range_offset,
+                                   .size = part.size});
+            const vk::MemoryBarrier2 copied{
+                .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite};
+            s.cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &copied});
         }
-        auto out = device->WrapBuffer(
-            reinterpret_cast<u64>(static_cast<VkBuffer>(found->first->Handle())),
-            found->first->SizeBytes());
-        if (registry->RecordDownload(*s.list, *entry, *out, found->second,
+        if (registry->RecordDownload(*s.list, *entry, *plan.out, plan.offset,
                                      use_batch ? &batch : nullptr)) {
             batch_ranges.emplace_back(address, address + size);
             NATIVE_DIAGNOSTIC(++stats.writebacks);
-            if (RegionOver(address, size)) {
+            if (!plan.scatter.empty() || !plan.copies.empty()) {
                 if (use_batch) {
                     // GTS consumes the downloaded bytes in its native region now.
                     // Complete this batch before recording that ordered copy-in.
@@ -2334,27 +2499,29 @@ void NativeRenderer::FlushWritebacks() {
                     .memoryBarrierCount = 1,
                     .pMemoryBarriers = &downloaded,
                 });
-                for (auto& [base, region] : regions) {
-                    const VAddr begin = std::max(address, region.begin);
-                    const VAddr end = std::min(address + size, region.end);
-                    if (begin >= end) {
-                        continue;
-                    }
-                    s.cmd.copyBuffer(found->first->Handle(),
-                                     vk::Buffer{Handle<VkBuffer_T>(region.buffer->NativeHandle())},
-                                     vk::BufferCopy{.srcOffset = found->second + begin - address,
-                                                    .dstOffset = begin - region.begin,
-                                                    .size = end - begin});
-                }
+                for (const auto& copy : plan.scatter)
+                    s.cmd.copyBuffer(vk::Buffer{Handle<VkBuffer_T>(plan.out->NativeHandle())}, copy.destination,
+                                     vk::BufferCopy{.srcOffset = copy.source_offset,
+                                                    .dstOffset = copy.destination_offset, .size = copy.size});
+                for (const auto& copy : plan.copies)
+                    s.cmd.copyBuffer(vk::Buffer{Handle<VkBuffer_T>(plan.out->NativeHandle())}, copy.destination,
+                                     vk::BufferCopy{.srcOffset = copy.source_offset,
+                                                    .dstOffset = copy.destination_offset, .size = copy.size});
 
             }
             // NAT-146: regions over the picture's memory copy it in before their next use.
-            if (Region* region = RegionOver(address, size)) {
-                for (VAddr page = Common::AlignDown(std::max<VAddr>(address, region->begin), 4096);
-                     page < std::min<VAddr>(address + size, region->end); page += 4096) {
-                    region->dirty_pages.push_back(page);
+            if (RegionOver(address, size)) {
+                std::scoped_lock lock{region_dirty_mutex};
+                for (auto& [base, region] : regions) {
+                    const VAddr from = std::max(address, region.begin);
+                    const VAddr to = std::min(address + size, region.end);
+                    for (VAddr page = Common::AlignDown(from, 4096); from < to && page < to; page += 4096) {
+                        region.dirty_pages.push_back(page);
+                        Native::AddPageDownloadRange(downloaded_ranges[page], std::max(from, page),
+                                                     std::min(to, page + 4096));
+                    }
+                    if (from < to) region.dirty_sorted = false;
                 }
-                region->dirty_sorted = false;
             }
             // NAT-150: so do mirrors.
             for (auto it = FirstMirror(address);
@@ -2365,8 +2532,11 @@ void NativeRenderer::FlushWritebacks() {
                     mirror.dirty_pages.push_back(page);
                 }
             }
+        } else {
+            UNREACHABLE_MSG("native image download recording failed");
         }
-        s.keep.push_back(std::move(out));
+        s.keep.push_back(std::move(plan.out));
+        for (auto& part : plan.imports) s.imported_view_leases.push_back(std::move(part.lease));
     }
     if (use_batch) registry->FinishDownloads(*s.list, batch);
     writebacks.clear();
@@ -2728,6 +2898,8 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
         // FIX-173: CPU writes to it not copied in yet are copied in at the new one's next use.
         region.dirty_pages.insert(region.dirty_pages.end(), old.dirty_pages.begin(),
                                   old.dirty_pages.end());
+        region.cpu_pages->merge(*old.cpu_pages);
+        region.gpu_pages->merge(*old.gpu_pages);
         region.dirty_sorted = false;
     }
     s.buffers_written = true;
@@ -3257,6 +3429,288 @@ void NativeRenderer::DropMirrors(VAddr address, u64 size, u32 diagnostic_reason)
     }
 }
 
+static const std::vector<std::pair<VAddr, VAddr>>& NativeInplaceRanges() {
+    static const auto ranges = [] {
+        std::vector<std::pair<VAddr, VAddr>> result;
+        const char* configured = std::getenv("RYGT_NATIVE_INPLACE_RANGES");
+        const char* extra = std::getenv("RYGT_NATIVE_INPLACE_EXTRA");
+        for (const char* source : {configured, extra}) {
+            for (const char* at = source; at && *at;) {
+                char* end = nullptr;
+                const VAddr begin = std::strtoull(at, &end, 16);
+                if (end == at || *end != '+') break;
+                at = end + 1;
+                const u64 length = std::strtoull(at, &end, 16);
+                if (end == at || begin > UINT64_MAX - std::max<u64>(length, 1)) break;
+                result.emplace_back(begin, begin + std::max<u64>(length, 1));
+                at = *end == ',' ? end + 1 : end;
+            }
+        }
+        return result;
+    }();
+    return ranges;
+}
+
+static bool NativeInplaceWritebackEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_INPLACE_WRITEBACK");
+        return !env || env[0] != '0';
+    }();
+    return enabled;
+}
+
+static bool NativeRegionWritebackEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_REGION_WRITEBACK");
+        return !env || env[0] != '0';
+    }();
+    return enabled;
+}
+
+bool NativeRenderer::PrepareRegionWriteback(WritebackPlan& plan,
+    std::span<const std::pair<VAddr, u64>> writes, bool shader) {
+    return Native::PrepareWritebackOperation(plan, writes, [&](auto& candidate, const auto& range) {
+        candidate.region_generation = regions_taken_in;
+        return PrepareRegionWritebackRange(candidate, std::span{&range, 1}, shader);
+    });
+}
+
+bool NativeRenderer::PrepareRegionWritebackRange(WritebackPlan& plan,
+    std::span<const std::pair<VAddr, u64>> writes, bool shader) {
+    plan.shader = shader;
+    if (!NativeRegionWritebackEnabled()) return true;
+    auto* direct = r.buffer_cache.GetDirectMemory();
+    const u64 alignment = r.instance.StorageMinAlignment();
+    try {
+        for (const auto [address, size] : writes) {
+            if (!size) continue;
+            if (address > UINT64_MAX - size) return false;
+            const VAddr end = address + size;
+            auto it = regions.upper_bound(address);
+            if (it != regions.begin() && std::prev(it)->second.end > address) --it;
+            for (; it != regions.end() && it->second.begin < end; ++it) {
+                Region& region = it->second;
+                const VAddr from = std::max(address, region.begin), to = std::min(end, region.end);
+                if (from >= to) continue;
+                if (to - from > 4_MB) {
+                    for (const auto [page, recent_frame] : *region.cpu_pages) {
+                        if (page < to && page + 4096 > from && frame >= recent_frame &&
+                            frame - recent_frame <= 600)
+                            plan.forget_pages.emplace_back(region.begin, page);
+                    }
+                    if (NativeInplaceWritebackEnabled())
+                        plan.skipped_listed |= std::ranges::any_of(NativeInplaceRanges(),
+                            [&](const auto& range) { return from < range.second && range.first < to; });
+                    continue;
+                }
+                std::size_t before_index = plan.before.size();
+                for (VAddr page = Common::AlignDown(from, 4096); page < to; page += 4096) {
+                    const auto known = region.cpu_pages->find(page);
+                    const bool recent = known != region.cpu_pages->end() && frame >= known->second &&
+                                        frame - known->second <= 600;
+                    const bool listed = NativeInplaceWritebackEnabled() &&
+                        std::ranges::any_of(NativeInplaceRanges(), [&](const auto& range) {
+                            return page < range.second && range.first < page + 4096 &&
+                                   from < range.second && range.first < to;
+                        });
+                    if (!recent && !listed) continue;
+                    if (shader && Native::WritebackPageAlreadyPlanned(plan.parts, region.begin, page)) continue;
+                    const auto forget = [&] {
+                        if (recent && std::ranges::find(plan.forget_pages, std::pair{region.begin, page}) == plan.forget_pages.end())
+                            plan.forget_pages.emplace_back(region.begin, page);
+                        plan.skipped_listed |= listed;
+                    };
+                    if (Native::RegionWritebackNeedsFallback(to - from, direct != nullptr, shader,
+                        writeback_pipeline != nullptr, device->Caps().max_push_bindings >= 3,
+                        page >= region.begin && page + 4096 <= region.end)) {
+                        forget();
+                        continue;
+                    }
+                    const VAddr part_begin = shader ? page : std::max(page, from);
+                    const VAddr part_end = shader ? page + 4096 : std::min(page + 4096, to);
+                    const u64 part_size = part_end - part_begin;
+                    if (!direct->EnsureImported(part_begin, part_size)) { forget(); continue; }
+                    auto parts = direct->PlanLeasedParts(part_begin, part_size,
+                                                        shader ? alignment : 4, shader ? 16 : 4);
+                    if (!parts) { forget(); continue; }
+                    if (shader && before_index == plan.before.size()) {
+                        const VAddr snapshot_begin = Common::AlignDown(from, 4096);
+                        if (to > UINT64_MAX - 4095) { forget(); continue; }
+                        const VAddr snapshot_end = Common::AlignUp(to, 4096);
+                        if (snapshot_begin < region.begin || snapshot_end > region.end ||
+                            (snapshot_begin - region.begin) % 4) { forget(); continue; }
+                        const u64 class_size = std::max<u64>(std::bit_ceil(snapshot_end - snapshot_begin), 64_KB);
+                        auto* semaphore = r.scheduler.GetWorkSemaphore();
+                        auto copy = snapshot_pool.Take(class_size, semaphore->KnownGpuTick());
+                        if (!copy) copy = device->CreateBuffer({.size = class_size,
+                            .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageTransferDst,
+                            .memory = Native::Rhi::MemoryKind::DeviceLocal, .name = "native write-back before"});
+                        if (!copy) { forget(); continue; }
+                        plan.before.push_back({.address = address, .begin = snapshot_begin,
+                            .end = snapshot_end, .size = size, .copy = std::move(copy)});
+                    }
+                    const auto first_part = plan.parts.size();
+                    bool complete = true;
+                    for (auto& part : *parts) {
+                        const u64 region_offset = part_begin - region.begin + part.range_offset;
+                        const u64 before_offset = shader ? part_begin - plan.before[before_index].begin + part.range_offset : 0;
+                        if (region_offset % (shader ? alignment : 4) ||
+                            (shader && before_offset % alignment)) { complete = false; break; }
+                        auto guest = device->WrapBuffer(reinterpret_cast<u64>(static_cast<VkBuffer>(part.buffer)), part.view_size);
+                        if (!guest) { complete = false; break; }
+                        plan.parts.push_back({region.begin, page, region_offset, before_offset,
+                            part.view_offset, part.size, region.buffer.get(), std::move(guest),
+                            std::move(part.lease), before_index});
+                    }
+                    if (!complete) {
+                        plan.parts.resize(first_part);
+                        if (shader && plan.before.size() == before_index + 1 &&
+                            std::ranges::none_of(plan.parts, [&](const auto& item) { return item.before_index == before_index; }))
+                            plan.before.pop_back();
+                        forget();
+                    }
+                }
+            }
+        }
+        std::erase_if(plan.forget_pages, [&](const auto& page) {
+            return Native::WritebackPageAlreadyPlanned(plan.parts, page.first, page.second);
+        });
+        Native::ReserveAdditional(stream.writeback_plan_leases, 2);
+        Native::ReserveAdditional(stream.pooled_snapshots, plan.before.size());
+        std::unordered_set<VAddr> pending_nodes;
+        for (const auto& part : plan.parts) {
+            auto found = regions.find(part.region_begin);
+            if (found == regions.end() || found->second.buffer.get() != part.region_buffer) return false;
+            auto& gpu_pages = *found->second.gpu_pages;
+            const auto needed = gpu_pages.size() + plan.parts.size();
+            if (needed > gpu_pages.bucket_count() * gpu_pages.max_load_factor())
+                gpu_pages.reserve(std::max(needed, gpu_pages.size() * 2 + 8));
+            const bool already_planned = std::ranges::any_of(plan.marks, [&](const auto& mark) {
+                return mark.region_begin == part.region_begin && mark.node.value() == part.page;
+            });
+            if (!already_planned) {
+                pending_nodes.insert(part.page);
+                plan.marks.push_back({part.region_begin, pending_nodes.extract(part.page)});
+            }
+        }
+        return true;
+    } catch (...) { return false; }
+}
+
+void NativeRenderer::RecordRegionSnapshots(const std::shared_ptr<WritebackPlan>& owner) {
+    auto& plan = *owner;
+    if (plan.before.empty()) return;
+    Stream& s = Begin();
+    GlobalBarrier();
+    try { Native::ReserveAdditional(s.writeback_plan_leases, 2); }
+    catch (...) { UNREACHABLE_MSG("native writeback stream retention allocation failed"); }
+    RetainRegionPlan(owner);
+    try { Native::ReserveAdditional(s.pooled_snapshots, plan.before.size()); }
+    catch (...) { UNREACHABLE_MSG("native region snapshot retention allocation failed"); }
+    for (auto& before : plan.before) {
+        auto* region = RegionOver(before.begin, before.end - before.begin);
+        if (!region || before.begin < region->begin || before.end > region->end)
+            UNREACHABLE_MSG("native writeback region changed after preflight");
+        s.cmd.copyBuffer(vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
+            vk::Buffer{Handle<VkBuffer_T>(before.copy->NativeHandle())},
+            vk::BufferCopy{.srcOffset = before.begin - region->begin, .dstOffset = 0,
+                           .size = before.end - before.begin});
+        before.recorded_copy = before.copy.get();
+    }
+    const vk::MemoryBarrier2 copied{
+        .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite};
+    s.cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &copied});
+}
+
+void NativeRenderer::RetainRegionPlan(const std::shared_ptr<WritebackPlan>& plan) {
+    if (!plan || plan->parts.empty()) return;
+    ValidateRegionPlan(*plan);
+    Stream& s = Begin();
+    if (s.writeback_plan_leases.size() == s.writeback_plan_leases.capacity())
+        UNREACHABLE_MSG("native region writeback retention was not preallocated");
+    s.writeback_plan_leases.push_back(plan);
+}
+
+bool NativeRenderer::RegionPlanValid(const WritebackPlan& plan) const {
+    if (plan.region_generation != regions_taken_in) return false;
+    for (const auto& part : plan.parts) {
+        const auto found = regions.find(part.region_begin);
+        if (found == regions.end() || found->second.buffer.get() != part.region_buffer) return false;
+    }
+    for (const auto [base, page] : plan.forget_pages) {
+        const auto found = regions.find(base);
+        if (found == regions.end() || page < found->second.begin || page >= found->second.end) return false;
+    }
+    return true;
+}
+
+void NativeRenderer::ValidateRegionPlan(const WritebackPlan& plan) {
+    if (!RegionPlanValid(plan)) UNREACHABLE_MSG("native region changed after writeback preflight");
+}
+
+void NativeRenderer::ApplyRegionWritebackFallback(WritebackPlan& plan) {
+    if (!plan.forget_pages.empty()) {
+        std::scoped_lock lock{region_dirty_mutex};
+        Native::ForgetWritebackPages(plan.forget_pages, [&](const auto& entry) {
+            const auto [base, page] = entry;
+            if (auto found = regions.find(base); found != regions.end()) found->second.cpu_pages->erase(page);
+            cpu_recent_pages.erase(page);
+        });
+    }
+    if (plan.skipped_listed) {
+        static std::atomic<u32> skipped{};
+        if (Sample(skipped)) LOG_WARNING(Render_Vulkan, "native listed-region writeback unavailable for this operation");
+        plan.skipped_listed = false;
+    }
+}
+
+void NativeRenderer::RecordRegionWriteback(const std::shared_ptr<WritebackPlan>& owner) {
+    if (!owner) return;
+    auto& plan = *owner;
+    if (plan.parts.empty()) return;
+    Stream& s = Begin();
+    RetainRegionPlan(owner);
+    GlobalBarrier();
+    for (auto& mark : plan.marks) {
+        auto found = regions.find(mark.region_begin);
+        if (found == regions.end()) UNREACHABLE_MSG("native writeback region changed after preflight");
+        found->second.gpu_pages->insert(std::move(mark.node));
+    }
+    for (auto& part : plan.parts) {
+        auto found = regions.find(part.region_begin);
+        if (found == regions.end() || found->second.buffer.get() != part.region_buffer)
+            UNREACHABLE_MSG("native writeback region changed after preflight");
+        if (plan.shader) {
+            auto* snapshot = plan.before[part.before_index].recorded_copy;
+            const std::array<Native::Rhi::Binding, 3> inputs{{
+                {.slot = 0, .type = Native::Rhi::BindingType::StorageBuffer, .buffer = part.region_buffer,
+                 .offset = part.region_offset, .size = part.size},
+                {.slot = 1, .type = Native::Rhi::BindingType::StorageBuffer, .buffer = snapshot,
+                 .offset = part.before_offset, .size = part.size},
+                {.slot = 2, .type = Native::Rhi::BindingType::StorageBuffer, .buffer = part.guest.get(),
+                 .offset = part.guest_offset, .size = part.size}}};
+            const u32 count = static_cast<u32>(part.size / 16);
+            s.list->BindPipeline(writeback_pipeline.get());
+            s.list->PushBindings(inputs);
+            s.list->PushConstants(0, std::span<const u8>{reinterpret_cast<const u8*>(&count), sizeof(count)});
+            s.list->Dispatch((count + 63) / 64, 1, 1);
+        } else {
+            s.cmd.copyBuffer(vk::Buffer{Handle<VkBuffer_T>(part.region_buffer->NativeHandle())},
+                vk::Buffer{Handle<VkBuffer_T>(part.guest->NativeHandle())},
+                vk::BufferCopy{.srcOffset = part.region_offset, .dstOffset = part.guest_offset, .size = part.size});
+        }
+    }
+    s.pipelines.Invalidate();
+    s.buffers_written = true;
+    for (auto& before : plan.before) {
+        if (s.pooled_snapshots.size() == s.pooled_snapshots.capacity()) break;
+        s.pooled_snapshots.push_back(std::move(before.copy));
+    }
+}
+
 void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
     SortRegionWrites();
     auto& dirty = region.dirty_pages;
@@ -3279,7 +3733,6 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         return;
     }
     std::vector<VAddr> pages(first, last);
-    dirty.erase(first, last);
 #if !defined(NDEBUG)
     const auto refresh_start = std::chrono::steady_clock::now();
     struct Timed {
@@ -3296,55 +3749,153 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
 #endif
     auto* direct = r.buffer_cache.GetDirectMemory();
     if (!direct) {
+        UNREACHABLE_MSG("native region refresh requires imported guest memory");
         return;
     }
+    struct RefreshPagePlan {
+        std::vector<VideoCore::DirectMemory::LeasedPart> whole;
+        std::vector<std::pair<VAddr, VAddr>> downloads;
+        std::vector<std::vector<VideoCore::DirectMemory::LeasedPart>> download_parts;
+        vk::Buffer upload{};
+        u64 upload_offset{};
+        u8* mapped{};
+    };
+    std::vector<RefreshPagePlan> refresh(pages.size());
+    {
+        std::scoped_lock lock{region_dirty_mutex};
+        for (size_t i = 0; i < pages.size(); ++i) {
+            if (auto it = downloaded_ranges.find(pages[i]); it != downloaded_ranges.end())
+                refresh[i].downloads = it->second;
+        }
+    }
+    size_t lease_count = 0;
+    for (size_t i = 0; i < pages.size(); ++i) {
+        const VAddr page = pages[i];
+        if (page < region.begin || page >= region.end) {
+            UNREACHABLE_MSG("native region refresh page outside region");
+            return;
+        }
+        const u64 page_bytes = std::min<u64>(4096, region.end - page);
+        if ((page - region.begin) % 4 || page_bytes % 4 ||
+            !direct->EnsureImported(page, page_bytes)) {
+            UNREACHABLE_MSG("native region refresh page import or alignment failed");
+            return;
+        }
+        auto whole = direct->PlanLeasedParts(page, page_bytes, 4, 4);
+        if (!whole) {
+            UNREACHABLE_MSG("native region refresh page preflight failed");
+            return;
+        }
+        refresh[i].whole = std::move(*whole);
+        lease_count += refresh[i].whole.size();
+        for (const auto [from, to] : refresh[i].downloads) {
+            if (from < page || to > page + page_bytes || from >= to ||
+                (from - region.begin) % 4 || (to - from) % 4 ||
+                !direct->EnsureImported(from, to - from)) {
+                UNREACHABLE_MSG("native image download range cannot be copied safely");
+                return;
+            }
+            auto parts = direct->PlanLeasedParts(from, to - from, 4, 4);
+            if (!parts) {
+                UNREACHABLE_MSG("native image download preflight failed");
+                return;
+            }
+            lease_count += parts->size();
+            refresh[i].download_parts.push_back(std::move(*parts));
+        }
+    }
     Stream& s = Begin();
-    GlobalBarrier();
+    try {
+        Native::ReserveAdditional(s.imported_view_leases, lease_count);
+        for (size_t i = 0; i < pages.size(); ++i) {
+            bool valid = false;
+            std::tie(refresh[i].upload, refresh[i].upload_offset, refresh[i].mapped) =
+                Allocate(std::min<u64>(4096, region.end - pages[i]), 4, &valid);
+            if (!valid) {
+                UNREACHABLE_MSG("native region refresh upload allocation failed");
+                return;
+            }
+        }
+    } catch (...) {
+        UNREACHABLE_MSG("native region refresh allocation failed");
+        return;
+    }
+    for (size_t i = 0; i < pages.size(); ++i) {
+        const u64 bytes = std::min<u64>(4096, region.end - pages[i]);
+        if (!Core::RytyMemory::GuardedCopy(refresh[i].mapped,
+                reinterpret_cast<const void*>(pages[i]), bytes)) {
+            UNREACHABLE_MSG("native region refresh cannot safely read guest page");
+            return;
+        }
+    }
     const vk::Buffer dst{Handle<VkBuffer_T>(region.buffer->NativeHandle())};
     // The selected dirty pages are already sorted and unique. Detach their old snapshots
     // before rearming protection: a write fault after that must save a new snapshot for the
     // next refresh, rather than have its snapshot consumed by this one.
     std::vector<std::unique_ptr<std::array<u8, 4096>>> snapshots(pages.size());
+    std::vector<bool> opened_ahead(pages.size());
+    std::vector<std::vector<std::pair<VAddr, VAddr>>> downloads(pages.size());
     {
         std::scoped_lock lock{region_dirty_mutex};
+        for (size_t i = 0; i < pages.size(); ++i) {
+            auto it = downloaded_ranges.find(pages[i]);
+            if ((it == downloaded_ranges.end() && !refresh[i].downloads.empty()) ||
+                (it != downloaded_ranges.end() && it->second != refresh[i].downloads)) {
+                UNREACHABLE_MSG("native image download changed during refresh preflight");
+                return;
+            }
+        }
         for (size_t i = 0; i < pages.size(); ++i) {
             if (const auto it = page_snapshots.find(pages[i]); it != page_snapshots.end()) {
                 snapshots[i] = std::move(it->second);
                 page_snapshots.erase(it);
             }
+            opened_ahead[i] = ahead_pages.erase(pages[i]) != 0;
+            if (auto it = downloaded_ranges.find(pages[i]); it != downloaded_ranges.end()) {
+                downloads[i] = std::move(it->second);
+                downloaded_ranges.erase(it);
+            }
         }
     }
+    dirty.erase(first, last);
+    for (size_t first = 0; first < pages.size();) {
+        size_t last = first + 1;
+        while (last < pages.size() && pages[last] == pages[last - 1] + 4096) ++last;
+        const VAddr watched_end = std::min(region.end, pages[last - 1] + 4096);
+        WatchPages(pages[first], watched_end - pages[first]);
+        first = last;
+    }
+    for (size_t i = 0; i < pages.size(); ++i) {
+        const u64 bytes = std::min<u64>(4096, region.end - pages[i]);
+        if (!Core::RytyMemory::GuardedCopy(refresh[i].mapped,
+                reinterpret_cast<const void*>(pages[i]), bytes)) {
+            UNREACHABLE_MSG("native region refresh cannot safely read guest page");
+            return;
+        }
+    }
+    for (auto& page : refresh) {
+        for (auto& part : page.whole) s.imported_view_leases.push_back(part.lease);
+        for (auto& group : page.download_parts)
+            for (auto& part : group) s.imported_view_leases.push_back(part.lease);
+    }
+    GlobalBarrier();
     // One protection operation per contiguous run, instead of one per dirty page. All pages
     // are watched before comparing guest bytes, so writes racing with the comparison still
     // fault and remain pending for the next use.
-    for (size_t first = 0; first < pages.size();) {
-        size_t last = first + 1;
-        while (last < pages.size() && pages[last] == pages[last - 1] + 4096) {
-            ++last;
-        }
-        const VAddr end = std::min(region.end, pages[last - 1] + 4096);
-        WatchPages(pages[first], end - pages[first]);
-        first = last;
-    }
-    const auto copy_imported = [&](VAddr from, u64 size) {
-        direct->ForEachPart(from, size,
-                            [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset,
-                                u64 bytes) {
-                                s.cmd.copyBuffer(view.Handle(), dst,
-                                                 vk::BufferCopy{.srcOffset = view_offset,
-                                                                .dstOffset = from - region.begin +
-                                                                             offset,
-                                                                .size = bytes});
-                            });
+    const auto copy_imported = [&](VAddr from, const auto& parts) {
+        for (const auto& part : parts)
+            s.cmd.copyBuffer(part.buffer, dst,
+                vk::BufferCopy{.srcOffset = part.view_offset,
+                               .dstOffset = from - region.begin + part.range_offset,
+                               .size = part.size});
     };
-    const auto copy_snapshot = [&](VAddr from, const u8* data, u64 bytes) {
+    const auto copy_snapshot = [&](size_t index, VAddr from, u64 bytes) {
         // The CPU can rewrite/reuse the imported guest pages before a queued
         // copy executes. Upload exactly the bytes compared below from storage
         // retained by this stream until GPU completion, not from the live pages.
-        const auto [buffer, offset, upload] = Allocate(bytes, 4);
-        std::memcpy(upload, data, bytes);
-        s.cmd.copyBuffer(buffer, dst,
-                         vk::BufferCopy{.srcOffset = offset,
+        const u64 offset = from - pages[index];
+        s.cmd.copyBuffer(refresh[index].upload, dst,
+                         vk::BufferCopy{.srcOffset = refresh[index].upload_offset + offset,
                                         .dstOffset = from - region.begin,
                                         .size = bytes});
     };
@@ -3353,17 +3904,39 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         if (page < region.begin || page >= region.end) {
             continue;
         }
+        const auto recent = region.cpu_pages->find(page);
+        const bool was_recent = recent != region.cpu_pages->end() && frame >= recent->second &&
+                                frame - recent->second <= 600;
+        const bool gpu_wrote = region.gpu_pages->erase(page) != 0;
+        static const bool compare_all = [] {
+            const char* env = std::getenv("RYGT_NATIVE_REGION_COMPARE");
+            return env && env[0] == '1';
+        }();
+        static const bool force_whole = [] {
+            const char* env = std::getenv("RYGT_NATIVE_REGION_WHOLE");
+            return env && env[0] == '1';
+        }();
         const u64 page_bytes = std::min<u64>(4096, region.end - page);
         const auto& before = snapshots[i];
-        std::array<u8, 4096> now;
-        if (!Core::RytyMemory::GuardedCopy(now.data(), reinterpret_cast<const void*>(page),
-                                         page_bytes)) {
-            // GPU-only/unreadable memory must continue to use its GPU backing.
-            copy_imported(page, page_bytes);
-            continue;
-        }
-        if (!before) {
-            copy_snapshot(page, now.data(), page_bytes);
+        if (!opened_ahead[i] && (downloads[i].empty() || before))
+            (*region.cpu_pages)[page] = frame;
+        const auto copy_downloads = [&] {
+            if (downloads[i].empty()) return;
+            const vk::MemoryBarrier2 after_cpu_copy{
+                .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite};
+            s.cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &after_cpu_copy});
+            for (size_t n = 0; n < downloads[i].size(); ++n)
+                copy_imported(downloads[i][n].first, refresh[i].download_parts[n]);
+        };
+        if (opened_ahead[i] && !was_recent && !before) { copy_downloads(); continue; }
+        const u8* now = refresh[i].mapped;
+        if (force_whole || !before || (NativeRegionWritebackEnabled() && !opened_ahead[i] &&
+                                      (!was_recent || (!gpu_wrote && !compare_all)))) {
+            copy_snapshot(i, page, page_bytes);
+            copy_downloads();
             continue;
         }
         // The runs of 16-byte pieces the CPU changed (gaps under 64 bytes joined).
@@ -3372,7 +3945,7 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         bool in_run = false;
         for (u64 at = 0; at < page_bytes; at += Piece) {
             const u64 n = std::min(Piece, page_bytes - at);
-            if (std::memcmp(now.data() + at, before->data() + at, n) == 0) {
+            if (std::memcmp(now + at, before->data() + at, n) == 0) {
                 continue;
             }
             if (in_run && at - run_end < 64) {
@@ -3380,7 +3953,7 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
                 continue;
             }
             if (in_run) {
-                copy_snapshot(page + run_begin, now.data() + run_begin, run_end - run_begin);
+                copy_snapshot(i, page + run_begin, run_end - run_begin);
                 changed += run_end - run_begin;
             }
             in_run = true;
@@ -3388,11 +3961,21 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
             run_end = at + n;
         }
         if (in_run) {
-            copy_snapshot(page + run_begin, now.data() + run_begin, run_end - run_begin);
+            copy_snapshot(i, page + run_begin, run_end - run_begin);
             changed += run_end - run_begin;
         }
+        if (changed) (*region.cpu_pages)[page] = frame;
+        copy_downloads();
         NATIVE_DIAGNOSTIC(++stats.region_partial_pages);
         NATIVE_DIAGNOSTIC(stats.region_partial_bytes += changed);
+    }
+    {
+        std::scoped_lock lock{region_dirty_mutex};
+        if (cpu_recent_pages.size() >= 1'000'000) cpu_recent_pages.clear();
+        for (VAddr page : pages) {
+            const auto it = region.cpu_pages->find(page);
+            if (it != region.cpu_pages->end()) cpu_recent_pages[page] = it->second;
+        }
     }
     s.buffers_written = true;
     NATIVE_DIAGNOSTIC(++stats.region_refreshes);
@@ -3505,7 +4088,11 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     if (Region* region = RegionOver(address, size)) {
         if (address < region->begin || address + size > region->end) {
             region = MakeRegion(address, size, write);
-            if (!region && RegionOver(address, size)) return std::nullopt;
+            if (!region && RegionOver(address, size)) {
+                // The failed merge left GPU-authoritative bytes in an overlapping region.
+                // A direct guest-memory fallback would observe or overwrite stale data.
+                return std::nullopt;
+            }
         }
         if (region) {
             RefreshRegion(*region, address, size);
@@ -3535,22 +4122,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     }();
     // FIX-172 (diagnosis, RYGT_NATIVE_INPLACE_RANGES=<hex address>+<hex size>,...): written
     // ranges meeting one of these stay in guest memory too.
-    static const std::vector<std::pair<VAddr, VAddr>> inplace_ranges = [] {
-        std::vector<std::pair<VAddr, VAddr>> list;
-        const char* env = std::getenv("RYGT_NATIVE_INPLACE_RANGES");
-        for (const char* at = env; at && *at;) {
-            char* end = nullptr;
-            const VAddr begin = std::strtoull(at, &end, 16);
-            if (end == at || *end != '+') {
-                break;
-            }
-            at = end + 1;
-            const u64 length = std::strtoull(at, &end, 16);
-            list.emplace_back(begin, begin + std::max<u64>(length, 1));
-            at = *end == ',' ? end + 1 : end;
-        }
-        return list;
-    }();
+    const auto& inplace_ranges = NativeInplaceRanges();
     const bool listed_in_place = std::ranges::any_of(inplace_ranges, [&](const auto& range) {
         return address < range.second && address + size > range.first;
     });
@@ -6065,6 +6637,7 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
         }
     }
     s.buffers_written |= b.writes_buffers;
+    if (b.region_writeback) RecordRegionWriteback(b.region_writeback);
     // NAT-119: images the shader overwrote in memory are uploaded again (after this work, in
     // GPU order: the next PrepareImages records the uploads behind a barrier).
     for (const auto& [address, size] : b.gpu_writes) {
@@ -6488,6 +7061,24 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     if (!native_fsr_composition && !PrepareUiTarget(targets, *pipeline)) {
         NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
+    }
+    for (unsigned attempt = 0; b.region_writeback && !RegionPlanValid(*b.region_writeback) && attempt < 4; ++attempt) {
+        b.Clear();
+        b.push = UserData(regs);
+        BindStagesStable(pipeline->GetStages(), regs, false, b);
+        if (b.failed) return;
+        vertex_index = {};
+        ResolveVertexBuffers(*pipeline, regs, vertex_index);
+        if (!ResolveIndices(regs, is_indexed, index_offset, quad_triangles, vertex_index)) return;
+        vi = &vertex_index;
+        WritebacksBefore(b);
+        if (b.failed) return;
+        PrepareImages();
+    }
+    if (b.region_writeback) ValidateRegionPlan(*b.region_writeback);
+    if (b.region_writeback) {
+        ApplyRegionWritebackFallback(*b.region_writeback);
+        RecordRegionSnapshots(b.region_writeback);
     }
     Begin();
     // A color image sampled while this draw writes it is a feedback attachment. Native
@@ -9867,6 +10458,17 @@ void NativeRenderer::DispatchDirect() {
     ReadFillShader(pipeline->GetStage(Shader::SwStage::Compute), b); // NAT-120
     const bool image_work = device->PendingImageInit() || registry->HasPendingUploads();
     PrepareImages();
+    for (unsigned attempt = 0; b.region_writeback && !RegionPlanValid(*b.region_writeback) && attempt < 4; ++attempt) {
+        b.Clear();
+        b.push = UserData(regs);
+        BindStagesStable(pipeline->GetStages(), regs, true, b);
+        if (b.failed) return;
+        WritebacksBefore(b);
+        if (b.failed) return;
+        ReadFillShader(pipeline->GetStage(Shader::SwStage::Compute), b);
+        PrepareImages();
+    }
+    if (b.region_writeback) ValidateRegionPlan(*b.region_writeback);
     const u64 program = pipeline->GetStage(Shader::SwStage::Compute).pgm_hash;
     const bool recorded = image_work || s.resource_recording_serial != work_before;
     const std::optional<u64> texel = b.stored.size() == 1
@@ -9976,6 +10578,8 @@ void NativeRenderer::DispatchDirect() {
             b.push=UserData(regs);
             BindStagesStable(pipeline->GetStages(),regs,true,b);
             if (b.failed) { NATIVE_DIAGNOSTIC(++stats.skipped); return; }
+            WritebacksBefore(b);
+            if (b.failed) { NATIVE_DIAGNOSTIC(++stats.skipped); return; }
             PrepareImages();
             GlobalBarrier();
             const auto rebound=b.buffers.empty()?vk::DescriptorBufferInfo{}:b.buffers[0];
@@ -10013,12 +10617,17 @@ void NativeRenderer::DispatchDirect() {
 #if !defined(NDEBUG)
     scene_trace.Programs(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash);
 #endif
+    if (b.region_writeback) {
+        ValidateRegionPlan(*b.region_writeback);
+        ApplyRegionWritebackFallback(*b.region_writeback);
+        RecordRegionSnapshots(b.region_writeback);
+    }
     if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-compute id={} cs={:#x} groups={}x{}x{} threads={}x{}x{} host_subgroup={}",SceneTrace::Id(),pipeline->GetStage(Shader::SwStage::Compute).pgm_hash,cs_program.dim_x,cs_program.dim_y,cs_program.dim_z,cs_program.num_thread_x.full,cs_program.num_thread_y.full,cs_program.num_thread_z.full,r.instance.SubgroupSize()));
     SceneTrace::GpuBegin(s.cmd);
     const CmdBuf cmdbuf{s.cmd};
     bool transferred = false;
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
-    if (b.fill_arguments_snapshot && b.fill_pattern && b.fill_size != 0 &&
+    if (!b.region_writeback && b.fill_arguments_snapshot && b.fill_pattern && b.fill_size != 0 &&
         cs.pgm_hash == 0x8aa6e00c && cs.flattened_ud_buf.size() > 2 &&
         cs_program.dim_y == 1 && cs_program.dim_z == 1 &&
         cs_program.start_x == 0 && cs_program.start_y == 0 && cs_program.start_z == 0 &&
@@ -10221,8 +10830,23 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         }
     }
     WritebacksBefore(b);
+    if (b.failed) return;
     PrepareImages();
+    for (unsigned attempt = 0; b.region_writeback && !RegionPlanValid(*b.region_writeback) && attempt < 4; ++attempt) {
+        b.Clear();
+        b.push = UserData(regs);
+        BindStagesStable(pipeline->GetStages(), regs, true, b);
+        if (b.failed) return;
+        WritebacksBefore(b);
+        if (b.failed) return;
+        PrepareImages();
+    }
+    if (b.region_writeback) ValidateRegionPlan(*b.region_writeback);
     GlobalBarrier();
+    if (b.region_writeback) {
+        ApplyRegionWritebackFallback(*b.region_writeback);
+        RecordRegionSnapshots(b.region_writeback);
+    }
     const CmdBuf cmdbuf{s.cmd};
     // FIX-188: Intel Arc (#65) binds the pipeline every time (tile work runs between).
     s.pipelines.Compute(pipeline->Handle(), r.instance.IsIntel(), [&] {
@@ -10352,8 +10976,24 @@ void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is
     }
     NATIVE_DIAGNOSTIC(++stats.fills);
     WritebacksBefore(address, num_bytes);
-    if (const auto found = GuestBuffer(address, num_bytes, true)) {
+    const auto found = GuestBuffer(address, num_bytes, true);
+    WritebackPlan candidate;
+    const std::pair<VAddr, u64> written{address, num_bytes};
+    if (!PrepareRegionWriteback(candidate, std::span{&written, 1}, false)) {
+        ASSERT_MSG(false, "native region writeback preflight failed before fill");
+        return;
+    }
+    std::shared_ptr<WritebackPlan> writeback;
+    if (!candidate.parts.empty() || !candidate.forget_pages.empty() || candidate.skipped_listed)
+        writeback = std::make_shared<WritebackPlan>(std::move(candidate));
+    if (found) {
         GlobalBarrier();
+        if (writeback) {
+            try { Native::ReserveAdditional(s.writeback_plan_leases, 2); }
+            catch (...) { UNREACHABLE_MSG("native fill writeback retention allocation failed"); }
+        }
+        if (writeback) ApplyRegionWritebackFallback(*writeback);
+        RetainRegionPlan(writeback);
         CmdBuf{s.cmd}.fillBuffer(found->first, found->second, num_bytes, value);
         s.buffers_written = true;
         ++s.commands;
@@ -10368,6 +11008,7 @@ void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is
         cleared_meta.insert(address); // a CMASK/HTILE cleared by the CP
         NATIVE_DIAGNOSTIC(++stats.meta_clears);
     }
+    RecordRegionWriteback(writeback);
     const std::array<u32, 2> pattern{value, value};
     GpuWrote(address, num_bytes, &pattern, true); // NAT-119/120
 }
@@ -10399,8 +11040,23 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
     const auto dest = dst_gds ? std::optional{std::pair{gds_buffer, u64(dst)}}
                               : GuestBuffer(dst, num_bytes, true);
     if (!src_gds && regions_taken_in != before_destination) source = GuestBuffer(src, num_bytes, false);
+    WritebackPlan candidate;
+    const std::pair<VAddr, u64> written{dst, num_bytes};
+    if (!dst_gds && !PrepareRegionWriteback(candidate, std::span{&written, 1}, false)) {
+        ASSERT_MSG(false, "native region writeback preflight failed before copy");
+        return;
+    }
+    std::shared_ptr<WritebackPlan> writeback;
+    if (!candidate.parts.empty() || !candidate.forget_pages.empty() || candidate.skipped_listed)
+        writeback = std::make_shared<WritebackPlan>(std::move(candidate));
     if (source && dest) {
         GlobalBarrier();
+        if (writeback) {
+            try { Native::ReserveAdditional(s.writeback_plan_leases, 2); }
+            catch (...) { UNREACHABLE_MSG("native copy writeback retention allocation failed"); }
+        }
+        if (writeback) ApplyRegionWritebackFallback(*writeback);
+        RetainRegionPlan(writeback);
         CmdBuf{s.cmd}.copyBuffer(source->first, dest->first,
                                  vk::BufferCopy{.srcOffset = source->second,
                                                 .dstOffset = dest->second,
@@ -10422,6 +11078,7 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
         }
     }
     if (!dst_gds) {
+        RecordRegionWriteback(writeback);
         GpuWrote(dst, num_bytes, nullptr, true); // NAT-119
     }
 }
@@ -10513,6 +11170,10 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
     // NAT-146: regions over unmapped memory go (the device frees their buffers once the GPU is
     // done with them).
     std::scoped_lock lock{mutex};
+    if (FaultAheadEnabled() && size != 0) {
+        page_watches.ClearExclusions(VideoCore::PageManager::GetPageAddr(address),
+                                    VideoCore::PageManager::GetNextPageAddr(address + size - 1));
+    }
     {
         std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
         for (auto it = regions.begin(); it != regions.end();) {
@@ -10530,6 +11191,18 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
         std::scoped_lock pending_lock{region_dirty_mutex}; // FIX-173
         std::erase_if(page_snapshots, [&](const auto& snapshot) {
             return snapshot.first >= address && snapshot.first < address + size;
+        });
+        std::erase_if(cpu_recent_pages, [&](const auto& entry) {
+            return entry.first < address + size && entry.first + 4096 > address;
+        });
+        std::erase_if(ahead_pages, [&](VAddr page) {
+            return page < address + size && page + 4096 > address;
+        });
+        std::erase_if(fault_chunks, [&](const auto& entry) {
+            return entry.first < address + size && entry.first + 64_KB > address;
+        });
+        std::erase_if(downloaded_ranges, [&](const auto& entry) {
+            return entry.first < address + size && entry.first + 4096 > address;
         });
     }
     ++buffer_generation;        // OPT-003
@@ -11048,6 +11721,47 @@ void NativeRenderer::OnCpuStack(VAddr address, u64 size) {
     has_pending_region_writes.store(true, std::memory_order_release);
     OnCpuWrite(address, size, 0);
 }
+void NativeRenderer::FaultAhead(VAddr begin, VAddr end) {
+    if (!FaultAheadEnabled() || !NativeRegionWritebackEnabled() || !writeback_pipeline) return;
+    const VAddr chunk = begin & ~VAddr{0xffff};
+    if (end > chunk + 64_KB) return;
+    const u64 now = shared_frame.load(std::memory_order_relaxed);
+    {
+        std::scoped_lock lock{region_dirty_mutex};
+        if (fault_chunks.size() >= 65536) fault_chunks.clear();
+        auto [it, first] = fault_chunks.try_emplace(chunk, now);
+        const bool recent = !first && now >= it->second && now - it->second <= 8;
+        it->second = now;
+        if (!recent) return;
+    }
+    std::shared_lock map_lock{buffer_map_mutex};
+    const Region* region = RegionOver(begin, 4096);
+    if (!region) return;
+    const VAddr from = std::max(chunk, region->begin), to = std::min(chunk + 64_KB, region->end);
+    for (VAddr page = from; page + 4096 <= to; page += 4096) {
+        if (page >= begin && page < end) continue;
+        page_watches.CaptureAndUntrack(page, [&] {
+                std::scoped_lock lock{region_dirty_mutex};
+                const auto it = cpu_recent_pages.find(page);
+                if (it == cpu_recent_pages.end() || now < it->second || now - it->second > 600)
+                    return false;
+                if (!page_snapshots.contains(page)) {
+                    auto copy = std::make_unique<std::array<u8, 4096>>();
+                    if (!Native::CopyPageWithoutFault(copy->data(), reinterpret_cast<void*>(page), 4096))
+                        return false;
+                    page_snapshots.emplace(page, std::move(copy));
+                }
+                ahead_pages.insert(page);
+                return true;
+            }, [&](VAddr address, u64 bytes) {
+                r.page_manager.UpdatePageWatchers(address, bytes, VideoCore::PageOp::Untrack);
+                std::scoped_lock lock{region_dirty_mutex};
+                pending_region_writes.emplace_back(address, address + bytes);
+                has_pending_region_writes.store(true, std::memory_order_release);
+        });
+    }
+}
+
 void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
     // The written pages stop being watched (so they open up and the write goes on), and the
     // textures over them are uploaded again when next used (which watches them again).
@@ -11098,6 +11812,7 @@ void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
         pending_region_writes.emplace_back(begin, end);
     }
     has_pending_region_writes.store(true, std::memory_order_release);
+    FaultAhead(begin, end);
 }
 
 u32 NativeRenderer::ReadGds(u32 gds_offset) {
@@ -11160,6 +11875,8 @@ void NativeRenderer::Splice() {
     if (auto* direct = r.buffer_cache.GetDirectMemory()) {
         const u64 retire_tick = std::max(tick, boundary_signal);
         direct->RetireLeasesAfterSplice(s.imported_view_leases, retire_tick);
+        retired_writeback_plans.Retire(s.writeback_plan_leases, retire_tick);
+        retired_writeback_plans.Collect(r.scheduler.GetWorkSemaphore()->KnownGpuTick());
         direct->ReleaseHeldAfterSplice(retire_tick);
     }
     {
@@ -11187,6 +11904,11 @@ void NativeRenderer::Splice() {
         }
     }
     s.pools.clear();
+    for (auto& snapshot : s.pooled_snapshots) {
+        if (!snapshot_pool.Retire(snapshot, std::max(tick, boundary_signal)))
+            s.keep.push_back(std::move(snapshot));
+    }
+    s.pooled_snapshots.clear();
     s.keep.clear(); // freed by the device once the GPU ran this list (NAT-107)
     device->Collect(); // objects the GPU finished with (staging buffers of uploads)
     s.wrapped_list.reset();

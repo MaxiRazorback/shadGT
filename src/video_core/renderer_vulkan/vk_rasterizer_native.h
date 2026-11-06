@@ -36,6 +36,8 @@
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/cb_db_extent.h"
 #include "ryty_gpu/native/same_texel.h"
+#include "ryty_gpu/native/retired_snapshot_pool.h"
+#include "ryty_gpu/native/writeback_plan.h"
 #include "video_core/renderer_vulkan/pipeline_binding_state.h"
 #include "video_core/renderer_vulkan/descriptor_set_memo.h"
 #include "shader_recompiler/backend/bindings.h"
@@ -170,6 +172,7 @@ private:
         const Native::ImageEntry* depth = nullptr;
     };
 
+    struct WritebackPlan;
     /// The bindings of one draw or dispatch.
     struct DrawBindings {
         Pipeline::DescriptorWrites writes;
@@ -196,6 +199,7 @@ private:
         u64 fill_size = 0;
         bool writes_buffers = false;
         bool failed = false;
+        std::shared_ptr<WritebackPlan> region_writeback;
         void Clear();
     };
 
@@ -274,6 +278,8 @@ private:
         std::vector<vk::DescriptorPool> pools; ///< for pipelines without push descriptors
         std::vector<std::unique_ptr<Native::Rhi::Buffer>> keep; ///< alive until the list ran
         std::vector<std::shared_ptr<void>> imported_view_leases;
+        std::vector<std::shared_ptr<void>> writeback_plan_leases;
+        std::vector<std::unique_ptr<Native::Rhi::Buffer>> pooled_snapshots;
         std::vector<LdsReader> lds_readers;
         u64 lds_bytes = 0;
         u32 commands = 0;
@@ -329,6 +335,8 @@ private:
         VAddr end = 0;
         std::unique_ptr<Native::Rhi::Buffer> buffer;
         std::vector<VAddr> dirty_pages; ///< written by the CPU since the last use
+        std::unique_ptr<std::unordered_map<VAddr, u64>> cpu_pages = std::make_unique<std::unordered_map<VAddr, u64>>(); ///< last refresh after a CPU write
+        std::unique_ptr<std::unordered_set<VAddr>> gpu_pages = std::make_unique<std::unordered_set<VAddr>>(); ///< recently CPU-written pages changed by GPU work
         bool dirty_sorted = true;
     };
     std::map<VAddr, Region> regions; ///< by begin; guarded by mutex
@@ -340,6 +348,50 @@ private:
     /// FIX-173: region pages as guest memory held them before the CPU's first write since they
     /// were last copied in (taken at the write fault; guarded by region_dirty_mutex).
     std::unordered_map<VAddr, std::unique_ptr<std::array<u8, 4096>>> page_snapshots;
+    std::unordered_map<VAddr, u64> cpu_recent_pages; ///< under region_dirty_mutex
+    std::unordered_set<VAddr> ahead_pages; ///< under region_dirty_mutex
+    std::unordered_map<VAddr, u64> fault_chunks; ///< under region_dirty_mutex
+    std::unordered_map<VAddr, std::vector<std::pair<VAddr, VAddr>>> downloaded_ranges;
+    void FaultAhead(VAddr begin, VAddr end);
+    struct WrittenBefore {
+        VAddr address{}, begin{}, end{};
+        u64 size{};
+        std::unique_ptr<Native::Rhi::Buffer> copy;
+        Native::Rhi::Buffer* recorded_copy{};
+    };
+    struct WritebackPlan {
+        struct PageMark {
+            VAddr region_begin{};
+            std::unordered_set<VAddr>::node_type node;
+        };
+        struct Part {
+            VAddr region_begin{}, page{};
+            u64 region_offset{}, before_offset{}, guest_offset{}, size{};
+            Native::Rhi::Buffer* region_buffer{};
+            std::unique_ptr<Native::Rhi::Buffer> guest;
+            std::shared_ptr<void> lease;
+            std::size_t before_index{};
+        };
+        std::vector<WrittenBefore> before;
+        std::vector<Part> parts;
+        std::vector<std::pair<VAddr, VAddr>> forget_pages;
+        bool skipped_listed{};
+        u64 region_generation{};
+        std::vector<PageMark> marks;
+        bool shader{};
+    };
+    bool PrepareRegionWriteback(WritebackPlan& plan,
+        std::span<const std::pair<VAddr, u64>> writes, bool shader);
+    bool PrepareRegionWritebackRange(WritebackPlan& plan,
+        std::span<const std::pair<VAddr, u64>> writes, bool shader);
+    void RecordRegionSnapshots(const std::shared_ptr<WritebackPlan>& plan);
+    void RecordRegionWriteback(const std::shared_ptr<WritebackPlan>& plan);
+    void RetainRegionPlan(const std::shared_ptr<WritebackPlan>& plan);
+    bool RegionPlanValid(const WritebackPlan& plan) const;
+    void ValidateRegionPlan(const WritebackPlan& plan);
+    void ApplyRegionWritebackFallback(WritebackPlan& plan);
+    std::unique_ptr<Native::Rhi::PipelineLayout> writeback_layout;
+    std::unique_ptr<Native::Rhi::Pipeline> writeback_pipeline;
     std::atomic<u32> logged_partial{};
     void SortRegionWrites();
     bool HasImageBacking(VAddr address, u64 size);
@@ -602,7 +654,7 @@ private:
     std::vector<Native::ImageEntry*> frame_writebacks;
     void QueueWriteback(const Native::ImageEntry* entry);
     void WritebacksBefore(VAddr address, u64 size);
-    void WritebacksBefore(const DrawBindings& b);
+    void WritebacksBefore(DrawBindings& b);
     bool writebacks_due = false;
     std::vector<const Native::ImageEntry*> dump_entries; // NAT-116
     /// NAT-123: GPU-written images the dumped frame sampled, by texture key.
@@ -876,6 +928,8 @@ private:
 
     std::mutex chunk_mutex;
     std::vector<Chunk> free_chunks;
+    Native::RetiredSnapshotPool<Native::Rhi::Buffer> snapshot_pool;
+    Native::RetiredWritebackPlans retired_writeback_plans;
     std::deque<Chunk> retiring_chunks;
     std::vector<vk::DescriptorPool> free_pools;
     std::deque<std::pair<u64, vk::DescriptorPool>> retiring_pools;
