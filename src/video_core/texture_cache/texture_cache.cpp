@@ -190,7 +190,14 @@ bool TextureCache::HasPendingReadbacks() {
 std::vector<TextureCache::PendingReadback> TextureCache::RecordPendingReadbacks() {
     std::unique_lock lk{download_images_mutex};
     std::vector<PendingReadback> readbacks;
-    for (const ImageId image_id : download_images) {
+    // FIX-GTS-009: in the order the pictures were drawn, so that where read-back pictures overlap
+    // the last one drawn lands last, as on the console (they were taken in hash order). GT Sport
+    // draws a car thumbnail's colour halves and its silhouette into overlapping linear targets.
+    std::vector<ImageId> ordered(download_images.begin(), download_images.end());
+    std::ranges::sort(ordered, [this](ImageId a, ImageId b) {
+        return slot_images[a].contents_version < slot_images[b].contents_version;
+    });
+    for (const ImageId image_id : ordered) {
         if (auto readback = RecordImageReadback(image_id)) {
             readbacks.push_back(*readback);
         }
@@ -400,9 +407,13 @@ bool TextureCache::ShouldReadBack(const Image& image) {
     // read back, which avoids heavy copies every submission. GT Sport renders car thumbnails
     // into 448x126 linear targets (225 KB) that its CPU PNG-encodes; with a 64 KB limit the
     // encoder saw empty memory and the game stopped with "BREAK! thumbnail_functions.ad:473".
+    // FIX-GTS-006: in the CPU-mapped range (0xf0'0000'0000 and up) up to 16 MB: a Scapes photo
+    // is drawn into 1920x540 linear targets (8 MB) and a 320x167 preview there, which the CPU
+    // JPEG-encodes; not read back, the photos were saved black.
     static constexpr u32 MaxReadbackSize = 256_KB;
     const u32 size = ImageDownloadSize(image);
-    if (size <= MaxReadbackSize) {
+    const u32 limit = image.info.guest_address >= 0xf000000000ULL ? 16_MB : MaxReadbackSize;
+    if (size <= limit) {
         static std::unordered_set<VAddr> logged_readbacks;
         if (logged_readbacks.size() < 16 &&
             logged_readbacks.insert(image.info.guest_address).second) {
@@ -909,6 +920,14 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     auto& src_image = slot_images[image_id];
     auto& new_image = slot_images[new_image_id];
 
+    // FIX-GTS-008: a big GPU-drawn picture is not read from guest memory first. GT Sport's Scapes
+    // background is a 7368x4920 RGBA16F target (512 MB) that it then samples with 5 mip levels:
+    // the expansion detiled all 682 MB through a staging buffer, only for the copy below to
+    // overwrite it, and the old renderer ran out of device memory on the way to Scapes. Its
+    // smaller mip levels are drawn by the game.
+    if (info.guest_size >= 128_MB && src_image.usage.render_target) {
+        new_image.flags &= ~ImageFlagBits::Dirty;
+    }
     RefreshImage(new_image);
     runtime.CopyImage(&src_image, &new_image);
 

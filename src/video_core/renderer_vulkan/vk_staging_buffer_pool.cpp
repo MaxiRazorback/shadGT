@@ -6,6 +6,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/types.h"
 #include "core/devtools/widget/gpu_memory.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -116,6 +117,36 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
     }
 
     if (!best) {
+        // FIX-GTS-007: large staging buffers are reused only once the GPU is done with them and
+        // trimmed once a frame, so a frame that detiles many big images (GT Sport on the way to
+        // Scapes with the old renderer) made a new one each time until device memory ran out.
+        // Past 512 MB, wait for the submitted work that holds them and free the finished ones.
+        static constexpr u64 LargeCap = 512_MB;
+        const auto cache_bytes = [&cache] {
+            u64 bytes = 0;
+            for (const LargeBuffer& entry : cache) {
+                bytes += entry.buffer->SizeBytes();
+            }
+            return bytes;
+        };
+        const u64 before = cache_bytes();
+        if (before + size > LargeCap) {
+            const u64 current = scheduler.CurrentTick();
+            for (const LargeBuffer& entry : cache) {
+                if (!entry.held && entry.tick < current && !scheduler.IsFree(entry.tick)) {
+                    scheduler.Wait(entry.tick);
+                }
+            }
+            std::erase_if(cache, [this](const LargeBuffer& entry) {
+                return !entry.held && scheduler.IsFree(entry.tick);
+            });
+            const u64 after = cache_bytes();
+            static u32 logged = 0;
+            if (logged++ < 40) {
+                LOG_WARNING(Render_Vulkan, "FIX-GTS-007: large staging buffers {} MB -> {} MB "
+                            "before a {} MB request", before >> 20, after >> 20, size >> 20);
+            }
+        }
         best = &cache.emplace_back(LargeBuffer{
             .buffer = std::make_unique<VideoCore::Buffer>(instance, 0, RoundAllocationSize(size),
                                                           type, "StagingBufferPool:Dedicated"),
