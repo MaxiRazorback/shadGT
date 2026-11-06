@@ -57,6 +57,12 @@ target_include_directories(shadps4_tess_lds_test PRIVATE ${CMAKE_SOURCE_DIR}/src
 target_link_libraries(shadps4_tess_lds_test PRIVATE GTest::gtest_main)
 gtest_discover_tests(shadps4_tess_lds_test)
 
+if (WIN32 AND CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_executable(shadgt_tess_lds_gpu tools/tess_lds_gpu.cpp)
+    target_compile_features(shadgt_tess_lds_gpu PRIVATE cxx_std_23)
+    target_link_libraries(shadgt_tess_lds_gpu PRIVATE Vulkan::Headers)
+endif()
+
 add_executable(shadps4_device_service_test test_device_service.cpp
     ${CMAKE_SOURCE_DIR}/src/core/libraries/device_service/device_service.cpp)
 target_include_directories(shadps4_device_service_test PRIVATE ${CMAKE_SOURCE_DIR}/src)

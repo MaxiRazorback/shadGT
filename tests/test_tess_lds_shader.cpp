@@ -32,6 +32,10 @@ TEST(TessLdsShader, EmitsRealWriterAndReaderModule) {
     ir.Prologue();
     const auto value = ir.GetTessGenericAttribute(ir.Imm32(1u), ir.Imm32(0u), ir.Imm32(0u));
     ir.SetTcsGenericAttribute(value, ir.Imm32(0u), ir.Imm32(0u));
+    ir.SetPatch(IR::Patch::TessellationLodLeft, ir.Imm32(1.0f));
+    ir.SetPatch(IR::Patch::TessellationLodTop, ir.Imm32(1.0f));
+    ir.SetPatch(IR::Patch::TessellationLodRight, ir.Imm32(1.0f));
+    ir.SetPatch(IR::Patch::TessellationLodInteriorU, ir.Imm32(1.0f));
     ir.Epilogue();
     Profile profile{};
     profile.supported_spirv = 0x00010600;
