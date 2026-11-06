@@ -2479,31 +2479,44 @@ NativeRenderer::Region* NativeRenderer::RegionOver(VAddr address, u64 size) {
     return nullptr;
 }
 
-NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
-    ++buffer_generation; // OPT-003: regions are taken in or made
+NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool write) {
     auto* direct = r.buffer_cache.GetDirectMemory();
     // The new region takes in every region it overlaps (their GPU-written contents kept).
     VAddr begin = Common::AlignDown(address, 4096);
     VAddr end = Common::AlignUp(address + size, 4096);
     std::vector<Region> merged;
+    bool refused = false;
+    Region region;
     {
         std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
-        for (auto it = regions.begin(); it != regions.end();) {
-            if (it->second.begin < end && it->second.end > begin) {
-                begin = std::min(begin, it->second.begin);
-                end = std::max(end, it->second.end);
-                retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
-                merged.push_back(std::move(it->second));
+        const auto action = Native::ReplaceOverlappingRegions(
+            regions, begin, end, write, size, 1_GB,
+            [&](VAddr from, VAddr to) {
+                return direct && to - from <= 1_GB && r.IsMappedStart(from) &&
+                       r.memory->IsValidGpuMapping(from, to - from);
+            }, [&](VAddr from, VAddr to) {
+            region.begin = from;
+            region.end = to;
+            region.buffer = device->CreateBuffer({.size = to - from,
+                .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageVertex |
+                         Native::Rhi::BufferUsageIndex | Native::Rhi::BufferUsageIndirect |
+                         Native::Rhi::BufferUsageTransferSrc | Native::Rhi::BufferUsageTransferDst,
+                .memory = Native::Rhi::MemoryKind::DeviceLocal, .name = "native region"});
+            return bool(region.buffer);
+        }, [&](Region&& old) {
+                retired_watch_ranges.emplace_back(old.begin, old.end);
+                merged.push_back(std::move(old));
                 ++regions_taken_in;
-                it = regions.erase(it);
-            } else {
-                ++it;
-            }
-        }
+        });
+        if (action == Native::RegionMergeDisposition::Preserve) return nullptr;
+        refused = action == Native::RegionMergeDisposition::Invalidate;
     }
+    ++buffer_generation;
     buffer_log.Note(begin, end); // OPT-010
-    if (!direct || end - begin > 1_GB || !r.IsMappedStart(begin) ||
-        !r.memory->IsValidGpuMapping(begin, end - begin)) {
+    if (refused) {
+        // A refused write must not leave overlapping stale regions available for reuse.
+        Stream& s = Begin();
+        for (auto& old : merged) s.keep.push_back(std::move(old.buffer));
         return nullptr;
     }
     // GPU-only guest allocations need not have CPU-importable backing. They still need
@@ -2514,21 +2527,6 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
     const auto gaps = Native::RegionInitGaps(begin,end,covered);
     u64 guest_init_bytes = 0;
     for (const auto gap : gaps) guest_init_bytes += gap.end-gap.begin;
-    Region region;
-    region.begin = begin;
-    region.end = end;
-    region.buffer = device->CreateBuffer({.size = end - begin,
-                                          .usage = Native::Rhi::BufferUsageStorage |
-                                                   Native::Rhi::BufferUsageVertex |
-                                                   Native::Rhi::BufferUsageIndex |
-                                                   Native::Rhi::BufferUsageIndirect |
-                                                   Native::Rhi::BufferUsageTransferSrc |
-                                                   Native::Rhi::BufferUsageTransferDst,
-                                          .memory = Native::Rhi::MemoryKind::DeviceLocal,
-                                          .name = "native region"});
-    if (!region.buffer) {
-        return nullptr;
-    }
     Stream& s = Begin();
     GlobalBarrier();
     const vk::Buffer dst{Handle<VkBuffer_T>(region.buffer->NativeHandle())};
@@ -3348,7 +3346,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     // NAT-114: ranges in (or reaching into) a region use it.
     if (Region* region = RegionOver(address, size)) {
         if (address < region->begin || address + size > region->end) {
-            region = MakeRegion(address, size);
+            region = MakeRegion(address, size, write);
         }
         if (region) {
             RefreshRegion(*region, address, size);
@@ -3398,7 +3396,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
         return address < range.second && address + size > range.first;
     });
     if (write && write_regions && size <= 256_MB && address < inplace_from && !listed_in_place) {
-        if (Region* region = MakeRegion(address, size)) {
+        if (Region* region = MakeRegion(address, size, true)) {
             NATIVE_DIAGNOSTIC(++stats.region_binds);
             memo_kind = MemoKind::Region; // OPT-003
             memo_region = region;
@@ -3437,7 +3435,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
         }
     }
     if (write) {
-        if (Region* region = MakeRegion(address, size)) {
+        if (Region* region = MakeRegion(address, size, true)) {
             NATIVE_DIAGNOSTIC(++stats.region_binds);
             return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
                              u64{address - region->begin}};

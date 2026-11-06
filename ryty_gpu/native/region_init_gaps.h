@@ -2,9 +2,40 @@
 #include <algorithm>
 #include <cstdint>
 #include <span>
+#include <utility>
 #include <vector>
 namespace Native {
 struct RegionInitRange { std::uint64_t begin{}, end{}; };
+enum class RegionMergeDisposition { Replace, Preserve, Invalidate };
+inline RegionMergeDisposition RegionMergePolicy(bool valid, bool write, std::uint64_t write_size,
+                                                 std::uint64_t max_size) {
+    if (valid) return RegionMergeDisposition::Replace;
+    return write && write_size <= max_size ? RegionMergeDisposition::Invalidate
+                                           : RegionMergeDisposition::Preserve;
+}
+// The allocation callback runs before any region is removed, so failure leaves the map intact.
+template <class Map, class Validate, class Allocate, class Removed>
+RegionMergeDisposition ReplaceOverlappingRegions(Map& regions, std::uint64_t& begin,
+    std::uint64_t& end, bool write, std::uint64_t write_size, std::uint64_t max_size,
+    Validate validate, Allocate allocate, Removed removed) {
+    for (const auto& [base, region] : regions) {
+        if (region.begin < end && region.end > begin) {
+            begin = std::min(begin, region.begin);
+            end = std::max(end, region.end);
+        }
+    }
+    const auto action = RegionMergePolicy(validate(begin, end), write, write_size, max_size);
+    if (action == RegionMergeDisposition::Preserve) return action;
+    if (action == RegionMergeDisposition::Replace && !allocate(begin, end))
+        return RegionMergeDisposition::Preserve;
+    for (auto it = regions.begin(); it != regions.end();) {
+        if (it->second.begin < end && it->second.end > begin) {
+            removed(std::move(it->second));
+            it = regions.erase(it);
+        } else ++it;
+    }
+    return action;
+}
 inline std::vector<RegionInitRange> RegionInitGaps(
     std::uint64_t begin, std::uint64_t end, std::span<const RegionInitRange> covered) {
     std::vector<RegionInitRange> ordered, gaps;

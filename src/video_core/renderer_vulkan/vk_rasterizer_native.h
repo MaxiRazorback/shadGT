@@ -327,7 +327,7 @@ private:
     void SortRegionWrites();
     bool HasImageBacking(VAddr address, u64 size);
     Region* RegionOver(VAddr address, u64 size);
-    Region* MakeRegion(VAddr address, u64 size);
+    Region* MakeRegion(VAddr address, u64 size, bool write);
     void RefreshRegion(Region& region, VAddr address, u64 size);
     /// NAT-150: copies in video memory of guest memory the GPU reads as vertices and indices
     /// and the CPU leaves alone (meshes), instead of reading it over PCIe at every draw. A range
