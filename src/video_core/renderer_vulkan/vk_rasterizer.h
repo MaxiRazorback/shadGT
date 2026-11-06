@@ -615,6 +615,7 @@ private:
     std::atomic<u32> deferred_fences{};
     std::atomic<u64> background_readbacks{}; // FIX-070
     std::atomic<s64> last_readback_fence_ns{}; // PERF-063
+    std::atomic<s64> last_native_fence_submit_ns{}; // per renderer, never shared across devices
     /// PERF-014b: deferred fences that will also bring GPU data back to guest memory.
     std::atomic<u32> readback_fences{};
     u32 draws_since_submit{};

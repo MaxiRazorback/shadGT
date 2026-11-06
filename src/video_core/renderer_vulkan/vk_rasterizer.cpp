@@ -36,6 +36,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/native_fence_batch.h"
 #ifdef RYTY_GPU
 #include "ryty_gpu/native/image_registry.h"
 #include "ryty_gpu/native/shadow.h"
@@ -2952,9 +2953,25 @@ std::optional<std::pair<const VideoCore::Buffer*, u64>> Rasterizer::DirectReadBu
     return found;
 }
 
+#ifdef RYTY_GPU
+static s64 NativeFenceBatchInterval() {
+    static const s64 interval = [] {
+        const char* value = std::getenv("RYGT_NATIVE_FENCE_BATCH_MS");
+        return NativeFenceBatchNs(value ? value : "");
+    }();
+    return interval;
+}
+#endif
+
 void Rasterizer::FlushDeferredFences() {
     if (deferred_unflushed.exchange(false, std::memory_order_acq_rel)) {
         scheduler.Flush();
+#ifdef RYTY_GPU
+        if (native && NativeFenceBatchInterval() > 0) last_native_fence_submit_ns.store(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count(),
+            std::memory_order_relaxed);
+#endif
     }
 }
 
@@ -3139,7 +3156,20 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
         const char* env = std::getenv("SHADGT_DIRECT_HOLD_FLUSH");
         return env && env[0] == '1';
     }();
-    if (flush || hold_flush || readbacks_pending || address_pending || !direct_hold) {
+    bool submit_now = flush || hold_flush || readbacks_pending || address_pending || !direct_hold;
+#ifdef RYTY_GPU
+    if (native && NativeFenceBatchInterval() > 0 && (submit_now || flush)) {
+        const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        submit_now = SubmitNativeFence(liverpool && liverpool->Pipelined(), flush, hold_flush, readbacks_pending, address_pending,
+            direct_hold, now, last_native_fence_submit_ns.load(std::memory_order_relaxed), NativeFenceBatchInterval());
+        if (submit_now) last_native_fence_submit_ns.store(now, std::memory_order_relaxed);
+        // This is submission batching only: callbacks remain deferred to GPU completion.
+        // Recorder idle and WaitRegMem still force submission. The source's two GT7-only
+        // spun-label addresses must not be transplanted into the GT Sport address space.
+    }
+#endif
+    if (submit_now) {
         scheduler.Flush();
         deferred_unflushed.store(false, std::memory_order_relaxed);
     } else {
@@ -3824,6 +3854,12 @@ void Rasterizer::FlushForDeferredFences() {
     // any recorded work so the deferred operations can complete instead of deadlocking.
     if (deferred_fences.load() != 0) {
         scheduler.Flush();
+#ifdef RYTY_GPU
+        if (native && NativeFenceBatchInterval() > 0) last_native_fence_submit_ns.store(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count(),
+            std::memory_order_relaxed);
+#endif
     }
 }
 
