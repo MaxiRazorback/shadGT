@@ -5073,8 +5073,14 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
     // as in the old renderer (TextureCache::ShouldReadBack): GT Sport draws a new save's car
     // thumbnail into a 448x126 linear target (225 KB) that its CPU PNG-encodes; with 64 KB the
     // encoder saw empty memory and the thumbnail was saved black for good.
+    // FIX-GTS-006: untiled targets in the CPU-mapped range (0xf0'0000'0000 and up) up to 16 MB:
+    // GT Sport draws a Scapes photo into 1920x540 linear targets (8 MB) and its preview into a
+    // 320x167 one there, then its CPU JPEG-encodes them; not written back, photos saved black.
     const auto writeback_size = [](const Native::ImageEntry& entry) -> u64 {
-        return entry.info.props.is_tiled ? 64_KB : 256_KB;
+        if (entry.info.props.is_tiled) {
+            return 64_KB;
+        }
+        return entry.info.guest_address >= 0xf000000000ULL ? 16_MB : 256_KB;
     };
     for (const auto* entry : b.sampled) {
         if (entry && std::ranges::find(s.read, entry) == s.read.end()) {
@@ -5103,7 +5109,9 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
     }
     for (const auto* entry : b.stored) {
         note(entry);
-        if (entry->info.guest_size <= writeback_size(*entry) && entry->info.num_samples == 1 &&
+        // FIX-GTS-006: the photo is a color target; stored images keep the 256 KB limit.
+        if (entry->info.guest_size <= std::min<u64>(writeback_size(*entry), 256_KB) &&
+            entry->info.num_samples == 1 &&
             !entry->info.props.is_depth &&
             std::ranges::find(writebacks, entry) == writebacks.end()) {
             writebacks.push_back(const_cast<Native::ImageEntry*>(entry));

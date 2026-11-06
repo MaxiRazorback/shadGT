@@ -182,6 +182,40 @@ bool CopyThroughAlias(VAddr address, void* dest, const void* source, u64 size) {
         return true;
     }
     void* alias = map_alias(first, last - first);
+    if (alias == nullptr && last - first > AliasPage) {
+        // FIX-GTS-010: a range over two shared mappings has no single alias, but each of its
+        // pages does. GT Sport's car thumbnail halves (448x126, 220 KB) are read back to linear
+        // memory; the one crossing a 2 MB boundary (0xf4039cc000+0x37200) was copied into the
+        // address directly, which the game's CPU view does not share, and the thumbnail was
+        // saved with its bottom half missing. Copy it page by page through aliases instead.
+        bool all = true;
+        for (VAddr page = first; page < last && all; page += AliasPage) {
+            const VAddr begin = std::max(page, address);
+            const VAddr end = std::min(page + AliasPage, address + size);
+            void* page_alias = map_alias(page, AliasPage);
+            if (page_alias == nullptr) {
+                all = false; // not shared memory after all: the lifted copy below
+                break;
+            }
+            auto* target = static_cast<u8*>(page_alias) + (begin - page);
+            if (dest != nullptr) {
+                std::memcpy(static_cast<u8*>(dest) + (begin - address), target, end - begin);
+            } else {
+                std::memcpy(target, static_cast<const u8*>(source) + (begin - address),
+                            end - begin);
+            }
+            unmap_alias(page_alias);
+        }
+        if (all) {
+            static std::atomic<u32> logged_split{};
+            if (logged_split++ < 20) {
+                LOG_WARNING(Render_Vulkan, "FIX-GTS-010: {:#x}+{:#x} copied {} page by page "
+                            "through aliases", address, size,
+                            dest != nullptr ? "from" : "into");
+            }
+            return true;
+        }
+    }
     if (alias == nullptr) {
         // Not Ryty shared memory (the title's own image, for example): lift the protection page
         // tracking set for the copy and put it back, rather than drop GPU results or read zeros.

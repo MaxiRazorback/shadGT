@@ -41,6 +41,9 @@ static constexpr u32 ShaderBinaryVersionNativeCube = 279u;
 static constexpr u32 ShaderBinaryVersionSingleSampleBarycentric = 282u;
 // Tessellation modules and keys must use the same translation-time layout.
 static constexpr u32 ShaderBinaryVersionTessellationLayout = 283u;
+// FIX-223: fragment shaders whose discards end the pixel (AMD). 285: FIX-GTS-011 keeps some
+// shaders' discarded pixels as helpers again.
+static constexpr u32 ShaderBinaryVersionDiscardKill = 285u;
 
 static bool UsesScalarPrefix(const Shader::Info& info) {
     return info.hw_stage == Shader::HwStage::Compute &&
@@ -84,6 +87,12 @@ void SetVertexOrderCheckCacheEnabled(bool enabled) {
 void SetSingleSampleBarycentricCacheEnabled(bool enabled) {
     single_sample_barycentric_cache_enabled.store(enabled, std::memory_order_relaxed);
 }
+// FIX-223: fragment shaders translated with discards that end the pixel are stored under their
+// own version, so binaries made before (pixels demoted to helpers) are translated again.
+static std::atomic<bool> discard_kill_cache_enabled{false};
+void SetDiscardKillCacheEnabled(bool enabled) {
+    discard_kill_cache_enabled.store(enabled, std::memory_order_relaxed);
+}
 
 static bool HasMsaaImage(const Shader::StageSpecialization& spec) {
     return std::ranges::any_of(spec.images, [](const auto& image) {
@@ -97,6 +106,10 @@ static u32 ShaderBinaryVersionFor(const Shader::StageSpecialization& spec,
     if (spec.runtime_info.sw_stage == Shader::SwStage::TessellationControl ||
         spec.runtime_info.sw_stage == Shader::SwStage::TessellationEval) {
         return Serialization::ShaderBinaryVersionTessellationLayout;
+    }
+    if (spec.runtime_info.hw_stage == Shader::HwStage::Fragment &&
+        discard_kill_cache_enabled.load(std::memory_order_relaxed)) {
+        return Serialization::ShaderBinaryVersionDiscardKill;
     }
     if (spec.runtime_info.hw_stage == Shader::HwStage::Fragment &&
         spec.runtime_info.hw.fs.single_sample_barycentric) {
@@ -132,6 +145,9 @@ static bool IsKnownShaderBinaryVersion(u32 version) {
     // binary revision and retranslates it. Never relabel an old binary as corrected.
     version |= 0x100u;
     if (version == Serialization::ShaderBinaryVersionTessellationLayout) return true;
+    if (version == Serialization::ShaderBinaryVersionDiscardKill) {
+        return discard_kill_cache_enabled.load(std::memory_order_relaxed);
+    }
     if (version == Serialization::ShaderBinaryVersionSingleSampleBarycentric) {
         return single_sample_barycentric_cache_enabled.load(std::memory_order_relaxed);
     }

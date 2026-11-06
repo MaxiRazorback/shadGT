@@ -897,6 +897,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .support_fp16_denorm_flush = bool(vk12_props.shaderDenormFlushToZeroFloat16),
         .support_fp16_round_to_zero = bool(vk12_props.shaderRoundingModeRTZFloat16),
         .support_fp32_denorm_preserve = bool(vk12_props.shaderDenormPreserveFloat32),
+        // FIX-223 (RYGT_DISCARD_KILL=0 or 1 overrides): AMD ends discarded pixels at once.
+        .discard_kills = [&] {
+            const char* env = std::getenv("RYGT_DISCARD_KILL");
+            return env && *env ? *env == '1' : instance.GetVendorID() == 0x1002;
+        }(),
         .support_fp32_denorm_flush = bool(vk12_props.shaderDenormFlushToZeroFloat32),
         .support_fp32_round_to_zero = bool(vk12_props.shaderRoundingModeRTZFloat32),
         .support_fp64_denorm_preserve = bool(vk12_props.shaderDenormPreserveFloat64),
@@ -970,6 +975,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 #endif
     const char* barycentric_env = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC");
     SetVertexOrderCheckCacheEnabled(profile.vertex_order_check); // AMD-307
+    SetDiscardKillCacheEnabled(profile.discard_kills);           // FIX-223
     SetSingleSampleBarycentricCacheEnabled(UseSingleSampleBarycentric(
         instance.GetVendorID(), profile.supports_fragment_shader_barycentric, 1,
         !barycentric_env || std::strcmp(barycentric_env, "0") != 0));
