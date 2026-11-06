@@ -1894,7 +1894,9 @@ void VulkanCommandList::BeginHere() {
         .pInheritanceInfo = level == CommandListLevel::Secondary ? &inheritance : nullptr,
     });
 #ifndef NDEBUG
-    if (device.gpu_timing_enabled) timing = device.BeginGpuTiming(cmd);
+    // Deferred replay owns only the Vulkan command buffer. Recorder-side
+    // pipeline and timing bookkeeping is never written on this thread.
+    if (!ring && device.gpu_timing_enabled) timing = device.BeginGpuTiming(cmd);
 #endif
 }
 

@@ -7828,8 +7828,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         if (Native::GpuCheckpoints::Requested()) {
             const auto vs_hash = vs_info.pgm_hash, fs_hash = fs ? fs->pgm_hash : 0;
             const auto count = regs.num_indices;
+            const auto captured_frame = frame;
             s.cmd.Invoke([=](vk::CommandBuffer cmd) {
-                Native::GpuCheckpoints::Record(static_cast<VkCommandBuffer>(cmd), 1, frame,
+                Native::GpuCheckpoints::Record(static_cast<VkCommandBuffer>(cmd), 1, captured_frame,
                                                vs_hash, fs_hash, count);
             });
         }
@@ -10055,8 +10056,9 @@ void NativeRenderer::DispatchDirect() {
         if (Native::GpuCheckpoints::Requested()) {
             const auto hash = cs.pgm_hash, x = u64(cs_program.dim_x);
             const auto yz = u64(cs_program.dim_y) << 32 | cs_program.dim_z;
+            const auto captured_frame = frame;
             s.cmd.Invoke([=](vk::CommandBuffer cmd) {
-                Native::GpuCheckpoints::Record(static_cast<VkCommandBuffer>(cmd), 2, frame, hash, x, yz);
+                Native::GpuCheckpoints::Record(static_cast<VkCommandBuffer>(cmd), 2, captured_frame, hash, x, yz);
             });
         }
         cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
