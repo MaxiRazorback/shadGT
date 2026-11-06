@@ -5182,6 +5182,26 @@ static std::optional<Shader::StageSpecialization> TryMatchingSpecialization(
     }
 }
 
+namespace {
+int SpecFastMode() {
+    static const int mode = [] {
+        const char* env = std::getenv("RYGT_SPEC_FAST");
+        return env && *env ? std::clamp(env[0] - '0', 0, 2) : 1;
+    }();
+    return mode;
+}
+void RecordSpecInputs(Program::Module& module, const Shader::Info& info,
+                      const Shader::RuntimeInfo& runtime, const Shader::Backend::Bindings& start) {
+    if (!Shader::StageSpecialization::Packable(info)) return;
+    thread_local Shader::Gcn::FetchShaderData fetch;
+    module.inputs.words.clear();
+    Shader::StageSpecialization::PackInputs(info, module.inputs.words, fetch);
+    module.inputs.runtime_info = runtime;
+    module.inputs.start = start;
+    module.inputs.valid = true;
+}
+} // namespace
+
 PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
@@ -5370,11 +5390,29 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
             info.pgm_base = params.Base();
             info.user_data = params.user_data;
             { Common::PhaseTimer flat_timer{Common::Phase::SelFlatten}; info.RefreshFlatBuf(); }
-            const auto current_spec = [&] {
-                    Common::PhaseTimer spec_timer{Common::Phase::SelSpec};
-                    return TryMatchingSpecialization(info, runtime_info, profile, binding);
-                }();
-            if (current_spec && permutation.spec == *current_spec &&
+            const int fast_mode = SpecFastMode();
+            bool packed_match = false;
+            if (fast_mode && permutation.inputs.valid &&
+                Shader::StageSpecialization::Packable(info) &&
+                permutation.inputs.start == binding && permutation.inputs.runtime_info == runtime_info) {
+                thread_local std::vector<u64> words;
+                thread_local Shader::Gcn::FetchShaderData fetch;
+                words.clear();
+                Shader::StageSpecialization::PackInputs(info, words, fetch);
+                packed_match = words == permutation.inputs.words &&
+                               fetch == permutation.spec.fetch_shader_data;
+            }
+            bool matched = packed_match && fast_mode == 1;
+            if (!matched) {
+                Common::PhaseTimer spec_timer{Common::Phase::SelSpec};
+                const auto current_spec = TryMatchingSpecialization(info, runtime_info, profile, binding);
+                matched = current_spec && permutation.spec == *current_spec;
+                if (packed_match && !matched) {
+                    LOG_ERROR(Render_Vulkan, "PERF-GT7-058 packed specialization mismatch: {:#x}", params.hash);
+                }
+                if (matched && fast_mode) RecordSpecInputs(permutation, info, runtime_info, binding);
+            }
+            if (matched &&
                 !(AsyncTranslation() && !info.attribute_flags_known && IsTessEmulatedDraw())) {
                 if (!info.attribute_flags_known && IsTessEmulatedDraw()) {
                     RecoverAttributeFlags(info, permutation.spec, params, runtime_info,
@@ -5468,6 +5506,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
             memo.flats.assign(flats.begin(), flats.end());
         }
         program->last_match = perm_idx; // R7
+        if (!memo_usable && SpecFastMode()) RecordSpecInputs(permutation, info, runtime_info, binding);
         if (!info.attribute_flags_known && IsTessEmulatedDraw()) {
             RecoverAttributeFlags(info, permutation.spec, params, runtime_info, perm_idx);
         }
