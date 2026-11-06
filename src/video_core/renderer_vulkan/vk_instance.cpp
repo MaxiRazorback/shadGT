@@ -856,8 +856,8 @@ bool Instance::CreateDevice() {
             .extendedDynamicState3ColorWriteMask =
                 dynamic_state_3_features.extendedDynamicState3ColorWriteMask,
             .extendedDynamicState3DepthClipEnable = shader_object,
-            .extendedDynamicState3DepthClipNegativeOneToOne = shader_object,
             .extendedDynamicState3ProvokingVertexMode = shader_object,
+            .extendedDynamicState3DepthClipNegativeOneToOne = shader_object,
         },
         vk::PhysicalDeviceShaderObjectFeaturesEXT{
             .shaderObject = true, // SO-001

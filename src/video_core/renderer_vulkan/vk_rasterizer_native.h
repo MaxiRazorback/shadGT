@@ -74,6 +74,8 @@ class Image;
 class CommandList;
 class Device;
 class Fence;
+class Pipeline;
+class PipelineLayout;
 } // namespace Rhi
 } // namespace Native
 
