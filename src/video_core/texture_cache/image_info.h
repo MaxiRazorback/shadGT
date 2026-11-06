@@ -34,6 +34,7 @@ struct ImageProperties {
     u32 is_block : 1;
     u32 is_depth : 1;
     u32 has_stencil : 1;
+    u32 is_bgr_packed_float : 1;
 };
 
 struct ImageInfo {
@@ -58,10 +59,19 @@ struct ImageInfo {
 
     bool IsCompatible(const ImageInfo& info) const;
 
+    // Both guest packed-float orders map to the same Vulkan format. Other
+    // color formats retain the existing cross-format reinterpretation path.
+    bool PackedOrdersCompatible(const ImageInfo& info) const {
+        constexpr auto packed = vk::Format::eB10G11R11UfloatPack32;
+        return pixel_format != packed || info.pixel_format != packed ||
+               props.is_bgr_packed_float == info.props.is_bgr_packed_float;
+    }
+
     bool IsVideoOutSource(const ImageInfo& surface) const {
         return guest_address == surface.guest_address && type == AmdGpu::ImageType::Color2D &&
                type == surface.type && size == surface.size && pitch == surface.pitch &&
                pixel_format == surface.pixel_format && num_bits == surface.num_bits &&
+               PackedOrdersCompatible(surface) &&
                num_samples == 1 && surface.num_samples == 1 && resources.levels == 1 &&
                resources.layers == 1 && surface.resources.levels == 1 &&
                surface.resources.layers == 1 && tile_mode == surface.tile_mode &&
@@ -79,6 +89,7 @@ struct ImageInfo {
                info.resources.levels == 1 && info.resources.layers == 1 && !props.is_depth &&
                !info.props.is_depth && !props.is_block && !info.props.is_block &&
                pixel_format == info.pixel_format && num_bits == info.num_bits &&
+               PackedOrdersCompatible(info) &&
                num_samples == info.num_samples && pitch == info.pitch &&
                tile_mode == info.tile_mode && bank_swizzle == info.bank_swizzle &&
                alt_tile == info.alt_tile && mips_layout[0].pitch == info.mips_layout[0].pitch &&

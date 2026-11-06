@@ -1,5 +1,6 @@
 #include <exception>
 #include "ryty_gpu/native/cpu_stack_registry.h"
+#include "ryty_gpu/native/cube_view_policy.h"
 #include "ryty_gpu/native/ahead_descriptor_pools.h"
 #include "ryty_gpu/native/per_draw_view_proof.h"
 #include "ryty_gpu/native/adaptive_xxh3.h"
@@ -75,6 +76,8 @@
 
 #include <fmt/ranges.h>
 #include <magic_enum/magic_enum.hpp>
+#include <vulkan/vulkan_format_traits.hpp>
+#include "video_core/texture_cache/host_compatibility.h"
 #include <xxhash.h>
 
 #include "ryty_gpu/ryty_upscaler_status.h"
@@ -1640,6 +1643,11 @@ vk::ImageView NativeRenderer::View(const Native::ImageEntry& entry,
     }
     vk::ImageViewType view_type = VideoCore::ConvertImageViewType(info.type);
     if (use == ViewUse::CubeSampled) {
+        const auto whole_layers = Native::CubeViewLayers(r.instance.IsImageCubeArraySupported(),
+            volume, image_desc.width, image_desc.height,
+            image_desc.layers, image_desc.samples, info.range.extent.layers);
+        if (!whole_layers) return {};
+        info.range.extent.layers = whole_layers;
         view_type = vk::ImageViewType::eCubeArray;
     }
     if (volume) {
@@ -10936,6 +10944,85 @@ void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
     const vk::Image src_image{Handle<VkImage_T>(src->image->NativeHandle())};
     const vk::Image dst_image{Handle<VkImage_T>(dst->image->NativeHandle())};
     if (src->image->Desc().samples > 1 && dst->image->Desc().samples == 1) {
+        const auto src_format = src->image->Desc().format;
+        if (src_format != dst->image->Desc().format) {
+            // Resolve through attachment views in the source format. Vulkan's
+            // direct resolve requires identical image formats.
+            static const bool resolve_view = [] {
+                const char* env = std::getenv("RYGT_NATIVE_RESOLVE_VIEW");
+                return !(env && env[0] == '0');
+            }();
+            const vk::Format format = static_cast<vk::Format>(src_format);
+            const vk::Format dst_format = static_cast<vk::Format>(dst->image->Desc().format);
+            const bool view_compatible = [&] {
+                try { return VideoCore::IsVulkanFormatCompatible(dst_format, format); }
+                catch (const std::out_of_range&) { return false; }
+            }();
+            const bool compatible = resolve_view && layers == 1 &&
+                src->info.num_bits == dst->info.num_bits &&
+                view_compatible &&
+                r.instance.GetSupportedFormat(format, vk::FormatFeatureFlags2{src->backend_features}) == format &&
+                r.instance.GetSupportedFormat(format, vk::FormatFeatureFlags2{dst->backend_features}) == format;
+            const auto attachment_view = [&](const Native::ImageEntry& entry, u32 layer) {
+                VideoCore::ImageViewInfo view{};
+                view.format = format;
+                view.range.base.layer = u16(layer);
+                return View(entry, view, ViewUse::Attachment);
+            };
+            const auto src_view = compatible ? attachment_view(*src, region.srcSubresource.baseArrayLayer) : vk::ImageView{};
+            const auto dst_view = compatible ? attachment_view(*dst, region.dstSubresource.baseArrayLayer) : vk::ImageView{};
+            if (src_view && dst_view) {
+                const std::string_view numeric = vk::componentNumericFormat(format, 0);
+                const vk::RenderingAttachmentInfo attachment{
+                .imageView = src_view,
+                .imageLayout = vk::ImageLayout::eGeneral,
+                .resolveMode = numeric == "UINT" || numeric == "SINT"
+                                   ? vk::ResolveModeFlagBits::eSampleZero
+                                   : vk::ResolveModeFlagBits::eAverage,
+                .resolveImageView = dst_view,
+                .resolveImageLayout = vk::ImageLayout::eGeneral,
+                .loadOp = vk::AttachmentLoadOp::eLoad,
+                .storeOp = vk::AttachmentStoreOp::eStore,
+                };
+                s.cmd.beginRendering(vk::RenderingInfo{
+                    .renderArea{.extent = {region.extent.width, region.extent.height}},
+                    .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &attachment});
+                s.cmd.endRendering();
+                Written(dst);
+                s.buffers_written = true;
+                ++s.commands;
+                return;
+            }
+            // A same-format single-sample intermediate can be copied bitwise
+            // to a size-compatible destination without requiring mutable views.
+            ASSERT_MSG(src->info.num_bits == dst->info.num_bits && vk::blockSize(format) == vk::blockSize(dst_format) &&
+                           !src->info.props.is_block &&
+                           !dst->info.props.is_block,
+                       "Resolve requires size-compatible uncompressed color formats");
+            auto scratch = device->CreateImage({.format = src_format,
+                .width = region.extent.width, .height = region.extent.height,
+                .layers = layers, .samples = 1,
+                .usage = Native::Rhi::ImageUsageTransferSrc | Native::Rhi::ImageUsageTransferDst,
+                .name = "resolve format intermediate"});
+            ASSERT_MSG(scratch, "Unable to allocate resolve format intermediate");
+            device->RecordPendingImageInit(*s.list);
+            auto middle = region;
+            middle.dstSubresource.baseArrayLayer = 0;
+            const vk::Image temporary{Handle<VkImage_T>(scratch->NativeHandle())};
+            s.cmd.resolveImage(src_image, vk::ImageLayout::eGeneral, temporary,
+                               vk::ImageLayout::eGeneral, middle);
+            s.list->Barrier(Native::Rhi::ScopeTransfer, Native::Rhi::ScopeTransfer);
+            vk::ImageCopy copy{.srcSubresource = middle.dstSubresource,
+                               .dstSubresource = region.dstSubresource, .extent = region.extent};
+            s.cmd.copyImage(temporary, vk::ImageLayout::eGeneral, dst_image,
+                            vk::ImageLayout::eGeneral, copy);
+            // RHI image destruction is deferred by the scheduler timeline.
+            scratch.reset();
+            Written(dst);
+            s.buffers_written = true;
+            ++s.commands;
+            return;
+        }
         CmdBuf{s.cmd}.resolveImage(src_image, vk::ImageLayout::eGeneral, dst_image,
                                    vk::ImageLayout::eGeneral, region);
     } else {

@@ -368,6 +368,49 @@ bool RunResolveFormatCase(ImageRegistry& registry, std::string& log) {
     return ok;
 }
 
+bool RunRegistryReuseAndFillCase(ImageRegistry& registry, std::string& log) {
+    // Make the smaller target first; after the larger one takes its draws, an
+    // exact-size lookup must not resurrect the old picture.
+    auto small = MakeInfo(AmdGpu::TileMode::Thin1DThin, 64, 64, 1, 0x7200'0000'0000ULL);
+    auto large = MakeInfo(AmdGpu::TileMode::Thin1DThin, 128, 128, 1, small.guest_address);
+    small.pitch = large.pitch; small.UpdateSize();
+    auto* old_target = registry.Find(small, true, 1);
+    auto* large_target = registry.Find(large, true, 1);
+    auto* selected = registry.Find(small, true, 2);
+    const bool retired = old_target && large_target && old_target != large_target &&
+                         selected == large_target && old_target->reused.load();
+
+    auto pyramid = MakeInfo(AmdGpu::TileMode::Thin1DThin, 128, 128, 2, 0x7300'0000'0000ULL);
+    auto corner = MakeInfo(AmdGpu::TileMode::Thin1DThin, 64, 64, 1, pyramid.guest_address);
+    corner.pitch = pyramid.pitch; corner.UpdateSize();
+    const auto place = Native::PlaceOf(pyramid, corner);
+    auto different_tiling = corner;
+    different_tiling.micro_tiled_mips ^= 1u;
+    const bool crop = place.width == corner.size.width && place.height == corner.size.height &&
+                      Native::PlaceOf(pyramid, different_tiling).mip == -1;
+
+    auto texture_info = MakeInfo(AmdGpu::TileMode::Thin1DThin, 32, 32, 1, 0x7400'0000'0000ULL);
+    auto* texture = registry.Find(texture_info, false, 1);
+    if (!texture) return false;
+    texture->content_hash = 123;
+    const std::array<u32, 2> fill{0, 0};
+    registry.GpuWrote(texture_info.guest_address, texture_info.guest_size, &fill, true, 3);
+    const bool invalidated = texture->content_hash == 0 && texture->rewrite == ImageEntry::Rewrite::Clear;
+    auto packed_a = MakeInfo(AmdGpu::TileMode::Thin1DThin, 128, 128, 1, 0x7500'0000'0000ULL);
+    packed_a.pixel_format = vk::Format::eB10G11R11UfloatPack32;
+    auto packed_b = packed_a;
+    packed_b.props.is_bgr_packed_float = true;
+    auto* target_a = registry.Find(packed_a, true, 1);
+    auto* target_b = registry.Find(packed_b, true, 1);
+    const bool packed = target_a && target_b && target_a != target_b && !packed_a.IsCompatible(packed_b) &&
+                        Native::PlaceOf(packed_a, packed_b).mip == -1;
+    const bool ok = retired && crop && invalidated && packed;
+    log += fmt::format("registry larger-target retirement/mip-crop/fill-hash/packed-layout: {} / {} / {} / {}\n",
+                       retired ? "pass" : "FAIL", crop ? "pass" : "FAIL", invalidated ? "pass" : "FAIL",
+                       packed ? "pass" : "FAIL");
+    return ok;
+}
+
 bool RunUploadChunkCacheCase(Rhi::Device& device, Rhi::Fence& fence, u64& tick, std::string& log) {
     struct Chunk { std::unique_ptr<Rhi::Buffer> buffer; u64 retire_tick; };
     std::vector<Chunk> free;
@@ -1013,6 +1056,7 @@ bool RunImageSelfTest(std::string& log) {
     {
         ImageRegistry registry{*device};
         ok = RunResolveFormatCase(registry, log) && ok;
+        ok = RunRegistryReuseAndFillCase(registry, log) && ok;
         for (const auto mode : {AmdGpu::TileMode::Thin1DThin, AmdGpu::TileMode::Thin2DThin,
                                 AmdGpu::TileMode::Display2DThin}) {
             ok = RunCase(*device, registry, *fence, tick, mode, log) && ok;

@@ -193,7 +193,7 @@ bool SameLayout(const VideoCore::ImageInfo& a, const VideoCore::ImageInfo& b) {
         a.array_mode != b.array_mode || a.bank_swizzle != b.bank_swizzle ||
         a.alt_tile != b.alt_tile || a.resources != b.resources ||
         a.num_samples != b.num_samples || a.props.is_depth != b.props.is_depth ||
-        a.props.is_block != b.props.is_block || a.type != b.type) {
+        a.props.is_block != b.props.is_block || !a.PackedOrdersCompatible(b) || a.type != b.type) {
         return false;
     }
     // Equal dimensions do not imply equal byte offsets or padded mip footprints.
@@ -303,7 +303,8 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                     (c.size != info.size || c.resources != info.resources || SameLayout(c, info)) &&
                     c.num_bits == info.num_bits &&
                     c.num_samples == 1 && !c.props.is_depth && c.type == info.type &&
-                    c.pixel_format == info.pixel_format && c.resources.levels == 1 &&
+                    c.pixel_format == info.pixel_format &&
+                    c.PackedOrdersCompatible(info) && c.resources.levels == 1 &&
                     c.resources.layers == 1 && c.size.width >= info.size.width &&
                     c.size.height >= info.size.height &&
                     (!largest || u64(c.size.width) * c.size.height >
@@ -319,6 +320,9 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
 #ifndef NDEBUG
                     ++stats.reused_larger;
 #endif
+                    // The old smaller target will no longer receive the draws.
+                    // Make later texture lookups resolve to the larger picture.
+                    if (exact) MarkReused(*exact);
                 }
                 largest->last_use.store(frame, std::memory_order_relaxed);
                 return largest;
@@ -381,6 +385,7 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                     (c.size != info.size || c.resources != info.resources || SameLayout(c, info)) &&
                     c.num_bits == info.num_bits &&
                     c.num_samples == info.num_samples && c.props.is_depth == info.props.is_depth &&
+                    c.PackedOrdersCompatible(info) &&
                     c.props.has_stencil == info.props.has_stencil && c.type == info.type &&
                     c.resources.levels >= info.resources.levels &&
                     c.resources.layers >= info.resources.layers &&
@@ -554,18 +559,27 @@ ImageEntry* ImageRegistry::FindExisting(VAddr address,
 
 SourcePlace PlaceOf(const VideoCore::ImageInfo& target, const VideoCore::ImageInfo& texture) {
     if (target.props.is_depth || texture.props.is_depth || target.props.is_block ||
-        texture.props.is_block || target.num_bits != texture.num_bits ||
+        texture.props.is_block || !target.PackedOrdersCompatible(texture) ||
+        target.num_bits != texture.num_bits ||
         target.num_samples != texture.num_samples) {
         return {};
     }
     // A crop: the texture is the corner of the target in the same layout (as IsSubrectOf, any
     // colour format of the texel size).
-    if (target.guest_address == texture.guest_address && target.resources.levels == 1 &&
+    static const bool crop_of_mips = [] {
+        const char* env = std::getenv("RYGT_NATIVE_CROP_OF_MIPS");
+        return !(env && env[0] == '0');
+    }();
+    if (target.guest_address == texture.guest_address &&
+        (target.resources.levels == 1 || crop_of_mips) &&
         target.resources.layers == 1 && texture.resources.levels == 1 &&
         texture.resources.layers == 1 && target.pitch == texture.pitch &&
-        target.tile_mode == texture.tile_mode && target.bank_swizzle == texture.bank_swizzle &&
+        target.tile_mode == texture.tile_mode && target.array_mode == texture.array_mode &&
+        ((target.micro_tiled_mips ^ texture.micro_tiled_mips) & 1u) == 0 &&
+        target.bank_swizzle == texture.bank_swizzle &&
         target.alt_tile == texture.alt_tile &&
         target.mips_layout[0].pitch == texture.mips_layout[0].pitch &&
+        target.mips_layout[0].offset == texture.mips_layout[0].offset &&
         texture.size.width <= target.size.width && texture.size.height <= target.size.height &&
         (texture.size.width < target.size.width || texture.size.height < target.size.height) &&
         target.size.depth == 1 && texture.size.depth == 1 &&
@@ -997,6 +1011,13 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
                 entry.rewrite_pattern = *pattern;
                 entry.rewrite_bytes = entry.info.guest_size;
                 entry.rewrite_clock = clock;
+                // A later CPU write of the old bytes must upload them, rather
+                // than matching the hash from before this GPU fill.
+                static const bool forget_hash = [] {
+                    const char* env = std::getenv("RYGT_NATIVE_FILL_FORGETS_HASH");
+                    return !(env && env[0] == '0');
+                }();
+                if (forget_hash) entry.content_hash = 0;
                 return;
             }
             bool made_of_targets;
