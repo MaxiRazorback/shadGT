@@ -6,6 +6,7 @@
 #include "video_core/renderer_vulkan/pipeline_cleanup_worker.h"
 #include "video_core/renderer_vulkan/draw_preparation_options.h"
 #include "video_core/renderer_vulkan/compile_cpu_batch.h"
+#include "video_core/renderer_vulkan/speculative_key.h"
 #include "shader_recompiler/lane_read_policy.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
@@ -2553,10 +2554,8 @@ void PipelineCache::ReadAhead(const DrawIndirectParams params, bool restore) {
             }
         }
         ++evaluated;
-        regs_override = &regs;
         S().draw_indirect_params = {};
-        const bool valid = RefreshGraphicsKey();
-        regs_override = nullptr;
+        const bool valid = TrySpeculativeKey(regs_override, &regs, [&] { return RefreshGraphicsKey(); });
         if (!valid || !HasSupportedColorTargets() || graphics_pipelines.contains(S().graphics_key)) {
             return false;
         }
@@ -2616,6 +2615,7 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
     Common::PhaseTimer eval_timer{Common::Phase::ReadAheadEval};
     const auto key = S().graphics_key;
     const bool key_was_legacy = S().key_uses_legacy; // D10: made again the same way below
+    const auto* previous_regs = regs_override;
     u32 evaluated = 0;
     u32 started = 0;
     // Check time and the required build between states. One key evaluation cannot be preempted.
@@ -2623,7 +2623,7 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
     std::exception_ptr restore_error;
     {
     SCOPE_EXIT {
-        regs_override = nullptr;
+        regs_override = previous_regs;
         try {
             S().draw_indirect_params = params;
             if (restore && evaluated > 0) {
@@ -2642,10 +2642,9 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
             t_required_pipeline_build->wait_for(std::chrono::microseconds{0}) != std::future_status::ready) &&
            states->Take(queued_state_regs->reg_array)) {
         ++evaluated;
-        regs_override = queued_state_regs.get();
         S().draw_indirect_params = {};
-        const bool valid = RefreshGraphicsKey();
-        regs_override = nullptr;
+        const bool valid = TrySpeculativeKey(regs_override, queued_state_regs.get(),
+                                             [&] { return RefreshGraphicsKey(); });
         if (!valid || !HasSupportedColorTargets() || graphics_pipelines.contains(S().graphics_key)) {
             continue;
         }
