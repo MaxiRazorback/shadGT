@@ -576,6 +576,7 @@ private:
     /// MT-005: set by the indexed direct draw packets for the next RecordDraw (its index offset).
     std::optional<u32> staged_index_offset;
     /// Waits for the recorder thread to finish, before the command thread uses the rasterizer.
+    bool WaitsYieldToRecorder() const;
     void SyncRecorder(std::string_view reason);
     /// Whether [address, address + size) overlaps a command buffer being decoded.
     bool WritesLiveCommands(VAddr address, u64 size) const;
@@ -629,9 +630,20 @@ private:
         std::vector<u32> ccb_buffer;
         std::queue<Task::Handle> submits{};
         ComputeProgram cs_state{};
+        std::atomic<u32> pending{}; // Compute submissions awaiting decode.
+        u32 parked{}; // Accessed only by the command thread.
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
-    u32 num_mapped_queues{1u}; // GFX is always available
+    std::atomic<u32> num_mapped_queues{1u}; // GFX is always available.
+    bool ComputeQueueRunnable() const {
+        const u32 count = num_mapped_queues.load(std::memory_order_acquire);
+        for (u32 q = 1; q < count; ++q) {
+            const auto& queue = mapped_queues[q];
+            if (!queue.parked && queue.pending.load(std::memory_order_relaxed)) return true;
+        }
+        return false;
+    }
+    u32 gfx_packets_since_yield{};
 
     VAddr indirect_args_addr{};
     u32 num_counter_pairs{};

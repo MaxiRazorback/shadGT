@@ -1027,6 +1027,14 @@ void Liverpool::PipeReadAhead() {
 #endif
 }
 
+bool Liverpool::WaitsYieldToRecorder() const {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_WAIT_NO_DRAIN");
+        return !(env && env[0] == '0');
+    }();
+    return enabled && draw_pipe;
+}
+
 void Liverpool::SyncRecorder(std::string_view reason) {
     if (!draw_pipe) {
         return;
@@ -1431,7 +1439,7 @@ void Liverpool::Process(std::stop_token stoken) {
         while (num_tasks || num_commands) {
             ProcessCommands();
 
-            curr_qid = (curr_qid + 1) % num_mapped_queues;
+            curr_qid = (curr_qid + 1) % num_mapped_queues.load(std::memory_order_acquire);
 
             auto& queue = mapped_queues[curr_qid];
 
@@ -1451,6 +1459,7 @@ void Liverpool::Process(std::stop_token stoken) {
                 {
                     std::scoped_lock lock{queue.m_access};
                     queue.submits.pop();
+                    if (curr_qid != GfxQueueId) queue.pending.fetch_sub(1, std::memory_order_relaxed);
                 }
                 --num_tasks;
 #ifndef NDEBUG
@@ -1767,6 +1776,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     u32 num_recent = 0;
     while (!dcb.empty()) {
         ProcessCommands();
+
+        // PERF-GT7-052: let runnable compute submissions decode between graphics packets.
+        static const u32 yield_packets = [] {
+            const char* env = std::getenv("RYGT_GFX_YIELD_PACKETS");
+            return env && *env ? u32(std::strtoul(env, nullptr, 10)) : 32u;
+        }();
+        if (yield_packets && ++gfx_packets_since_yield >= yield_packets) {
+            gfx_packets_since_yield = 0;
+            if (ComputeQueueRunnable()) YIELD_GFX();
+        }
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
@@ -2803,6 +2822,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 #endif
                         break;
                     }
+                    while (WaitsYieldToRecorder() && !wait_reg_mem->Test(regs.reg_array) &&
+                           !draw_pipe->QueueIdle()) {
+                        YIELD_GFX();
+                    }
                     if (!wait_reg_mem->Test(regs.reg_array)) {
                         SyncRecorder("wait reg mem");
                     }
@@ -3133,6 +3156,12 @@ bool Liverpool::ScanAheadForPipelines(const std::function<bool(const Regs&)>& on
     return !scan_finished;
 }
 
+struct ComputeParkedScope {
+    u32& parked;
+    explicit ComputeParkedScope(u32& value) : parked{value} { ++parked; }
+    ~ComputeParkedScope() { --parked; }
+};
+
 template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
@@ -3286,6 +3315,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
             const auto wait_start = FrontendWaitNow();
             const bool waited = !rewind->Valid();
+            ComputeParkedScope parked{mapped_queues[vqid + 1].parked};
             while (!rewind->Valid()) {
                 YIELD_ASC(vqid);
             }
@@ -3444,6 +3474,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     SyncRecorder("mem semaphore");
                 }
                 const bool waited = !mem_semaphore->Signaled();
+                ComputeParkedScope parked{mapped_queues[vqid + 1].parked};
                 while (!mem_semaphore->Signaled()) {
                     YIELD_ASC(vqid);
                 }
@@ -3459,6 +3490,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             const auto wait_start = FrontendWaitNow();
+            ComputeParkedScope parked{mapped_queues[vqid + 1].parked};
             // PERF-048: as for graphics waits, the other queues decode first.
             bool yielded = false;
             for (u32 turn = 0; draw_pipe && WaitTurnsEnabled() && turn < 4 &&
@@ -3474,6 +3506,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 waits_moved_after_turns += yielded;
                 RecordSafe([this, wait = *wait_reg_mem] { RecorderWaitRegMem(wait); });
                 break;
+            }
+            while (WaitsYieldToRecorder() && !wait_reg_mem->Test(regs.reg_array) &&
+                   !draw_pipe->QueueIdle()) {
+                YIELD_ASC(vqid);
             }
             // PERF-031: what is waited on may be written by recorded work; the pending-fence
             // check reads the rasterizer, which only the drained recorder lets the command use.
@@ -3997,11 +4033,13 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     const auto& task = ProcessCompute(acb, vqid);
     {
         std::scoped_lock lock{queue.m_access};
+        queue.pending.fetch_add(1, std::memory_order_relaxed);
         queue.submits.emplace(task.handle);
     }
 
     std::scoped_lock lk{submit_mutex};
-    num_mapped_queues = std::max(num_mapped_queues, gnm_vqid + 1);
+    num_mapped_queues.store(std::max(num_mapped_queues.load(std::memory_order_relaxed),
+                                     gnm_vqid + 1), std::memory_order_release);
     ++num_submits;
     ++num_tasks;
     submit_cv.notify_one();
