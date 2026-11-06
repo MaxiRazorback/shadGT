@@ -72,6 +72,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/exit_save_registry.h"
+#include "video_core/renderer_vulkan/shader_store_readers.h"
 #include "video_core/shader_store_policy.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -482,6 +483,23 @@ PrecompileProgress GetPrecompileProgress() {
 
 // PERF-019: worker threads that build graphics pipelines ahead of the draws that need them.
 // PERF-038: stored pipelines are built in the background on a few of them, at low priority.
+// PERF-GT7-019: read metadata and prefetch bounded SPIR-V files off the recorder.
+class PipelineCache::StoreReaders {
+public:
+    explicit StoreReaders(u32 count)
+        : readers(count, [](u64 hash) { return ReadStoredListing(hash); },
+            [](u64 hash, size_t index) {
+                std::vector<u32> words;
+                Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
+                    fmt::format("{:#018x}_{}", hash, index), words);
+            }, [](u32 index) {
+                Common::SetCurrentThreadName(fmt::format("shadGT:ShaderStore{}", index).c_str());
+            }) {}
+    std::future<StoredListing> List(u64 hash) { return readers.List(hash); }
+private:
+    ShaderStoreReaders<StoredListing> readers;
+};
+
 class PipelineCache::PipelineBuildWorkers {
 public:
     PipelineBuildWorkers()
@@ -1035,7 +1053,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // pipeline_cache_enabled off for the driver's cache file, and that closed the store too, so
     // with 16 GB nothing was written to or read from the shaders folder (Lance, 2026-10-21).
 #ifdef RYTY_GPU
-    const bool store_wanted = true;
+    const char* shader_store = std::getenv("RYGT_SHADER_STORE");
+    const bool store_wanted = !(shader_store && shader_store[0] == '0');
 #else
     const bool store_wanted = EmulatorSettings.IsPipelineCacheEnabled();
 #endif
@@ -1055,6 +1074,13 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             Storage::DataBase::Instance().Open();
             use_stored_shaders = Storage::DataBase::Instance().IsOpened();
             if (use_stored_shaders) LoadElseScopeFixed();
+            const char* readers = std::getenv("RYGT_STORE_READERS");
+            if (use_stored_shaders && !(readers && readers[0] == '0')) {
+                try { store_readers = std::make_unique<StoreReaders>(8); }
+                catch (const std::exception& e) {
+                    LOG_WARNING(Render_Vulkan, "Shader store readers unavailable, using synchronous reads: {}", e.what());
+                }
+            }
             // D10: the old renderer's translations stand in while the new renderer's are built.
             // SHADGT_LEGACY_FALLBACK=0 turns it off.
             // SHD-002: not with stage descriptor sets: the old translations bind everything
@@ -1131,6 +1157,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 
 PipelineCache::~PipelineCache() {
     ExitCacheRegistry().Unregister(this); // Wait for an in-flight close save before teardown.
+    store_readers.reset();
     if (liverpool) {
         liverpool->on_command_buffer_start = nullptr;
     }
@@ -5135,11 +5162,34 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
     if (t_lookup_only) {
         return GetProgramForJob(hw_stage, params, runtime_info, binding); // NAT-031
     }
+    if (program_cache.contains(params.hash)) pending_listings.erase(params.hash);
+    if (store_readers && !program_cache.contains(params.hash)) {
+        auto pending = pending_listings.find(params.hash);
+        if (pending == pending_listings.end() && pending_listings.size() < 1024) {
+            try { pending = pending_listings.emplace(params.hash, store_readers->List(params.hash)).first; }
+            catch (const std::bad_alloc&) { /* Use the synchronous listing path. */ }
+        }
+        if (pending != pending_listings.end()) {
+            const bool skip = SkipTranslationWait(sw_stage, params);
+            const bool may_skip = regs_override != nullptr || defer_misses || skip;
+            if (may_skip && pending->second.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
+                if (!regs_override) { deferred_miss = true; translation_skipped |= skip; }
+                return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
+            }
+            if (!may_skip) pending->second.wait();
+        }
+    }
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
     if (new_program) {
         it_pgm.value() = std::make_unique<Program>();
         if (use_stored_shaders) {
-            ListStoredPermutations(params.hash, *it_pgm.value());
+            const auto pending = pending_listings.find(params.hash);
+            if (pending == pending_listings.end()) ListStoredPermutations(params.hash, *it_pgm.value());
+            else {
+                try { ApplyStoredListing(pending->second.get(), *it_pgm.value()); }
+                catch (...) { ListStoredPermutations(params.hash, *it_pgm.value()); }
+                pending_listings.erase(pending);
+            }
         }
     }
     // FIX-018: stored permutations of a program with an else after an empty if were translated

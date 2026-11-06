@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
+#include <future>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -551,6 +552,10 @@ private:
         std::chrono::steady_clock::time_point since{};
     } translate_stats;
     std::unique_ptr<TranslateWorkers> translate_workers;
+
+    class StoreReaders;
+    std::unordered_map<u64, std::future<StoredListing>> pending_listings;
+    std::unique_ptr<StoreReaders> store_readers;
 
     // Last member, so the workers stop before anything they use is destroyed.
     std::unique_ptr<PipelineBuildWorkers> build_workers;
