@@ -243,7 +243,8 @@ target_link_libraries(shadps4_read_capture_test PRIVATE GTest::gtest_main xxHash
 gtest_discover_tests(shadps4_read_capture_test)
 
 add_executable(shadps4_fps_lock_test test_fps_lock.cpp)
-target_include_directories(shadps4_fps_lock_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(shadps4_fps_lock_test PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+target_compile_definitions(shadps4_fps_lock_test PRIVATE NOMINMAX)
 target_compile_features(shadps4_fps_lock_test PRIVATE cxx_std_23)
 target_link_libraries(shadps4_fps_lock_test PRIVATE GTest::gtest_main)
 gtest_discover_tests(shadps4_fps_lock_test)

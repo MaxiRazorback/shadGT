@@ -2,8 +2,30 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <gtest/gtest.h>
-
+#include "ryty_gpu/ryty_pro_mode.h"
 #include "core/libraries/videoout/fps_lock.h"
+
+TEST(FastFlips, ExplicitEnvironmentAndConfigOverrideNativeDefaults) {
+    using Libraries::VideoOut::FastFlipsEnabled;
+    EXPECT_TRUE(FastFlipsEnabled(nullptr, std::nullopt, true, false));
+    EXPECT_FALSE(FastFlipsEnabled(nullptr, std::nullopt, true, true));
+    EXPECT_FALSE(FastFlipsEnabled(nullptr, std::nullopt, false, false));
+    EXPECT_FALSE(FastFlipsEnabled(nullptr, false, true, false));
+    EXPECT_TRUE(FastFlipsEnabled(nullptr, true, false, true));
+    EXPECT_FALSE(FastFlipsEnabled("0", true, true, false));
+    EXPECT_TRUE(FastFlipsEnabled("1", false, false, true));
+    EXPECT_FALSE(Ryty::ParseConfigBool("{\"fast_flips\": false}", "fast_flips").value());
+    EXPECT_TRUE(Ryty::ParseConfigBool("{\"fast_flips\": true}", "fast_flips").value());
+    EXPECT_FALSE(Ryty::ParseConfigBool("{}", "fast_flips").has_value());
+}
+
+TEST(FastFlips, IntervalHonoursGuestRateAndNeverGoesNegative) {
+    using namespace std::chrono_literals;
+    using Libraries::VideoOut::FastFlipInterval;
+    EXPECT_EQ(FastFlipInterval(16666666ns, 0), 15666666ns);
+    EXPECT_EQ(FastFlipInterval(16666666ns, 1), 32333332ns);
+    EXPECT_EQ(FastFlipInterval(500us, 0), 0ns);
+}
 
 namespace {
 
