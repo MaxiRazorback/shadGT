@@ -864,6 +864,12 @@ constexpr u32 SpliceAfter = 512; ///< commands per list before it is run and sub
 
 } // namespace
 
+constexpr size_t SnapshotMemoMaxBytes = 1_MB;
+struct NativeRenderer::SnapshotUploadMemo {
+    ImmutableUploadMemo<std::pair<vk::Buffer, u64>, 1, 8, SnapshotMemoMaxBytes> memo;
+    std::unique_ptr<u8[]> scratch;
+};
+
 bool NativeModeRequested() {
     // NAT-160: the launcher's renderer choice (GPU.native_renderer in the game's settings, so
     // GTSport.exe started on its own follows it too); RYGT_NATIVE=1 or =0 overrides it.
@@ -1640,6 +1646,7 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     // Zero permanently disables receipts after incarnation overflow.
     s.upload_incarnation=s.upload_incarnation && s.upload_incarnation!=UINT64_MAX ? s.upload_incarnation+1 : 0;
     UploadMemoFor(this).Clear(); // new list: old upload-buffer bindings cannot be reused
+    if (snapshot_upload_memo) snapshot_upload_memo->memo.Clear();
     if (r.instance.IsIntel()) {
         // FIX-188: Intel Arc (#65) records into the scheduler's own command buffer.
         r.scheduler.EndRendering();
@@ -3121,6 +3128,35 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr address, u64 size) {
     // A snapshot of what the range holds now, in the list's upload memory (zeros where the CPU
     // can't read it: NAT-106).
+    NATIVE_DIAGNOSTIC(++stats.copied_reads);
+    NATIVE_DIAGNOSTIC(stats.copied_bytes += size);
+    if (stream.list && size > 4_KB && size <= SnapshotMemoMaxBytes) {
+        if (!snapshot_upload_memo) snapshot_upload_memo = std::make_unique<SnapshotUploadMemo>();
+        auto& cache = *snapshot_upload_memo;
+        if (!cache.scratch) cache.scratch = std::make_unique_for_overwrite<u8[]>(SnapshotMemoMaxBytes);
+        u8* const captured = cache.scratch.get();
+        const u64 readable = Native::ReadablePrefix(reinterpret_cast<const void*>(address), size);
+        if (readable != 0 && !Core::RytyMemory::GuardedCopy(
+                                 captured, reinterpret_cast<const void*>(address), readable)) {
+            r.memory->CopySparseMemory(address, captured, readable);
+        }
+        if (readable < size) std::memset(captured + readable, 0, size - readable);
+        const std::span<const u8> bytes{captured, static_cast<size_t>(size)};
+        const auto lookup = cache.memo.Find(0, bytes, [](const void* data, size_t length) {
+            return Native::Parallel::AdaptiveXXH3(data, length);
+        });
+        if (lookup.binding) {
+            NATIVE_DIAGNOSTIC(++stats.snapshot_memo_hits);
+            NATIVE_DIAGNOSTIC(stats.snapshot_upload_bytes_saved += size);
+            return *lookup.binding;
+        }
+        NATIVE_DIAGNOSTIC(++stats.snapshot_memo_misses);
+        const auto [buffer, offset, data] = Allocate(size, r.instance.StorageMinAlignment());
+        std::memcpy(data, captured, size);
+        const std::pair binding{buffer, offset};
+        cache.memo.Store(lookup, 0, bytes, binding);
+        return binding;
+    }
     const auto [buffer, offset, data] = Allocate(size, r.instance.StorageMinAlignment());
     const u64 readable = Native::ReadablePrefix(reinterpret_cast<const void*>(address), size);
     // FIX-160: the game can release part of the range meanwhile (zeros there then).
@@ -3131,8 +3167,6 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::SnapshotRange(VAddr ad
     if (readable < size) {
         std::memset(data + readable, 0, size - readable);
     }
-    NATIVE_DIAGNOSTIC(++stats.copied_reads);
-    NATIVE_DIAGNOSTIC(stats.copied_bytes += size);
     return std::pair{buffer, offset};
 }
 
@@ -9902,6 +9936,7 @@ void NativeRenderer::Splice() {
         }
     }
     UploadMemoFor(this).Clear(); // bindings expire before upload chunks can be recycled
+    if (snapshot_upload_memo) snapshot_upload_memo->memo.Clear();
     for (auto& upload : s.flat_uploads) {
         upload.bytes.clear();
         upload.binding = {};
@@ -10987,6 +11022,9 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
     stats.prepared_vertices = stats.prepared_vertices_rejected = 0;
     stats.prepared_installed = 0;
     ++stats_reset_generation;
+    LOG_INFO(Render_Vulkan, "Snapshot upload memo: {} hits, {} misses, {} bytes saved",
+             stats.snapshot_memo_hits, stats.snapshot_memo_misses, stats.snapshot_upload_bytes_saved);
+    stats.snapshot_memo_hits = stats.snapshot_memo_misses = stats.snapshot_upload_bytes_saved = 0;
     stats.record_ns = {};
     prepare_stats.made = 0;
     prepare_stats.failed = 0;

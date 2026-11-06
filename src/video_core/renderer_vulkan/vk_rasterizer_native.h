@@ -718,6 +718,8 @@ private:
     bool composition_scratch_initialized = false;
 
     std::recursive_mutex mutex; ///< v0: the recorder thread records; flips may come from others
+    struct SnapshotUploadMemo;
+    std::unique_ptr<SnapshotUploadMemo> snapshot_upload_memo; ///< guarded by mutex
     Stream stream;
     DrawBindings bindings;
     u64 frame = 0;
@@ -789,6 +791,9 @@ private:
     u64 stats_reset_generation{};
 #endif
     struct Stats {
+#ifndef NDEBUG
+        u64 snapshot_memo_hits = 0, snapshot_memo_misses = 0, snapshot_upload_bytes_saved = 0;
+#endif
         u64 rewrite_clears = 0, rewrite_uploads = 0, fill_shaders = 0; ///< NAT-120
         u64 rewrite_partial = 0; ///< NAT-124
         u64 pass_barriers = 0, passes_unblocked = 0; ///< NAT-140

@@ -18,6 +18,7 @@
 
 #include "ryty_gpu/native/rhi/rhi.h"
 #include "ryty_gpu/native/rhi/rhi_vulkan.h"
+#include "video_core/renderer_vulkan/immutable_upload_memo.h"
 #include "video_core/host_shaders/fs_tri_vert.h"
 #include "video_core/host_shaders/native_test_comp.h"
 #include "video_core/host_shaders/native_test_frag.h"
@@ -399,6 +400,75 @@ bool RunSelfTest(std::string& log) {
                            wrong == 0 ? "values correct" : fmt::format("{} WRONG values", wrong));
     }
 
+    // Immutable snapshot reuse: hold upload buffers through completion, and prove that
+    // mutation of the original source cannot alter already-recorded GPU copies.
+    for (u32 case_index = 0; case_index < 2; ++case_index) {
+        const size_t size = case_index == 0 ? 194016 : 676180;
+        std::vector<u8> guest(size), captured(size);
+        for (size_t i = 0; i < size; ++i) guest[i] = u8((i * 37 + i / 251) & 255);
+        captured = guest;
+        const auto original = captured;
+        Vulkan::ImmutableUploadMemo<u32, 1, 8, 1024 * 1024> memo;
+        auto collision = [](const void*, size_t) { return u64{0}; };
+        auto first = memo.Find(0, captured, collision);
+        if (first.binding) { log += "snapshot first lookup unexpectedly hit\n"; return false; }
+        auto a = device->CreateBuffer({.size = size, .usage = BufferUsageTransferSrc,
+                                       .memory = MemoryKind::Upload});
+        auto b = device->CreateBuffer({.size = size, .usage = BufferUsageTransferSrc,
+                                       .memory = MemoryKind::Upload});
+        auto result = device->CreateBuffer({.size = size * 3, .usage = BufferUsageTransferDst,
+                                            .memory = MemoryKind::Readback});
+        if (!a || !b || !result || !a->Mapped() || !b->Mapped() || !result->Mapped()) {
+            log += "snapshot test buffer allocation failed\n"; return false;
+        }
+        std::memcpy(a->Mapped(), captured.data(), size);
+        memo.Store(first, 0, captured, 0);
+        captured = guest; // A fresh snapshot of identical source must reuse A.
+        const auto hit = memo.Find(0, captured, collision);
+        if (!hit.binding || *hit.binding != 0) { log += "snapshot identical miss\n"; return false; }
+        CommandList* list = device->AcquireCommandList();
+        list->Begin();
+        const std::array<Buffer*, 2> uploads{a.get(), b.get()};
+        list->CopyBuffer(a.get(), 0, result.get(), 0, size);
+        list->CopyBuffer(uploads[*hit.binding], 0, result.get(), size, size);
+        guest[size / 2] ^= 1; // Before submit, mutation must not change A.
+        captured = guest;
+        const auto changed = memo.Find(0, captured, collision);
+        if (changed.binding) { log += "snapshot collision reused changed bytes\n"; return false; }
+        std::memcpy(b->Mapped(), captured.data(), size);
+        memo.Store(changed, 0, captured, 1);
+        if (!FlushSelfTestUpload(*a) || !FlushSelfTestUpload(*b)) {
+            log += "snapshot upload flush failed\n"; return false;
+        }
+        list->CopyBuffer(b.get(), 0, result.get(), size * 2, size);
+        list->Barrier(ScopeTransfer, ScopeHost);
+        list->End();
+        CommandList* lists[] = {list};
+        const u64 tick = 7 + case_index * 2;
+        device->GraphicsQueue().Submit(lists, {}, {fence.get(), tick});
+        if (!fence->Wait(tick, 5'000'000'000ULL)) {
+            log += "snapshot GPU copy timed out\n"; return false;
+        }
+        result->Invalidate();
+        if (std::memcmp(result->Mapped(), original.data(), size) ||
+            std::memcmp(result->Mapped() + size, original.data(), size) ||
+            std::memcmp(result->Mapped() + size * 2, guest.data(), size)) {
+            log += "snapshot GPU bytes differ\n"; return false;
+        }
+        memo.Clear();
+        CommandList* next = device->AcquireCommandList();
+        next->Begin();
+        if (memo.Find(0, original, collision).binding) {
+            log += "snapshot survived list retirement\n"; return false;
+        }
+        next->End();
+        CommandList* next_lists[] = {next};
+        device->GraphicsQueue().Submit(next_lists, {}, {fence.get(), tick + 1});
+        if (!fence->Wait(tick + 1, 5'000'000'000ULL)) {
+            log += "snapshot next list timed out\n"; return false;
+        }
+        log += fmt::format("snapshot immutable GPU copy {} bytes: correct\n", size);
+    }
     device->Collect();
     return ok;
 }

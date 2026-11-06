@@ -10,11 +10,11 @@
 namespace Vulkan {
 // Immutable uploads belong to one command list. Hashes select candidates only;
 // full CPU-byte equality and stage identity establish reuse. No upload-heap reads.
-template<class Binding, std::size_t Stages, std::size_t Slots = 128>
+template<class Binding, std::size_t Stages, std::size_t Slots = 128,
+         std::size_t MaxBytes = 64 * 1024>
 class ImmutableUploadMemo {
     static constexpr std::size_t Ways = 4, Buckets = Slots / Ways;
     static_assert(Slots >= Ways && Slots % Ways == 0);
-    static constexpr std::size_t MaxBytes = 64 * 1024;
     struct Entry {
         bool valid{},backing_proven{};
         std::uint32_t stage{};
@@ -69,6 +69,10 @@ public:
         // Avoid geometric vector growth beyond the explicit per-entry bound.
         if (bytes.size() > entry.bytes.capacity()) {
             std::vector<std::uint8_t>(bytes.begin(), bytes.end()).swap(entry.bytes);
+            if (entry.bytes.capacity() > MaxBytes) {
+                std::vector<std::uint8_t>().swap(entry.bytes);
+                return;
+            }
         } else {
             entry.bytes.assign(bytes.begin(), bytes.end());
         }
