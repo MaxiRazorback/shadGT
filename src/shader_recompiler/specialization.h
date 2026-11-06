@@ -83,6 +83,7 @@ struct SamplerSpecialization {
  */
 struct StageSpecialization {
     static constexpr size_t MaxStageResources = 128;
+    static_assert(NUM_BUFFERS + NUM_IMAGES + NUM_FMASKS <= MaxStageResources);
 
     const Info* info{};
     RuntimeInfo runtime_info{};
@@ -178,7 +179,12 @@ struct StageSpecialization {
             usage_known);
         ForEachSharp(
             binding, images, info->images, [&](auto& spec, const auto& desc, AmdGpu::Image sharp) {
-                spec.type = sharp.GetViewType(desc.is_array);
+                // FIX-GT7-043: translation has no image for an FMask, so code with one isn't for
+                // this T#. Two translations matching one state would let the read-ahead change the
+                // current draw's key, as the last match decides between them.
+                spec.type = FMaskKeyEnabled() && sharp.Valid() && AmdGpu::IsFmask(sharp.GetDataFmt())
+                                ? AmdGpu::ImageType::Invalid
+                                : sharp.GetViewType(desc.is_array);
                 spec.is_integer = AmdGpu::IsInteger(sharp.GetNumberFmt());
                 spec.is_storage = desc.is_written;
                 if (spec.is_storage) {
@@ -195,8 +201,18 @@ struct StageSpecialization {
             true);
         ForEachSharp(binding, fmasks, info->fmasks,
                      [](auto& spec, const auto& desc, AmdGpu::Image sharp) {
-                         spec.width = sharp.width;
-                         spec.height = sharp.height;
+                         if (!FMaskKeyEnabled()) {
+                             spec.width = sharp.width;
+                             spec.height = sharp.height;
+                             return;
+                         }
+                         // FIX-GT7-043: zero for a T# that isn't an FMask, which this code
+                         // can't read. The size counts only where the code reads it: GT7 leaves
+                         // float data in many slots, which would make a variant per value.
+                         if (sharp.Valid() && AmdGpu::IsFmask(sharp.GetDataFmt())) {
+                             spec.width = desc.size_read ? sharp.width + 1 : 1;
+                             spec.height = desc.size_read ? sharp.height + 1 : 1;
+                         }
                      });
         ForEachSharp(samplers, info->samplers,
                      [](auto& spec, const auto& desc, AmdGpu::Sampler sharp) {

@@ -61,7 +61,8 @@ static_assert(sizeof(Shader::HwFragmentRuntimeInfo) == 248 && sizeof(Shader::Run
 // 16: the resource usage FIX-043 keys permutations by follows the Info. Versions 14 and 15
 // still load, as translations of unknown usage (keyed on every resource property, as stored).
 // 17: worker translations own resolved descriptor inputs and compile-time keys.
-static constexpr u32 ShaderMetaVersion = 17u;
+// FMask descriptors now store their complete fetch and size-use flag.
+static constexpr u32 ShaderMetaVersion = 18u;
 static constexpr u32 ShaderMetaVersionWithoutResourceUsage = 15u;
 static constexpr u32 ShaderMetaVersionWithoutAttributeFlags = 14u;
 // 9: rect/quad-list helper shaders built from complete attribute info (FIX-012). Version 8

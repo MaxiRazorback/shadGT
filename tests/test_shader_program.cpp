@@ -206,6 +206,30 @@ TEST(ShaderSpecialization, StrideOfABufferWithoutIndexedAddressingDoesNotSplitPe
     EXPECT_FALSE(indexed == KeyFor(info));
 }
 
+TEST(ShaderSpecialization, FmaskKeyTracksTypeAndOnlyRequiredDimensions) {
+    Shader::Info info;
+    info.hw_stage = Shader::HwStage::Fragment;
+    info.sw_stage = Shader::SwStage::Fragment;
+    auto& resource = info.fmasks.emplace_back();
+    auto image = AmdGpu::Image::Null(false);
+    image.base_address = 0x100;
+    image.data_format = u64(AmdGpu::DataFormat::FormatFmask64_S16_F8);
+    auto bind = [&] { std::memcpy(resource.sharp_fetch.immediates.data(), &image, sizeof(image)); };
+    bind();
+    const auto original = KeyFor(info);
+    image.width = 23;
+    bind();
+    EXPECT_TRUE(original == KeyFor(info));
+    resource.size_read = true;
+    const auto sized = KeyFor(info);
+    image.width = 42;
+    bind();
+    EXPECT_FALSE(sized == KeyFor(info));
+    image.data_format = u64(AmdGpu::DataFormat::Format32);
+    bind();
+    EXPECT_FALSE(original == KeyFor(info));
+}
+
 TEST(ShaderSpecialization, KeepsEveryBufferPropertyWhenTranslationUsageIsUnknown) {
     // A shader loaded from storage carries no usage flags.
     auto info = TranslatedFragmentWithBuffer(false);
