@@ -6,6 +6,7 @@
 #include "video_core/renderer_vulkan/pipeline_cleanup_worker.h"
 #include "video_core/renderer_vulkan/draw_preparation_options.h"
 #include "video_core/renderer_vulkan/compile_cpu_batch.h"
+#include "video_core/renderer_vulkan/stale_pipeline_builds.h"
 #include "video_core/renderer_vulkan/speculative_key.h"
 #include "shader_recompiler/lane_read_policy.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
@@ -1624,9 +1625,7 @@ std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::MakePipelineBuild()
     }
     build->modules = S().modules;
     build->done = build->promise.get_future().share();
-#ifndef NDEBUG
     build->queued = std::chrono::steady_clock::now();
-#endif
     return build;
 }
 
@@ -2477,11 +2476,7 @@ bool PipelineCache::MenusWait() {
 bool PipelineCache::CancelBuild(PipelineBuild& build) {
     // A worker may already have taken the job and wait in FinishBuild for whoever claimed the
     // build; release it, the build stays empty.
-    if (build.started.exchange(true)) {
-        return false;
-    }
-    build.promise.set_value();
-    return true;
+    return CancelUnstartedPipeline(build);
 }
 
 void PipelineCache::QueueBackgroundBuild(const std::shared_ptr<PipelineBuild>& build) {
@@ -2813,6 +2808,13 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     }
     if (!key_valid) {
         return nullptr;
+    }
+    if (regs_override == nullptr) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - stale_ahead_checked >= std::chrono::seconds{2}) {
+            stale_ahead_checked = now;
+            ExpireStaleAheadBuilds(pending_builds, S().graphics_key, now);
+        }
     }
     // D10: a key of new translations whose pipeline is not built yet. It is built in the
     // background; meanwhile the draw uses the key made of the old renderer's translations.

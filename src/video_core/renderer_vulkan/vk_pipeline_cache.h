@@ -463,6 +463,7 @@ private:
         bool on{}, stepped_back{};
     } catch_up;
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<PipelineBuild>> pending_builds;
+    std::chrono::steady_clock::time_point stale_ahead_checked{};
     // PERF-038: stored pipelines built in the background (opt-in, SHADGT_PREWARM=1).
     bool prewarm_enabled{};
     std::mutex prewarm_mutex;
