@@ -901,10 +901,6 @@ int CurrentCoreIsFast() {
     return index < classes.fast_by_index.size() ? classes.fast_by_index[index] : -1;
 }
 
-void KeepDisplayAwake() {
-    SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
-}
-
 void SetCurrentThreadPriority(ThreadPriority new_priority) {
     auto handle = GetCurrentThread();
     int windows_priority = 0;
@@ -976,8 +972,6 @@ void AllowAllCores() {}
 int CurrentCoreIsFast() {
     return -1;
 }
-
-void KeepDisplayAwake() {}
 
 void SetCurrentThreadPriority(ThreadPriority new_priority) {
     pthread_t this_thread = pthread_self();
