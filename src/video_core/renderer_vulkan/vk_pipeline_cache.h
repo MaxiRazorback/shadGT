@@ -142,6 +142,9 @@ public:
     std::shared_ptr<const void> KeepAlive(const ComputePipeline* pipeline) const;
 
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
+    // Caller holds lock; required pipeline waits may release and reacquire it.
+    const GraphicsPipeline* GetGraphicsPipelineUnlocked(const DrawIndirectParams params,
+                                                        std::unique_lock<LookupLock>& lock);
     /// The pipeline of the key RefreshGraphicsKey made (built if needed).
     const GraphicsPipeline* PipelineForCurrentKey(const DrawIndirectParams params);
 
@@ -502,6 +505,7 @@ private:
     } prewarm_stats;
     std::jthread prewarm_reader;
     LookupLock lookup_mutex; // PERF-047, PERF-060; NAT-031: shared for job threads
+    u32 unlocked_required_waits{}; // Protected by lookup_mutex.
 
     /// FIX-078: a shader the read-ahead found with no matching translation is translated on a
     /// worker thread; the draw that needs it takes the result (or waits for it) instead of
@@ -539,6 +543,10 @@ private:
     };
     class TranslateWorkers;
     bool AsyncTranslation() const;
+    void NoteRequiredTranslations(u64 hash, Shader::HwStage hw_stage, Shader::SwStage sw_stage,
+                                  const Shader::RuntimeInfo& runtime_info,
+                                  const Shader::Backend::Bindings& binding);
+    static thread_local std::vector<std::shared_ptr<TranslateJob>> unlocked_translations;
     /// FIX-078 (lookup lock held): moves the finished translations of a program to its ready
     /// list, first waiting for its unfinished ones when `wait`.
     void HarvestTranslations(u64 hash, bool wait, Shader::HwStage hw_stage,

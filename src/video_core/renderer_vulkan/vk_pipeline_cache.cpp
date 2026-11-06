@@ -76,6 +76,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/shader_usage_serde.h"
+#include "video_core/renderer_vulkan/required_pipeline_wait.h"
 #include "video_core/renderer_vulkan/exit_save_registry.h"
 #include "video_core/renderer_vulkan/compute_warm_recipe.h"
 #include "video_core/renderer_vulkan/shader_store_readers.h"
@@ -671,6 +672,7 @@ struct PipelineCache::PipelineBuild {
     bool preloading{};
     // PERF-076: a new pipeline its draws skip until a worker has built it.
     bool async{};
+    u32 required_waiters{}; // lookup mutex only; never touched by compiler workers
     // A worker claims the build once; cancellation claims an unstarted job without compiling.
     std::atomic<bool> started{};
     std::atomic<bool> bumped{};
@@ -2479,7 +2481,7 @@ bool PipelineCache::MenusWait() {
 bool PipelineCache::CancelBuild(PipelineBuild& build) {
     // A worker may already have taken the job and wait in FinishBuild for whoever claimed the
     // build; release it, the build stays empty.
-    return CancelUnstartedPipeline(build);
+    return CanCancelRequiredBuild(build.required_waiters) && CancelUnstartedPipeline(build);
 }
 
 void PipelineCache::QueueBackgroundBuild(const std::shared_ptr<PipelineBuild>& build) {
@@ -2608,6 +2610,16 @@ void PipelineCache::ReadAhead(const DrawIndirectParams params, bool restore) {
 
 // Required-build context is local to this translation unit and restored after nested waits.
 static thread_local const std::shared_future<void>* t_required_pipeline_build = nullptr;
+static thread_local std::unique_lock<LookupLock>* t_required_lookup_lock = nullptr;
+thread_local std::vector<std::shared_ptr<PipelineCache::TranslateJob>>
+    PipelineCache::unlocked_translations;
+static bool UnlockedShadersEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("RYGT_ONE_OFF_SHADERS_UNLOCKED");
+        return !value || value[0] != '0';
+    }();
+    return enabled;
+}
 
 void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool restore) {
     auto* states = liverpool->PipeReadAheadStates();
@@ -2745,6 +2757,42 @@ void PipelineCache::WaitForBuild(PipelineBuild& build, const DrawIndirectParams 
 #endif
 }
 
+const GraphicsPipeline* PipelineCache::GetGraphicsPipelineUnlocked(
+    const DrawIndirectParams params, std::unique_lock<LookupLock>& lock) {
+    ASSERT(lock.owns_lock());
+    static const bool enabled = [] {
+        const char* value = std::getenv("RYGT_ONE_OFF_UNLOCKED");
+        return !value || value[0] != '0';
+    }();
+    if (!enabled) return GetGraphicsPipeline(params);
+    auto* previous = std::exchange(t_required_lookup_lock, &lock);
+    SCOPE_EXIT { t_required_lookup_lock = previous; unlocked_translations.clear(); };
+    for (u32 attempt = 0; attempt < 8; ++attempt) {
+        unlocked_translations.clear();
+        const auto* pipeline = GetGraphicsPipeline(params);
+        if (pipeline || unlocked_translations.empty()) return pipeline;
+        // Speculative and legacy modes use shared lookup state and may not cross an unlock.
+        if (!CanUnlockRequired(regs_override != nullptr, force_legacy, fallback_nested,
+                               defer_misses)) {
+            t_required_lookup_lock = nullptr;
+            return GetGraphicsPipeline(params);
+        }
+        auto jobs = std::move(unlocked_translations);
+        t_required_lookup_lock = nullptr;
+        WaitOutsideLookup(lock, unlocked_required_waits, [&] {
+            Common::GuestClock::CompilePause pause;
+            for (const auto& job : jobs) {
+                std::unique_lock job_lock{job->mutex};
+                job->cv.wait(job_lock, [&] { return job->done.load(); });
+            }
+        });
+        t_required_lookup_lock = &lock;
+    }
+    // Bounded retries: preserve the preexisting required-draw fallback.
+    t_required_lookup_lock = nullptr;
+    return GetGraphicsPipeline(params);
+}
+
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     UpdateCatchUp(std::chrono::steady_clock::now());
     // PERF-034: builds for the upcoming draws the command thread read ahead start first.
@@ -2796,11 +2844,16 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         }
         deferred_miss = false;
         key_valid = RefreshGraphicsKey();
+        if (!key_valid && t_required_lookup_lock && !unlocked_translations.empty()) break;
         if (!key_valid && translation_skipped) {
             break; // SHD-005
         }
     }
     defer_misses = false;
+    if (!key_valid && t_required_lookup_lock && !unlocked_translations.empty()) {
+        deferred_miss = false;
+        return nullptr;
+    }
     if (!key_valid && translation_skipped) {
         // SHD-005: skipped while its shaders translate; a later draw takes them.
         deferred_miss = false;
@@ -3076,7 +3129,10 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 NoteAsyncSkip(stored, true);
                 return nullptr;
             }
-            if (CancelBuild(*stored)) {
+            if (!(t_required_lookup_lock &&
+                  CanUnlockRequired(regs_override != nullptr, force_legacy, fallback_nested,
+                                    defer_misses) && PreservesDepthOutput()) &&
+                CancelBuild(*stored)) {
                 // Not started in the background yet: built now the usual way.
                 pending_builds.erase(pending);
                 pending = pending_builds.end();
@@ -3159,6 +3215,26 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 build->done.wait_for(std::chrono::microseconds{0}) != std::future_status::ready) {
                 build->urgent = true;
                 QueueBuild(build, BuildQueue::Kind::Urgent);
+            }
+            if (t_required_lookup_lock &&
+                CanUnlockRequired(regs_override != nullptr, force_legacy, fallback_nested,
+                                  defer_misses) && PreservesDepthOutput() &&
+                build->done.wait_for(std::chrono::microseconds{0}) != std::future_status::ready) {
+                // Keep the job discoverable while the recorder sleeps. Do not retain an
+                // iterator or draw-stage pointers across the unlock: another lookup can
+                // install the result or rehash the maps. Recompute the key on return.
+                pending_builds[S().graphics_key] = build;
+                graphics_pipelines.erase(it);
+                auto* lock = std::exchange(t_required_lookup_lock, nullptr);
+                ++build->required_waiters;
+                SCOPE_EXIT { --build->required_waiters; };
+                WaitOutsideLookup(*lock, unlocked_required_waits, [&] {
+                    Common::GuestClock::CompilePause pause;
+                    Common::SetCompileCoresWide(true);
+                    SCOPE_EXIT { Common::SetCompileCoresWide(false); };
+                    build->done.wait();
+                });
+                return GetGraphicsPipeline(params);
             }
 #ifndef NDEBUG
             const auto wait_start = std::chrono::steady_clock::now();
@@ -5075,6 +5151,21 @@ bool PipelineCache::TakeReadyTranslation(HwStage hw_stage, SwStage sw_stage, u64
     return false;
 }
 
+void PipelineCache::NoteRequiredTranslations(u64 hash, HwStage hw_stage, SwStage sw_stage,
+                                             const Shader::RuntimeInfo& runtime_info,
+                                             const Shader::Backend::Bindings& binding) {
+    const auto it = translate_jobs.find(hash);
+    if (it == translate_jobs.end()) return;
+    for (const auto& job : it->second) {
+        if (!job->done.load() &&
+            MatchesTranslationRequest(*job, hw_stage, sw_stage, runtime_info, binding) &&
+            std::ranges::find(unlocked_translations, job) == unlocked_translations.end()) {
+            translate_workers->Prioritize(job);
+            unlocked_translations.push_back(job);
+        }
+    }
+}
+
 void PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, SwStage sw_stage,
                                        const Shader::RuntimeInfo& runtime_info,
                                        const Shader::Backend::Bindings& binding) {
@@ -5083,6 +5174,11 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
         return;
     }
     auto& jobs = it.value();
+    if (wait && t_required_lookup_lock && UnlockedShadersEnabled() && !regs_override &&
+        !force_legacy && !fallback_nested && PreservesDepthOutput()) {
+        NoteRequiredTranslations(hash, hw_stage, sw_stage, runtime_info, binding);
+        wait = false;
+    }
     if (wait) {
 #ifndef NDEBUG
         const auto wait_start = std::chrono::steady_clock::now();
@@ -5757,16 +5853,19 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
             fallback_miss = true;
             return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
         }
-        if (read_ahead || defer_misses || skip_wait) {
+        const bool unlocked = t_required_lookup_lock && UnlockedShadersEnabled() && !read_ahead &&
+                              !force_legacy && !fallback_nested && PreservesDepthOutput();
+        if (read_ahead || defer_misses || skip_wait || unlocked) {
             // A shader an upcoming draw needs (or this draw, which looks again once the next
             // draws' shaders are queued too); translated on a worker while this thread reads
             // on. No key without it: the state is skipped for now. SHD-005: a stage's bindings
             // no longer follow from the stages before it, so a race queues every missing stage
             // of the draw at once and skips it.
-            if (!S().stage_deferred || skip_wait) {
+            if (!S().stage_deferred || skip_wait || unlocked) {
                 S().stage_deferred = true;
-                QueueTranslation(hw_stage, sw_stage, params, runtime_info, binding, true);
+                QueueTranslation(hw_stage, sw_stage, params, runtime_info, binding, !unlocked);
             }
+            if (unlocked) NoteRequiredTranslations(params.hash, hw_stage, sw_stage, runtime_info, binding);
             if (!read_ahead) {
                 deferred_miss = true;
                 translation_skipped |= skip_wait;
@@ -5894,6 +5993,12 @@ void PipelineCache::RecoverAttributeFlags(Shader::Info& info,
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,
                                                              std::span<const u32> spv_code) {
+    std::unique_lock lock{lookup_mutex};
+    if (!CanReplaceShader(unlocked_required_waits,
+                          !pending_builds.empty() || (build_workers && build_workers->Busy()))) {
+        LOG_WARNING(Render_Vulkan, "Shader replacement deferred while pipeline builds are active");
+        return std::nullopt;
+    }
     std::optional<vk::ShaderModule> new_module{};
     for (const auto& [_, program] : program_cache) {
         for (auto& m : program->modules) {

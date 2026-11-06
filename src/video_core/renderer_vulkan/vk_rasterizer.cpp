@@ -273,22 +273,22 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead() {
     selected.compute = nullptr;
     selected.is_quad_list = quad_list;
     selected.quad_tess_pipeline = nullptr;
-    std::scoped_lock lk{pipeline_cache.LookupMutex()};
-    selected.pipeline = pipeline_cache.GetGraphicsPipeline({
+    std::unique_lock lk{pipeline_cache.LookupMutex()};
+    selected.pipeline = pipeline_cache.GetGraphicsPipelineUnlocked({
         .vertex_sgpr_offset = 0,
         .instance_sgpr_offset = 0,
         .tessellate_quads = false,
-    });
+    }, lk);
     selected.keepalive[0] = pipeline_cache.KeepAlive(selected.pipeline);
     if (selected.pipeline) {
         CopySelectedStages(selected.stages);
     }
     if (quad_list) {
-        selected.quad_tess_pipeline = pipeline_cache.GetGraphicsPipeline({
+        selected.quad_tess_pipeline = pipeline_cache.GetGraphicsPipelineUnlocked({
             .vertex_sgpr_offset = 0,
             .instance_sgpr_offset = 0,
             .tessellate_quads = true,
-        });
+        }, lk);
         selected.keepalive[2] = pipeline_cache.KeepAlive(selected.quad_tess_pipeline);
         if (selected.quad_tess_pipeline) {
             CopySelectedStages(selected.quad_tess_stages);
@@ -1125,8 +1125,8 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
         std::array<SelectedStage, Shader::MaxStageTypes> stages{};
         const GraphicsPipeline* pipeline;
         {
-            std::scoped_lock lk{pipeline_cache.LookupMutex()};
-            pipeline = pipeline_cache.GetGraphicsPipeline(params);
+            std::unique_lock lk{pipeline_cache.LookupMutex()};
+            pipeline = pipeline_cache.GetGraphicsPipelineUnlocked(params, lk);
             if (!pipeline) return nullptr;
             CopySelectedStages(stages);
         }
@@ -1243,8 +1243,8 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
     std::array<SelectedStage, Shader::MaxStageTypes> stages{};
     const GraphicsPipeline* pipeline;
     {
-        std::scoped_lock lk{pipeline_cache.LookupMutex()};
-        pipeline = pipeline_cache.GetGraphicsPipeline(params);
+        std::unique_lock lk{pipeline_cache.LookupMutex()};
+        pipeline = pipeline_cache.GetGraphicsPipelineUnlocked(params, lk);
         if (!pipeline) {
             return nullptr;
         }
