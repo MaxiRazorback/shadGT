@@ -113,6 +113,11 @@ enum class Phase : u32 {
 std::array<std::atomic<u64>, size_t(Phase::Count)>& GetPhaseTicks();
 #endif
 
+// Functional frame cadence for compile admission, retained when diagnostics are disabled.
+struct GameFrameTotals { u64 frames; u64 us; };
+void NoteGameFrameCadence();
+GameFrameTotals GetGameFrameTotals();
+
 /// DIAG-033: called for every presented game frame. A frame that took longer than
 /// SHADGT_STALL_MS (default 100) is logged with what the emulator did during it.
 #ifdef SHADGT_DIAGNOSTICS

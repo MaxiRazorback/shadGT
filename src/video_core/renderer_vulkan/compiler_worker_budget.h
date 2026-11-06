@@ -2,8 +2,22 @@
 #pragma once
 #include <algorithm>
 #include <semaphore>
+#include <new>
+#include <system_error>
 namespace Vulkan {
 std::counting_semaphore<64>& HeavyPipelineGate();
+// Extra catch-up workers are optional. Existing workers remain owned if a later creation fails.
+template <typename Workers, typename Factory>
+bool TryGrowCompileWorkers(Workers& workers, unsigned width, Factory&& factory) {
+    try {
+        while (workers.size() < width) factory();
+        return true;
+    } catch (const std::system_error&) {
+        return false;
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+}
 struct CompilerWorkerBudget {
     // Concurrent tessellation compiles exhausted system commit in NVIDIA LLVM.
     // Share one admission limit between dispatch and direct driver calls.

@@ -513,6 +513,7 @@ public:
         }
     }
     ~PipelineBuildWorkers() {
+        if (catch_up) SetCatchUpPolicy(false);
         for (auto& thread : threads) {
             thread.request_stop();
         }
@@ -542,6 +543,29 @@ public:
         }
         queue.SetBoost(on);
     }
+    static u32 UsualWidth() { return NumWorkers(); }
+    void SetPace(u32 limit) { queue.SetReadAheadLimit(limit); }
+    bool SetCatchUp(bool on) {
+        if (on == catch_up) return true;
+        if (on) {
+            const u32 width = std::max(NumWorkers(), std::min(8u, StartupWorkers()));
+            if (!TryGrowCompileWorkers(threads, width, [this] {
+                    threads.emplace_back([this](std::stop_token stop) { Work(stop); });
+                })) {
+                LOG_WARNING(Render_Vulkan, "Catch-up workers unavailable; retaining normal admission");
+                return false;
+            }
+            SetCatchUpPolicy(true);
+            queue.SetForegroundLimit(width);
+        } else {
+            queue.SetForegroundLimit(NumWorkers());
+            SetCatchUpPolicy(false);
+        }
+        catch_up = on;
+        return true;
+    }
+    bool Busy() { return queue.Busy(); }
+
     size_t BackgroundQueued() {
         return queue.BackgroundQueued();
     }
@@ -550,6 +574,15 @@ public:
     }
 
 private:
+    static void SetCatchUpPolicy(bool on) {
+        static const bool low = [] {
+            const char* value = std::getenv("RYGT_CATCH_UP_LOW");
+            return !(value && value[0] == '0');
+        }();
+        if (low) Common::SetCompileCatchUp(on);
+        else Common::SetCompileCoresWide(on);
+    }
+
     static u32 NumWorkers() {
         return CompilerWorkerBudget::ForLogicalThreads(
             std::thread::hardware_concurrency()).pipeline;
@@ -569,8 +602,8 @@ private:
         static const bool backlog_cores = Common::PerfFeatureEnabled(160);
         while (true) {
             BuildQueue::Job job;
-            bool background = false, heavy = false;
-            if (!queue.Pop(job, background, stop, &heavy)) {
+            bool background = false, heavy = false, read_ahead = false;
+            if (!queue.Pop(job, background, stop, &heavy, &read_ahead)) {
                 return;
             }
             if (backlog_cores) {
@@ -594,13 +627,14 @@ private:
             if (background) {
                 queue.FinishedBackground(heavy);
             } else {
-                queue.FinishedForeground(heavy);
+                queue.FinishedForeground(heavy, read_ahead);
             }
         }
     }
 
     BuildQueue queue;
     std::vector<std::jthread> threads;
+    bool catch_up{};
 };
 
 // PERF-019: what a worker needs to build one graphics pipeline. The shader infos are copied
@@ -625,6 +659,9 @@ struct PipelineCache::PipelineBuild {
     bool async{};
     // A worker claims the build once; cancellation claims an unstarted job without compiling.
     std::atomic<bool> started{};
+    std::atomic<bool> bumped{};
+    std::atomic<u64> skips{};
+    std::atomic<s64> last_skip_ms{};
     // The cached infos the copies were made from; the pipeline points at them once built.
     std::array<const Shader::Info*, MaxShaderStages> canonical{};
 };
@@ -1601,6 +1638,98 @@ void PipelineCache::FinishBuild(PipelineBuild& build) {
         build.promise.set_exception(std::current_exception());
       }
     }
+}
+
+void PipelineCache::NoteAsyncSkip(const std::shared_ptr<PipelineBuild>& build, bool again) {
+    catch_up_skips.fetch_add(1, std::memory_order_relaxed);
+    build->skips.fetch_add(1, std::memory_order_relaxed);
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    build->last_skip_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(now).count(), std::memory_order_relaxed);
+    if (again && build_workers && !build->started.load(std::memory_order_acquire) &&
+        !build->bumped.exchange(true)) {
+        try {
+            { std::scoped_lock lock{on_screen_mutex}; on_screen.push_back(build); }
+            // The chosen build is not known until this job runs, so reserve the heavy slot.
+            build_workers->Push([this] { BuildOnScreen(); }, BuildQueue::Kind::Screen, true);
+        } catch (const std::exception&) {
+            std::scoped_lock lock{on_screen_mutex};
+            std::erase(on_screen, build);
+            build->bumped.store(false, std::memory_order_release);
+        }
+    }
+}
+
+void PipelineCache::BuildOnScreen() {
+    std::shared_ptr<PipelineBuild> best;
+    {
+        std::scoped_lock lock{on_screen_mutex};
+        std::erase_if(on_screen, [](const auto& build) { return build->started.load(std::memory_order_acquire); });
+        const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto chosen = on_screen.end();
+        std::pair<bool, u64> best_score{};
+        for (auto it = on_screen.begin(); it != on_screen.end(); ++it) {
+            const auto score = std::pair{now - (*it)->last_skip_ms.load(std::memory_order_relaxed) <= 1000,
+                                         (*it)->skips.load(std::memory_order_relaxed)};
+            if (chosen == on_screen.end() || score > best_score) { chosen = it; best_score = score; }
+        }
+        if (chosen != on_screen.end()) { best = std::move(*chosen); on_screen.erase(chosen); }
+    }
+    if (best) FinishBuild(*best);
+}
+
+void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
+    static const bool enabled = [] { const char* v = std::getenv("RYGT_COMPILE_CATCH_UP"); return !(v && v[0] == '0'); }();
+    static const bool paced = [] { const char* v = std::getenv("RYGT_CATCH_UP_PACE"); return !(v && v[0] == '0'); }();
+    if (!enabled || !build_workers) return;
+    std::unique_lock lock{catch_up_mutex, std::try_to_lock};
+    if (!lock.owns_lock()) return;
+    auto& state = catch_up;
+    if (state.window == std::chrono::steady_clock::time_point{}) { state.window = now; return; }
+    const auto elapsed = now - state.window;
+    if (elapsed < std::chrono::milliseconds{250}) return;
+    const double rate = double(catch_up_skips.exchange(0, std::memory_order_relaxed)) / std::chrono::duration<double>(elapsed).count();
+    state.window = now;
+    if (!state.on && rate >= 3000.0) {
+        state.calm = 0; state.stepped_back = false;
+        state.on = build_workers->SetCatchUp(true);
+    } else if (state.on) {
+        state.calm = rate < 1000.0 ? state.calm + 1 : 0;
+        if (state.calm >= 4) {
+            state.on = false;
+            if (!state.stepped_back) build_workers->SetCatchUp(false);
+        }
+    }
+    if (!paced) return;
+    const auto totals = Common::GetGameFrameTotals();
+    if (state.pace_window == std::chrono::steady_clock::time_point{}) {
+        state.pace_window = now; state.frames = totals.frames; state.us = totals.us;
+        state.pace_limit = PipelineBuildWorkers::UsualWidth();
+        return;
+    }
+    if (now - state.pace_window < std::chrono::seconds{1}) return;
+    const u64 frames = totals.frames - state.frames;
+    const double ms = frames ? double(totals.us - state.us) / 1000.0 / double(frames)
+                             : std::chrono::duration<double, std::milli>(now - state.pace_window).count();
+    state.pace_window = now; state.frames = totals.frames; state.us = totals.us;
+    if (ms >= 80.0) { state.fast = 0; return; }
+    if (ms > 34.0) {
+        state.fast = 0;
+        if (state.on && !state.stepped_back) {
+            state.stepped_back = true;
+            build_workers->SetCatchUp(false);
+        } else if (state.pace_limit > 1 && build_workers->Busy()) {
+            build_workers->SetPace(--state.pace_limit);
+        }
+    } else if (ms < 33.8 && ++state.fast >= 3) {
+        state.fast = 0;
+        const u32 usual = PipelineBuildWorkers::UsualWidth();
+        if (state.pace_limit < usual) {
+            ++state.pace_limit;
+            build_workers->SetPace(state.pace_limit == usual ? UINT32_MAX : state.pace_limit);
+        } else if (state.on && state.stepped_back) {
+            if (build_workers->SetCatchUp(true)) state.stepped_back = false;
+        }
+    } else if (ms >= 33.8) state.fast = 0;
 }
 
 void PipelineCache::QueueBuild(const std::shared_ptr<PipelineBuild>& build, BuildQueue::Kind kind) {
@@ -2602,6 +2731,7 @@ void PipelineCache::WaitForBuild(PipelineBuild& build, const DrawIndirectParams 
 }
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
+    UpdateCatchUp(std::chrono::steady_clock::now());
     // PERF-034: builds for the upcoming draws the command thread read ahead start first.
     BuildQueuedStates(params, false);
     // PERF-038: then, while no draw waits for pipelines, stored ones go to the background.
@@ -2921,6 +3051,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                 ++async_stats.skipped_draws;
 #endif
                 NoteSkippedDraw(); // PERF-103
+                NoteAsyncSkip(stored, true);
                 return nullptr;
             }
             if (CancelBuild(*stored)) {
@@ -2994,6 +3125,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             ++async_stats.skipped_draws;
 #endif
             NoteSkippedDraw(); // PERF-103
+            NoteAsyncSkip(build, false);
             return nullptr;
         }
         if (build) {

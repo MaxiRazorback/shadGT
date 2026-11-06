@@ -22,6 +22,24 @@
 #endif
 
 namespace Common {
+namespace {
+std::atomic<u64> cadence_frames{};
+std::atomic<u64> cadence_us{};
+}
+void NoteGameFrameCadence() {
+    static thread_local auto last = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (last != std::chrono::steady_clock::time_point{}) {
+        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(now - last).count();
+        cadence_us.fetch_add(u64(us), std::memory_order_relaxed);
+        cadence_frames.fetch_add(1, std::memory_order_release);
+    }
+    last = now;
+}
+GameFrameTotals GetGameFrameTotals() {
+    const auto frames = cadence_frames.load(std::memory_order_acquire);
+    return {frames, cadence_us.load(std::memory_order_relaxed)};
+}
 
 #ifdef SHADGT_DIAGNOSTICS
 

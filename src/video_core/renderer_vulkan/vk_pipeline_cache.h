@@ -216,6 +216,9 @@ private:
     void QueueBuild(const std::shared_ptr<PipelineBuild>& build, BuildQueue::Kind kind);
     /// Builds the pipeline unless a worker already started; returns when it is built.
     void FinishBuild(PipelineBuild& build);
+    void NoteAsyncSkip(const std::shared_ptr<PipelineBuild>& build, bool again);
+    void BuildOnScreen();
+    void UpdateCatchUp(std::chrono::steady_clock::time_point now);
     /// PERF-019: starts builds for the new pipelines of the draws after the current one.
     void ReadAhead(const DrawIndirectParams params, bool restore = true);
     /// PERF-020: while new pipelines keep appearing, reads each command buffer ahead as soon as
@@ -446,6 +449,16 @@ private:
         double ms{};
         std::chrono::steady_clock::time_point since{};
     } queued_state_stats;
+    std::mutex on_screen_mutex;
+    std::vector<std::shared_ptr<PipelineBuild>> on_screen;
+    std::atomic<u64> catch_up_skips{};
+    std::mutex catch_up_mutex;
+    struct CatchUpState {
+        std::chrono::steady_clock::time_point window{}, pace_window{};
+        u64 frames{}, us{};
+        u32 calm{}, fast{}, pace_limit{};
+        bool on{}, stepped_back{};
+    } catch_up;
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<PipelineBuild>> pending_builds;
     // PERF-038: stored pipelines built in the background (opt-in, SHADGT_PREWARM=1).
     bool prewarm_enabled{};
