@@ -431,7 +431,12 @@ void Liverpool::StartDrawPipe() {
         // A held label may be the very thing the guest waits for before
         // publishing its next command buffer. Submit it before the recorder
         // sleeps instead of requiring another draw or EOP to trigger a flush.
-        if (rasterizer) rasterizer->FlushDeferredFences();
+        if (rasterizer) {
+            rasterizer->FlushDeferredFences();
+#ifdef RYTY_GPU
+            if (auto* native = rasterizer->Native()) native->BeginAhead();
+#endif
+        }
     });
     pipe_report_start = std::chrono::steady_clock::now();
     pipelined.store(true, std::memory_order_release);

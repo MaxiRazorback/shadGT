@@ -94,6 +94,9 @@ public:
     NativeRenderer(const NativeRenderer&) = delete;
     NativeRenderer& operator=(const NativeRenderer&) = delete;
 
+    // PERF-GT7-008: prepare a direct list when the serialized recorder goes idle.
+    void BeginAhead();
+
     void Draw(bool is_indexed, u32 index_offset);
     void DispatchDirect();
     void DispatchIndirect(VAddr address, u32 offset, u32 size);
@@ -286,8 +289,13 @@ private:
     size_t TextureMemoSlot(const std::array<u64, 4>& raw_sharp, u32 flags) const;
 
     void AcquireList(Stream& s);
+    bool RingEnabled();
+    void ApplyRingPriority(bool enabled);
     CmdBuf CmdOf(Native::Rhi::CommandList& list) const;
     Stream& Begin();
+    std::chrono::steady_clock::time_point ring_ab_start{};
+    u64 ring_ab_window{};
+    bool command_priority_boosted{};
     void EndRendering(u32 reason = 0);
     bool ContinueSmallParallelPass(const RenderState& target, u32 reason, bool safe);
     void BeginRendering(const RenderState& state);

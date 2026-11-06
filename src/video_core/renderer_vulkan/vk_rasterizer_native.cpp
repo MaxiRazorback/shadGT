@@ -57,6 +57,8 @@
 #include "video_core/renderer_vulkan/scene_region_scale.h"
 #include "video_core/renderer_vulkan/upload_chunk_tail.h"
 #include "video_core/renderer_vulkan/upload_chunk_cache.h"
+#include "video_core/renderer_vulkan/native_ring_policy.h"
+#include "common/thread.h"
 
 #include <fstream>
 #include <algorithm>
@@ -1381,6 +1383,7 @@ NativeRenderer::~NativeRenderer() {
     // Finish all deferred recording before resources referenced by replay are destroyed.
     if (!ParallelRecordingRequested()) {
         Splice();
+        ApplyRingPriority(false);
         r.scheduler.Finish();
         r.scheduler.SyncCommandThread();
     }
@@ -1787,12 +1790,56 @@ vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
 }
 
 
-void NativeRenderer::AcquireList(Stream& s) {
+bool NativeRenderer::RingEnabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("RYGT_NATIVE_RING");
         return !value || std::strcmp(value, "0") != 0;
     }();
-    static const bool logged = [] {
+#ifndef NDEBUG
+    static const bool compare = [] {
+        const char* value = std::getenv("RYGT_NATIVE_AB");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    if (enabled && compare) {
+        const auto now = std::chrono::steady_clock::now();
+        if (ring_ab_start == std::chrono::steady_clock::time_point{}) {
+            ring_ab_start = now;
+            LOG_INFO(Render_Vulkan, "Native ring comparison window 0: direct");
+        }
+        const auto window = u64(std::chrono::duration_cast<std::chrono::seconds>(now - ring_ab_start).count() / 10);
+        if (window != ring_ab_window) {
+            ring_ab_window = window;
+            LOG_INFO(Render_Vulkan, "Native ring comparison window {}: {}", window,
+                     window % 2 ? "deferred" : "direct");
+        }
+        return NativeRingWindow(enabled, true, compare, window);
+    }
+#endif
+    return NativeRingWindow(enabled, false, false, 0);
+}
+
+void NativeRenderer::ApplyRingPriority(bool enabled) {
+    // The scheduler's main ring has exactly one producer. A worker's private
+    // chunk must never enqueue a control operation onto that ring directly.
+    if (Scheduler::ThreadRing()) return;
+    static const bool boost = [] {
+        const char* value = std::getenv("RYGT_NATIVE_GPU_PRIORITY");
+        return !(value && value[0] == '0');
+    }();
+    const bool wanted = enabled && boost;
+    if (wanted == command_priority_boosted) return;
+    if (auto* ring = r.scheduler.CommandThreadRing()) {
+        command_priority_boosted = wanted;
+        ring->RecordControl([wanted](Scheduler&) {
+            Common::SetCurrentThreadPriority(wanted ? Common::ThreadPriority::High
+                                                    : Common::ThreadPriority::Normal);
+        });
+    }
+}
+
+void NativeRenderer::AcquireList(Stream& s) {
+    const bool enabled = RingEnabled();
+    static const bool logged = [enabled] {
         if (enabled && ParallelRecordingRequested())
             LOG_INFO(Render_Vulkan, "Native command ring disabled while parallel recording is requested");
         return true;
@@ -1804,6 +1851,7 @@ void NativeRenderer::AcquireList(Stream& s) {
         !Scheduler::ThreadRing()) {
         if (CommandRing* ring = r.scheduler.CommandThreadRing()) {
             if (auto* list = device->AcquireDeferredCommandList(ring)) {
+                ApplyRingPriority(true);
                 s.list = list;
                 list->Begin();
                 s.cmd = CmdBuf{ring, reinterpret_cast<const vk::CommandBuffer*>(list->NativeHandleSlot())};
@@ -1811,9 +1859,24 @@ void NativeRenderer::AcquireList(Stream& s) {
             }
         }
     }
+    ApplyRingPriority(false);
     s.list = device->AcquireCommandList(Native::Rhi::CommandListLevel::Secondary);
     s.list->Begin();
     s.cmd = CmdBuf{vk::CommandBuffer{Handle<VkCommandBuffer_T>(s.list->NativeHandle())}};
+}
+
+void NativeRenderer::BeginAhead() {
+    static const bool reuse = [] {
+        const char* value = std::getenv("RYGT_NATIVE_REUSE");
+        return !(value && value[0] == '0');
+    }();
+    const bool intel = r.instance.IsIntel(), parallel = ParallelRecordingRequested();
+    const bool worker = Scheduler::ThreadRing() != nullptr;
+    if (!reuse || intel || parallel || worker) return;
+    std::scoped_lock lock{mutex};
+    const bool ring_available = RingEnabled() && r.scheduler.CommandThreadRing() && !Native::GpuCheckpoints::Requested();
+    if (!NativeBeginAheadAllowed(reuse, intel, parallel, worker, stream.list != nullptr, ring_available)) return;
+    Begin();
 }
 
 CmdBuf NativeRenderer::CmdOf(Native::Rhi::CommandList& list) const {

@@ -4,6 +4,7 @@
 #include <vector>
 #include <gtest/gtest.h>
 #include "video_core/renderer_vulkan/vk_command_stream.h"
+#include "video_core/renderer_vulkan/native_ring_policy.h"
 
 // This isolated test replays Slot commands without constructing a GPU scheduler.
 namespace Vulkan {
@@ -40,4 +41,18 @@ TEST(NativeCommandRing, ReplaysInOrderWithCopiedPayloadAndLateSlot) {
         ring.SetReplayed(cursor);
     }
     EXPECT_EQ(observed, (std::vector<uintptr_t>{0x1234, 3, 5, 8}));
+}
+
+TEST(NativeCommandRing, ComparisonAndIdleRespectExplicitOffAndExclusions) {
+    using Vulkan::NativeRingWindow;
+    EXPECT_FALSE(NativeRingWindow(false, true, true, 1));
+    EXPECT_TRUE(NativeRingWindow(true, false, true, 0));
+    EXPECT_FALSE(NativeRingWindow(true, true, true, 0));
+    EXPECT_TRUE(NativeRingWindow(true, true, true, 1));
+    EXPECT_TRUE(Vulkan::NativeBeginAheadAllowed(true, false, false, false, false, false));
+    EXPECT_FALSE(Vulkan::NativeBeginAheadAllowed(true, false, false, false, false, true));
+    EXPECT_FALSE(Vulkan::NativeBeginAheadAllowed(true, true, false, false, false, false));
+    EXPECT_FALSE(Vulkan::NativeBeginAheadAllowed(true, false, true, false, false, false));
+    EXPECT_FALSE(Vulkan::NativeBeginAheadAllowed(true, false, false, true, false, false));
+    EXPECT_FALSE(Vulkan::NativeBeginAheadAllowed(true, false, false, false, true, false));
 }
