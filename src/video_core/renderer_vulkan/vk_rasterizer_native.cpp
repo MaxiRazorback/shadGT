@@ -5390,6 +5390,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                     WatchBind(*entry, tsharp, storage, true, stage.pgm_hash); // FIX-157
                 }
 #endif
+                if (!storage && entry->from_cpu) registry->LayersRewritten(*entry, frame);
                 ApplyRewrite(*entry); // NAT-120
                 if (!storage && entry->from_cpu) {
                     RefreshSources(*entry); // NAT-104
@@ -5539,6 +5540,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             WatchBind(*entry, tsharp, storage, false, stage.pgm_hash); // FIX-157 (diagnosis)
         }
 #endif
+        if (!storage && entry->from_cpu) registry->LayersRewritten(*entry, frame);
         ApplyRewrite(*entry); // NAT-120 (NAT-133: textures too)
         if (!storage && r.FrameDumpCollecting()) {
             // FIX-152 (diagnosis): RYGT_FRAME_DUMP_ALL_TEXTURES=1 dumps uploaded ones too.
@@ -10089,6 +10091,7 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     for (const auto* sampled : p.bindings.sampled) {
         auto& entry = *const_cast<Native::ImageEntry*>(sampled);
         entry.last_use.store(frame, std::memory_order_relaxed);
+        if (entry.from_cpu) registry->LayersRewritten(entry, frame);
         ApplyRewrite(entry); // NAT-120, NAT-133
         if (entry.from_cpu) {
             RefreshSources(entry); // NAT-104

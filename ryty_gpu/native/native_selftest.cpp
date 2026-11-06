@@ -1035,6 +1035,35 @@ bool RunCpuRefreshOwnershipCase(Rhi::Device& device, Rhi::Fence& fence, u64& tic
     return ok;
 }
 
+bool RunLayerHashUploadCase(Rhi::Device& device, Rhi::Fence& fence, u64& tick, std::string& log) {
+    constexpr u64 layer_bytes = 512ull * 256 * 4;
+    std::vector<u8> guest(layer_bytes * 16, 0);
+    auto info = MakeInfo(AmdGpu::TileMode::DisplayLinearAligned, 512, 256, 1,
+                         reinterpret_cast<VAddr>(guest.data()));
+    info.resources.layers = 16;
+    info.UpdateSize();
+    if (info.guest_size != guest.size()) return false;
+    ImageRegistry registry{device};
+    registry.SetMemoryClamp([](VAddr, u64 size) { return size; });
+    auto* image = registry.Find(info, false, 1);
+    if (!image) return false;
+    auto upload = [&] {
+        auto* list = device.AcquireCommandList(); list->Begin();
+        const bool recorded = registry.RecordUploads(*list) == 1;
+        list->End(); Rhi::CommandList* lists[]{list};
+        device.GraphicsQueue().Submit(lists, {}, {&fence, ++tick});
+        return recorded && fence.Wait(tick, 5'000'000'000ULL);
+    };
+    bool ok = upload() && !registry.LayersRewritten(*image, 1);
+    guest[12 * layer_bytes + 1000] = 1; // outside every 64-byte sample
+    ok = ok && registry.LayersRewritten(*image, 2) && image->needs_upload.load();
+    registry.QueueUploadForUse(*image);
+    ok = upload() && ok;
+    ok = !registry.LayersRewritten(*image, 3) && ok;
+    log += fmt::format("large layered upload detects unsampled rewrite: {}\n", ok ? "passed" : "FAILED");
+    return ok;
+}
+
 bool RunImageSelfTest(std::string& log) {
     std::string error;
     auto device = Rhi::CreateStandaloneVulkanDevice(&error);
@@ -1053,6 +1082,7 @@ bool RunImageSelfTest(std::string& log) {
     ok = RunRegionMergeOrderCase(*device,*fence,tick,log) && ok;
     ok = RunRegionWritebackReplay(*device,*fence,tick,log) && ok;
     ok = RunCpuRefreshOwnershipCase(*device,*fence,tick,log) && ok;
+    ok = RunLayerHashUploadCase(*device,*fence,tick,log) && ok;
     {
         ImageRegistry registry{*device};
         ok = RunResolveFormatCase(registry, log) && ok;

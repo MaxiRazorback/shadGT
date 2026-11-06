@@ -9,6 +9,7 @@
 // frame's jobs; render targets start empty and are GPU-only.
 
 #pragma once
+#include "ryty_gpu/native/layer_hash.h"
 
 #include <array>
 #include <atomic>
@@ -96,6 +97,7 @@ public:
     /// NAT-109: hash of the guest bytes last uploaded (small textures; 0: none), so a texture
     /// made stale by a write to its page that left its bytes alone is not uploaded again.
     u64 content_hash = 0;
+    LayerHashState layer_hash;
     /// A GPU-only target cannot be checked against a CPU hash. Its initial upload can instead
     /// establish that CPU writes to the complete backing range are already being watched.
     bool guest_writes_tracked = false;
@@ -306,6 +308,7 @@ public:
     /// FIX-157: whether guest memory under a picture the GPU wrote still holds what it held
     /// when the picture was last uploaded from it (its content hash).
     bool MemoryUnchanged(const ImageEntry& entry);
+    bool LayersRewritten(ImageEntry& entry, u64 frame);
     u64 Count();
 
     /// Records the uploads queued since the last call (copy from guest memory, untile, copy

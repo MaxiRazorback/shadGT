@@ -979,6 +979,39 @@ bool ImageRegistry::MemoryUnchanged(const ImageEntry& entry) {
     return hash == entry.content_hash;
 }
 
+static bool LayerSamplesEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_LAYER_SAMPLES");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
+
+static bool LayerWholeHashEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_LAYER_HASH");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
+
+bool ImageRegistry::LayersRewritten(ImageEntry& entry, u64 frame) {
+    const bool samples = LayerSamplesEnabled();
+    const bool whole = LayerWholeHashEnabled();
+    const u64 size = entry.info.guest_size;
+    const u32 layers = entry.info.resources.layers;
+    if (!samples || !entry.from_cpu || layers < 16 || size <= (4ull << 20) ||
+        size % layers != 0 || entry.gpu_backing_written.load(std::memory_order_acquire) ||
+        !memory_clamp || memory_clamp(entry.info.guest_address, size) != size) return false;
+    const u64 layer_size = size / layers;
+    const bool changed = entry.layer_hash.Changed(layers, layer_size, frame,
+        [&](u32 layer, u64 offset, u64 bytes) {
+            return Core::HashGuestBytes(entry.info.guest_address + layer * layer_size + offset, bytes);
+        }, samples, whole);
+    if (changed) MarkStale(entry, Stale::CpuWrite);
+    return changed;
+}
+
 void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern,
                              bool exact, u64 clock) {
 #ifndef NDEBUG
@@ -1463,6 +1496,21 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
         }
         trace.Next(13);
         list.CopyBufferToImage(linear, entry->image.get(), copies);
+        if (LayerSamplesEnabled() && entry->from_cpu && info.resources.layers >= 16 && size > HashedSize &&
+            size % info.resources.layers == 0 &&
+            !entry->gpu_backing_written.load(std::memory_order_acquire) &&
+            memory_clamp && memory_clamp(info.guest_address, size) == size &&
+            (source || gpu_source.kind == 2 || gpu_source.kind == 3)) {
+            const u64 layer_size = size / info.resources.layers;
+            entry->layer_hash.Capture(info.resources.layers, layer_size,
+                [&](u32 layer, u64 offset, u64 bytes) {
+                    const u64 at = layer * layer_size + offset;
+                    return source ? XXH3_64bits(source->Mapped() + at, bytes) :
+                                    Core::HashGuestBytes(info.guest_address + at, bytes);
+                }, LayerWholeHashEnabled());
+        } else {
+            entry->layer_hash.ClearUpload();
+        }
 #ifndef NDEBUG
         const u8 kind = source ? 4 : gpu_source.kind; // FIX-153 (diagnosis)
 #endif
