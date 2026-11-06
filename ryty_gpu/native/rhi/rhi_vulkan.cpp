@@ -2185,6 +2185,14 @@ void VulkanCommandList::EndMarker() {
 
 } // namespace
 
+#ifndef NDEBUG
+bool FlushSelfTestUpload(Buffer& buffer) {
+    auto& vulkan = static_cast<VulkanBuffer&>(buffer);
+    return vulkan.allocation &&
+           vmaFlushAllocation(vulkan.device.allocator, vulkan.allocation, 0, VK_WHOLE_SIZE) == VK_SUCCESS;
+}
+#endif
+
 bool TryEnqueueCompleted(Device& device,std::function<void()>& release) noexcept {
     try {return static_cast<VulkanDevice&>(device).completed_resources.TryEnqueue(release);}
     catch (...) {return false;}

@@ -437,6 +437,9 @@ bool RunSelfTest(std::string& log) {
         if (changed.binding) { log += "snapshot collision reused changed bytes\n"; return false; }
         std::memcpy(b->Mapped(), captured.data(), size);
         memo.Store(changed, 0, captured, 1);
+        if (!FlushSelfTestUpload(*a) || !FlushSelfTestUpload(*b)) {
+            log += "snapshot upload flush failed\n"; return false;
+        }
         list->CopyBuffer(b.get(), 0, result.get(), size * 2, size);
         list->Barrier(ScopeTransfer, ScopeHost);
         list->End();

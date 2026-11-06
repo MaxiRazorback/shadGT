@@ -29,4 +29,9 @@ std::unique_ptr<Image> CreateVulkanImage(Device& device, const VkImageCreateInfo
 /// A device of its own (headless instance, first Vulkan 1.3 GPU), for tests and tools.
 std::unique_ptr<Device> CreateStandaloneVulkanDevice(std::string* error = nullptr);
 
+#ifndef NDEBUG
+/// Flush an upload allocation used by the standalone RHI self-test.
+bool FlushSelfTestUpload(Buffer& buffer);
+#endif
+
 } // namespace Native::Rhi
