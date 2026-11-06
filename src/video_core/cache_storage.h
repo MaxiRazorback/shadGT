@@ -38,6 +38,8 @@ public:
     [[nodiscard]] bool IsOpened() const {
         return opened;
     }
+    [[nodiscard]] bool UsesCompatibleSibling() const { return compatible_sibling; }
+    [[nodiscard]] const std::filesystem::path& StorePath() const { return cache_path; }
     void FinishPreload();
 
     bool Save(BlobType type, const std::string& name, std::vector<u8>&& data);
@@ -58,6 +60,8 @@ private:
     std::jthread io_worker{};
     std::filesystem::path cache_path{};
     bool opened{};
+    bool archived{};
+    bool compatible_sibling{};
 };
 
 } // namespace Storage

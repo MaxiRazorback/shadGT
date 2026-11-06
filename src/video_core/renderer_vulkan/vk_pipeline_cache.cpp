@@ -72,6 +72,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/exit_save_registry.h"
+#include "video_core/shader_store_policy.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -1027,7 +1028,6 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         instance.GetVendorID(), profile.supports_fragment_shader_barycentric, 1,
         !barycentric_env || std::strcmp(barycentric_env, "0") != 0));
     CreateDriverCache();
-    LoadElseScopeFixed();
     // PERF-032: the shader store is used again, without the startup precompile Lance had removed:
     // a program's stored translations are read when a draw first uses it, and new translations
     // are stored. -DisablePerf 47 leaves the store closed.
@@ -1053,7 +1053,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                                        "pipeline cache (pipeline_cache_archived)");
         } else {
             Storage::DataBase::Instance().Open();
-            use_stored_shaders = true;
+            use_stored_shaders = Storage::DataBase::Instance().IsOpened();
+            if (use_stored_shaders) LoadElseScopeFixed();
             // D10: the old renderer's translations stand in while the new renderer's are built.
             // SHADGT_LEGACY_FALLBACK=0 turns it off.
             // SHD-002: not with stage descriptor sets: the old translations bind everything
@@ -4209,8 +4210,10 @@ bool IsWatchedShader(u64 hash) {
 
 void PipelineCache::LoadElseScopeFixed() {
     const auto& serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
-    else_scope_fixed_path = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
-                            fmt::format("{}.else-scope-fix", serial);
+    const auto& store = Storage::DataBase::Instance();
+    else_scope_fixed_path = VideoCore::ShaderStoreMarksPath(
+        Common::FS::GetUserPath(Common::FS::PathType::CacheDir), serial, store.StorePath(),
+        store.UsesCompatibleSibling());
     std::ifstream file{else_scope_fixed_path};
     std::string line;
     while (std::getline(file, line)) {
