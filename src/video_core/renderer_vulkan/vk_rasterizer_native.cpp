@@ -10995,16 +10995,16 @@ void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
             }
             // A same-format single-sample intermediate can be copied bitwise
             // to a size-compatible destination without requiring mutable views.
-            ASSERT_MSG(src->info.num_bits == dst->info.num_bits && vk::blockSize(format) == vk::blockSize(dst_format) &&
-                           !src->info.props.is_block &&
-                           !dst->info.props.is_block,
-                       "Resolve requires size-compatible uncompressed color formats");
+            if (src->info.num_bits != dst->info.num_bits ||
+                vk::blockSize(format) != vk::blockSize(dst_format) ||
+                src->info.props.is_block || dst->info.props.is_block)
+                UNREACHABLE_MSG("Resolve requires size-compatible uncompressed color formats");
             auto scratch = device->CreateImage({.format = src_format,
                 .width = region.extent.width, .height = region.extent.height,
                 .layers = layers, .samples = 1,
                 .usage = Native::Rhi::ImageUsageTransferSrc | Native::Rhi::ImageUsageTransferDst,
                 .name = "resolve format intermediate"});
-            ASSERT_MSG(scratch, "Unable to allocate resolve format intermediate");
+            if (!scratch) UNREACHABLE_MSG("Unable to allocate resolve format intermediate");
             device->RecordPendingImageInit(*s.list);
             auto middle = region;
             middle.dstSubresource.baseArrayLayer = 0;
