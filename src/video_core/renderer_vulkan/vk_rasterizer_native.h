@@ -315,6 +315,7 @@ private:
         bool dirty_sorted = true;
     };
     std::map<VAddr, Region> regions; ///< by begin; guarded by mutex
+    u64 regions_taken_in{}; ///< recorder: incremented whenever region storage is replaced
     std::mutex region_dirty_mutex;   ///< pending_region_writes (CPU write faults: any thread)
     std::vector<std::pair<VAddr, VAddr>> pending_region_writes;
     std::vector<std::pair<VAddr, VAddr>> pending_stack_retirements;
@@ -493,6 +494,8 @@ private:
     void SyncUiRange(VAddr address, u64 size, bool keep);
     void BindStages(std::span<const Shader::Info* const> stages, const AmdGpu::Regs& regs,
                     bool compute, DrawBindings& b);
+    void BindStagesStable(std::span<const Shader::Info* const> stages, const AmdGpu::Regs& regs,
+                          bool compute, DrawBindings& b);
     void BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& regs, bool compute,
                      Shader::Backend::Bindings& binding, DrawBindings& b);
     void BindTextures(const Shader::Info& stage, const AmdGpu::Regs& regs,

@@ -52,6 +52,7 @@
 // own threads with this code (ryty_gpu/native/DESIGN.md, N4).
 
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
+#include "video_core/renderer_vulkan/stable_region_bindings.h"
 #include "video_core/renderer_vulkan/scene_region_scale.h"
 #include "video_core/renderer_vulkan/upload_chunk_tail.h"
 #include "video_core/renderer_vulkan/upload_chunk_cache.h"
@@ -2493,6 +2494,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
                 end = std::max(end, it->second.end);
                 retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
                 merged.push_back(std::move(it->second));
+                ++regions_taken_in;
                 it = regions.erase(it);
             } else {
                 ++it;
@@ -4004,6 +4006,29 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
         m.targets = out;
     }
     return true;
+}
+
+void NativeRenderer::BindStagesStable(std::span<const Shader::Info* const> stages,
+                                      const AmdGpu::Regs& regs, bool compute, DrawBindings& b) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_STABLE_BINDINGS");
+        return !env || env[0] != '0';
+    }();
+    if (!enabled) {
+        BindStages(stages, regs, compute, b);
+        return;
+    }
+    if (BindRegionsStable([&] { return regions_taken_in; }, [&] {
+            BindStages(stages, regs, compute, b);
+            return !b.failed;
+        }, [&] {
+            b.Clear();
+            b.push = UserData(regs);
+        })) return;
+    if (b.failed) return;
+    // Do not submit descriptors that might refer to a retired region.
+    b.failed = true;
+    LOG_WARNING(Render_Vulkan, "FIX-GT7-090: region bindings did not stabilize");
 }
 
 void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
@@ -6244,7 +6269,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     if (!from_prepared) {
         b.Clear();
         b.push = UserData(regs);
-        BindStages(pipeline->GetStages(), regs, false, b);
+        BindStagesStable(pipeline->GetStages(), regs, false, b);
     }
     WritebacksBefore(b); // includes worker-prepared bindings
     if (b.failed) {
@@ -9615,7 +9640,7 @@ void NativeRenderer::DispatchDirect() {
     DrawBindings& b = bindings;
     b.Clear();
     b.push = UserData(regs);
-    BindStages(pipeline->GetStages(), regs, true, b);
+    BindStagesStable(pipeline->GetStages(), regs, true, b);
     WritebacksBefore(b);
     if (b.failed) {
         NATIVE_DIAGNOSTIC(++stats.skipped);
@@ -9731,7 +9756,7 @@ void NativeRenderer::DispatchDirect() {
             Begin();
             b.Clear();
             b.push=UserData(regs);
-            BindStages(pipeline->GetStages(),regs,true,b);
+            BindStagesStable(pipeline->GetStages(),regs,true,b);
             if (b.failed) { NATIVE_DIAGNOSTIC(++stats.skipped); return; }
             PrepareImages();
             GlobalBarrier();
@@ -9950,7 +9975,7 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     UiHires::Get().scale = 0.f;
     SyncUiReads(pipeline->GetStages());
     Stream& s = Begin();
-    const auto args = GuestBuffer(address + offset, std::max<u32>(size, 12), false);
+    auto args = GuestBuffer(address + offset, std::max<u32>(size, 12), false);
     if (!args) {
         NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
@@ -9958,7 +9983,19 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     DrawBindings& b = bindings;
     b.Clear();
     b.push = UserData(regs);
-    BindStages(pipeline->GetStages(), regs, true, b);
+    const u64 indirect_region_before = regions_taken_in;
+    BindStagesStable(pipeline->GetStages(), regs, true, b);
+    if (b.failed) {
+        NATIVE_DIAGNOSTIC(++stats.skipped);
+        return;
+    }
+    if (regions_taken_in != indirect_region_before) {
+        args = GuestBuffer(address + offset, std::max<u32>(size, 12), false);
+        if (!args) {
+            NATIVE_DIAGNOSTIC(++stats.skipped);
+            return;
+        }
+    }
     WritebacksBefore(b);
     PrepareImages();
     GlobalBarrier();
