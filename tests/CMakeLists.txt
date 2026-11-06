@@ -112,6 +112,11 @@ if(WIN32)
     add_test(NAME compile_thread_policy_late COMMAND ${CMAKE_COMMAND} -E env RYGT_POLICY_TEST_LATE=1
         $<TARGET_FILE:shadps4_compile_thread_policy_test>)
 endif()
+add_executable(shadps4_exit_save_registry_test test_exit_save_registry.cpp)
+target_include_directories(shadps4_exit_save_registry_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_exit_save_registry_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_exit_save_registry_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_exit_save_registry_test)
 
 add_executable(shadps4_image_aliasing_test test_image_aliasing.cpp)
 target_include_directories(shadps4_image_aliasing_test PRIVATE ${CMAKE_SOURCE_DIR}/src)

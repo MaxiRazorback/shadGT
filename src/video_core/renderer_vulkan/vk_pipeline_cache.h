@@ -57,6 +57,7 @@ class DataBase;
 }
 
 namespace Vulkan {
+bool SaveDriverCacheAtExit();
 
 /// FIX-227: the hull shader LDS emulation mode for the current draw (0: off).
 u32 TessLdsEmulation(const AmdGpu::Regs& regs);

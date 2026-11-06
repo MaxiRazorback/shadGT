@@ -111,10 +111,8 @@ void RunWindowThread() {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(50)); // Flush queued HID releases.
     try {
-        if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
-            LOG_INFO(Render_Vulkan, "CACHE-EXIT: saving driver pipelines before process termination");
-            rasterizer->GetPipelineCache().PersistDriverCacheForExit();
-        }
+        if (Vulkan::SaveDriverCacheAtExit())
+            LOG_INFO(Render_Vulkan, "CACHE-EXIT: driver pipeline save attempted before process termination");
     } catch (const std::exception& error) {
         LOG_WARNING(Render_Vulkan, "CACHE-EXIT: save failed: {}", error.what());
     }

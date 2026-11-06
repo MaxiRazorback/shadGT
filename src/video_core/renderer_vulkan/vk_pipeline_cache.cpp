@@ -71,6 +71,7 @@
 #include "video_core/renderer_vulkan/spirv_check.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
+#include "video_core/renderer_vulkan/exit_save_registry.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -89,6 +90,15 @@ u32 TessLdsEmulation(const AmdGpu::Regs& regs) {
     if (mode == 0 || !regs.stage_enable.hs_en || regs.ls_hs_config.hs_input_control_points == 0 ||
         regs.ls_hs_config.num_patches <= 1) return 0;
     return TessLdsModeForMask(mode, regs.reg_array[0xa30e], regs.reg_array[0xa30f]);
+}
+namespace {
+ExitSaveRegistry<PipelineCache>& ExitCacheRegistry() {
+    static auto* registry = new ExitSaveRegistry<PipelineCache>();
+    return *registry;
+}
+}
+bool SaveDriverCacheAtExit() {
+    return ExitCacheRegistry().Invoke([](PipelineCache& cache) { cache.PersistDriverCacheForExit(); });
 }
 static PipelineCleanupWorker& PipelineRetirementWorker() {
     static PipelineCleanupWorker worker([] {
@@ -1114,9 +1124,12 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         translate_stats.since = std::chrono::steady_clock::now();
 #endif
     }
+    if (!ExitCacheRegistry().Register(this))
+        LOG_WARNING(Render_Vulkan, "CACHE-EXIT: another pipeline cache owns exit-save registration");
 }
 
 PipelineCache::~PipelineCache() {
+    ExitCacheRegistry().Unregister(this); // Wait for an in-flight close save before teardown.
     if (liverpool) {
         liverpool->on_command_buffer_start = nullptr;
     }
