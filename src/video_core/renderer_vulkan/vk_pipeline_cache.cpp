@@ -30,6 +30,7 @@
 #include <windows.h>
 #endif
 
+#include "common/diagnostics.h"
 #include "common/elf_info.h"
 #include "common/guest_clock.h"
 #include "common/nvtx.h"
@@ -4107,7 +4108,7 @@ bool IsWatchedShader(u64 hash) {
         // The Nurburgring grass: vertex generator, blade generator, and the pass before them.
         // DIAG-039: the dealership shader whose buffer V#s read as float constants.
         std::vector<u64> hashes{0xab6a2d10, 0xaa3822a3, 0x766d0f18, 0xae32f77f};
-        if (const char* env = std::getenv("SHADGT_WATCH_SHADERS"); env && *env) {
+        if (const char* env = Common::DiagEnv("SHADGT_WATCH_SHADERS"); env && *env) {
             hashes.clear();
             const std::string list{env};
             for (size_t start = 0; start < list.size();) {
@@ -4387,7 +4388,7 @@ static bool SaneTessConstants(const Shader::Info& hull, const AmdGpu::Liverpool*
     if (sane && !read_ahead) {
         // DIAG-067: who writes these constants next, and when (SHADGT_WATCH_TESS=<ms>).
         static const u32 watch_ms = [] {
-            const char* env = std::getenv("SHADGT_WATCH_TESS");
+            const char* env = Common::DiagEnv("SHADGT_WATCH_TESS");
             return env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0u;
         }();
         static auto next_watch = std::chrono::steady_clock::now();

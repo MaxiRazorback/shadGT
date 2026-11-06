@@ -23,7 +23,7 @@
 
 namespace Common {
 
-#if !defined(NDEBUG)
+#ifdef SHADGT_DIAGNOSTICS
 
 #ifdef _WIN32
 namespace {
@@ -185,6 +185,7 @@ bool LeanRun() {
     return lean;
 }
 
+#endif // SHADGT_DIAGNOSTICS
 bool PerfFeatureEnabled(u32 id) {
     static const std::vector<u32> disabled = [] {
         std::vector<u32> ids;
@@ -205,6 +206,7 @@ bool PerfFeatureEnabled(u32 id) {
     return std::ranges::find(disabled, id) == disabled.end();
 }
 
+#ifdef SHADGT_DIAGNOSTICS
 WorkCounters& GetWorkCounters() {
     static WorkCounters counters;
     return counters;

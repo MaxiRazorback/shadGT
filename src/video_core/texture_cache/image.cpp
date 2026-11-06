@@ -12,6 +12,7 @@
 #include <vector>
 #include <memory>
 #include <string>
+#include "common/diagnostics.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/ryty_config.h"
@@ -39,7 +40,7 @@ std::span<const VAddr> WatchedImageWindows() {
     // reused for the 400x225 result) and the 1600x225 vertical pass.
     static const std::vector<VAddr> windows = [] {
         std::vector<VAddr> list{0x101fe00000, 0x1027800000, 0x101f210000};
-        if (const char* env = std::getenv("SHADGT_WATCH_IMAGE"); env && *env) {
+        if (const char* env = Common::DiagEnv("SHADGT_WATCH_IMAGE"); env && *env) {
             list.clear();
             const std::string text{env};
             for (size_t start = 0; start < text.size();) {

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/diagnostics.h"
 #include "common/debug.h"
 #include "common/frame_queue_trace.h"
 #include "common/elf_info.h"
@@ -463,7 +464,7 @@ std::atomic<u64> g_prepared_frames{0};
 #ifndef NDEBUG
 static int FlashWatchMode() {
     static const int mode = [] {
-        const char* env = std::getenv("SHADGT_FLASH_WATCH");
+        const char* env = Common::DiagEnv("SHADGT_FLASH_WATCH");
         return env ? std::atoi(env) : 0;
     }();
     return mode;
@@ -510,7 +511,7 @@ static void CheckFlashFrame(const ScreenshotReadback& readback) {
         // SHADGT_FLASH_WATCH=4: every frame is written as it comes, to recorder_all_<time>\, for
         // scripted runs.
         static const bool write_all = [] {
-            const char* env = std::getenv("SHADGT_FLASH_WATCH");
+            const char* env = Common::DiagEnv("SHADGT_FLASH_WATCH");
             return env && std::atoi(env) == 4;
         }();
         if (write_all) {
