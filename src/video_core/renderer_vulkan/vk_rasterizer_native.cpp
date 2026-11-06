@@ -52,6 +52,7 @@
 // own threads with this code (ryty_gpu/native/DESIGN.md, N4).
 
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
+#include "video_core/renderer_vulkan/upload_memory_recovery.h"
 #include "video_core/renderer_vulkan/stable_region_bindings.h"
 #include "video_core/renderer_vulkan/scene_region_scale.h"
 #include "video_core/renderer_vulkan/upload_chunk_tail.h"
@@ -2359,14 +2360,32 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
     }
     Chunk chunk;
     trace.Next(5);
-    chunk.buffer = device->CreateBuffer({
+    const auto create = [&] {
+        Chunk result;
+        result.buffer = device->CreateBuffer({
         .size = UploadChunkCapacity(size, ChunkSize),
         .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageUniform |
                  Native::Rhi::BufferUsageIndex | Native::Rhi::BufferUsageVertex |
                  Native::Rhi::BufferUsageIndirect | Native::Rhi::BufferUsageTransferSrc,
         .memory = Native::Rhi::MemoryKind::Upload,
         .name = "native upload",
-    });
+        });
+        return result;
+    };
+    chunk = create();
+    if (!chunk.buffer || !chunk.buffer->Mapped()) {
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-276: reclaiming completed upload allocations for {} bytes", size);
+        device->DestroyCompletedBuffer(std::move(chunk.buffer)); // Never submitted.
+        chunk = RecoverUploadMemory(
+            size, r.scheduler.CurrentTick(), true, free_chunks, retiring_chunks,
+            [&] { semaphore->Refresh(); return semaphore->KnownGpuTick(); },
+            [&](u64 tick) { r.scheduler.Wait(tick); },
+            [&](std::unique_ptr<Native::Rhi::Buffer> buffer) {
+                device->DestroyCompletedBuffer(std::move(buffer));
+            },
+            [&] { device->Collect(); return create(); });
+    }
     ASSERT_MSG(chunk.buffer && chunk.buffer->Mapped(), "NAT-100: no upload memory ({} bytes)",
                size);
     return chunk;
