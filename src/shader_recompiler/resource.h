@@ -299,6 +299,8 @@ struct PushData {
     static constexpr u32 BufOffsetIndex = 4;
     /// After the four buffer-offset vectors (SHD-002).
     static constexpr u32 QuadSampleMaskIndex = 8;
+    // FIX-227: scratch address aliases the all-ones sample mask on eligible draws.
+    static constexpr u32 LdsScratchIndex = QuadSampleMaskIndex;
 
     float xoffset;
     float yoffset;

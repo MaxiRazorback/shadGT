@@ -375,6 +375,11 @@ GraphicsPipeline::GraphicsPipeline(
     const Shader::Gcn::FetchShaderData* fetch_shader_, std::span<const vk::ShaderModule> modules,
     SerializationSupport& sdata, bool preloading)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_} {
+    if (infos[u32(Shader::SwStage::TessellationControl)]) {
+        const auto& tcs = runtime_infos[u32(Shader::SwStage::TessellationControl)].sw.tcs;
+        lds_emulation = tcs.lds_emulation;
+        lds_vertex_bytes = ((tcs.ls_stride + 15) / 16) * 16;
+    }
     if (fetch_shader_) {
         fetch_shader = *fetch_shader_;
     }

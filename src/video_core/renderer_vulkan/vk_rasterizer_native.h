@@ -194,6 +194,7 @@ private:
         void Clear();
     };
 
+    struct LdsReader;
     /// The command list being recorded and its state.
     struct Stream {
         std::unique_ptr<Native::Rhi::CommandList> wrapped_list;
@@ -260,6 +261,8 @@ private:
         DescriptorSetReserve<u64, vk::DescriptorSet> descriptor_reserve;
         std::vector<vk::DescriptorPool> pools; ///< for pipelines without push descriptors
         std::vector<std::unique_ptr<Native::Rhi::Buffer>> keep; ///< alive until the list ran
+        std::vector<LdsReader> lds_readers;
+        u64 lds_bytes = 0;
         u32 commands = 0;
     };
 
@@ -507,6 +510,26 @@ private:
         vk::IndexType index_type = vk::IndexType::eUint32;
         u32 index_count = 0;
     };
+    /// PERF-GT7-060: a FIX-227 draw's reader pass, recorded after its run's barrier: what it
+    /// binds and draws.
+    struct LdsReader {
+        const GraphicsPipeline* pipeline = nullptr;
+        std::shared_ptr<const void> pipeline_owner;
+        DynamicState dynamic{};
+        VertexIndexState vertices{};
+        DrawBindings bindings;
+        std::vector<std::pair<u32, u32>> infos;
+        u64 address = 0;       ///< its scratch
+        bool indexed = false;
+        u32 count = 0, instances = 0, vertex_offset = 0, first_instance = 0;
+    };
+    /// PERF-GT7-060 (on; RYGT_NATIVE_LDS_BATCH=0 off): the FIX-227 draws of a
+    /// run share one barrier.
+    static bool LdsBatchOn();
+    static bool CaptureLdsReader(LdsReader& reader, const DrawBindings& bindings);
+    /// PERF-GT7-060: the stream's waiting reader passes, after one full barrier, in their pass
+    /// (reason: 0 another draw, 1 the pass ends, 2 the run's limit).
+    void FlushLdsReaders(u32 reason);
     void ResolveVertexBuffers(const GraphicsPipeline& pipeline, const AmdGpu::Regs& regs,
                               VertexIndexState& v);
     bool ResolveIndices(const AmdGpu::Regs& regs, bool is_indexed, u32 index_offset,

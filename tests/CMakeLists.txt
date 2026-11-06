@@ -52,6 +52,11 @@ target_link_libraries(shadps4_buffer_copy_test PRIVATE
     GTest::gtest_main fmt::fmt Boost::headers Vulkan::Headers)
 gtest_discover_tests(shadps4_buffer_copy_test)
 
+add_executable(shadps4_tess_lds_test test_tess_lds.cpp)
+target_include_directories(shadps4_tess_lds_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_tess_lds_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_tess_lds_test)
+
 add_executable(shadps4_device_service_test test_device_service.cpp
     ${CMAKE_SOURCE_DIR}/src/core/libraries/device_service/device_service.cpp)
 target_include_directories(shadps4_device_service_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -383,6 +388,7 @@ set(GCN_TEST_SOURCES
     test_dynamic_readconst.cpp
     test_resource_patching.cpp
     test_color_export.cpp
+    test_tess_lds_shader.cpp
     test_srt_walker_registry.cpp
     test_number_conversion.cpp
 )

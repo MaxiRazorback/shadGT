@@ -17,6 +17,11 @@ namespace Shader::Backend::SPIRV {
 using PointerType = EmitContext::PointerType;
 using PointerSize = EmitContext::PointerSize;
 
+static Id AttrArray(Id array, const char* which) {
+    ASSERT_MSG(array.value != 0, "{} not defined: a stride of 0 in tessellation constants", which);
+    return array;
+}
+
 static std::pair<Id, bool> OutputAttrComponentType(EmitContext& ctx, IR::Attribute attr) {
     if (IR::IsParam(attr)) {
         const u32 index{u32(attr) - u32(IR::Attribute::Param0)};
@@ -284,7 +289,7 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
         const u32 attr_index{u32(attr) - u32(IR::Attribute::Param0)};
         if (ctx.hw_stage == HwStage::Local) {
             const auto component_ptr = ctx.TypePointer(spv::StorageClass::Output, ctx.F32[1]);
-            return op_store(ctx.OpAccessChain(component_ptr, ctx.output_attr_array,
+            return op_store(ctx.OpAccessChain(component_ptr, AttrArray(ctx.output_attr_array, "out_attrs"),
                                               ctx.ConstU32(attr_index), ctx.ConstU32(element)));
         } else {
             const auto& info{ctx.output_params.at(attr_index)};
@@ -352,6 +357,32 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
 }
 
 Id EmitGetTessGenericAttribute(EmitContext& ctx, Id vertex_index, Id attr_index, Id comp_index) {
+    ASSERT_MSG(ctx.input_attr_array.value != 0, "in_attrs not defined: a stride of 0 in tessellation constants");
+    if (ctx.sw_stage == SwStage::TessellationControl && Sirit::ValidId(ctx.lds_vertex_base)) {
+        const u32 num_attrs = (ctx.runtime_info.sw.tcs.ls_stride + 15) / 16;
+        const Id vertex = ctx.OpIAdd(ctx.U32[1], ctx.lds_vertex_base, vertex_index);
+        const Id dword = ctx.OpIAdd(ctx.U32[1], ctx.OpIMul(ctx.U32[1], vertex, ctx.ConstU32(num_attrs * 4)),
+            ctx.OpIAdd(ctx.U32[1], ctx.OpShiftLeftLogical(ctx.U32[1], attr_index, ctx.ConstU32(2u)), comp_index));
+        const Id address = ctx.OpIAdd(ctx.U64, ctx.lds_scratch_base,
+            ctx.OpUConvert(ctx.U64, ctx.OpShiftLeftLogical(ctx.U32[1], dword, ctx.ConstU32(2u))));
+        const u32 num_cp = std::max(ctx.runtime_info.sw.tcs.num_input_control_points, 1u);
+        const Id in_range = ctx.OpULessThan(ctx.U1[1], vertex_index, ctx.ConstU32(num_cp));
+        const Id from_scratch = ctx.OpLogicalAnd(ctx.U1[1], ctx.lds_enabled, ctx.OpLogicalNot(ctx.U1[1], in_range));
+        const auto own_ptr = ctx.TypePointer(spv::StorageClass::Input, ctx.F32[1]);
+        const Id own_value = ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(own_ptr, ctx.input_attr_array,
+                                                                      vertex_index, attr_index, comp_index));
+        const Id own_label = ctx.last_label;
+        const Id scratch_label = ctx.OpLabel();
+        const Id merge_label = ctx.OpLabel();
+        ctx.OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+        ctx.OpBranchConditional(from_scratch, scratch_label, merge_label);
+        ctx.AddLabel(scratch_label);
+        const Id scratch_value = ctx.OpLoad(ctx.F32[1], ctx.OpConvertUToPtr(ctx.physical_pointer_type_f32, address),
+                                             spv::MemoryAccessMask::Aligned, 4u);
+        ctx.OpBranch(merge_label);
+        ctx.AddLabel(merge_label);
+        return ctx.OpPhi(ctx.F32[1], scratch_value, scratch_label, own_value, own_label);
+    }
     const auto attr_comp_ptr = ctx.TypePointer(spv::StorageClass::Input, ctx.F32[1]);
     return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(attr_comp_ptr, ctx.input_attr_array,
                                                     vertex_index, attr_index, comp_index));
@@ -360,7 +391,7 @@ Id EmitGetTessGenericAttribute(EmitContext& ctx, Id vertex_index, Id attr_index,
 Id EmitReadTcsGenericOuputAttribute(EmitContext& ctx, Id vertex_index, Id attr_index,
                                     Id comp_index) {
     const auto attr_comp_ptr = ctx.TypePointer(spv::StorageClass::Output, ctx.F32[1]);
-    return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(attr_comp_ptr, ctx.output_attr_array,
+    return ctx.OpLoad(ctx.F32[1], ctx.OpAccessChain(attr_comp_ptr, AttrArray(ctx.output_attr_array, "out_attrs"),
                                                     vertex_index, attr_index, comp_index));
 }
 
@@ -368,7 +399,7 @@ void EmitSetTcsGenericAttribute(EmitContext& ctx, Id value, Id attr_index, Id co
     // Implied vertex index is invocation_id
     const auto component_ptr = ctx.TypePointer(spv::StorageClass::Output, ctx.F32[1]);
     Id pointer =
-        ctx.OpAccessChain(component_ptr, ctx.output_attr_array,
+        ctx.OpAccessChain(component_ptr, AttrArray(ctx.output_attr_array, "out_attrs"),
                           ctx.OpLoad(ctx.U32[1], ctx.invocation_id), attr_index, comp_index);
     ctx.OpStore(pointer, value);
 }

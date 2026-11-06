@@ -36,6 +36,7 @@
 #include "video_core/renderer_vulkan/immutable_upload_memo.h"
 #include "video_core/renderer_vulkan/freshness_range_search.h"
 #include "video_core/renderer_vulkan/draw_preparation_options.h"
+#include "video_core/renderer_vulkan/tess_lds_scratch.h"
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -1812,7 +1813,97 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     return s;
 }
 
+bool NativeRenderer::LdsBatchOn() {
+    static const bool on = [] { const char* p = std::getenv("RYGT_NATIVE_LDS_BATCH");
+                                return !(p && p[0] == '0'); }();
+    return on;
+}
+
+bool NativeRenderer::CaptureLdsReader(LdsReader& reader, const DrawBindings& b) {
+    auto& out = reader.bindings;
+    out.buffers.assign(b.buffers.begin(), b.buffers.end());
+    out.images.assign(b.images.begin(), b.images.end());
+    out.writes = b.writes;
+    out.write_sets = b.write_sets;
+    out.push = b.push;
+    const auto index_of = [](const auto* info, u32 count, const auto& from) {
+        if (!info) return u32{~0u};
+        const auto at = reinterpret_cast<uintptr_t>(info);
+        const auto begin = reinterpret_cast<uintptr_t>(from.data());
+        using Info = std::remove_cvref_t<decltype(*info)>;
+        if (at < begin || (at - begin) % sizeof(Info) != 0 ||
+            (at - begin) / sizeof(Info) > from.size() ||
+            count > from.size() - (at - begin) / sizeof(Info)) return u32{~0u - 1};
+        return u32((at - begin) / sizeof(Info));
+    };
+    for (auto& write : out.writes) {
+        if (write.pNext || write.pTexelBufferView) return false;
+        const u32 buffer = index_of(write.pBufferInfo, write.descriptorCount, b.buffers);
+        const u32 image = index_of(write.pImageInfo, write.descriptorCount, b.images);
+        if (buffer == ~0u - 1 || image == ~0u - 1) return false;
+        reader.infos.emplace_back(buffer, image);
+        write.pBufferInfo = nullptr;
+        write.pImageInfo = nullptr;
+    }
+    return true;
+}
+
+void NativeRenderer::FlushLdsReaders(u32) {
+    Stream& s = stream;
+    if (s.lds_readers.empty()) return;
+    auto readers = std::move(s.lds_readers);
+    s.lds_readers.clear();
+    s.lds_bytes = 0;
+    const RenderState current = s.render;
+    RenderState resumed = current;
+    for (u32 i = 0; i < resumed.num_color_attachments; ++i)
+        resumed.color_attachments[i].is_clear = false;
+    resumed.depth_stencil_attachment.depth_clear = false;
+    resumed.depth_stencil_attachment.stencil_clear = false;
+    if (s.rendering) { s.cmd.endRendering(); s.rendering = false; }
+    const vk::MemoryBarrier2 barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+    };
+    s.cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount=1,.pMemoryBarriers=&barrier});
+    BeginRendering(resumed);
+    s.render = current;
+    s.pipelines.Invalidate();
+    s.vertex_state_known = false;
+    for (auto& reader : readers) {
+        const auto& pipeline = *reader.pipeline;
+        s.pipelines.Graphics(pipeline.Handle(), [&] {
+            s.cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.Handle());
+        });
+        s.dynamic = reader.dynamic;
+        s.dynamic.Invalidate();
+        s.dynamic.Commit(r.instance, CmdBuf{s.cmd});
+        RecordVertexIndex(reader.vertices);
+        auto& bound = reader.bindings;
+        for (size_t i = 0; i < bound.writes.size(); ++i) {
+            const auto [buffer, image] = reader.infos[i];
+            bound.writes[i].pBufferInfo = buffer != ~0u ? bound.buffers.data() + buffer : nullptr;
+            bound.writes[i].pImageInfo = image != ~0u ? bound.images.data() + image : nullptr;
+        }
+        PushBindings(pipeline, vk::PipelineBindPoint::eGraphics, bound);
+        const std::array<u32, 2> words{u32(reader.address), u32(reader.address >> 32)};
+        s.cmd.pushConstants(pipeline.GetLayout(), AllGraphicsStageBits,
+                           u32(offsetof(Shader::PushData, quad_sample_mask)), 8u, words.data());
+        if (reader.indexed) {
+            if (reader.count) s.cmd.drawIndexed(reader.count, reader.instances, 0,
+                                                s32(reader.vertex_offset), reader.first_instance);
+        } else s.cmd.draw(reader.count, reader.instances, reader.vertex_offset, reader.first_instance);
+        r.scheduler.DeferOperation([owner=std::move(reader.pipeline_owner)] {});
+    }
+    s.pipelines.Invalidate();
+    s.dynamic.Invalidate();
+    s.vertex_state_known = false;
+}
+
 void NativeRenderer::EndRendering(u32 reason) {
+    if (!stream.lds_readers.empty()) FlushLdsReaders(reason);
     RecordPartitionClock end_partition{t_record_partition_end};
     auto* sidecar=FindParallelRuntime(this);
     if(sidecar)sidecar->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::EndPass);
@@ -6336,7 +6427,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         const bool prohibited_clear=any_clear;
         const bool fast_race=RytyGtsInRace(),fast_patch=EmulatorSettings.IsPatchShaders();
         const bool fast_trace=r.FrameDumpActive() || SceneTrace::Id() || Native::GpuCheckpoints::Requested();
-        const bool inline_safe=bool(parallel->active) && fast_race && !fast_trace && !prohibited_clear && feedback.empty() &&
+        const bool inline_safe=bool(parallel->active) && pipeline->LdsEmulation()==0 && fast_race && !fast_trace && !prohibited_clear && feedback.empty() &&
             !scale_composition && !native_fsr_composition;
 #if !defined(NDEBUG)
         static const bool serial_audit=[] {const char* p=std::getenv("RYGT_PARALLEL_SERIAL_AUDIT");return p && p[0]=='1' && p[1]=='\0';}();
@@ -6353,7 +6444,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         // Do not build a captured pass when even its prefix and pass nodes
         // cannot fit. Recheck on later serial draws as retired nodes may free.
         const bool no_pass_room=!parallel->active && !parallel->coordinator->HasRoomForPass();
-        bool fast_reject=no_pass_room || serial_scope_bypass || !fast_race || fast_patch || fast_trace || quad_list || quad_triangles ||
+        bool fast_reject=pipeline->LdsEmulation()!=0 || no_pass_room || serial_scope_bypass || !fast_race || fast_patch || fast_trace || quad_list || quad_triangles ||
             (!extended && is_indexed) || scale_composition || native_fsr_composition ||
             (!extended && targets.state.num_color_attachments!=1) || targets.state.num_color_attachments>8 || prohibited_clear ||
             (!extended && (fast_depth.has_depth || fast_depth.has_stencil || bool(vi->index_buffer))) ||
@@ -7293,6 +7384,40 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             r.instance.GetPhysicalDevice().getProperties().limits.timestampPeriod);
     }
     admission_partition.Finish();
+    // Deferred readers own their pipeline and copy descriptor metadata; GPU objects
+    // remain alive under the stream's existing graphics retirement policy.
+    const auto lds_proposed_size = pipeline->LdsEmulation() ? TessLdsScratchSize(regs.num_indices,
+        regs.num_instances.NumInstances(), regs.ls_hs_config.hs_input_control_points,
+        pipeline->LdsVertexBytes()) : std::optional<u64>{};
+    const bool lds_readonly_stages = !pipeline->LdsEmulation() || std::ranges::all_of(pipeline->GetStages(), [](const Shader::Info* stage) {
+        return !stage || (stage->resource_usage_known && !stage->uses_dma && !stage->uses_direct &&
+            !stage->has_storage_images && !stage->uses_shader_clock &&
+            std::ranges::none_of(stage->buffers, [](const auto& buffer) { return buffer.is_written; }));
+    });
+    const auto lds_owned_buffer = [&](vk::Buffer handle) {
+        if (!handle) return true;
+        const auto matches = [handle](const auto& buffer) {
+            return buffer && vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())} == handle;
+        };
+        // s.keep can also contain non-owning wrappers over imported guest memory.
+        if (std::ranges::any_of(s.chunks, [&](const auto& chunk) { return matches(chunk.buffer); })) return true;
+        for (const auto& [_, region] : regions) if (matches(region.buffer)) return true;
+        for (const auto& [_, mirror] : mirrors) if (matches(mirror.buffer)) return true;
+        return false;
+    };
+    const bool lds_owned_buffers = !pipeline->LdsEmulation() ||
+        (std::ranges::all_of(b.buffers, [&](const auto& descriptor) { return lds_owned_buffer(descriptor.buffer); }) &&
+         std::ranges::all_of(vi->buffers, lds_owned_buffer) && lds_owned_buffer(vi->index_buffer));
+    const bool lds_safe_draw = pipeline->LdsEmulation() &&
+        TessLdsSafeShape(regs.num_instances.NumInstances(), quad_triangles, lds_readonly_stages && lds_owned_buffers,
+                         !b.stored.empty() || !b.gpu_writes.empty() || b.writes_buffers,
+                         regs.reg_array[0xa30e] == ~0u && regs.reg_array[0xa30f] == ~0u) && feedback.empty() &&
+        !r.FrameDumpActive() && !SceneTrace::Id() && !Native::GpuCheckpoints::Requested() &&
+        !scale_composition && !native_fsr_composition &&
+        b.push.quad_sample_mask[0] == ~0u && b.push.quad_sample_mask[1] == ~0u;
+    const bool lds_batch_candidate = lds_proposed_size && LdsBatchOn() && lds_safe_draw;
+    if (!s.lds_readers.empty() && (!lds_batch_candidate || s.lds_readers.size() >= 1024 ||
+        s.lds_bytes + *lds_proposed_size > (32ull << 20))) FlushLdsReaders(0);
     {
         PhaseClock part{stats.record_ns[1]};
         if(!parallel_draw) BeginRendering(targets.state);
@@ -7494,6 +7619,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         SceneTrace::GpuBegin(s.cmd);
         Native::GpuCheckpoints::Record(static_cast<VkCommandBuffer>(s.cmd), 1, frame,
             vs_info.pgm_hash, fs ? fs->pgm_hash : 0, regs.num_indices);
+        const auto record_draw = [&] {
         if (quad_triangles) {
             if (index_count != 0) {
                 cmdbuf.drawIndexed(index_count, instances, 0, s32(vertex_offset),
@@ -7504,6 +7630,108 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                instance_offset);
         } else {
             cmdbuf.draw(regs.num_indices, instances, vertex_offset, instance_offset);
+        }
+        };
+        bool lds_used = false;
+        bool lds_deferred = false;
+        std::optional<DynamicState> lds_draw_dynamic;
+        if (pipeline->LdsEmulation() || !s.lds_readers.empty()) lds_draw_dynamic = s.dynamic;
+        if (lds_safe_draw) {
+            const u32 cp = std::max<u32>(regs.ls_hs_config.hs_input_control_points, 1u);
+            const u64 vertex_bytes = std::max<u32>(pipeline->LdsVertexBytes(), 64u);
+            // Per-draw owned storage survives with the stream until its graphics tick retires.
+            // Cap the allocation; on failure the shader sees its ordinary all-ones mask.
+            if (const auto size = TessLdsScratchSize(regs.num_indices, instances, cp, vertex_bytes)) {
+                auto scratch = device->CreateBuffer({.size = *size,
+                    .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageDeviceAddress,
+                    .memory = Native::Rhi::MemoryKind::DeviceLocal, .name = "hull LDS scratch"});
+                if (scratch && scratch->GpuAddress() && (scratch->GpuAddress() & 3u) == 0 &&
+                    u32(scratch->GpuAddress() >> 32) != ~0u) {
+                    const u64 address = scratch->GpuAddress();
+                    s.keep.push_back(std::move(scratch));
+                    bool deferred = false;
+                    if (lds_batch_candidate) {
+                        try {
+                            s.lds_readers.emplace_back();
+                            auto& reader = s.lds_readers.back();
+                            reader.pipeline = pipeline;
+                            reader.pipeline_owner = prepared && from_prepared && prepared->pipeline == pipeline
+                                ? prepared->pipeline_keepalive : r.GetPipelineCache().KeepAlive(pipeline);
+                            reader.dynamic = s.dynamic;
+                            reader.vertices = *vi;
+                            if (!reader.pipeline_owner || !CaptureLdsReader(reader, b)) {
+                                s.lds_readers.pop_back();
+                            } else {
+                            reader.address = address;
+                            reader.indexed = quad_triangles || is_indexed;
+                            reader.count = quad_triangles ? index_count : regs.num_indices;
+                            reader.instances = instances;
+                            reader.vertex_offset = u32(vertex_offset);
+                            reader.first_instance = instance_offset;
+                            s.lds_bytes += *size;
+                            deferred = true;
+                            }
+                        } catch (const std::bad_alloc&) {
+                            if (!s.lds_readers.empty() && !s.lds_readers.back().address)
+                                s.lds_readers.pop_back();
+                        }
+                    }
+                    const auto push_scratch = [&](u64 value) {
+                        const std::array<u32, 2> words{u32(value), u32(value >> 32)};
+                        s.cmd.pushConstants(pipeline->GetLayout(), AllGraphicsStageBits,
+                            u32(offsetof(Shader::PushData, quad_sample_mask)), 8u, words.data());
+                    };
+                    if (!deferred && !s.lds_readers.empty()) {
+                        FlushLdsReaders(0);
+                        s.dynamic = *lds_draw_dynamic;
+                        s.dynamic.Invalidate();
+                        s.dynamic.Commit(r.instance, CmdBuf{s.cmd});
+                        RecordVertexIndex(*vi);
+                        s.pipelines.Graphics(pipeline->Handle(), [&] {
+                            s.cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+                        });
+                        PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
+                    }
+                    push_scratch(address | 1);
+                    record_draw();
+                    if (deferred) {
+                        // The reader is emitted in order after the run's shared barrier.
+                        lds_deferred = true;
+                        lds_used = true;
+                    } else {
+                    RenderState resumed = s.render;
+                    for (u32 i = 0; i < resumed.num_color_attachments; ++i)
+                        resumed.color_attachments[i].is_clear = false;
+                    resumed.depth_stencil_attachment.depth_clear = false;
+                    resumed.depth_stencil_attachment.stencil_clear = false;
+                    const RenderState current = s.render;
+                    EndRendering();
+                    GlobalBarrier();
+                    BeginRendering(resumed);
+                    s.render = current;
+                    push_scratch(address);
+                    lds_used = true;
+                    }
+                }
+            }
+        }
+        if (!lds_deferred) {
+            if (!s.lds_readers.empty()) {
+                FlushLdsReaders(0);
+                s.dynamic = *lds_draw_dynamic;
+                s.dynamic.Invalidate();
+                s.dynamic.Commit(r.instance, CmdBuf{s.cmd});
+                RecordVertexIndex(*vi);
+                s.pipelines.Graphics(pipeline->Handle(), [&] {
+                    s.cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+                });
+                PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
+            }
+            record_draw();
+        }
+        if (lds_used) {
+            s.cmd.pushConstants(pipeline->GetLayout(), AllGraphicsStageBits,
+                u32(offsetof(Shader::PushData, quad_sample_mask)), 8u, b.push.quad_sample_mask.data());
         }
         SceneTrace::GpuEnd(s.cmd);
         }

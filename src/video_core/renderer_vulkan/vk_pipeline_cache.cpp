@@ -23,6 +23,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 #include <string>
 #include <unordered_map>
@@ -79,6 +80,15 @@ extern thread_local std::span<const u32> g_diag_compiling_code;
 extern thread_local u64 g_diag_compiling_hash;
 } // namespace Shader::Optimization
 namespace Vulkan {
+u32 TessLdsEmulation(const AmdGpu::Regs& regs) {
+    static const u32 mode = [] {
+        const char* env = std::getenv("RYGT_TESS_LDS_EMULATION");
+        return env && *env ? u32(env[0] - '0') : 2u;
+    }();
+    if (mode == 0 || !regs.stage_enable.hs_en || regs.ls_hs_config.hs_input_control_points == 0 ||
+        regs.ls_hs_config.num_patches <= 1) return 0;
+    return mode;
+}
 static PipelineCleanupWorker& PipelineRetirementWorker() {
     static PipelineCleanupWorker worker([] {
         Common::SetCurrentThreadName("shadGT:PipelineCleanup");
@@ -856,6 +866,8 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.sw.tcs.num_threads = regs.ls_hs_config.hs_output_control_points;
         info.sw.tcs.tess_type = regs.tess_config.type;
         info.sw.tcs.offchip_lds_enable = regs.hs_program.settings.oc_lds_en;
+        info.sw.tcs.lds_emulation = u8(TessLdsEmulation(regs));
+        info.sw.tcs.num_patches = u8(info.sw.tcs.lds_emulation ? regs.ls_hs_config.num_patches : 0);
         break;
     }
     case SwStage::TessellationEval: {

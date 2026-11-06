@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 
@@ -41,6 +42,8 @@ static constexpr u32 ShaderBinaryVersionNativeCube = 279u;
 static constexpr u32 ShaderBinaryVersionSingleSampleBarycentric = 282u;
 // Tessellation modules and keys must use the same translation-time layout.
 static constexpr u32 ShaderBinaryVersionTessellationLayout = 283u;
+static constexpr u32 ShaderBinaryVersionTessellationMip = 286u;
+static constexpr u32 ShaderBinaryVersionTessellationNoMip = 287u;
 // FIX-223: fragment shaders whose discards end the pixel (AMD). 285: FIX-GTS-011 keeps some
 // shaders' discarded pixels as helpers again.
 static constexpr u32 ShaderBinaryVersionDiscardKill = 285u;
@@ -104,6 +107,14 @@ static bool HasMsaaImage(const Shader::StageSpecialization& spec) {
 
 static u32 ShaderBinaryVersionFor(const Shader::StageSpecialization& spec,
                                   bool scalar_prefix = false) {
+    if (spec.runtime_info.sw_stage == Shader::SwStage::TessellationControl) {
+        static const bool mip = [] {
+            const char* env = std::getenv("RYGT_UNNORMALIZED_MIP");
+            return !(env && env[0] == '0');
+        }();
+        return mip ? Serialization::ShaderBinaryVersionTessellationMip
+                   : Serialization::ShaderBinaryVersionTessellationNoMip;
+    }
     if (spec.runtime_info.sw_stage == Shader::SwStage::TessellationControl ||
         spec.runtime_info.sw_stage == Shader::SwStage::TessellationEval) {
         return Serialization::ShaderBinaryVersionTessellationLayout;
@@ -145,6 +156,8 @@ static bool IsKnownShaderBinaryVersion(u32 version) {
     // Recognize old metadata for prewarm discovery, but LoadShaderMeta below rejects its
     // binary revision and retranslates it. Never relabel an old binary as corrected.
     version |= 0x100u;
+    if (version == Serialization::ShaderBinaryVersionTessellationMip ||
+        version == Serialization::ShaderBinaryVersionTessellationNoMip) return true;
     if (version == Serialization::ShaderBinaryVersionTessellationLayout) return true;
     if (version == Serialization::ShaderBinaryVersionDiscardKill) {
         return discard_kill_cache_enabled.load(std::memory_order_relaxed);
