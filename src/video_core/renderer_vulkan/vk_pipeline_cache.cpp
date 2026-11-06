@@ -5108,7 +5108,14 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
         if (hw_stage == HwStage::Compute && profile.subgroup_size < 64 &&
             wg[0] * wg[1] * wg[2] > 32 && Common::PerfFeatureEnabled(31) &&
             Shader::HasLaneReadsAndLoop(params.code)) {
-            needed_fixes |= 8u; // FIX-020 v3 (conditions behind ConditionRef); v1/v2 were 2/4
+            needed_fixes |= 8u | 128u; // Wave64 lowering also changes stored loop translations.
+        }
+        if (hw_stage == HwStage::Compute && profile.subgroup_size < 64 &&
+            wg[0] * wg[1] * wg[2] == 64 && Common::PerfFeatureEnabled(31)) {
+            needed_fixes |= 128u;
+            if (Shader::HasLaneReads(params.code)) {
+                needed_fixes |= 1024u; // FIX-GT7-028: EXEC scopes around upper-lane reads.
+            }
         }
     }
     const auto known = else_scope_fixed.find(params.hash);
