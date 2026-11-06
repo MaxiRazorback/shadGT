@@ -489,6 +489,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
     Common::SetCurrentThreadName("shadGT:PresentThread");
     Common::SetCurrentThreadRealtime(tick_period);
+    Common::KeepDisplayAwake(); // GT7-DISPLAY: request ends with the present thread.
 
     using Clock = std::chrono::steady_clock;
     auto next_tick = Clock::now();
