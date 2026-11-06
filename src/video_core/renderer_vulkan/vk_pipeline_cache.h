@@ -528,6 +528,9 @@ private:
         Shader::StageSpecialization spec;
         std::chrono::steady_clock::time_point ready_since{};
         std::chrono::steady_clock::time_point retry_after{};
+        std::chrono::steady_clock::time_point queued_at{};
+        bool required{}; // protected by the translation queue mutex until claimed
+        bool cancelled{}; // published before done
         bool failure_reported{};
         std::atomic<bool> done{};
         std::mutex mutex;

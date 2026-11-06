@@ -284,7 +284,7 @@ public:
     void Prioritize(const std::shared_ptr<TranslateJob>& job) {
         {
             std::scoped_lock lk{mutex};
-            PrioritizeTranslation(queue, job);
+            RequireTranslation(queue, job);
         }
         cv.notify_one();
     }
@@ -292,12 +292,20 @@ public:
     void Queue(std::shared_ptr<TranslateJob> job) {
         {
             std::scoped_lock lk{mutex};
-            queue.push_back(std::move(job));
+            job->queued_at = std::chrono::steady_clock::now();
+            EnqueueTranslation(queue, std::move(job), MaxAge().count() > 0);
         }
         cv.notify_one();
     }
 
 private:
+    static std::chrono::milliseconds MaxAge() {
+        static const auto max_age = [] {
+            return ParseTranslationMaxAge(std::getenv("RYGT_TRANSLATE_MAX_AGE_MS"));
+        }();
+        return max_age;
+    }
+
     void Run(std::stop_token stop, u32 index) {
         Common::SetCurrentThreadName(fmt::format("shadGT:ShaderTranslate{}", index).c_str());
         if (Common::HybridCpu()) Common::PreferCompileCores();
@@ -306,15 +314,16 @@ private:
         bool low_priority = false;
         while (!stop.stop_requested()) {
             std::shared_ptr<TranslateJob> job;
+            bool expired = false;
             {
                 std::unique_lock lk{mutex};
                 cv.wait(lk, stop, [this] { return !queue.empty(); });
                 if (queue.empty()) {
                     continue;
                 }
-                job = std::move(queue.front());
-                queue.pop_front();
+                std::tie(job, expired) = TakeTranslation(queue, std::chrono::steady_clock::now(), MaxAge());
             }
+            if (expired) continue;
             const bool want_low = Common::CompileThreadsLow();
             if (want_low != low_priority) {
                 low_priority = want_low;
@@ -4870,6 +4879,7 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
     auto& jobs = translate_jobs[params.hash];
     const auto now = std::chrono::steady_clock::now();
     std::erase_if(jobs, [&](const auto& job) {
+        if (job->done && job->cancelled) return true;
         if (!job->done || job->module) return false;
         const bool same_inputs = std::ranges::equal(job->user_data, params.user_data);
         return !CompileCpuBatchEnabled(2) || !DelayFailedTranslationRetry(job->retry_after, now, speculative, same_inputs);
@@ -4890,6 +4900,7 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
     }
     if (outstanding >= 8) return false;
     auto job = std::make_shared<TranslateJob>(runtime_info);
+    job->required = !speculative;
     job->hw_stage = hw_stage;
     job->sw_stage = sw_stage;
     job->hash = params.hash;
@@ -4973,10 +4984,15 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
         return false;
     }
     jobs.push_back(job);
+    try {
+        translate_workers->Queue(job);
+    } catch (const std::bad_alloc&) {
+        jobs.pop_back(); // No worker owns it and no waiter can observe it under the lookup lock.
+        return false;
+    }
 #ifndef NDEBUG
     ++translate_stats.queued;
 #endif
-    translate_workers->Queue(std::move(job));
     return true;
 }
 
@@ -5075,6 +5091,7 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
         if (!job->done) {
             return false;
         }
+        if (job->cancelled) return true;
         if (!job->info || !job->module) {
             if (!job->failure_reported) {
 #ifndef NDEBUG
