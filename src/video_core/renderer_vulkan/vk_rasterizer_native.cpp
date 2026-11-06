@@ -4820,9 +4820,23 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
          "copy-writes", "update-descriptors", "store-key", "bind-set"}};
     Stream& s = stream;
     const CmdBuf cmdbuf{s.cmd};
+    static const bool reuse_enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_REUSE");
+        return !(env && env[0] == '0');
+    }();
+    const bool reuse = reuse_enabled && !parallel_binding_capture;
+    if (reuse) {
+        s.binding_commands.Prepare(pipeline.GetLayout(), u32(bind_point),
+            registry->Generation() + unmap_generation.load(std::memory_order_acquire) +
+                buffer_generation,
+            s.pipelines.InvalidationEpoch());
+    }
     const auto stage_flags =
         pipeline.IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
-    if(!parallel_binding_capture) cmdbuf.pushConstants(pipeline.GetLayout(), stage_flags, 0u, sizeof(b.push), &b.push);
+    if (!parallel_binding_capture && (!reuse || !s.binding_commands.SamePush(b.push))) {
+        cmdbuf.pushConstants(pipeline.GetLayout(), stage_flags, 0u, sizeof(b.push), &b.push);
+        if (reuse) s.binding_commands.NotePush(b.push);
+    }
     if (b.writes.empty()) {
         return;
     }
@@ -4999,15 +5013,50 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         cmdbuf.bindDescriptorSets(bind_point, pipeline.GetLayout(), bind_first,
                                   vk::ArrayProxy<const vk::DescriptorSet>{bind_count, bind_run.data()}, {});
         if (alloc_diag) { descriptor_bind_sets[alloc_kind] += bind_count; ++descriptor_bind_runs[alloc_kind]; if (bind_count > 1) ++descriptor_bind_multi[alloc_kind]; }
+        if (reuse) {
+            for (u32 i = 0; i < bind_count; ++i)
+                s.binding_commands.NoteSet(bind_first + i, bind_run[i]);
+        }
         bind_count = 0;
     };
     Native::CommitDescriptorBatch(updates,sets,pipeline.PushSet(),by_set,
         [&](const auto& all) {trace.Next(6);vk_device.updateDescriptorSets(all,{});},
         [&](u32 index,const auto& writes) {
+            static thread_local std::vector<u64> signature;
+            signature.clear();
+            bool cacheable = reuse;
+            if (reuse) for (const auto& write : writes) {
+                if (write.pNext || write.pTexelBufferView ||
+                    (bool(write.pBufferInfo) == bool(write.pImageInfo))) {
+                    cacheable = false;
+                    break;
+                }
+                signature.push_back(write.dstBinding);
+                signature.push_back(write.dstArrayElement);
+                signature.push_back(u64(write.descriptorType));
+                signature.push_back(write.descriptorCount);
+                for (u32 n = 0; n < write.descriptorCount; ++n) {
+                    if (write.pBufferInfo) {
+                        const auto& info = write.pBufferInfo[n];
+                        signature.push_back(u64(VkBuffer(info.buffer)));
+                        signature.push_back(info.offset);
+                        signature.push_back(info.range);
+                    } else {
+                        const auto& info = write.pImageInfo[n];
+                        signature.push_back(u64(VkSampler(info.sampler)));
+                        signature.push_back(u64(VkImageView(info.imageView)));
+                        signature.push_back(u64(info.imageLayout));
+                    }
+                }
+            }
+            if (cacheable && s.binding_commands.SamePushed(index, signature)) return;
             flush_bind_run();
             trace.Next(2);cmdbuf.pushDescriptorSetKHR(bind_point,pipeline.GetLayout(),index,writes);
+            if (cacheable) s.binding_commands.NotePushed(index, signature);
+            else if (reuse) s.binding_commands.ForgetSet(index);
         },
         [&](u32 index,vk::DescriptorSet set) {
+            if (reuse && s.binding_commands.SameSet(index, set)) return;
             if (bind_count && index != bind_first + bind_count) flush_bind_run();
             if (!bind_count) bind_first = index;
             bind_run[bind_count++] = set;

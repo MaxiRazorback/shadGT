@@ -31,6 +31,7 @@
 #include <boost/container/static_vector.hpp>
 
 #include "common/types.h"
+#include "video_core/renderer_vulkan/binding_command_memo.h"
 #include "video_core/amdgpu/regs_depth.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/cb_db_extent.h"
@@ -204,6 +205,8 @@ private:
         RenderState render{};
         DynamicState dynamic{};
         PipelineBindingState<vk::Pipeline> pipelines;
+        BindingCommandMemo<vk::PipelineLayout, vk::DescriptorSet, Shader::PushData,
+                           Shader::Backend::MaxDescriptorSets> binding_commands;
         /// OPT-005: the vertex input layout, vertex buffers and index buffer last recorded in
         /// this list (the same ones are not recorded again).
         bool vertex_state_known = false;
