@@ -260,8 +260,9 @@ bool RunCase(Rhi::Device& device, ImageRegistry& registry, Rhi::Fence& fence, u6
         log += "CPU refresh staging and sticky GPU ownership: passed\n";
     }
     const auto* saved_params = texture->download_params.get();
-    if (!saved_params) {
-        log += fmt::format("{}: missing cached upload parameters\n", name);
+    if (bool(saved_params) != texture_info.props.is_tiled) {
+        log += fmt::format("{}: incorrect tiling parameter allocation for {} upload\n", name,
+                           texture_info.props.is_tiled ? "tiled" : "linear");
         return false;
     }
     // Several uploads in the same list must retain their immutable parameter buffer
@@ -314,12 +315,14 @@ bool RunCase(Rhi::Device& device, ImageRegistry& registry, Rhi::Fence& fence, u6
             }
         }
     }
-    // The tiled bytes must differ from the linear ones (otherwise nothing was tiled).
+    // Tiled copies must change the layout. Linear copies have no conversion
+    // parameters; their valid texels and untouched guards are checked above.
+    // Do not compare their padding to the original upload's unspecified padding.
     const bool changed = std::memcmp(tiled->Mapped(), pattern->Mapped(), size) != 0;
     log += fmt::format("{}: {} uploaded, guest size {} bytes, tiled layout {}, {} of {} texels {}\n",
                        name, uploads, size, changed ? "differs from linear" : "SAME AS LINEAR",
                        total - wrong, total, wrong == 0 ? "correct" : "WRONG");
-    return wrong == 0 && uploads == 1 && changed;
+    return wrong == 0 && uploads == 1 && (!texture_info.props.is_tiled || changed);
 }
 
 bool RunResolveFormatCase(ImageRegistry& registry, std::string& log) {
