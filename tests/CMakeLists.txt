@@ -694,8 +694,14 @@ set(WAVE64_INSPECT_SOURCES ${GCN_TEST_SOURCES})
 list(FILTER WAVE64_INSPECT_SOURCES EXCLUDE REGEX "/shader_recompiler/|gcn/|test_|resource_tracking_pass_stub|perf_monitor_stub")
 add_executable(shadgt_wave64_inspect tools/wave64_inspect.cpp ${WAVE64_INSPECT_RECOMPILER}
                ${WAVE64_INSPECT_SOURCES})
+# The guard regression builds hand-written IR. It needs the real lowering pass and
+# IR implementation, not the emulator's logger, guest runtime or translator startup.
+file(GLOB WAVE64_GUARD_IR ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/*.cpp)
+list(FILTER WAVE64_GUARD_IR EXCLUDE REGEX "/program\\.cpp$")
 add_executable(shadgt_wave64_guard_regression tools/wave64_guard_regression.cpp
-               ${WAVE64_INSPECT_RECOMPILER} ${WAVE64_INSPECT_SOURCES})
+    tools/wave64_guard_stubs.cpp ${WAVE64_GUARD_IR}
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/lower_wave64_pass.cpp
+    ${CMAKE_SOURCE_DIR}/src/video_core/amdgpu/pixel_format.cpp)
 target_include_directories(shadgt_wave64_inspect PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
 target_compile_features(shadgt_wave64_inspect PRIVATE cxx_std_23)
 target_link_libraries(shadgt_wave64_inspect PRIVATE xxHash::xxhash fmt::fmt nlohmann_json::nlohmann_json
@@ -708,12 +714,14 @@ if (WIN32)
         NTDDI_VERSION=0x0A000006 _WIN32_WINNT=0x0A00 WINVER=0x0A00 _CRT_SECURE_NO_WARNINGS)
 endif()
 
-foreach(property INCLUDE_DIRECTORIES COMPILE_FEATURES COMPILE_DEFINITIONS LINK_LIBRARIES)
+foreach(property INCLUDE_DIRECTORIES COMPILE_FEATURES COMPILE_DEFINITIONS)
     get_target_property(value shadgt_wave64_inspect ${property})
     if(value)
         set_property(TARGET shadgt_wave64_guard_regression PROPERTY ${property} "${value}")
     endif()
 endforeach()
+target_link_libraries(shadgt_wave64_guard_regression PRIVATE fmt::fmt Boost::headers
+    Vulkan::Headers magic_enum::magic_enum half::half tsl::robin_map)
 add_test(NAME wave64_guard_regression COMMAND shadgt_wave64_guard_regression)
 
 # Standalone CPU checks for immutable Native descriptors and vertex-state reuse.
