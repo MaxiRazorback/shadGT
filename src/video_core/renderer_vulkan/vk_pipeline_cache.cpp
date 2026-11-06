@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include <chrono>
 #include <cstdlib>
+#include "video_core/renderer_vulkan/tess_lds_scratch.h"
 #include <thread>
 #include <string>
 #include <unordered_map>
@@ -87,7 +88,7 @@ u32 TessLdsEmulation(const AmdGpu::Regs& regs) {
     }();
     if (mode == 0 || !regs.stage_enable.hs_en || regs.ls_hs_config.hs_input_control_points == 0 ||
         regs.ls_hs_config.num_patches <= 1) return 0;
-    return mode;
+    return TessLdsModeForMask(mode, regs.reg_array[0xa30e], regs.reg_array[0xa30f]);
 }
 static PipelineCleanupWorker& PipelineRetirementWorker() {
     static PipelineCleanupWorker worker([] {

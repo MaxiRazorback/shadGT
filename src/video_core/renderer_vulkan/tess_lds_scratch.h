@@ -5,6 +5,12 @@
 #include <optional>
 
 namespace Vulkan {
+// Scratch aliases the quad mask. Select an unmodified TCS for every nontrivial
+// raw mask, even when a later guest-specific override changes the pushed mask.
+constexpr std::uint32_t TessLdsModeForMask(std::uint32_t mode, std::uint32_t low,
+                                           std::uint32_t high) {
+    return low == ~std::uint32_t{0} && high == ~std::uint32_t{0} ? mode : 0;
+}
 // The writer indexes by primitive, so instances would alias each other's scratch.
 constexpr bool TessLdsSafeInstanceCount(std::uint64_t instances) { return instances == 1; }
 constexpr bool TessLdsSafeShape(std::uint64_t instances, bool quad_triangles,

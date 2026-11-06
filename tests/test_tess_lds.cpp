@@ -22,3 +22,14 @@ TEST(TessLdsScratch, RejectsUnsafeDraws) {
     EXPECT_FALSE(TessLdsSafeShape(1, false, true, true));
     EXPECT_FALSE(TessLdsSafeShape(1, false, true, false, false));
 }
+
+TEST(TessLdsScratch, RawMaskSelectsUnmodifiedShader) {
+    using Vulkan::TessLdsModeForMask;
+    EXPECT_EQ(TessLdsModeForMask(2, ~0u, ~0u), 2u);
+    EXPECT_EQ(TessLdsModeForMask(2, ~0u, 0xffff0000u), 0u);
+    EXPECT_EQ(TessLdsModeForMask(2, 0xffff0000u, ~0u), 0u);
+    EXPECT_EQ(TessLdsModeForMask(2, 0xffff0000u, 0xffff0000u), 0u);
+    EXPECT_EQ(TessLdsModeForMask(0, ~0u, ~0u), 0u);
+    // A ghost override only changes pushed words; raw registers still select mode zero.
+    EXPECT_EQ(TessLdsModeForMask(2, ~0u, 0xffff0000u), 0u);
+}

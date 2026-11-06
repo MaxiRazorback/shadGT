@@ -10,6 +10,19 @@
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
+#include "video_core/renderer_vulkan/tess_lds_scratch.h"
+
+TEST(TessLdsShader, RawMaskChangesRuntimeSpecialization) {
+    Shader::RuntimeInfo full{}, partial{};
+    full.Initialize(Shader::HwStage::Hull, Shader::SwStage::TessellationControl);
+    partial = full;
+    full.sw.tcs.lds_emulation = u8(Vulkan::TessLdsModeForMask(2, ~0u, ~0u));
+    full.sw.tcs.num_patches = full.sw.tcs.lds_emulation ? 4 : 0;
+    partial.sw.tcs.lds_emulation = u8(Vulkan::TessLdsModeForMask(2, ~0u, 0xffff0000u));
+    partial.sw.tcs.num_patches = partial.sw.tcs.lds_emulation ? 4 : 0;
+    EXPECT_NE(full, partial);
+    EXPECT_EQ(partial.sw.tcs.lds_emulation, 0);
+}
 
 TEST(TessLdsShader, EmitsRealWriterAndReaderModule) {
     using namespace Shader;
