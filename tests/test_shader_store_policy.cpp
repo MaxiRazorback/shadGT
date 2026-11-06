@@ -28,6 +28,31 @@ TEST(ShaderStorePolicy, ProgramFixScansAreReusedAndComputeScansAreLazy) {
     EXPECT_EQ(compute_calls, 2u);
 }
 
+TEST(ShaderStorePolicy, StoredBoundaryAndLegacyControlActualScansAcrossComputeVariants) {
+    Vulkan::ShaderFixScanCache cache;
+    unsigned base_calls = 0, compute_calls = 0;
+    const auto base = [&] { ++base_calls; return 16u; };
+    const auto compute = [&] { ++compute_calls; return std::pair{true, true}; };
+    // A fresh translation uses the current lowering regardless of the skipped compatibility scan.
+    EXPECT_EQ(cache.GetIfNeeded(1, true, false, true, 0, base, compute), nullptr);
+    EXPECT_EQ(base_calls, 0u);
+    EXPECT_EQ(compute_calls, 0u);
+    EXPECT_EQ(Shader::LaneReadFixMarker(true, 32, 64, true), 2048u);
+    EXPECT_EQ(Shader::LaneReadFixMarker(true, 32, 128, true), 0u);
+    // A stored program first seen at 32 threads can later require the 64-thread policy.
+    const auto* stored = cache.GetIfNeeded(2, true, false, true, 3, base, compute);
+    ASSERT_NE(stored, nullptr);
+    EXPECT_TRUE(stored->lane_reads);
+    EXPECT_EQ(cache.GetIfNeeded(2, false, false, true, 3, base, compute), stored);
+    EXPECT_EQ(base_calls, 1u);
+    EXPECT_EQ(compute_calls, 1u);
+    // D10 must classify even if this store did not list a matching program.
+    ASSERT_NE(cache.GetIfNeeded(1, false, true, true, 0, base, compute), nullptr);
+    EXPECT_EQ(base_calls, 2u);
+    EXPECT_EQ(compute_calls, 2u);
+    EXPECT_EQ(cache.GetIfNeeded(2, false, false, false, 3, base, compute), nullptr);
+}
+
 TEST(ShaderStorePolicy, LaneReadSwitchKeepsDefaultAndOffStoresSeparate) {
     EXPECT_TRUE(Shader::LaneReadUnbranchPolicy(nullptr));
     EXPECT_TRUE(Shader::LaneReadUnbranchPolicy(""));

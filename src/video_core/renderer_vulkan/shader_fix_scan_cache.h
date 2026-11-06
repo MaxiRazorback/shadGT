@@ -2,7 +2,9 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <unordered_map>
+#include <utility>
 
 namespace Vulkan {
 // Called under the pipeline lookup lock. Base and compute-only scans are each done once per
@@ -13,6 +15,13 @@ public:
         std::uint32_t base_fixes{};
         bool base_scanned{}, compute_scanned{}, lane_reads{}, lane_reads_in_loop{};
     };
+
+    template <typename BaseScan, typename ComputeScan>
+    const Entry* GetIfNeeded(std::uint64_t hash, bool first_use, bool legacy, bool compute,
+                             std::size_t stored_boundary, BaseScan&& base, ComputeScan&& extra) {
+        if (!legacy && (stored_boundary == 0 || (!first_use && !compute))) return nullptr;
+        return &Get(hash, compute, std::forward<BaseScan>(base), std::forward<ComputeScan>(extra));
+    }
 
     template <typename BaseScan, typename ComputeScan>
     const Entry& Get(std::uint64_t hash, bool compute, BaseScan&& base, ComputeScan&& extra) {

@@ -5460,7 +5460,10 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
     // policy from its cached code classification for each compute lookup, so an initial
     // <=32-thread use cannot hide a later 64-thread translation needing the fix.
     if (first_use || force_legacy || hw_stage == HwStage::Compute) {
-        const auto& scan = shader_fix_scans.Get(params.hash, hw_stage == HwStage::Compute, [&] {
+      const auto stored_end = stored_perm_end.find(params.hash);
+      const size_t stored_boundary = stored_end == stored_perm_end.end() ? 0 : stored_end->second;
+      if (const auto* scan = shader_fix_scans.GetIfNeeded(
+            params.hash, first_use, force_legacy, hw_stage == HwStage::Compute, stored_boundary, [&] {
             u32 flags = Shader::HasEmptyScopeBeforeElse(params.code) ? 1u : 0u;
             if (Shader::HasSdwaCompareDestination(params.code)) flags |= 32u;
             if (Shader::HasLegacyMad(params.code)) flags |= 16u;
@@ -5468,12 +5471,12 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
         }, [&] {
             return std::pair{Shader::HasLaneReads(params.code),
                              Shader::HasLaneReadsAndLoop(params.code)};
-        });
-        needed_fixes |= scan.base_fixes;
+        })) {
+        needed_fixes |= scan->base_fixes;
         const auto& wg = runtime_info.hw.cs.workgroup_size;
         if (hw_stage == HwStage::Compute && profile.subgroup_size < 64 &&
             wg[0] * wg[1] * wg[2] > 32 && Common::PerfFeatureEnabled(31) &&
-            scan.lane_reads_in_loop) {
+            scan->lane_reads_in_loop) {
             needed_fixes |= 8u | 128u; // Wave64 lowering also changes stored loop translations.
         }
         if (hw_stage == HwStage::Compute && profile.subgroup_size < 64 &&
@@ -5484,11 +5487,12 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
         // Bit 1024 was also written with unbranching disabled; do not trust it as proof.
         if (hw_stage == HwStage::Compute && profile.subgroup_size < 64 &&
             u64(wg[0]) * wg[1] * wg[2] == 64 &&
-            (force_legacy || Shader::LaneReadUnbranchEnabled()) && scan.lane_reads) {
+            (force_legacy || Shader::LaneReadUnbranchEnabled()) && scan->lane_reads) {
             legacy_lane_sensitive = force_legacy;
             needed_fixes |= Shader::LaneReadFixMarker(true, profile.subgroup_size, 64,
                                                       Shader::LaneReadUnbranchEnabled());
         }
+      }
     }
     const auto known = else_scope_fixed.find(params.hash);
     const auto session = session_fix_marks.find(params.hash);
