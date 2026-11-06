@@ -358,6 +358,7 @@ set(GCN_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/video_core/amdgpu/resource.h
 
     # Minimal common support
+    ${CMAKE_SOURCE_DIR}/src/common/read_capture.cpp
     ${CMAKE_SOURCE_DIR}/src/common/path_util.cpp
     ${CMAKE_SOURCE_DIR}/src/common/assert.cpp
     ${CMAKE_SOURCE_DIR}/src/common/error.cpp
@@ -372,6 +373,7 @@ set(GCN_TEST_SOURCES
     # Stubs that replace dependencies
     stubs/common_stub.cpp
     stubs/resource_tracking_pass_stub.cpp
+    stubs/perf_monitor_stub.cpp
     stubs/scm_rev_stub.cpp
     stubs/sdl_stub.cpp
     stubs/core_stub.cpp
@@ -424,6 +426,7 @@ target_link_libraries(shadps4_ngs2_test PRIVATE
 )
 target_link_libraries(shadps4_gcn_test PRIVATE
     GTest::gtest_main
+    xxHash::xxhash
     fmt::fmt
     tsl::robin_map
     nlohmann_json::nlohmann_json
@@ -561,14 +564,14 @@ gtest_discover_tests(shadps4_http_test
 # ===========================================================================
 file(GLOB_RECURSE WAVE64_INSPECT_RECOMPILER ${CMAKE_SOURCE_DIR}/src/shader_recompiler/*.cpp)
 set(WAVE64_INSPECT_SOURCES ${GCN_TEST_SOURCES})
-list(FILTER WAVE64_INSPECT_SOURCES EXCLUDE REGEX "/shader_recompiler/|gcn/|test_|resource_tracking_pass_stub")
+list(FILTER WAVE64_INSPECT_SOURCES EXCLUDE REGEX "/shader_recompiler/|gcn/|test_|resource_tracking_pass_stub|perf_monitor_stub")
 add_executable(shadgt_wave64_inspect tools/wave64_inspect.cpp ${WAVE64_INSPECT_RECOMPILER}
                ${WAVE64_INSPECT_SOURCES})
 add_executable(shadgt_wave64_guard_regression tools/wave64_guard_regression.cpp
                ${WAVE64_INSPECT_RECOMPILER} ${WAVE64_INSPECT_SOURCES})
 target_include_directories(shadgt_wave64_inspect PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
 target_compile_features(shadgt_wave64_inspect PRIVATE cxx_std_23)
-target_link_libraries(shadgt_wave64_inspect PRIVATE fmt::fmt nlohmann_json::nlohmann_json
+target_link_libraries(shadgt_wave64_inspect PRIVATE xxHash::xxhash fmt::fmt nlohmann_json::nlohmann_json
     magic_enum::magic_enum toml11::toml11 Boost::headers Vulkan::Headers sirit SDL3::SDL3
     tsl::robin_map
     spdlog::spdlog half::half xbyak::xbyak Zydis::Zydis)
