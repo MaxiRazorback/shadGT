@@ -17,6 +17,7 @@
 #include <vector>
 #include <unordered_set>
 #include <fmt/format.h>
+#include "common/alignment.h"
 
 #include "ryty_gpu/native/image_registry.h"
 #include "ryty_gpu/native/rhi/rhi_vulkan.h"
@@ -54,21 +55,23 @@ u32 Texel(u32 x, u32 y, u32 mip) {
 
 bool RunCase(Rhi::Device& device, ImageRegistry& registry, Rhi::Fence& fence, u64& tick,
              AmdGpu::TileMode tile_mode, std::string& log,
-             u32 kWidth = 256, u32 kHeight = 256) {
+             u32 kWidth = 256, u32 kHeight = 256, bool batch_download = false) {
     registry.SetUploadSource({}); // Do not carry a previous case's CPU-only fixture into targets.
     constexpr u32 kMips = 4;
     const auto name = AmdGpu::NameOf(tile_mode);
     // 1. A render target filled with the pattern from a linear buffer.
     const VAddr target_address = 0x7000'0000'0000ULL + (u64(tile_mode) << 24);
     const auto target_info = MakeInfo(tile_mode, kWidth, kHeight, kMips,
-                                     target_address + (kWidth > 256 ? 0x100000000ULL : 0));
+                                     target_address + (kWidth > 256 ? 0x100000000ULL : 0) +
+                                         (batch_download ? 0x200000000ULL : 0));
     const u64 size = target_info.guest_size;
     ImageEntry* target = registry.Find(target_info, true, 1);
     auto pattern = device.CreateBuffer({.size = size,
                                         .usage = Rhi::BufferUsageTransferSrc,
                                         .memory = Rhi::MemoryKind::Upload});
     auto tiled = device.CreateBuffer({.size = size,
-                                      .usage = Rhi::BufferUsageStorage | Rhi::BufferUsageTransferDst,
+                                      .usage = Rhi::BufferUsageStorage | Rhi::BufferUsageTransferDst |
+                                               Rhi::BufferUsageTransferSrc,
                                       .memory = Rhi::MemoryKind::Readback});
     if (!target || !pattern || !tiled) {
         log += fmt::format("{}: setup failed\n", name);
@@ -87,13 +90,35 @@ bool RunCase(Rhi::Device& device, ImageRegistry& registry, Rhi::Fence& fence, u6
     }
     Rhi::CommandList* list = device.AcquireCommandList();
     list->Begin();
+    std::unique_ptr<Rhi::Buffer> batch_echo;
+    DownloadBatch batch;
+    if (batch_download) {
+        batch_echo = device.CreateBuffer({.size = size + 512,
+            .usage = Rhi::BufferUsageStorage | Rhi::BufferUsageTransferSrc |
+                     Rhi::BufferUsageTransferDst,
+            .memory = Rhi::MemoryKind::Readback});
+        if (!batch_echo || !registry.BeginDownloads(batch, 4 * Common::AlignUp(size, u64{256}), 256)) {
+            log += "download batch setup failed\n";
+            return false;
+        }
+        list->FillBuffer(tiled.get(), 0, size, 0x5a5a5a5a);
+        list->FillBuffer(batch_echo.get(), 0, size + 512, 0x3c3c3c3c);
+        list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+        list->FillBuffer(batch_echo.get(), 256, size, 0x5a5a5a5a);
+    }
     registry.RecordUploads(*list);
     list->Barrier(Rhi::ScopeTransfer | Rhi::ScopeCompute, Rhi::ScopeTransfer);
     list->CopyBufferToImage(pattern.get(), target->image.get(), MipCopies(target_info));
     list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
-    if (!registry.RecordDownload(*list, *target, *tiled)) {
+    if (!registry.RecordDownload(*list, *target, *tiled, 0, batch_download ? &batch : nullptr)) {
         log += fmt::format("{}: download not recorded\n", name);
         return false;
+    }
+    if (batch_download) {
+        // Two independent destination ranges share scratch/tiling barriers. The
+        // nonzero destination offset and guard bytes detect overruns/misrouting.
+        if (!registry.RecordDownload(*list, *target, *batch_echo, 256, &batch)) return false;
+        registry.FinishDownloads(*list, batch);
     }
     list->Barrier(Rhi::ScopeTransfer | Rhi::ScopeCompute, Rhi::ScopeHost);
     list->End();
@@ -102,6 +127,22 @@ bool RunCase(Rhi::Device& device, ImageRegistry& registry, Rhi::Fence& fence, u6
     if (!fence.Wait(tick, 5'000'000'000ULL)) {
         log += fmt::format("{}: download did not finish\n", name);
         return false;
+    }
+    tiled->Invalidate();
+    if (batch_download) {
+        batch_echo->Invalidate();
+        const auto* bytes = batch_echo->Mapped();
+        if (std::memcmp(tiled->Mapped(), bytes + 256, size) != 0) {
+            log += "download batch destination bytes differ\n";
+            return false;
+        }
+        for (u64 i = 0; i < 256; ++i) {
+            if (bytes[i] != 0x3c || bytes[size + 256 + i] != 0x3c) {
+                log += "download batch overwrote a destination guard\n";
+                return false;
+            }
+        }
+        log += fmt::format("{}: two batched downloads, offset/guards verified\n", name);
     }
     // 2. The tiled bytes as guest memory, found as a texture and untiled by the upload.
     std::vector<u8> guest(size + 4096);
@@ -778,7 +819,10 @@ bool RunImageSelfTest(std::string& log) {
         for (const auto mode : {AmdGpu::TileMode::Thin1DThin, AmdGpu::TileMode::Thin2DThin,
                                 AmdGpu::TileMode::Display2DThin}) {
             ok = RunCase(*device, registry, *fence, tick, mode, log) && ok;
+            ok = RunCase(*device, registry, *fence, tick, mode, log, 256, 192, true) && ok;
         }
+        ok = RunCase(*device, registry, *fence, tick, AmdGpu::TileMode::DisplayLinearAligned,
+                     log, 256, 192, true) && ok;
         const auto& reuse = registry.GetUploadStats();
         // Exercise the actual large CPU staging + untiling/copy path with two
         // distinct textures, repeated uploads and shared scratch barriers.

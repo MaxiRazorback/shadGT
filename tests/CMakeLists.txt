@@ -22,6 +22,13 @@ add_executable(shadps4_stencil_test test_stencil_reference.cpp)
 target_include_directories(shadps4_stencil_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(shadps4_stencil_test PRIVATE GTest::gtest_main fmt::fmt)
 include(GoogleTest)
+# PERF-GT7-057, FIX-GT7-080/081/087: probe-filter subresource proof.
+add_executable(shadps4_same_texel_test test_same_texel.cpp)
+target_include_directories(shadps4_same_texel_test PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+target_compile_features(shadps4_same_texel_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_same_texel_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_same_texel_test)
+
 gtest_discover_tests(shadps4_stencil_test)
 
 add_executable(shadps4_depth_attachment_test test_depth_attachment.cpp)

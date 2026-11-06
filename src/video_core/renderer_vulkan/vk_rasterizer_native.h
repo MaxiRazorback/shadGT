@@ -31,6 +31,7 @@
 #include <boost/container/static_vector.hpp>
 
 #include "common/types.h"
+#include "ryty_gpu/native/same_texel.h"
 #include "video_core/renderer_vulkan/pipeline_binding_state.h"
 #include "video_core/renderer_vulkan/descriptor_set_memo.h"
 #include "shader_recompiler/backend/bindings.h"
@@ -177,6 +178,7 @@ private:
         Shader::PushData push{};
         std::vector<const Native::ImageEntry*> sampled;
         std::vector<const Native::ImageEntry*> stored;
+        std::vector<const Native::ImageEntry*> image_entries;
         /// NAT-119: guest memory the draw or dispatch writes through storage buffers.
         boost::container::small_vector<std::pair<VAddr, u64>, 8> gpu_writes;
         /// NAT-120: the dispatch is GT Sport's fill shader: what it fills, with what.
@@ -211,7 +213,32 @@ private:
         u64 index_offset = 0;
         vk::IndexType index_type = vk::IndexType::eUint32;
         std::vector<const Native::ImageEntry*> written; ///< since the last barrier
-        bool buffers_written = false;                   ///< by shaders since the last barrier
+        /// PERF-GT7-043: `foreign` says something else than a dispatch wrote them.
+        struct WrittenFlag {
+            bool value = false;
+            bool foreign = false;
+            WrittenFlag& operator=(bool written) {
+                value = foreign = written;
+                return *this;
+            }
+            WrittenFlag& operator|=(bool written) {
+                value |= written;
+                foreign |= written;
+                return *this;
+            }
+            operator bool() const {
+                return value;
+            }
+        };
+        WrittenFlag buffers_written;                    ///< by shaders since the last barrier
+        /// PERF-GT7-043: the program of the last dispatch, if it is the last command so far.
+        u64 run_program = 0;
+        u32 run_commands = 0;
+        /// PERF-GT7-057: what the run's same-texel dispatches stored since the last barrier:
+        /// (picture, mip << 32 | layer), what they sampled elsewhere (FIX-GT7-087), or that one
+        /// stored without a key (FIX-GT7-081).
+        Native::SameTexelRun run_texels;
+        u64 resource_recording_serial = 0;
         /// NAT-140: attachments drawn since the last pass or global barrier, and pictures
         /// sampled since the last global barrier: what a new pass has to wait for.
         std::vector<const Native::ImageEntry*> attach_dirty;
@@ -363,6 +390,8 @@ private:
         u64 size = 0;
         u32 flags = 0;
         u64 generation = ~u64{0};
+        u64 hard_generation = 0;
+        u64 log_seq = 0;
         vk::Buffer buffer{};
         u64 offset = 0;
         Region* region = nullptr;
@@ -371,6 +400,7 @@ private:
     };
     std::array<BufferMemo, 16384> buffer_memos{}; ///< OPT-006: 2048 thrashed
     u64 buffer_generation = 0;
+    u64 buffer_hard_generation = 0;
     /// OPT-003: what the last lookup can be remembered as (set by GuestBufferLookup).
     enum class MemoKind : u8 { None, Region, Mirror, InPlace };
     MemoKind memo_kind = MemoKind::None;
@@ -393,6 +423,10 @@ private:
         u64 generation = ~u64{0};
         Native::ImageEntry* entry = nullptr;
         std::array<vk::ImageView, 4> views{};
+        u64 registry_generation = 0;
+        u64 unmap_generation = 0;
+        VAddr range_begin = 0;
+        VAddr range_end = 0;
     };
     std::array<TextureMemo, 16384> texture_memos{}; ///< OPT-006
     std::atomic<u64> unmap_generation{0}; ///< (OPT-010: read by job threads)
@@ -450,6 +484,8 @@ private:
                         bool quad_triangles, VertexIndexState& v);
     void RecordVertexIndex(const VertexIndexState& v);
     bool NeedsBarrierFor(const DrawBindings& b) const;
+    bool RunNeedsBarrier(const Stream& s, const DrawBindings& b, u64 program, bool recorded,
+                         std::optional<u64> texel = std::nullopt) const;
     void NoteWrites(const Targets* targets, const DrawBindings& b);
     /// NAT-105: CPU writes to the pages of a range fault (once) from now on.
     void WatchPages(VAddr address, u64 size);
@@ -488,6 +524,11 @@ private:
     /// FIX-157: bytes of pictures kept past their idle time.
     u64 kept_bytes = 0;
     std::vector<Native::ImageEntry*> writebacks;
+    std::vector<Native::ImageEntry*> frame_writebacks;
+    void QueueWriteback(const Native::ImageEntry* entry);
+    void WritebacksBefore(VAddr address, u64 size);
+    void WritebacksBefore(const DrawBindings& b);
+    bool writebacks_due = false;
     std::vector<const Native::ImageEntry*> dump_entries; // NAT-116
     /// NAT-123: GPU-written images the dumped frame sampled, by texture key.
     std::vector<std::pair<std::string, const Native::ImageEntry*>> dump_textures;
@@ -743,7 +784,12 @@ private:
     } in_place;
     bool InPlaceSampled() const {
 #if !defined(NDEBUG)
-        return (frame & 7) == 0;
+        // PERF-GT7-001: collecting per-binding page coverage is opt-in.
+        static const bool on = [] {
+            const char* env = std::getenv("RYGT_NATIVE_INPLACE_STATS");
+            return env && env[0] == '1';
+        }();
+        return on && (frame & 7) == 0;
 #else
         return false;
 #endif

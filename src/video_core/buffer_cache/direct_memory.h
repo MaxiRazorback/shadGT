@@ -115,7 +115,9 @@ private:
         vk::DeviceAddress device_address;
         std::shared_ptr<Buffer> wrapper; // D6: owns `buffer`; bound as vertex/index buffer
     };
-    bool ImportView(VAddr address);
+    // PERF-GT7-022: at most two allocation-relative pieces per import,
+    // trimmed around already imported views; preserves non-overlap.
+    bool ImportView(VAddr address, VAddr want_end);
     void MapPages(VAddr begin, VAddr end, vk::DeviceAddress device_address);
     void UnmapPages(VAddr begin, VAddr end);
     u64* L2For(VAddr address, bool create);

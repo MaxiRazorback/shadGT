@@ -6,6 +6,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cerrno>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -235,20 +236,54 @@ std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindBuffer(VAddr addr
     return std::make_pair(static_cast<const Buffer*>(view.wrapper.get()), address - view.begin);
 }
 
-bool DirectMemory::ImportView(VAddr address) {
+namespace {
+// PERF-GT7-022 (Will Scarlett): import a bounded piece when first used rather
+// than pinning a whole multi-GiB allocation in one driver call. Zero restores
+// the original whole-allocation policy. Invalid/overflowing input uses 256 MiB.
+u64 ViewPiece() {
+    static const u64 piece = [] {
+        const char* env = std::getenv("RYGT_D1_VIEW_MB");
+        u64 mb = 256;
+        if (env && *env) {
+            char* end = nullptr;
+            errno = 0;
+            const u64 parsed = std::strtoull(env, &end, 10);
+            if (*env != '-' && end != env && *end == '\0' && errno != ERANGE && parsed <= 4096) {
+                mb = parsed;
+            }
+        }
+        return mb == 0 ? u64{1} << 32 : mb << 20;
+    }();
+    return piece;
+}
+} // namespace
+
+bool DirectMemory::ImportView(VAddr address, VAddr want_end) {
     Native::SlowCallTrace<8> trace{Native::trace_guest_hash_calls, "import-guest-view",
         {"guest-view", "map-alias", "host-properties", "allocate-memory", "create-bind-buffer",
          "device-address", "map-pages", "store-view"}};
     trace.Next(0, address, 0);
 #ifdef _WIN32
-    const VAddr base = GuestViewBase(address);
-    if (base == 0) {
+    const VAddr allocation = GuestViewBase(address);
+    if (allocation == 0) {
         return false;
+    }
+    const u64 piece = ViewPiece();
+    VAddr base = allocation + (address - allocation) / piece * piece;
+    if (auto next = views.upper_bound(address); next != views.begin()) {
+        base = std::max(base, std::prev(next)->second.end);
     }
     if (failed.contains(base)) {
         return false;
     }
-    const VAddr end = GuestViewEnd(base, 1ULL << 32);
+    const VAddr pieces_end = want_end > base + piece
+        ? std::min(base + 2 * piece,
+                   allocation + (want_end - 1 - allocation) / piece * piece + piece)
+        : base + piece;
+    VAddr end = std::min(GuestViewEnd(base, pieces_end - base), pieces_end);
+    if (const auto next = views.upper_bound(base); next != views.end()) {
+        end = std::min(end, next->second.begin);
+    }
     const auto fail = [&](const char* why) {
         // An unmap/remap can leave the allocation temporarily uncommitted or split
         // before the requested page. That is not a permanent import failure.
@@ -265,6 +300,9 @@ bool DirectMemory::ImportView(VAddr address) {
     if (end <= base || end > ImportedPageCoverage<>::Limit ||
         (base & (PageSize - 1)) != 0 || ((end - base) & (PageSize - 1)) != 0) {
         return fail("not whole pages");
+    }
+    if (end <= address) {
+        return fail("the address is past the piece");
     }
     const auto map_alias = MapAlias();
     if (!map_alias) {
@@ -464,7 +502,7 @@ void DirectMemory::WarmImported(VAddr address, u64 size) {
         if (!base || view_end <= page || view_end - base > MaxWarmViewBytes) {
             return;
         }
-        if (!ImportView(page)) {
+        if (!ImportView(page, end)) {
             return;
         }
         ++imported;
@@ -532,7 +570,7 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
                 continue;
             }
         }
-        if (!ImportView(page)) {
+        if (!ImportView(page, end)) {
             return false;
         }
     }

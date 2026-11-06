@@ -912,6 +912,7 @@ void NativeRenderer::DrawBindings::Clear() {
     push = {};
     sampled.clear();
     stored.clear();
+    image_entries.clear();
     gpu_writes.clear();
     fill_pattern.reset();
     fill_arguments_snapshot.reset();
@@ -1664,6 +1665,8 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     s.pipelines.Invalidate();
     s.vertex_state_known = false; // OPT-005
     s.commands = 0;
+    s.run_program = 0;
+    s.run_texels.Clear();
     // What was recorded before this list (earlier lists, the presenter) is finished first.
     GlobalBarrier();
     MakePendingMirrors(); // NAT-150: behind the barrier the list starts with anyway
@@ -1826,6 +1829,7 @@ void NativeRenderer::BeginRendering(const RenderState& state) {
 void NativeRenderer::GlobalBarrier() {
     Stream& s = stream;
     EndRendering();
+    ++s.resource_recording_serial;
     const vk::MemoryBarrier2 barrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
@@ -1840,6 +1844,7 @@ void NativeRenderer::GlobalBarrier() {
     s.buffers_written = false;
     s.attach_dirty.clear();
     s.read.clear();
+    s.run_texels.Clear();
     NATIVE_DIAGNOSTIC(++stats.barriers);
     FlushWritebacks();
 }
@@ -1868,6 +1873,54 @@ void NativeRenderer::PassBarrier() {
     NATIVE_DIAGNOSTIC(++stats.pass_barriers);
 }
 
+// PERF-GT7-044: NAT-112 writes a small picture back to guest memory once a frame, when the frame
+// ends, for the CPU to read (GT Sport's auto exposure), and not after every draw into it. GT7 draws
+// ~100 such pictures a frame: on its pre-race screens ~210 write-backs a frame, nearly all tiled (a
+// copy, a tiling dispatch and their barriers each) took 17% of the GPU's time in a GPU Trace.
+// RYGT_NATIVE_WRITEBACK_EACH=1: after each draw, as before.
+void NativeRenderer::QueueWriteback(const Native::ImageEntry* entry) {
+    static const bool each = [] {
+        const char* env = std::getenv("RYGT_NATIVE_WRITEBACK_EACH");
+        return env && env[0] == '1';
+    }();
+    if (each || entry->info.guest_size > 64_KB) {
+        if (std::ranges::find(writebacks, entry) == writebacks.end()) {
+            writebacks.push_back(const_cast<Native::ImageEntry*>(entry));
+        }
+        return;
+    }
+    // Pictures of the same size at the same memory each write all of it: only the last one drawn
+    // counts, and goes last.
+    std::erase_if(frame_writebacks, [&](const Native::ImageEntry* other) {
+        return other->info.guest_address == entry->info.guest_address &&
+               other->info.guest_size == entry->info.guest_size;
+    });
+    frame_writebacks.push_back(const_cast<Native::ImageEntry*>(entry));
+}
+
+// PERF-GT7-044: work that writes memory a waiting picture covers comes after that picture, as the
+// game ordered them; written back at the frame's end, the picture would overwrite the newer bytes.
+// It goes at the next global barrier, before that work, and the bytes the work leaves stay right.
+void NativeRenderer::WritebacksBefore(VAddr address, u64 size) {
+    std::erase_if(frame_writebacks, [&](Native::ImageEntry* entry) {
+        const VAddr begin = entry->info.guest_address;
+        if (address + std::max<u64>(size, 1) <= begin || begin + entry->info.guest_size <= address) {
+            return false;
+        }
+        if (std::ranges::find(writebacks, entry) == writebacks.end()) {
+            writebacks.push_back(entry);
+        }
+        writebacks_due = true;
+        return true;
+    });
+}
+
+void NativeRenderer::WritebacksBefore(const DrawBindings& b) {
+    for (const auto& [address, size] : b.gpu_writes) {
+        WritebacksBefore(address, size);
+    }
+}
+
 void NativeRenderer::FlushWritebacks() {
     if (writebacks.empty() || !stream.list) {
         return;
@@ -1875,11 +1928,32 @@ void NativeRenderer::FlushWritebacks() {
     Stream& s = stream;
     auto* direct = r.buffer_cache.GetDirectMemory();
     const u64 alignment = r.instance.StorageMinAlignment();
+    static const bool batched = [] {
+        const char* env = std::getenv("RYGT_NATIVE_WRITEBACK_BATCH");
+        return !(env && env[0] == '0');
+    }();
+    Native::DownloadBatch batch;
+    std::vector<std::pair<VAddr, VAddr>> batch_ranges;
+    bool use_batch = false;
+    if (batched) {
+        const u64 step_alignment = std::max<u64>(alignment, 256);
+        u64 bytes = 0;
+        for (const auto* entry : writebacks) {
+            bytes += 2 * Common::AlignUp(u64(entry->info.guest_size), step_alignment);
+        }
+        use_batch = bytes != 0 && registry->BeginDownloads(batch, bytes, alignment);
+    }
     for (auto* entry : writebacks) {
         const VAddr address = entry->info.guest_address;
         const u64 size = entry->info.guest_size;
         if (!direct || !direct->EnsureImported(address, size)) {
             continue;
+        }
+        if (use_batch && std::ranges::any_of(batch_ranges, [&](const auto& range) {
+                return address < range.second && range.first < address + size;
+            })) {
+            registry->FinishDownloads(*s.list, batch);
+            batch_ranges.clear();
         }
         const auto found = direct->FindBuffer(address, size);
         if (!found || found->second % alignment != 0) {
@@ -1888,9 +1962,17 @@ void NativeRenderer::FlushWritebacks() {
         auto out = device->WrapBuffer(
             reinterpret_cast<u64>(static_cast<VkBuffer>(found->first->Handle())),
             found->first->SizeBytes());
-        if (registry->RecordDownload(*s.list, *entry, *out, found->second)) {
+        if (registry->RecordDownload(*s.list, *entry, *out, found->second,
+                                     use_batch ? &batch : nullptr)) {
+            batch_ranges.emplace_back(address, address + size);
             NATIVE_DIAGNOSTIC(++stats.writebacks);
             if (RegionOver(address, size)) {
+                if (use_batch) {
+                    // GTS consumes the downloaded bytes in its native region now.
+                    // Complete this batch before recording that ordered copy-in.
+                    registry->FinishDownloads(*s.list, batch);
+                    batch_ranges.clear();
+                }
                 // Image writes are authoritative for their entire byte range. A CPU-page
                 // delta cannot represent them: its saved baseline can already contain the
                 // same image bytes while an older native region contains something else.
@@ -1940,7 +2022,9 @@ void NativeRenderer::FlushWritebacks() {
         }
         s.keep.push_back(std::move(out));
     }
+    if (use_batch) registry->FinishDownloads(*s.list, batch);
     writebacks.clear();
+    writebacks_due = false;
     s.pipelines.Invalidate(); // the re-tiling binds its own pipeline
     // What reads guest memory next (shaders, the CPU after the GPU) sees the pictures.
     const vk::MemoryBarrier2 barrier{
@@ -2290,7 +2374,12 @@ void NativeRenderer::SortRegionWrites() {
     }
     for (const auto& [begin, end] : stack_retirements) DropMirrors(begin, end - begin);
     for (const auto& [begin, end] : writes) {
-        for (auto& [base, region] : regions) {
+        // PERF-GT7-003/006: regions do not overlap; start at the possible
+        // predecessor and stop at the write's end instead of scanning the map.
+        auto first = regions.upper_bound(begin);
+        if (first != regions.begin() && std::prev(first)->second.end > begin) --first;
+        for (auto it = first; it != regions.end() && it->second.begin < end; ++it) {
+            Region& region = it->second;
             if (region.begin < end && region.end > begin) {
                 for (VAddr page = std::max(begin, region.begin); page < std::min(end, region.end);
                      page += 4096) {
@@ -2951,6 +3040,23 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
     const std::array<u64, 3> memo_key{address, size, flags};
     BufferMemo& memo =
         buffer_memos[XXH3_64bits(memo_key.data(), sizeof(memo_key)) & (buffer_memos.size() - 1)];
+    // PERF-GT7-047 (Will Scarlett): unrelated region/mirror changes do not
+    // invalidate owned-range memos. In-place reads still take the full lookup.
+    if (memo.address == address && memo.size == size && memo.flags == flags &&
+        memo.generation != buffer_generation) {
+        static const bool revalidate = [] {
+            const char* env = std::getenv("RYGT_NATIVE_BUFFER_REVALIDATE");
+            return !(env && env[0] == '0');
+        }();
+        const std::pair<VAddr, VAddr> range{address, address + size};
+        if (revalidate && (memo.region || memo.mirror) &&
+            memo.hard_generation == buffer_hard_generation &&
+            buffer_log.Seq() - memo.log_seq <= 64 &&
+            buffer_log.Untouched(memo.log_seq, {&range, 1})) {
+            memo.generation = buffer_generation;
+            memo.log_seq = buffer_log.Seq();
+        }
+    }
     if (memo.generation == buffer_generation && memo.address == address && memo.size == size &&
         memo.flags == flags) {
         if (memo.region || memo.mirror) {
@@ -2990,6 +3096,8 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
             .size = size,
             .flags = flags,
             .generation = buffer_generation,
+            .hard_generation = buffer_hard_generation,
+            .log_seq = buffer_log.Seq(),
             .buffer = result->first,
             .offset = result->second,
             .region = memo_region,
@@ -3868,6 +3976,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                         if (prefix) {
                             EndRendering();
                             const vk::Buffer target{Handle<VkBuffer_T>(prefix->NativeHandle())};
+                            ++stream.resource_recording_serial;
                             stream.cmd.copyBuffer(source, target,
                                 vk::BufferCopy{.srcOffset = offset, .dstOffset = 0,
                                                .size = PrefixSize});
@@ -4024,6 +4133,12 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
         const u32 num_bindings = image_desc.NumBindings(stage);
         const u32 first = static_cast<u32>(b.images.size());
         const bool storage = image_desc.is_written;
+        const auto note_entry = [&](const Native::ImageEntry* entry) {
+            if (stage.sw_stage != Shader::SwStage::Compute) return;
+            const size_t index = size_t(&image_desc - stage.images.data());
+            if (b.image_entries.size() <= index) b.image_entries.resize(index + 1, nullptr);
+            b.image_entries[index] = entry;
+        };
         const auto add_write = [&] {
             b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
             b.writes.push_back(vk::WriteDescriptorSet{
@@ -4072,6 +4187,24 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             memo = &texture_memos[XXH3_64bits_withSeed(raw_sharp.data(), sizeof(raw_sharp),
                                                        memo_flags) &
                                   (texture_memos.size() - 1)];
+            // Revalidate the complete lookup/returned-image range before ever
+            // dereferencing the old entry. Unmaps always invalidate it.
+            if (memo->entry && memo->flags == memo_flags && memo->sharp == raw_sharp &&
+                memo->generation != registry->Generation() + unmap_generation) {
+                static const bool revalidate = [] {
+                    const char* env = std::getenv("RYGT_NATIVE_TEXTURE_REVALIDATE");
+                    return !(env && env[0] == '0');
+                }();
+                const u64 registry_now = registry->Generation();
+                const u64 unmap_now = unmap_generation.load(std::memory_order_acquire);
+                const std::pair<VAddr, VAddr> range{memo->range_begin, memo->range_end};
+                if (revalidate && memo->unmap_generation == unmap_now &&
+                    registry_now - memo->registry_generation <= 256 &&
+                    registry->Untouched(memo->registry_generation, {&range, 1})) {
+                    memo->generation = registry_now + unmap_now;
+                    memo->registry_generation = registry_now;
+                }
+            }
             if (memo->entry && memo->flags == memo_flags && memo->sharp == raw_sharp &&
                 memo->generation == registry->Generation() + unmap_generation) {
                 Native::ImageEntry* entry = memo->entry;
@@ -4090,6 +4223,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                     b.images.push_back({VK_NULL_HANDLE, memo->views[i], vk::ImageLayout::eGeneral});
                 }
                 (storage ? b.stored : b.sampled).push_back(entry);
+                note_entry(entry);
                 add_write();
                 NATIVE_DIAGNOSTIC(++stats.texture_memo_hits);
                 continue;
@@ -4272,9 +4406,16 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             for (u32 i = 0; i < num_bindings; ++i) {
                 memo->views[i] = b.images[first + i].imageView;
             }
-            memo->generation = registry->Generation() + unmap_generation;
+            memo->registry_generation = registry->Generation();
+            memo->unmap_generation = unmap_generation.load(std::memory_order_acquire);
+            memo->generation = memo->registry_generation + memo->unmap_generation;
+            memo->range_begin = std::min(desc.info.guest_address, entry->info.guest_address);
+            memo->range_end =
+                std::max(desc.info.guest_address + std::max<u64>(desc.info.guest_size, 1),
+                         entry->info.guest_address + std::max<u64>(entry->info.guest_size, 1));
         }
         (storage ? b.stored : b.sampled).push_back(entry);
+        note_entry(entry);
         add_write();
     }
     for (const auto& sampler : stage.samplers) {
@@ -4866,9 +5007,166 @@ void NativeRenderer::RecordVertexIndex(const VertexIndexState& v) {
     }
 }
 
+// PERF-GT7-043: dispatches in a row of a listed program run without a barrier between them when
+// none of them writes buffers and none samples or stores a picture over memory another touched.
+// GT7's probe filter 0x490b6362 runs ~8 such dispatches at a time, each of a few groups: without
+// the barriers it takes 3.8 times less GPU time. A listed program must store into its images
+// without loading from them, and must not store the same texels twice in a run: their order is no
+// longer defined. RYGT_NATIVE_OVERLAP_PROGRAMS=<hex>[,...] sets the list (empty: none).
+bool NativeRenderer::RunNeedsBarrier(const Stream& s, const DrawBindings& b, u64 program,
+                                     bool recorded, std::optional<u64> texel) const {
+    static const std::vector<u64> listed = [] {
+        std::vector<u64> list;
+        const char* env = std::getenv("RYGT_NATIVE_OVERLAP_PROGRAMS");
+        for (const char* at = env ? env : "490b6362"; *at;) {
+            char* end = nullptr;
+            const u64 value = std::strtoull(at, &end, 16);
+            if (end == at) {
+                break;
+            }
+            list.push_back(value);
+            at = *end == ',' ? end + 1 : end;
+        }
+        return list;
+    }();
+    if ((std::ranges::find(listed, program) == listed.end() && !texel) ||
+        s.run_program != program || s.run_commands != s.commands || s.buffers_written.foreign ||
+        recorded || !writebacks.empty() || b.writes_buffers || !s.attach_dirty.empty()) {
+        return true;
+    }
+    const auto meets = [](const std::vector<const Native::ImageEntry*>& pictures,
+                          const Native::ImageEntry* entry) {
+        return std::ranges::any_of(pictures, [&](const Native::ImageEntry* picture) {
+            return picture && entry->info.guest_address < picture->info.guest_address +
+                                                              picture->info.guest_size &&
+                   picture->info.guest_address < entry->info.guest_address + entry->info.guest_size;
+        });
+    };
+    // PERF-GT7-057: a same-texel program (SameTexelKey) may read the picture it stores where the
+    // run wrote it, if the run hasn't stored that mip and layer since its last barrier: each of
+    // its dispatches reads only the texels it then stores. FIX-GT7-080: the key says no other of
+    // its pictures meets the stored one, so the sampled picture let through below is the one the
+    // code reads at the texel it stores. FIX-GT7-081: not after a dispatch of the run stored
+    // without a key. FIX-GT7-087: nor onto a picture the run sampled elsewhere.
+    const Native::ImageEntry* self = texel && b.stored.size() == 1 ? b.stored[0] : nullptr;
+    const auto same_picture = [&](const Native::ImageEntry* entry) {
+        return self && entry && entry->info.guest_address == self->info.guest_address &&
+               entry->info.guest_size == self->info.guest_size;
+    };
+    const bool texel_new =
+        self && s.run_texels.IsNew(self->info.guest_address, self->info.guest_size, *texel);
+    // The pictures of a list that meet an entry, but for the picture this dispatch stores.
+    const auto meets_other = [&](const std::vector<const Native::ImageEntry*>& pictures,
+                                 const Native::ImageEntry* entry) {
+        return std::ranges::any_of(pictures, [&](const Native::ImageEntry* picture) {
+            return picture && !same_picture(picture) &&
+                   entry->info.guest_address <
+                       picture->info.guest_address + picture->info.guest_size &&
+                   picture->info.guest_address < entry->info.guest_address + entry->info.guest_size;
+        });
+    };
+    for (const auto* entry : b.sampled) {
+        if (entry && meets(s.written, entry) &&
+            !(texel_new && same_picture(entry) && !meets_other(s.written, entry))) {
+            return true; // reads what the run wrote
+        }
+    }
+    for (const auto* entry : b.stored) {
+        if (entry && meets(s.read, entry) &&
+            !(texel_new && same_picture(entry) && !meets_other(s.read, entry))) {
+            return true; // writes what the run read
+        }
+    }
+    return false;
+}
+
+// PERF-GT7-057 (RYGT_NATIVE_SAME_TEXEL=0 turns it off): programs that read a picture they store
+// only at the texel they store, at the mip and layer words of their user data name. GT7's probe
+// filter 0xa8d4b6cd took 30-40% of the GPU's time in races: one run per probe cube, a dispatch per
+// mip [65] and face [66] (layer face + 6 * probe [67]), 42 or 48 of them, each reading cs_img3
+// with texelFetch at the texel it then stores into cs_img4[mip] (its decompiled code, all four
+// variants), and sampling cs_img0 to 2 with textureLod at other coordinates, pictures the run
+// doesn't write. Each waited for the one before at a global barrier, with 1 to 256 groups of 8x8
+// threads on the whole GPU.
+// FIX-GT7-080: the key is the level and layer the two views reach in the picture (Native::
+// SameTexelKey), from the pictures and views bound to the fetched and stored descriptors, which the
+// list names; any other descriptor that meets the stored picture keeps the barrier.
+namespace {
+struct SameTexelProgram {
+    u64 program;
+    u32 mip_word;
+    u32 face_word;
+    u32 probe_word;
+    u32 faces;
+    u32 fetch_image; ///< the descriptor read with texelFetch at the texel stored
+    u32 store_image;
+};
+constexpr SameTexelProgram SameTexelPrograms[] = {{0xa8d4b6cd, 65, 66, 67, 6, 3, 4}};
+
+bool IsSameTexelProgram(u64 program) {
+    return std::ranges::find(SameTexelPrograms, program, &SameTexelProgram::program) !=
+           std::end(SameTexelPrograms);
+}
+} // namespace
+
+static std::optional<u64> SameTexelKey(const Shader::Info& cs,
+                                       std::span<const Native::ImageEntry* const> entries) {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_NATIVE_SAME_TEXEL");
+        return !(env && env[0] == '0');
+    }();
+    if (!on) {
+        return std::nullopt;
+    }
+    const auto it = std::ranges::find(SameTexelPrograms, cs.pgm_hash, &SameTexelProgram::program);
+    if (it == std::end(SameTexelPrograms)) {
+        return std::nullopt;
+    }
+    const auto& words = cs.flattened_ud_buf;
+    if (std::max({it->mip_word, it->face_word, it->probe_word}) >= words.size() ||
+        std::max(it->fetch_image, it->store_image) >= cs.images.size() ||
+        cs.images[it->store_image].mip_fallback_mode ==
+            Shader::MipStorageFallbackMode::ConstantIndex) {
+        return std::nullopt;
+    }
+    boost::container::small_vector<Native::SameTexelImage, 8> images;
+    for (size_t i = 0; i < cs.images.size(); ++i) {
+        const auto& desc = cs.images[i];
+        const Native::ImageEntry* entry = i < entries.size() ? entries[i] : nullptr;
+        Native::SameTexelImage& image = images.emplace_back();
+        image.written = desc.is_written;
+        if (!entry) {
+            continue;
+        }
+        image.address = entry->info.guest_address;
+        image.size = std::max<u64>(entry->info.guest_size, 1);
+        if (i != it->fetch_image && i != it->store_image) {
+            continue;
+        }
+        // The view as BindTextures asks for it, and the picture View keeps it in.
+        const VideoCore::ImageViewInfo view{desc.GetSharp(cs), desc};
+        const auto& picture = entry->image->Desc();
+        image.base_level = view.range.base.level;
+        image.base_layer = view.range.base.layer;
+        image.layers = view.range.extent.layers;
+        image.image_mips = std::max<u32>(picture.mips, 1);
+        image.image_layers =
+            picture.dim == Native::Rhi::ImageDim::D3 ? 1u : std::max<u32>(picture.layers, 1);
+        image.level_per_binding =
+            desc.mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex;
+        image.levels = image.level_per_binding ? desc.NumBindings(cs) : view.range.extent.levels;
+    }
+    const u64 layer = u64(words[it->face_word]) + u64(it->faces) * words[it->probe_word];
+    if (layer > ~u32{0}) {
+        return std::nullopt;
+    }
+    return Native::SameTexelKey(images, it->fetch_image, it->store_image, words[it->mip_word],
+                                u32(layer));
+}
+
 bool NativeRenderer::NeedsBarrierFor(const DrawBindings& b) const {
     const Stream& s = stream;
-    if (s.buffers_written) {
+    if (s.buffers_written || writebacks_due) {
         return true;
     }
     for (const auto* entry : b.sampled) {
@@ -5100,9 +5398,8 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
         for (const auto* entry : targets->colors) {
             note(entry);
             if (entry && entry->info.guest_size <= writeback_size(*entry) &&
-                entry->info.num_samples == 1 &&
-                std::ranges::find(writebacks, entry) == writebacks.end()) {
-                writebacks.push_back(const_cast<Native::ImageEntry*>(entry));
+                entry->info.num_samples == 1) {
+                QueueWriteback(entry);
             }
         }
         note(targets->depth);
@@ -5112,9 +5409,8 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
         // FIX-GTS-006: the photo is a color target; stored images keep the 256 KB limit.
         if (entry->info.guest_size <= std::min<u64>(writeback_size(*entry), 256_KB) &&
             entry->info.num_samples == 1 &&
-            !entry->info.props.is_depth &&
-            std::ranges::find(writebacks, entry) == writebacks.end()) {
-            writebacks.push_back(const_cast<Native::ImageEntry*>(entry));
+            !entry->info.props.is_depth) {
+            QueueWriteback(entry);
         }
     }
     s.buffers_written |= b.writes_buffers;
@@ -5511,6 +5807,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         b.push = UserData(regs);
         BindStages(pipeline->GetStages(), regs, false, b);
     }
+    WritebacksBefore(b); // includes worker-prepared bindings
     if (b.failed) {
         NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
@@ -8738,17 +9035,38 @@ void NativeRenderer::DispatchDirect() {
     UiHires::Get().scale = 0.f;
     SyncUiReads(pipeline->GetStages());
     Stream& s = Begin();
+    const u64 work_before = s.resource_recording_serial;
     DrawBindings& b = bindings;
     b.Clear();
     b.push = UserData(regs);
     BindStages(pipeline->GetStages(), regs, true, b);
+    WritebacksBefore(b);
     if (b.failed) {
         NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
     ReadFillShader(pipeline->GetStage(Shader::SwStage::Compute), b); // NAT-120
+    const bool image_work = device->PendingImageInit() || registry->HasPendingUploads();
     PrepareImages();
-    GlobalBarrier();
+    const u64 program = pipeline->GetStage(Shader::SwStage::Compute).pgm_hash;
+    const bool recorded = image_work || s.resource_recording_serial != work_before;
+    const std::optional<u64> texel = b.stored.size() == 1
+        ? SameTexelKey(pipeline->GetStage(Shader::SwStage::Compute), b.image_entries)
+        : std::nullopt;
+    if (RunNeedsBarrier(s, b, program, recorded, texel)) {
+        GlobalBarrier();
+    } else {
+        EndRendering();
+    }
+    s.run_texels.Note(texel ? b.stored[0]->info.guest_address : 0, texel, !b.stored.empty());
+    if (IsSameTexelProgram(program)) {
+        for (const auto* entry : b.sampled) {
+            if (entry && !(texel && entry->info.guest_address == b.stored[0]->info.guest_address &&
+                           entry->info.guest_size == b.stored[0]->info.guest_size)) {
+                s.run_texels.NoteRead(entry->info.guest_address, entry->info.guest_size);
+            }
+        }
+    }
     // Intrusive opt-in diagnostic. Submit the bound input copy and wait before
     // recording this dispatch; shader and loop bounds are never modified.
 #if !defined(NDEBUG)
@@ -9024,8 +9342,11 @@ void NativeRenderer::DispatchDirect() {
     }
 #endif
     s.buffers_written = true; // what the dispatch wrote is seen after the next barrier
+    s.buffers_written.foreign = false;
     NATIVE_DIAGNOSTIC(++stats.dispatches);
     ++s.commands;
+    s.run_program = program;
+    s.run_commands = s.commands;
     ChunkFlushCheck();
     Report();
 }
@@ -9062,6 +9383,7 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     b.Clear();
     b.push = UserData(regs);
     BindStages(pipeline->GetStages(), regs, true, b);
+    WritebacksBefore(b);
     PrepareImages();
     GlobalBarrier();
     const CmdBuf cmdbuf{s.cmd};
@@ -9196,6 +9518,7 @@ void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is
                                      meta ? " (metadata clear)" : "")); // NAT-117
     }
     NATIVE_DIAGNOSTIC(++stats.fills);
+    WritebacksBefore(address, num_bytes);
     if (const auto found = GuestBuffer(address, num_bytes, true)) {
         GlobalBarrier();
         CmdBuf{s.cmd}.fillBuffer(found->first, found->second, num_bytes, value);
@@ -9229,6 +9552,8 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
                                      dst_gds ? " (GDS)" : "", src, src_gds ? " (GDS)" : "",
                                      num_bytes)); // NAT-117
     }
+    if (!src_gds) WritebacksBefore(src, num_bytes);
+    if (!dst_gds) WritebacksBefore(dst, num_bytes);
     const vk::Buffer gds_buffer{Handle<VkBuffer_T>(gds->NativeHandle())};
     const auto source = src_gds ? std::optional{std::pair{gds_buffer, u64(src)}}
                                 : GuestBuffer(src, num_bytes, false);
@@ -9274,6 +9599,7 @@ bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
         return false;
     }
     Stream& s = Begin();
+    WritebacksBefore(address, data.size());
     GlobalBarrier();
     CmdBuf{s.cmd}.updateBuffer(found->first->Handle(), found->second, data.size(), data.data());
     // NAT-146: a region over the range holds what the GPU reads there: it gets the bytes too.
@@ -9366,6 +9692,7 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
         });
     }
     ++buffer_generation;        // OPT-003
+    ++buffer_hard_generation;   // PERF-GT7-047: invalidates even disjoint memos
     ++unmap_generation;         // OPT-002
 }
 
@@ -9695,6 +10022,57 @@ void NativeRenderer::EvictImages() {
         return true;
     };
     trace.Next(2);
+    // PERF-GT7-005: textures the game loaded stay past their idle time, the most recently used
+    // first, up to a budget (RYGT_NATIVE_KEEP_TEXTURES_MB, 2048; 0 as before). Their pages are
+    // watched, so a CPU write or an unmap still uploads them again at their next use. GT7's
+    // license tests left the track's textures unused for over 4 s while a retry reloaded, and
+    // at ~4 s into the next attempt 50-120 MB of them were made and uploaded again.
+    static const u64 texture_budget = [] {
+        const char* env = std::getenv("RYGT_NATIVE_KEEP_TEXTURES_MB");
+        return (env && *env ? std::strtoull(env, nullptr, 10) : u64{2048}) << 20;
+    }();
+    // PERF-GT7-011: only textures the game loaded and left alone: uploaded at most twice, never
+    // rewritten by GPU work nor made of targets, and at most 4 at one address. Keeping every idle
+    // texture kept those GT7 makes in its scratch pool (0x100a0b0000, a new layout every few
+    // frames, rewritten by compute passes): 2,600 pictures at that one address after 19 minutes,
+    // walked by every lookup, CPU write and GPU write there (ImageRegistry::Find took 5% of the
+    // recorder; 2.5 million textures made stale by CPU writes every 10 s).
+    const auto loaded_texture = [](Native::ImageEntry& entry) {
+        if (entry.total_uploads.load(std::memory_order_relaxed) > 2 ||
+            entry.force_upload.load(std::memory_order_relaxed) ||
+            entry.gpu_backing_written.load(std::memory_order_acquire) ||
+            entry.foreign_clock.load(std::memory_order_relaxed) != 0) {
+            return false;
+        }
+        std::scoped_lock lock{entry.sources_mutex};
+        return entry.sources.empty();
+    };
+    std::unordered_set<const Native::ImageEntry*> kept_textures;
+    if (texture_budget != 0) {
+        std::vector<Native::ImageEntry*> idle;
+        registry->ForEachOverlapping(0, ~VAddr{0}, [&](Native::ImageEntry& entry) {
+            if (entry.from_cpu && entry.image &&
+                entry.last_use.load(std::memory_order_relaxed) < frame - KeepFrames) {
+                idle.push_back(&entry);
+            }
+        });
+        std::ranges::sort(idle, std::greater{}, [](const Native::ImageEntry* entry) {
+            return entry->last_use.load(std::memory_order_relaxed);
+        });
+        std::unordered_map<VAddr, u32> kept_at;
+        u64 bytes = 0;
+        for (Native::ImageEntry* entry : idle) {
+            if (!loaded_texture(*entry) || kept_at[entry->info.guest_address] >= 4) {
+                continue;
+            }
+            bytes += std::max<u64>(entry->info.guest_size, 1);
+            if (bytes > texture_budget) {
+                break;
+            }
+            ++kept_at[entry->info.guest_address];
+            kept_textures.insert(entry);
+        }
+    }
     registry->Evict(frame - KeepFrames, [&](Native::ImageEntry& entry) {
         retired_watch_ranges.emplace_back(
             VideoCore::PageManager::GetPageAddr(entry.info.guest_address),
@@ -9725,13 +10103,16 @@ void NativeRenderer::EvictImages() {
         held_versions.erase(&entry);
         std::erase(stream.written, &entry);
         std::erase(writebacks, &entry);
+        std::erase(frame_writebacks, &entry);
         std::erase(dump_entries, &entry);
         for (auto it = stencil_owners.begin(); it != stencil_owners.end();) {
             auto& owners = it->second;
             owners.erase(std::remove(owners.begin(), owners.end(), &entry), owners.end());
             it = owners.empty() ? stencil_owners.erase(it) : std::next(it);
         }
-    }, keep, 16);
+    }, [&](Native::ImageEntry& entry) {
+        return kept_textures.contains(&entry) || keep(entry);
+    }, 16);
     if (newly_kept != 0) {
         static std::atomic<u32> logged{};
         if (const u32 n = logged++; n < 20 || n % 100 == 0) {
@@ -10115,6 +10496,12 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         }
         ++in_place.frames;
     }
+    for (auto* entry : frame_writebacks) {
+        if (std::ranges::find(writebacks, entry) == writebacks.end()) {
+            writebacks.push_back(entry);
+        }
+    }
+    frame_writebacks.clear();
     ++frame;
     shared_frame.store(frame, std::memory_order_relaxed); // OPT-010
     // The game's render target there (its layout from the CB registers may differ in details
@@ -10284,6 +10671,7 @@ void NativeRenderer::VerifyMirrors() {
     }
     if (changed != 0) {
         ++buffer_generation; // OPT-003: memos see the dirty pages
+        ++buffer_hard_generation; // PERF-GT7-047
     }
 #endif
 }

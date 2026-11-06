@@ -249,7 +249,13 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       // sparks) no longer reached guest memory before the game's CPU used them, and sparks
       // came with exploded vertices. The drain's wait for all earlier GPU work is what the game
       // relies on there.
-      split_gds_write_faults{false} {
+      split_gds_write_faults{[] {
+          const char* env = std::getenv("RYGT_SPLIT_GDS_WRITE_FAULTS");
+          return env && env[0] == '1' && env[1] == '\0';
+      }()} {
+    if (split_gds_write_faults) {
+        LOG_INFO(Render_Vulkan, "PERF-015: GDS write-fault splitting enabled by explicit trial switch");
+    }
     if (DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported()) { // D1
         direct_memory = std::make_unique<DirectMemory>(instance, scheduler);
     }
