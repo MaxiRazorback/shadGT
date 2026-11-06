@@ -61,6 +61,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <immintrin.h>
 #include <map>
 
 #include <fmt/ranges.h>
@@ -1622,22 +1623,160 @@ vk::ImageView NativeRenderer::View(const Native::ImageEntry& entry,
     return handle;
 }
 
-vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& sharp,
+namespace {
+bool NextMemoEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_NEXT");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+u64 MemoHash(const u64* words, size_t count, u64 seed) {
+    u64 h = seed ^ 0x9E3779B97F4A7C15ULL;
+    for (size_t i = 0; i < count; ++i) {
+        h = (h ^ words[i]) * 0xFF51AFD7ED558CCDULL;
+        h ^= h >> 32;
+    }
+    h *= 0xC4CEB9FE1A85EC53ULL;
+    return h ^ (h >> 29);
+}
+} // namespace
+
+vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& original,
                                        AmdGpu::BorderColorBuffer border, bool is_depth) {
+    auto sharp = original;
+    // PERF-GT7-015 (C): the samplers this thread looked up last, by raw S#, without the lock and
+    // the hash map (a draw binds ~4; samplers live as long as the renderer).
+    struct CachedSampler {
+        std::array<u64, 2> sharp;
+        u64 extra;
+        vk::Sampler sampler;
+        const NativeRenderer* owner = nullptr;
+        u64 epoch = 0;
+    };
+    static thread_local std::array<CachedSampler, 256> cached{};
+    static_assert(sizeof(AmdGpu::Sampler) == sizeof(std::array<u64, 2>));
+    CachedSampler* cache = nullptr;
+    std::array<u64, 2> raw;
+    std::memcpy(raw.data(), &sharp, sizeof(raw));
+    const bool custom = sharp.border_color_type == AmdGpu::BorderColor::Custom;
+    const u64 extra = (is_depth ? 1u : 0u) | (custom ? u64(border.Address()) << 1 : 0);
+    if (NextMemoEnabled()) {
+        cache = &cached[MemoHash(raw.data(), raw.size(), extra) & (cached.size() - 1)];
+        if (cache->sampler && cache->owner == this &&
+            cache->epoch == sampler_cache_epoch.load(std::memory_order_acquire) &&
+            cache->sharp == raw && cache->extra == extra) {
+            return cache->sampler;
+        }
+    }
+    const vk::Sampler sampler = MakeSampler(sharp, border, is_depth);
+    if (cache) {
+        *cache = {raw, extra, sampler, this, sampler_cache_epoch.load(std::memory_order_acquire)};
+    }
+    return sampler;
+}
+
+vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
+                                        AmdGpu::BorderColorBuffer border, bool is_depth) {
+    const bool custom = sharp.border_color_type == AmdGpu::BorderColor::Custom;
     const u64 hash = XXH3_64bits(&sharp, sizeof(sharp)) ^
-                     (is_depth ? 0x9E3779B97F4A7C15ULL : 0) ^ (u64(border.Address()) << 1);
+                     (is_depth ? 0x9E3779B97F4A7C15ULL : 0) ^
+                     (custom ? u64(border.Address()) << 1 : 0);
     static thread_local Native::EpochValueMemo<vk::Sampler> memo;
     const auto epoch = sampler_cache_epoch.load(std::memory_order_acquire);
     if (const auto found = memo.Find(this, epoch, hash)) return *found;
     std::scoped_lock lock{sampler_mutex};
-    auto& slot = samplers[hash];
-    if (!slot) {
-        slot = std::make_unique<VideoCore::Sampler>(r.instance, sharp, border, is_depth);
+    if (const auto it = sampler_lookup.find(hash); it != sampler_lookup.end()) {
+        memo.Store(this, epoch, hash, it->second);
+        return it->second;
     }
-    const auto handle = slot->Handle();
-    memo.Store(this, epoch, hash, handle);
-    return handle;
+    // FIX-GT7-002: one Vulkan sampler per state the device sees. GT7's S#s differ in bits the
+    // sampler doesn't use (performance hints, unused bits, the border colour table when the
+    // colour isn't custom), and a sampler per raw S# passed the driver's limit (4000 on NVIDIA):
+    // "Failed to create sampler: ErrorOutOfDeviceMemory" ended the game.
+    AmdGpu::Sampler state{};
+    state.clamp_x.Assign(sharp.clamp_x.Value());
+    state.clamp_y.Assign(sharp.clamp_y.Value());
+    state.clamp_z.Assign(sharp.clamp_z.Value());
+    state.xy_mag_filter.Assign(sharp.xy_mag_filter.Value());
+    state.xy_min_filter.Assign(sharp.xy_min_filter.Value());
+    state.mip_filter.Assign(sharp.mip_filter.Value());
+    if (AmdGpu::IsAnisoFilter(sharp.xy_mag_filter) || AmdGpu::IsAnisoFilter(sharp.xy_min_filter)) {
+        state.max_aniso.Assign(sharp.max_aniso.Value());
+    }
+    if (is_depth) {
+        state.depth_compare_func.Assign(sharp.depth_compare_func.Value());
+    }
+    state.border_color_type.Assign(sharp.border_color_type.Value());
+    std::array<float, 4> custom_color{};
+    if (custom) {
+        state.border_color_ptr.Assign(sharp.border_color_ptr.Value());
+        if (border.Address() != 0) {
+            custom_color = border.Address<std::array<float, 4>*>()[sharp.border_color_ptr.Value()];
+        }
+    }
+    const u32 limit = r.instance.GetMaxSamplerAllocationCount();
+    if (samplers.size() >= limit / 4 * 3) {
+        // Close to the limit: levels of detail in quarter steps.
+        const auto quarter = [](float lod) { return std::round(lod * 4.0f) * 64.0f; };
+        state.min_lod.Assign(u64(quarter(sharp.MinLod())));
+        state.max_lod.Assign(u64(quarter(sharp.MaxLod())));
+        state.lod_bias.Assign(u64(s64(quarter(sharp.LodBias()))) & 0x3fff);
+    } else {
+        state.min_lod.Assign(sharp.min_lod.Value());
+        state.max_lod.Assign(sharp.max_lod.Value());
+        state.lod_bias.Assign(sharp.lod_bias.Value());
+    }
+    // GFX-GT7-001 (the launcher's Texture sharpness, RYGT_TEXTURE_LOD_BIAS=<levels>): added to every
+    // sampler's bias, negative for sharper textures. Compare samplers keep theirs: a bias sharpens
+    // nothing in a shadow test.
+    static const float texture_lod_bias = [this] {
+        const char* env = std::getenv("RYGT_TEXTURE_LOD_BIAS");
+        const float bias = env && *env ? std::strtof(env, nullptr) : 0.0f;
+        if (!std::isfinite(bias) || bias == 0.0f) {
+            return 0.0f;
+        }
+        LOG_INFO(Render_Vulkan, "GFX-GT7-001: LOD bias {} on every sampler, device limit +-{}",
+                 bias, r.instance.MaxSamplerLodBias());
+        return bias;
+    }();
+    if (texture_lod_bias != 0.0f && !is_depth) {
+        // Vulkan bounds the bias's absolute value; sampler.cpp only bounds it from above.
+        const float max_bias = r.instance.MaxSamplerLodBias();
+        const float bias = std::clamp(state.LodBias() + texture_lod_bias, -max_bias, max_bias);
+        state.lod_bias.Assign(u64(s64(std::round(bias * 256.0f))) & 0x3fff);
+    }
+    struct Key {
+        AmdGpu::Sampler state;
+        std::array<float, 4> color;
+        u64 depth;
+    };
+    const Key key{state, custom_color, is_depth ? 1u : 0u};
+    const u64 state_hash = XXH3_64bits(&key, sizeof(key));
+    auto& slot = samplers[state_hash];
+    if (!slot) {
+        if (samplers.size() + 64 > limit && !samplers.empty()) {
+            // At the limit: the last sampler made stands in (logged), rather than a failure.
+            static std::atomic<u32> logged{};
+            if (Sample(logged)) {
+                LOG_ERROR(Render_Vulkan, "FIX-GT7-002: {} samplers, the device's limit is {}",
+                          samplers.size(), limit);
+            }
+            samplers.erase(state_hash);
+              memo.Store(this, epoch, hash, last_sampler);
+            return last_sampler;
+        }
+        slot = std::make_unique<VideoCore::Sampler>(r.instance, state, border, is_depth);
+        last_sampler = slot->Handle();
+    }
+    if (sampler_lookup.size() > (1u << 20)) {
+        sampler_lookup.clear();
+    }
+    sampler_lookup.emplace(hash, slot->Handle());
+    memo.Store(this, epoch, hash, slot->Handle());
+    return slot->Handle();
 }
+
 
 NativeRenderer::Stream& NativeRenderer::Begin() {
     Stream& s = stream;
@@ -3038,8 +3177,9 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
     // OPT-003: the range's last result, when nothing it depends on changed.
     const u32 flags = u32(write) | (u32(mirror) << 1);
     const std::array<u64, 3> memo_key{address, size, flags};
-    BufferMemo& memo =
-        buffer_memos[XXH3_64bits(memo_key.data(), sizeof(memo_key)) & (buffer_memos.size() - 1)];
+    const u64 slot = NextMemoEnabled() ? MemoHash(memo_key.data(), memo_key.size(), 0)
+                                      : XXH3_64bits(memo_key.data(), sizeof(memo_key));
+    BufferMemo& memo = buffer_memos[slot & (buffer_memos.size() - 1)];
     // PERF-GT7-047 (Will Scarlett): unrelated region/mirror changes do not
     // invalidate owned-range memos. In-place reads still take the full lookup.
     if (memo.address == address && memo.size == size && memo.flags == flags &&
@@ -3499,8 +3639,96 @@ bool NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
     return !ui_layer;
 }
 
+bool NativeRenderer::TargetsFromMemo(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline,
+                                     Targets& out) {
+    TargetsMemo& m = targets_memo;
+    const auto& key = pipeline.GetGraphicsKey();
+    if (!m.valid ||
+        m.generation != registry->Generation() + unmap_generation.load(std::memory_order_relaxed) ||
+        m.mrt_mask != key.mrt_mask || m.color_mode != u32(regs.color_control.mode) ||
+        m.target_mask != regs.color_target_mask.raw) {
+        return false;
+    }
+    for (u32 cb = 0; cb < m.num_colors; ++cb) {
+        if (std::memcmp(&m.color_buffers[cb], &regs.color_buffers[cb], sizeof(AmdGpu::ColorBuffer)) !=
+                0 ||
+            m.cb_extents[cb].raw != r.liverpool->DrawCbExtent(cb).raw) {
+            return false;
+        }
+    }
+    const bool depth_used = (regs.depth_control.depth_enable && regs.depth_buffer.DepthValid()) ||
+                            (regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid());
+    if (depth_used != m.depth_used) {
+        return false;
+    }
+    if (depth_used &&
+        (m.depth_flags != (u32(regs.depth_control.depth_enable) |
+                           (u32(regs.depth_control.stencil_enable) << 1) |
+                           (u32(regs.depth_control.depth_write_enable) << 2)) ||
+         std::memcmp(&m.depth_buffer, &regs.depth_buffer, sizeof(AmdGpu::DepthBuffer)) != 0 ||
+         std::memcmp(&m.depth_view, &regs.depth_view, sizeof(AmdGpu::DepthView)) != 0 ||
+         m.htile != regs.depth_htile_data_base.GetAddress() ||
+         m.db_extent.raw != r.liverpool->DrawDbExtent().raw)) {
+        return false;
+    }
+    // The pictures, views and ranges are the ones the lookups would give; what each draw does
+    // to them (pending rewrites, depth twins, clears of their metadata, their last use) is done
+    // as without the memo.
+    out = m.targets;
+    for (u32 cb = 0; cb < m.num_colors; ++cb) {
+        auto* entry = const_cast<Native::ImageEntry*>(out.colors[cb]);
+        if (!entry) {
+            continue;
+        }
+        entry->last_use.store(frame, std::memory_order_relaxed);
+        ApplyRewrite(*entry); // NAT-120
+        auto& attachment = out.state.color_attachments[cb];
+        const bool is_clear = m.cmasks[cb] != 0 && cleared_meta.erase(m.cmasks[cb]) != 0;
+        attachment.clear_value =
+            is_clear ? LiverpoolToVK::ColorBufferClearValue(regs.color_buffers[cb]).color.uint32
+                     : std::array<u32, 4>{};
+        attachment.is_clear = is_clear;
+    }
+    if (auto* entry = const_cast<Native::ImageEntry*>(out.depth)) {
+        entry->last_use.store(frame, std::memory_order_relaxed);
+        ApplyRewrite(*entry); // NAT-120
+        bool meta_clear = false;
+        if (m.htile != 0) {
+            meta_clear = cleared_meta.erase(m.htile) != 0;
+            if (!meta_clear && m.htile_meta && !entry->from_cpu &&
+                entry->write_version.load(std::memory_order_relaxed) == 0) {
+                meta_clear = true; // FIX-156
+                NATIVE_DIAGNOSTIC(++stats.meta_clears);
+            }
+        }
+        const auto aspects = DepthStencilClearAspects(regs.depth_buffer, regs.depth_control,
+                                                      regs.depth_render_control, meta_clear);
+        const bool depth_clear = bool(aspects & vk::ImageAspectFlagBits::eDepth);
+        const bool stencil_clear = bool(aspects & vk::ImageAspectFlagBits::eStencil);
+        auto& db = out.state.depth_stencil_attachment;
+        if (db.has_depth) {
+            db.clear_value[0] = depth_clear ? std::bit_cast<u32>(regs.depth_clear) : 0u;
+            db.depth_clear = depth_clear;
+        }
+        if (db.has_stencil) {
+            db.clear_value[1] = stencil_clear ? regs.stencil_clear : 0u;
+            db.stencil_clear = stencil_clear;
+        }
+    }
+    NATIVE_DIAGNOSTIC(++stats.targets_reused);
+    return true;
+}
+
 bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline,
                                     Targets& out) {
+    static const bool reuse = [] {
+        const char* env = std::getenv("RYGT_NATIVE_REUSE");
+        return !(env && env[0] == '0');
+    }();
+    const bool memo = reuse && Native::WatchedTextures().empty() && !r.FrameDumpActive();
+    if (memo && TargetsFromMemo(regs, pipeline, out)) return true;
+    const u64 generation = registry->Generation() + unmap_generation.load(std::memory_order_relaxed);
+    bool htile_meta = false;
     const auto& key = pipeline.GetGraphicsKey();
     RenderState& state = out.state;
     state = {};
@@ -3573,6 +3801,7 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
         const VideoCore::TextureCache::ImageDesc desc{regs.depth_buffer, regs.depth_view,
                                                       regs.depth_control, htile,
                                                       r.liverpool->DrawDbExtent()};
+        htile_meta = desc.info.meta_info.htile_addr != 0;
         Native::ImageEntry* entry = registry->Find(desc.info, true, frame);
         const vk::ImageView view =
             entry ? View(*entry, desc.view_info, ViewUse::Attachment) : vk::ImageView{};
@@ -3658,6 +3887,31 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
     state.height = static_cast<u16>(std::min<u32>(height, 0xffff));
     state.num_layers = static_cast<u16>(
         num_layers == std::numeric_limits<u16>::max() ? 1u : std::max(num_layers, 1u));
+    TargetsMemo& m = targets_memo; // OPT-013
+    m.valid = memo;
+    if (memo) {
+        m.generation = generation;
+        m.mrt_mask = key.mrt_mask;
+        m.color_mode = u32(regs.color_control.mode);
+        m.target_mask = regs.color_target_mask.raw;
+        m.num_colors = state.num_color_attachments;
+        for (u32 cb = 0; cb < m.num_colors; ++cb) {
+            m.color_buffers[cb] = regs.color_buffers[cb];
+            m.cb_extents[cb] = r.liverpool->DrawCbExtent(cb);
+            m.cmasks[cb] = regs.color_buffers[cb].CmaskAddress();
+        }
+        m.depth_used = (regs.depth_control.depth_enable && regs.depth_buffer.DepthValid()) ||
+                       (regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid());
+        m.depth_flags = u32(regs.depth_control.depth_enable) |
+                        (u32(regs.depth_control.stencil_enable) << 1) |
+                        (u32(regs.depth_control.depth_write_enable) << 2);
+        m.depth_buffer = regs.depth_buffer;
+        m.depth_view = regs.depth_view;
+        m.htile = regs.depth_htile_data_base.GetAddress();
+        m.db_extent = r.liverpool->DrawDbExtent();
+        m.htile_meta = htile_meta;
+        m.targets = out;
+    }
     return true;
 }
 
@@ -4064,8 +4318,36 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
     (void)compute;
 }
 
+size_t NativeRenderer::TextureMemoSlot(const std::array<u64, 4>& raw_sharp, u32 flags) const {
+    const u64 hash = NextMemoEnabled() ? MemoHash(raw_sharp.data(), raw_sharp.size(), flags)
+        : XXH3_64bits_withSeed(raw_sharp.data(), sizeof(raw_sharp), flags);
+    return hash & (texture_memos.size() - 1);
+}
+
 void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs& regs,
                                   Shader::Backend::Bindings& binding, DrawBindings& b) {
+    if (NextMemoEnabled() && stage.images.size() > 1 && !r.FrameDumpCollecting()) {
+        // PERF-GT7-014 (C): the stage's texture memo slots are fetched into the cache first;
+        // each slot's first touch was the costliest line of BindTextures (a 1.4 MB table).
+        for (const auto& image_desc : stage.images) {
+            const auto tsharp = image_desc.GetSharp(stage);
+            if (tsharp.Address() == 0) {
+                continue;
+            }
+            std::array<u64, 4> raw_sharp{};
+            std::memcpy(raw_sharp.data(), &tsharp, sizeof(raw_sharp));
+            const u32 memo_flags = u32(image_desc.is_written) | (u32(image_desc.is_array) << 1) |
+                                   (u32(image_desc.is_depth) << 2) |
+                                   (u32(image_desc.mip_fallback_mode) << 3) |
+                                   ((image_desc.constant_mip_index & 0xff) << 6) |
+                                   (image_desc.NumBindings(stage) << 16) |
+                                   (u32(image_desc.post_op == Shader::SharpFetchPostOp::NativeCubeSampling) << 31);
+            const char* line =
+                reinterpret_cast<const char*>(&texture_memos[TextureMemoSlot(raw_sharp, memo_flags)]);
+            _mm_prefetch(line, _MM_HINT_T0);
+            _mm_prefetch(line + 64, _MM_HINT_T0);
+        }
+    }
     if(SceneTrace::Id()) {
         std::string constants;
         for(size_t i=0;i<std::min<size_t>(stage.flattened_ud_buf.size(),128);++i)constants+=fmt::format(" {}:{:08x}",i,stage.flattened_ud_buf[i]);
@@ -4184,9 +4466,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                                ((image_desc.constant_mip_index & 0xff) << 6) |
                                (num_bindings << 16) | (u32(cube_sampling) << 31);
         if (num_bindings <= 4 && stage.pgm_hash != 0xaa3822a3 && !r.FrameDumpCollecting()) {
-            memo = &texture_memos[XXH3_64bits_withSeed(raw_sharp.data(), sizeof(raw_sharp),
-                                                       memo_flags) &
-                                  (texture_memos.size() - 1)];
+            memo = &texture_memos[TextureMemoSlot(raw_sharp, memo_flags)];
             // Revalidate the complete lookup/returned-image range before ever
             // dereferencing the old entry. Unmaps always invalidate it.
             if (memo->entry && memo->flags == memo_flags && memo->sharp == raw_sharp &&

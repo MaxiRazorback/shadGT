@@ -31,6 +31,9 @@
 #include <boost/container/static_vector.hpp>
 
 #include "common/types.h"
+#include "video_core/amdgpu/regs_depth.h"
+#include "video_core/amdgpu/regs_color.h"
+#include "video_core/amdgpu/cb_db_extent.h"
 #include "ryty_gpu/native/same_texel.h"
 #include "video_core/renderer_vulkan/pipeline_binding_state.h"
 #include "video_core/renderer_vulkan/descriptor_set_memo.h"
@@ -271,6 +274,9 @@ private:
                        ViewUse use);
     vk::Sampler SamplerFor(const AmdGpu::Sampler& sharp, AmdGpu::BorderColorBuffer border,
                            bool is_depth);
+    vk::Sampler MakeSampler(const AmdGpu::Sampler& sharp, AmdGpu::BorderColorBuffer border,
+                            bool is_depth);
+    size_t TextureMemoSlot(const std::array<u64, 4>& raw_sharp, u32 flags) const;
 
     Stream& Begin();
     void EndRendering(u32 reason = 0);
@@ -439,6 +445,29 @@ private:
     std::optional<std::pair<vk::Buffer, u64>> GuestBuffer(VAddr address, u64 size, bool write,
                                                           bool mirror = false);
 
+    /// OPT-013: the targets the previous draw resolved, by the registers that name them, while
+    /// the registry made or dropped no picture and no memory was unmapped. Clears, rewrites,
+    /// depth twins and last uses are still done at every draw.
+    struct TargetsMemo {
+        bool valid = false;
+        u64 generation = 0;
+        u32 mrt_mask = 0;
+        u32 color_mode = 0;
+        u32 target_mask = 0;
+        u32 num_colors = 0;
+        std::array<AmdGpu::ColorBuffer, 8> color_buffers{};
+        std::array<AmdGpu::CbDbExtent, 8> cb_extents{};
+        bool depth_used = false;
+        u32 depth_flags = 0; ///< depth and stencil enable, depth write enable
+        AmdGpu::DepthBuffer depth_buffer{};
+        AmdGpu::DepthView depth_view{};
+        VAddr htile = 0;
+        AmdGpu::CbDbExtent db_extent{};
+        std::array<VAddr, 8> cmasks{};
+        bool htile_meta = false; ///< the depth image has HTILE (FIX-156)
+        Targets targets{};
+    } targets_memo;
+    bool TargetsFromMemo(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline, Targets& out);
     bool ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline, Targets& out);
     bool PrepareUiTarget(Targets& targets, const GraphicsPipeline& pipeline);
     GtsSceneImage TemporalImage(const Native::ImageEntry& entry);
@@ -805,6 +834,8 @@ private:
     std::vector<vk::DescriptorPool> free_pools;
     std::deque<std::pair<u64, vk::DescriptorPool>> retiring_pools;
 
+    std::unordered_map<u64, vk::Sampler> sampler_lookup;
+    vk::Sampler last_sampler{};
     std::mutex sampler_mutex;
     std::unordered_map<u64, std::unique_ptr<VideoCore::Sampler>> samplers;
 
@@ -851,6 +882,7 @@ private:
         u64 guest_buffer_calls = 0, guest_buffer_ns = 0;     ///< NAT-145
         u64 rewrite_fills = 0;   ///< NAT-132
         u64 timed_draws = 0;     ///< OPT-001
+        u64 targets_reused = 0;
         u64 vertex_near = 0;     ///< OPT-004
         u64 vertex_skipped = 0;  ///< OPT-005
         /// OPT-010: draws bound from a prepared draw, without one, and prepared draws not used:
