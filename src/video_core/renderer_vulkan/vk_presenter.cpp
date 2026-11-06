@@ -1420,7 +1420,7 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread, Frame* frame) {
     return frame;
 }
 
-void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame, u64 anti_lag_frame) {
 #ifndef NDEBUG
     auto* trace = Common::FrameQueueTrace::current;
     struct TracePresentScope {
@@ -1734,7 +1734,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         if (trace)
             trace->lock_acquired = Common::FrameQueueTrace::Now(trace->ticket);
 #endif
-        const bool presented = swapchain.Present();
+        const bool presented = swapchain.Present(anti_lag_frame);
 #ifndef NDEBUG
         if (trace) {
             trace->swapchain_return = Common::FrameQueueTrace::Now(trace->ticket);

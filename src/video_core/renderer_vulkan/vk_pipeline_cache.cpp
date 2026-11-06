@@ -829,7 +829,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         // distances, layer), so the pixel shader reads the check only when those stay below 30;
         // the vertex side checks its own outputs the same way and then always writes it.
         info.hw.fs.vertex_order_check =
-            profile.vertex_order_check &&
+            profile.vertex_order_check && !IsTessEmulatedDraw() &&
             regs.vs_output_config.NumExports() + 2 <= 30; // OrderCheckRefLocation
         break;
     }
@@ -913,7 +913,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         // FIX-223 (RYGT_DISCARD_KILL=0 or 1 overrides): AMD ends discarded pixels at once.
         .discard_kills = [&] {
             const char* env = std::getenv("RYGT_DISCARD_KILL");
-            return env && *env ? *env == '1' : instance.GetVendorID() == 0x1002;
+            return env && *env ? *env == '1'
+                               : instance.GetDriverID() == vk::DriverId::eAmdProprietary;
         }(),
         .support_fp32_denorm_flush = bool(vk12_props.shaderDenormFlushToZeroFloat32),
         .support_fp32_round_to_zero = bool(vk12_props.shaderRoundingModeRTZFloat32),
@@ -4674,6 +4675,9 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
             .code = job->code, .hash = job->hash,
         };
         job->info = std::make_unique<Shader::Info>(hw_stage, sw_stage, owned_params);
+        // Pin the draw's vertex descriptors before translation and worker emission.
+        const char* pin_fetch = std::getenv("RYGT_PIN_FETCH_SHARPS");
+        job->info->pin_fetch_sharps = !pin_fetch || pin_fetch[0] != '0';
         job->info->pgm_base = job->code_base;
         auto prepared = std::make_shared<OwnedTranslation>(runtime_info);
         const auto* previous_fetch = Shader::t_fetch_code_snapshots;
@@ -4719,8 +4723,9 @@ bool PipelineCache::TakeReadyTranslation(HwStage hw_stage, SwStage sw_stage, u64
         info.pgm_base = params.Base();
         info.user_data = params.user_data;
         { Common::PhaseTimer flat_timer{Common::Phase::SelFlatten}; info.RefreshFlatBuf(); }
+        // FIX-GT7-024: the lookup's on the right, as GetProgram compares (its bitsets decide).
         if (job->hw_stage != hw_stage || job->sw_stage != sw_stage ||
-            Shader::StageSpecialization(info, runtime_info, profile, binding) != job->spec) {
+            job->spec != Shader::StageSpecialization(info, runtime_info, profile, binding)) {
             continue;
         }
         if (!insert) {
@@ -4813,6 +4818,8 @@ void PipelineCache::HarvestTranslations(u64 hash, bool wait, HwStage hw_stage, S
         // Tessellation keys were captured on the translating worker, not from
         // whatever the guest wrote to the constant buffer before harvesting.
         // Every stage key was captured from the owned compilation inputs on the worker.
+        job->info->pinned_fetch_sharps.clear();
+        job->info->pin_fetch_sharps = false;
         job->ready_since = now;
         ready.push_back(job);
         return true;

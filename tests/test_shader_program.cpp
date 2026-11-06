@@ -230,6 +230,27 @@ TEST(ShaderSpecialization, FmaskKeyTracksTypeAndOnlyRequiredDimensions) {
     EXPECT_FALSE(original == KeyFor(info));
 }
 
+TEST(ShaderSpecialization, PinnedFetchDescriptorIsUsedForCode) {
+    Shader::Info info;
+    auto original = BoundBuffer(16);
+    info.pinned_fetch_sharps.push_back({2, 4, original});
+    Shader::Gcn::VertexAttribute attrib{};
+    attrib.sgpr_base = 2;
+    attrib.dword_offset = 4;
+    EXPECT_EQ(attrib.GetSharpFromMemory(info).GetStride(), original.GetStride());
+}
+
+TEST(ShaderSpecialization, EmptyBoundBufferIgnoresUnusedAddressing) {
+    auto info = TranslatedFragmentWithBuffer(true);
+    auto buffer = BoundBuffer(16);
+    buffer.base_address = 0;
+    Bind(info.buffers[0], buffer);
+    const auto first = KeyFor(info);
+    buffer.stride = 48;
+    Bind(info.buffers[0], buffer);
+    EXPECT_TRUE(first == KeyFor(info));
+}
+
 TEST(ShaderSpecialization, KeepsEveryBufferPropertyWhenTranslationUsageIsUnknown) {
     // A shader loaded from storage carries no usage flags.
     auto info = TranslatedFragmentWithBuffer(false);

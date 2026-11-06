@@ -307,7 +307,7 @@ void VideoOutDriver::Flip(const Request& req) {
 #endif
     {
         Common::Nvtx::Scope nvtx{"present"};
-        presenter->Present(req.frame);
+        presenter->Present(req.frame, false, true, req.anti_lag_frame);
     }
     #ifndef NDEBUG
     {
@@ -389,17 +389,14 @@ bool VideoOutDriver::DrawLastFrame() {
     return false;
 }
 
-void VideoOutDriver::AntiLagInput() {
-    presenter->AntiLagInput(); // PERF-210
+u64 VideoOutDriver::AntiLagInput() {
+    return presenter->AntiLagInput();
 }
 
 bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
-                                bool is_eop /*= false*/) {
+                                bool is_eop, u64 anti_lag_frame) {
     auto trace = Common::FrameQueueTrace::Start();
     RyDiag::Mark(RyDiag::Zone::GameFlip, u64(index));
-    if (!is_eop) {
-        presenter->AntiLagInput(); // PERF-210: on the game's thread, never the command thread
-    }
     {
         std::unique_lock lock{port->port_mutex};
         if (index != -1 && port->flip_status.flip_pending_num > 16) {
@@ -413,20 +410,21 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
         ++port->flip_status.flip_pending_num; // integral GPU and CPU pending flips counter
         port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
     }
+    if (!is_eop) anti_lag_frame = presenter->AntiLagInput();
 
     if (!is_eop) {
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
         liverpool->SendCommand(
-            [=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop, trace); });
+            [=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop, trace, anti_lag_frame); });
     } else {
-        SubmitFlipInternal(port, index, flip_arg, is_eop, trace);
+        SubmitFlipInternal(port, index, flip_arg, is_eop, trace, anti_lag_frame);
     }
 
     return true;
 }
 
 void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
-                                        Common::FrameQueueTrace::Ticket trace) {
+                                        Common::FrameQueueTrace::Ticket trace, u64 anti_lag_frame) {
 #ifndef NDEBUG
     if (trace.generation)
         Common::FrameQueueTrace::Prepare(trace);
@@ -453,6 +451,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
             .flip_arg = flip_arg,
             .index = index,
             .eop = is_eop,
+            .anti_lag_frame = anti_lag_frame,
             .trace = trace,
 #ifndef NDEBUG
             .submitted = std::chrono::steady_clock::now(),

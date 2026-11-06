@@ -577,7 +577,8 @@ bool Instance::CreateDevice() {
             feature_chain.get<vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>()
                 .shaderMaximalReconvergence &&
             feature_chain.get<vk::PhysicalDeviceShaderQuadControlFeaturesKHR>().shaderQuadControl &&
-            !Simulates(VK_KHR_SHADER_QUAD_CONTROL_EXTENSION_NAME) &&
+            (GetSimulatedGpu() == SimulatedGpu::None ||
+             !Simulates(VK_KHR_SHADER_QUAD_CONTROL_EXTENSION_NAME)) &&
             add_extension(VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME) &&
             add_extension(VK_KHR_SHADER_QUAD_CONTROL_EXTENSION_NAME);
         LOG_INFO(Render_Vulkan, "AMD-306: whole quads in pixel shader branches: {} (driver {})",
@@ -1269,17 +1270,30 @@ void Instance::LogDeviceFault() const {
 
 // PERF-210: the input stage runs on the game thread that submits the flip, so the driver can hold
 // the game there and start its next frame later; the present stage closes that frame.
-void Instance::AntiLagUpdate(bool present) const {
+u64 Instance::AntiLagInput() const {
     if (!anti_lag) {
-        return;
+        return 0;
     }
     std::scoped_lock lock{anti_lag_mutex};
-    if (!present) {
-        ++anti_lag_frame;
-    }
+    ++anti_lag_frame;
     const vk::AntiLagPresentationInfoAMD info{
-        .stage = present ? vk::AntiLagStageAMD::ePresent : vk::AntiLagStageAMD::eInput,
+        .stage = vk::AntiLagStageAMD::eInput,
         .frameIndex = anti_lag_frame,
+    };
+    device->antiLagUpdateAMD(vk::AntiLagDataAMD{
+        .mode = vk::AntiLagModeAMD::eOn,
+        .maxFPS = 0,
+        .pPresentationInfo = &info,
+    });
+    return anti_lag_frame;
+}
+
+void Instance::AntiLagPresent(u64 frame) const {
+    if (!anti_lag || frame == 0) return;
+    std::scoped_lock lock{anti_lag_mutex};
+    const vk::AntiLagPresentationInfoAMD info{
+        .stage = vk::AntiLagStageAMD::ePresent,
+        .frameIndex = frame,
     };
     device->antiLagUpdateAMD(vk::AntiLagDataAMD{
         .mode = vk::AntiLagModeAMD::eOn,

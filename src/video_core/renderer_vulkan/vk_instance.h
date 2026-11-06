@@ -134,7 +134,8 @@ public:
     }
 
     /// Returns true if VK_KHR_maintenance8 is supported
-    void AntiLagUpdate(bool present) const; // PERF-210
+    u64 AntiLagInput() const;
+    void AntiLagPresent(u64 frame) const;
 
     bool IsMaintenance8Supported() const {
         return maintenance_8;
