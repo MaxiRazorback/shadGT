@@ -39,10 +39,15 @@ runtime comparison, not a resolved defect.
 - Real clang-cl front-end checks of the isolated native renderer, image registry
   and direct-memory imports, using the worktree's headers before dependency paths.
 - All nine upstream same-texel GoogleTest cases pass.
-- Added GPU regressions for two batched destinations, nonzero offsets, guard bytes,
-  linear/tiled layouts and mip roundtrips; execution is pending the integrated build.
-- Full Debug/Release builds, isolated GPU checks, gameplay and transition checks
-  are still required. No installed game or shader cache has changed.
+- Debug and Release checkpoint `958d7f1e` built and passed matching-symbol,
+  paired-runtime loading and all 2,766 import checks. Its Debug RHI, image and
+  descriptor GPU regressions passed, including nonzero offsets, guards,
+  linear/tiled layouts and mip roundtrips.
+- Debug checkpoint `2981d2e4` additionally includes shader objects, imported
+  backing lifetime protection, visible-build priority, ready-frame pacing and
+  speculative state isolation. The same ABI/symbol and three GPU suites passed.
+- Newer groups below require a fresh full assembly build and linked GPU checks.
+  No installed game, working runtime or production shader cache has changed.
 
 ## Additional integrated groups
 
@@ -80,9 +85,41 @@ runtime comparison, not a resolved defect.
   `RYGT_NATIVE_RING=0` remains available in Release; periodic A/B diagnostics
   are Debug-only.
 - `PERF-273`: early submission when the preceding tick is complete, bounded
-  read-only storage mirrors, and display-awake requests on the present thread.
+  read-only storage mirrors. `FIX-290` follows upstream `83502d8b`, removing
+  the display-awake workaround that upstream reverted after identifying the
+  Bluetooth HID removal stall.
 - `FIX-276`: reclaim GPU-completed upload allocations before an allocation
   retry; never wait for or free the current unsubmitted tick.
+- `PERF-261`, `PERF-281`: packed specialization lookup, Screen/Soon build
+  priority, bounded catch-up and required-build promotion. Speculative jobs
+  remain bounded and cannot displace required work.
+- `PERF-278`, `FIX-285`: shader objects with instance-owned stage sharing,
+  compatible binary storage, aligned cached binaries, and conventional pipeline
+  fallbacks for blended HUD and LDS-emulated draws. The dependency chain includes
+  MaxiRazorback's SO-001/SO-002 work (`2ddc0f9c`, `3ef6fe04`) and HUD correction
+  (`fd8a1740`), plus Will's later cache/layout fixes. Credit belongs to both
+  upstream contributors. GPL and shader objects are distinct Vulkan features.
+- `FIX-279`: lease imported buffers, aliases and memory through their actual GPU
+  submission lifetime, including removal and failed retirement scheduling.
+- `FIX-282`, `FIX-287`, `FIX-288`, `FIX-293`, `FIX-294`, `PERF-295`: semantic
+  lane-policy compatibility, recoverable speculative failures, isolated
+  read-ahead match state, safe stale-job cancellation, and the optional
+  3 ms per 16 ms read-ahead evaluation budget. Required jobs retain priority.
+- `PERF-284`, `FIX-286`: ready-frame default/rate pacing and joining the driver
+  cache writer before every early return that requires completion.
+- `FIX-258`: precise changed-word region writeback, operation-wide preflight,
+  imported-part leases, exact image overlap preservation, and a bounded snapshot
+  pool. Large or unsupported writebacks invalidate recency instead of dropping
+  the guest operation. Fault-ahead remains opt-in (`RYGT_NATIVE_FAULT_AHEAD=1`),
+  with image exclusions and guarded snapshots.
+- `FIX-289`, `FIX-302`: mip-crop layout checks, superseded-target retirement,
+  fill-hash invalidation, packed-order alias isolation, whole-cube view checks,
+  source-format resolves and an intermediate fallback. Unsupported resolves stop
+  before issuing an invalid Vulkan operation. The broader packed-float conversion
+  dependency is not represented by its metadata-only adaptation.
+- `FIX-291`, `FIX-292`: overlay gamepad input from event-thread atomics with
+  post-reassignment selection and balanced handles; one keyboard-open event
+  consistent with the absence of USB keyboard resource IDs.
 
 These groups include source defaults where their lifetime and API contracts can
 be retained. GT7-only addresses, game patch offsets and branding require a GTS
@@ -90,21 +127,19 @@ adaptation; they are not evidence of equivalent behavior in GT Sport.
 
 ## Remaining work
 
-The all-author inventory is not complete. Packed-specialization adaptation,
-on-screen build pacing/catch-up, precise page writeback/fault-ahead ownership,
-and the shader-object dependency chain remain under integration and review.
-Graphics pipeline libraries and Vulkan shader objects are separate features.
-Do not describe the existing library path as shader-object support.
+The all-author reconciliation remains in progress. Outstanding groups include
+map-time stale-copy handling, remaining packed-float conversion and remembered
+fills, shader-store cube-mode composition, readable-range handling and GTS fence
+batching. An inventory row without a mapping is unknown, not proof that the
+behavior is absent; final source reverts and GT7-only code need explicit handling.
 
-One integrated Debug checkpoint has built. The latest ring/prewarm assembly
-requires a fresh build and GPU validation. Twenty CPU cases covering upload
-recovery, store selection/readers, callable ownership and exit-save lifetime
-passed; the compute recipe and ring suites are additional checks. The real
-wave64 lowering tool passed 1,536 cases. The emitted tessellation shader passed
-SPIR-V validation and a standalone NVIDIA two-draw writer/reader fixture with
-both separate and shared barriers. That fixture does not prove NativeRenderer
-batch lifetime or game output. Full Release, latest Debug, import/symbol checks,
-NVIDIA regression tests and two-race menu/Brand Central checks remain required.
+Component checks cover ownership/cancellation failure paths, packed lookup,
+shader-object binary alignment and output, region scatter padding, and actual GPU
+tick retirement. The emitted tessellation shader passed SPIR-V validation and a
+standalone NVIDIA two-draw writer/reader fixture with both separate and shared
+barriers. None of those fixtures establishes the full NativeRenderer lifetime or
+game output. The latest assembly still needs both full builds, linked GPU tests,
+two-race menu/Brand Central checks and the explicitly requested GDS ON trial.
 
 No runtime speedup, stutter reduction or 16.6 ms target is established by these
 component tests. Nothing in this port has been installed or merged.
