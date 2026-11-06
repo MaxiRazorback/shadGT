@@ -9,6 +9,7 @@
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
+#include "shader_recompiler/lane_read_policy.h"
 
 #include "video_core/buffer_cache/direct_memory.h"
 #include "video_core/cache_storage.h"
@@ -131,7 +132,7 @@ void DataBase::Open() {
                     }
                 }
                 return parts;
-            }();
+            }() + std::string{Shader::LaneReadStoreSuffix(Shader::LaneReadUnbranchEnabled())};
         const auto original = cache_path;
         const auto selected = VideoCore::OpenCompatibleShaderStore(original, StoreVersion);
         if (!selected) {

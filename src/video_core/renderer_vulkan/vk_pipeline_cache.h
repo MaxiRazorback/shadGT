@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
+#include "video_core/renderer_vulkan/shader_fix_scan_cache.h"
 
 #include <atomic>
 #include <shared_mutex>
@@ -306,6 +307,8 @@ private:
         u32 fixes; ///< 1: FIX-018 else scope, 2/4: FIX-020 wave64 lane reads (v1/v2)
     };
     std::unordered_map<u64, RetranslatedProgram> else_scope_fixed;
+    std::unordered_map<u64, u32> session_fix_marks;
+    ShaderFixScanCache shader_fix_scans;
     std::unordered_set<u64> else_scope_checked;
     std::vector<std::unique_ptr<Program>> retired_programs;
     std::filesystem::path else_scope_fixed_path;

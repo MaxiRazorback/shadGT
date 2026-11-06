@@ -9,6 +9,7 @@
 #include "common/perf_monitor.h"
 #include "common/scope_exit.h"
 #include "shader_recompiler/info.h"
+#include "shader_recompiler/lane_read_policy.h"
 #include "video_core/renderer_vulkan/compute_warm_recipe.h"
 #include "video_core/renderer_vulkan/compiler_worker_budget.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
@@ -139,8 +140,9 @@ u64 RecipeSignature(const Instance& instance, const Shader::Profile& p) {
     const auto add = [&](u64 v) { for (u32 i=0;i<8;++i) { hash ^= (v >> (i*8)) & 255; hash *= 1099511628211ull; } };
     const auto props = instance.GetPhysicalDevice().getProperties();
     // Recipe translation ABI: bump when stored SPIR-V layout or policy changes.
-    constexpr u32 TranslationAbiVersion = 1;
+    constexpr u32 TranslationAbiVersion = 2;
     add(TranslationAbiVersion);
+    add(Shader::LaneReadUnbranchEnabled());
     add(props.vendorID);
     for (const auto v : {u64(p.direct_buffers),u64(p.max_viewport_width),u64(p.max_viewport_height),
         u64(p.max_shared_memory_size),u64(p.supported_spirv),u64(p.subgroup_size),u64(p.sparse_page_shift),

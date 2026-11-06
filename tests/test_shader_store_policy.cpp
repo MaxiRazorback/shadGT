@@ -6,7 +6,62 @@
 #include <thread>
 #include <vector>
 #include <gtest/gtest.h>
+#include "shader_recompiler/lane_read_policy.h"
 #include "video_core/shader_store_policy.h"
+#include "video_core/renderer_vulkan/shader_fix_scan_cache.h"
+
+TEST(ShaderStorePolicy, ProgramFixScansAreReusedAndComputeScansAreLazy) {
+    Vulkan::ShaderFixScanCache cache;
+    unsigned base_calls = 0, compute_calls = 0;
+    const auto base = [&] { ++base_calls; return 17u; };
+    const auto compute = [&] { ++compute_calls; return std::pair{true, false}; };
+    EXPECT_EQ(cache.Get(9, false, base, compute).base_fixes, 17u);
+    EXPECT_EQ(cache.Get(9, false, base, compute).base_fixes, 17u);
+    EXPECT_EQ(base_calls, 1u);
+    EXPECT_EQ(compute_calls, 0u);
+    EXPECT_TRUE(cache.Get(9, true, base, compute).lane_reads);
+    EXPECT_TRUE(cache.Get(9, true, base, compute).lane_reads);
+    EXPECT_EQ(base_calls, 1u);
+    EXPECT_EQ(compute_calls, 1u);
+    cache.Get(10, true, base, compute);
+    EXPECT_EQ(base_calls, 2u);
+    EXPECT_EQ(compute_calls, 2u);
+}
+
+TEST(ShaderStorePolicy, LaneReadSwitchKeepsDefaultAndOffStoresSeparate) {
+    EXPECT_TRUE(Shader::LaneReadUnbranchPolicy(nullptr));
+    EXPECT_TRUE(Shader::LaneReadUnbranchPolicy(""));
+    EXPECT_TRUE(Shader::LaneReadUnbranchPolicy("1"));
+    EXPECT_FALSE(Shader::LaneReadUnbranchPolicy("0"));
+    // The marker is independent of the separate loop-optimization feature switch.
+    EXPECT_EQ(Shader::LaneReadFixMarker(true, 32, 64, true), 2048u);
+    EXPECT_EQ(Shader::LaneReadFixMarker(true, 32, 64, false), 0u);
+    EXPECT_EQ(Shader::LaneReadFixMarker(true, 32, 128, true), 0u);
+    const auto parent = std::filesystem::temp_directory_path() /
+        ("ryty-lane-policy-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    ASSERT_TRUE(std::filesystem::create_directory(parent));
+    const auto original = parent / "store";
+    ASSERT_TRUE(std::filesystem::create_directory(original));
+    { std::ofstream(original / "store-version.txt") << "base\n"; }
+    { std::ofstream(original / "sentinel") << "preserve"; }
+    const std::string on = "base" + std::string(Shader::LaneReadStoreSuffix(true));
+    const std::string off = "base" + std::string(Shader::LaneReadStoreSuffix(false));
+    const auto enabled = VideoCore::OpenCompatibleShaderStore(original, on);
+    const auto disabled = VideoCore::OpenCompatibleShaderStore(original, off);
+    ASSERT_TRUE(enabled);
+    ASSERT_TRUE(disabled);
+    EXPECT_EQ(*enabled, original);
+    EXPECT_NE(*disabled, original);
+    EXPECT_EQ(VideoCore::OpenCompatibleShaderStore(original, off), disabled);
+    EXPECT_EQ(VideoCore::OpenCompatibleShaderStore(original, on), enabled);
+    EXPECT_TRUE(std::filesystem::exists(original / "sentinel"));
+    std::filesystem::remove(*disabled / "store-version.txt");
+    std::filesystem::remove(*disabled);
+    std::filesystem::remove(original / "store-version.txt");
+    std::filesystem::remove(original / "sentinel");
+    std::filesystem::remove(original);
+    std::filesystem::remove(parent);
+}
 
 TEST(ShaderStorePolicy, PreservesOriginalAndReusesCompatibleSibling) {
     const auto parent=std::filesystem::temp_directory_path() /

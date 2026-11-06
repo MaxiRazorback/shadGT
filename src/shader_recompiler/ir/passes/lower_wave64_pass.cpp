@@ -12,6 +12,7 @@
 #include "common/logging/classes.h"
 #include "common/perf_monitor.h"
 #include "shader_recompiler/info.h"
+#include "shader_recompiler/lane_read_policy.h"
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/breadth_first_search.h"
 #include "shader_recompiler/ir/ir_emitter.h"
@@ -329,10 +330,7 @@ static bool ReadsActiveLanes(const IR::Inst& inst) {
 
 static void UnbranchUpperLaneReads(IR::Program& program, const RuntimeInfo& runtime,
                                    const Profile& profile) {
-    static const bool enabled = [] {
-        const char* env = std::getenv("RYGT_LANE_READ_UNBRANCH");
-        return !(env && env[0] == '0');
-    }();
+    const bool enabled = Shader::LaneReadUnbranchEnabled();
     const auto [size_x, size_y, size_z] = runtime.hw.cs.workgroup_size;
     if (!enabled || size_x * size_y * size_z != 64) {
         return;

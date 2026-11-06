@@ -6,6 +6,7 @@
 #include "video_core/renderer_vulkan/pipeline_cleanup_worker.h"
 #include "video_core/renderer_vulkan/draw_preparation_options.h"
 #include "video_core/renderer_vulkan/compile_cpu_batch.h"
+#include "shader_recompiler/lane_read_policy.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -5427,34 +5428,45 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
 #endif
     // FIX-018/FIX-020: stored translations made before a translator fix that changes them.
     u32 needed_fixes = 0;
-    if (first_use) {
-        needed_fixes |= Shader::HasEmptyScopeBeforeElse(params.code) ? 1u : 0u;
-        if (Shader::HasSdwaCompareDestination(params.code)) {
-            needed_fixes |= 32u;
-            LOG_INFO(Render_Vulkan, "Shader {}_{:#x} uses an explicit SDWA compare destination",
-                     hw_stage, params.hash);
-        }
-        if (Shader::HasLegacyMad(params.code)) {
-            needed_fixes |= 16u; // FIX-101
-            LOG_INFO(Render_Vulkan, "FIX-101: {}_{:#x} uses legacy multiply-add", hw_stage,
-                     params.hash);
-        }
+    bool legacy_lane_sensitive = false;
+    // One program can be used with different compute workgroup sizes. Re-evaluate the cheap
+    // policy from its cached code classification for each compute lookup, so an initial
+    // <=32-thread use cannot hide a later 64-thread translation needing the fix.
+    if (first_use || force_legacy || hw_stage == HwStage::Compute) {
+        const auto& scan = shader_fix_scans.Get(params.hash, hw_stage == HwStage::Compute, [&] {
+            u32 flags = Shader::HasEmptyScopeBeforeElse(params.code) ? 1u : 0u;
+            if (Shader::HasSdwaCompareDestination(params.code)) flags |= 32u;
+            if (Shader::HasLegacyMad(params.code)) flags |= 16u;
+            return flags;
+        }, [&] {
+            return std::pair{Shader::HasLaneReads(params.code),
+                             Shader::HasLaneReadsAndLoop(params.code)};
+        });
+        needed_fixes |= scan.base_fixes;
         const auto& wg = runtime_info.hw.cs.workgroup_size;
         if (hw_stage == HwStage::Compute && profile.subgroup_size < 64 &&
             wg[0] * wg[1] * wg[2] > 32 && Common::PerfFeatureEnabled(31) &&
-            Shader::HasLaneReadsAndLoop(params.code)) {
+            scan.lane_reads_in_loop) {
             needed_fixes |= 8u | 128u; // Wave64 lowering also changes stored loop translations.
         }
         if (hw_stage == HwStage::Compute && profile.subgroup_size < 64 &&
             wg[0] * wg[1] * wg[2] == 64 && Common::PerfFeatureEnabled(31)) {
             needed_fixes |= 128u;
-            if (Shader::HasLaneReads(params.code)) {
-                needed_fixes |= 1024u; // FIX-GT7-028: EXEC scopes around upper-lane reads.
-            }
+        }
+        // FIX-GT7-028 has its own policy and does not depend on the loop-optimization switch.
+        // Bit 1024 was also written with unbranching disabled; do not trust it as proof.
+        if (hw_stage == HwStage::Compute && profile.subgroup_size < 64 &&
+            u64(wg[0]) * wg[1] * wg[2] == 64 &&
+            (force_legacy || Shader::LaneReadUnbranchEnabled()) && scan.lane_reads) {
+            legacy_lane_sensitive = force_legacy;
+            needed_fixes |= Shader::LaneReadFixMarker(true, profile.subgroup_size, 64,
+                                                      Shader::LaneReadUnbranchEnabled());
         }
     }
     const auto known = else_scope_fixed.find(params.hash);
-    const u32 applied_fixes = known != else_scope_fixed.end() ? known->second.fixes : 0u;
+    const auto session = session_fix_marks.find(params.hash);
+    const u32 applied_fixes = (known != else_scope_fixed.end() ? known->second.fixes : 0u) |
+                              (session != session_fix_marks.end() ? session->second : 0u);
     if ((needed_fixes & ~applied_fixes) != 0) {
         auto& boundary = stored_perm_end[params.hash];
         boundary = std::max(boundary, it_pgm.value()->modules.size());
@@ -5463,16 +5475,29 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
                         "FIX-018/020: translating {}_{:#x} again (fixes {:#x}, {} stored "
                         "permutations)",
                         hw_stage, params.hash, needed_fixes, boundary);
-            else_scope_fixed[params.hash] = {boundary, applied_fixes | needed_fixes};
-            SaveElseScopeFixed();
             if (!it_pgm.value()->modules.empty()) {
                 // Pipelines already built keep the old modules alive.
                 retired_programs.push_back(std::move(it_pgm.value()));
                 it_pgm.value() = std::make_unique<Program>();
             }
         }
+        if (boundary != 0) {
+            else_scope_fixed[params.hash] = {boundary, applied_fixes | needed_fixes};
+            SaveElseScopeFixed();
+        } else {
+            // No stored permutation was observed. Record this only for the current session:
+            // another insertion path may have bypassed listing existing disk records.
+            session_fix_marks[params.hash] = applied_fixes | needed_fixes;
+        }
     }
 
+    // D10's separate store has no trusted record of the current translator fixes. Reuse it only
+    // when the guest code does not require one; preserve every legacy file for other uses. Keep
+    // this after the normal-store marker update even when this is the program's first use.
+    if (force_legacy && (needed_fixes != 0 || legacy_lane_sensitive)) {
+        S().legacy_failed = true;
+        return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
+    }
     auto& program = it_pgm.value();
     // FIX-078: translations made on the workers become permutations; a draw (not a read-ahead)
     // first waits for any still running, as one of them is likely the permutation it needs.
