@@ -464,6 +464,11 @@ public:
     /// The backend's own object (Vulkan: VkCommandBuffer), for running a secondary list inside
     /// a command buffer the renderer records elsewhere.
     virtual u64 NativeHandle() const = 0;
+    /// PERF-GT7-018: where the backend's object of a list from AcquireDeferredCommandList is
+    /// kept, filled in and read by the thread that replays its commands only.
+    virtual const u64* NativeHandleSlot() const {
+        return nullptr;
+    }
 };
 
 /// A GPU timeline: Signal from a submission, wait from the CPU or another submission.
@@ -509,6 +514,9 @@ public:
     virtual const DeviceCaps& Caps() const = 0;
 
     virtual std::unique_ptr<Buffer> CreateBuffer(const BufferDesc& desc) = 0;
+    // The caller must prove all CPU recording/replay and GPU uses completed,
+    // or that this allocation was never submitted. Frees memory before retry.
+    virtual void DestroyCompletedBuffer(std::unique_ptr<Buffer> buffer) {}
     /// Wraps existing CPU memory (page aligned, `Caps().host_import_alignment`) as a buffer the
     /// GPU reads and writes in place; nullptr when unsupported.
     /// NAT-107: a buffer made elsewhere (Vulkan: a VkBuffer), not owned: bound and copied
@@ -532,6 +540,13 @@ public:
     /// pool once the GPU has run the submission it was part of (or when Release is called on a
     /// list that was never submitted).
     virtual CommandList* AcquireCommandList(CommandListLevel level = CommandListLevel::Primary) = 0;
+    /// PERF-GT7-018: a secondary list whose commands (Begin and End too) go into `command_ring`
+    /// (Vulkan: a Vulkan::CommandRing) and are made by the thread that replays it, which also
+    /// makes and resets the list's command buffer; one thread acquires and records these lists.
+    /// nullptr when unsupported.
+    virtual CommandList* AcquireDeferredCommandList(void* command_ring) {
+        return nullptr;
+    }
     /// Wraps an externally managed command buffer (e.g. from the scheduler's primary session).
     virtual std::unique_ptr<CommandList> WrapCommandBuffer(u64 native_cmdbuf) { return nullptr; }
     virtual void ReleaseUnsubmitted(CommandList* list) = 0;

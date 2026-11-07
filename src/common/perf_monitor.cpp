@@ -22,8 +22,26 @@
 #endif
 
 namespace Common {
+namespace {
+std::atomic<u64> cadence_frames{};
+std::atomic<u64> cadence_us{};
+}
+void NoteGameFrameCadence() {
+    static thread_local auto last = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (last != std::chrono::steady_clock::time_point{}) {
+        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(now - last).count();
+        cadence_us.fetch_add(u64(us), std::memory_order_relaxed);
+        cadence_frames.fetch_add(1, std::memory_order_release);
+    }
+    last = now;
+}
+GameFrameTotals GetGameFrameTotals() {
+    const auto frames = cadence_frames.load(std::memory_order_acquire);
+    return {frames, cadence_us.load(std::memory_order_relaxed)};
+}
 
-#if !defined(NDEBUG)
+#ifdef SHADGT_DIAGNOSTICS
 
 #ifdef _WIN32
 namespace {
@@ -185,6 +203,7 @@ bool LeanRun() {
     return lean;
 }
 
+#endif // SHADGT_DIAGNOSTICS
 bool PerfFeatureEnabled(u32 id) {
     static const std::vector<u32> disabled = [] {
         std::vector<u32> ids;
@@ -205,6 +224,7 @@ bool PerfFeatureEnabled(u32 id) {
     return std::ranges::find(disabled, id) == disabled.end();
 }
 
+#ifdef SHADGT_DIAGNOSTICS
 WorkCounters& GetWorkCounters() {
     static WorkCounters counters;
     return counters;

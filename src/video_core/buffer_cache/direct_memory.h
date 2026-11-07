@@ -25,6 +25,7 @@ namespace VideoCore {
 
 struct Buffer;
 class ImportCleanupWorker;
+class ImportedViewLease;
 
 /// D1 (direct memory model, SHADGT_DIRECT=1): the GPU reads guest memory itself.
 ///
@@ -72,6 +73,21 @@ public:
     bool ForEachPart(VAddr address, u64 size,
                      const std::function<void(const Buffer&, u64, u64, u64)>& fn) const;
 
+    struct LeasedPart {
+        vk::Buffer buffer;
+        u64 view_offset, range_offset, size, view_size;
+        std::shared_ptr<void> lease;
+    };
+    // Complete coverage and alignment are checked before returning any parts. Each lease keeps
+    // the VkBuffer, VkDeviceMemory and alias alive even after the view is unmapped.
+    std::optional<std::vector<LeasedPart>> PlanLeasedParts(VAddr address, u64 size,
+                                                           u64 alignment, u64 size_alignment) const;
+    // Transfer stream leases only after its actual submission tick is known.
+    bool RetireLeasesAfterSplice(std::vector<std::shared_ptr<void>>& leases, u64 tick);
+    void HoldNativeReleases();
+    bool ReleaseHeldAfterSplice(u64 tick, bool stop_holding = false);
+    void ReleaseHeldAfterGpuIdle(); // caller has waited for all prior submissions
+
     // Optional copies: never wait for an importer. Validate the entire range
     // before acquiring the destination or recording any copy. Callbacks must
     // not reenter DirectMemory; views stay protected through all copies.
@@ -113,9 +129,12 @@ private:
         VkDeviceMemory memory;
         VkBuffer buffer;
         vk::DeviceAddress device_address;
+        std::shared_ptr<ImportedViewLease> lease;
         std::shared_ptr<Buffer> wrapper; // D6: owns `buffer`; bound as vertex/index buffer
     };
-    bool ImportView(VAddr address);
+    // PERF-GT7-022: at most two allocation-relative pieces per import,
+    // trimmed around already imported views; preserves non-overlap.
+    bool ImportView(VAddr address, VAddr want_end);
     void MapPages(VAddr begin, VAddr end, vk::DeviceAddress device_address);
     void UnmapPages(VAddr begin, VAddr end);
     u64* L2For(VAddr address, bool create);
@@ -126,6 +145,8 @@ private:
     mutable std::mutex mutex;
     ImportedPageCoverage<> imported_coverage;
     std::map<VAddr, View> views; // by begin
+    bool hold_native_releases{};
+    std::vector<std::shared_ptr<void>> held_native_releases;
     std::map<VAddr, VAddr> failed; // failed view base -> committed end; invalidated on unmap
     u64 failed_generation{};
     std::unique_ptr<Buffer> l1;

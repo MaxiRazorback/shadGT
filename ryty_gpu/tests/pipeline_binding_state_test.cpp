@@ -5,7 +5,7 @@
 #include <stdexcept>
 
 int main() {
-    using Cache = Vulkan::PipelineBindingState<unsigned long long>;
+    using Cache = Vulkan::PipelineBindingState<unsigned long long, true>;
     Cache alternating;
     unsigned binds = 0;
     for (unsigned i = 0; i < 1000; ++i) {

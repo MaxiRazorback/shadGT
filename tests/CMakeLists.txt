@@ -22,12 +22,98 @@ add_executable(shadps4_stencil_test test_stencil_reference.cpp)
 target_include_directories(shadps4_stencil_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(shadps4_stencil_test PRIVATE GTest::gtest_main fmt::fmt)
 include(GoogleTest)
+add_executable(shadps4_push_data_layout_test test_push_data_layout.cpp)
+target_include_directories(shadps4_push_data_layout_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_push_data_layout_test PRIVATE cxx_std_23)
+target_compile_definitions(shadps4_push_data_layout_test PRIVATE NOMINMAX)
+target_link_libraries(shadps4_push_data_layout_test PRIVATE GTest::gtest_main fmt::fmt Boost::headers Vulkan::Headers)
+gtest_discover_tests(shadps4_push_data_layout_test)
+
+add_executable(shadps4_linear_image_download_test test_linear_image_download.cpp)
+target_include_directories(shadps4_linear_image_download_test PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_features(shadps4_linear_image_download_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_linear_image_download_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_linear_image_download_test)
+add_executable(shadps4_high_cpu_writeback_test test_high_cpu_writeback.cpp)
+target_include_directories(shadps4_high_cpu_writeback_test PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_high_cpu_writeback_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_high_cpu_writeback_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_high_cpu_writeback_test)
+add_executable(shadps4_recent_fills_test test_recent_fills.cpp)
+target_include_directories(shadps4_recent_fills_test PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_features(shadps4_recent_fills_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_recent_fills_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_recent_fills_test)
+
+add_executable(shadps4_packed_float_test test_packed_float.cpp)
+target_include_directories(shadps4_packed_float_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_packed_float_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_packed_float_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_packed_float_test)
+add_executable(shadps4_readable_binding_test test_readable_binding.cpp)
+target_include_directories(shadps4_readable_binding_test PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_features(shadps4_readable_binding_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_readable_binding_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_readable_binding_test)
+add_executable(shadps4_cube_store_policy_test test_cube_store_policy.cpp)
+target_include_directories(shadps4_cube_store_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_cube_store_policy_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_cube_store_policy_test PRIVATE GTest::gtest_main fmt::fmt Boost::headers Vulkan::Headers xxHash::xxhash)
+gtest_discover_tests(shadps4_cube_store_policy_test)
+add_executable(shadps4_cube_view_policy_test test_cube_view_policy.cpp)
+target_include_directories(shadps4_cube_view_policy_test PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_features(shadps4_cube_view_policy_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_cube_view_policy_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_cube_view_policy_test)
+add_executable(shadps4_image_packed_layout_test test_image_packed_layout.cpp)
+target_include_directories(shadps4_image_packed_layout_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_image_packed_layout_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_image_packed_layout_test PRIVATE GTest::gtest_main fmt::fmt Boost::headers Vulkan::Headers)
+gtest_discover_tests(shadps4_image_packed_layout_test)
+add_executable(shadgt_upload_memory_recovery_test test_upload_memory_recovery.cpp)
+target_include_directories(shadgt_upload_memory_recovery_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadgt_upload_memory_recovery_test PRIVATE cxx_std_23)
+target_link_libraries(shadgt_upload_memory_recovery_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadgt_upload_memory_recovery_test)
+add_executable(shadps4_shared_build_map_test test_shared_build_map.cpp)
+target_include_directories(shadps4_shared_build_map_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_shared_build_map_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_shared_build_map_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_shared_build_map_test)
+
+add_executable(shadps4_shader_object_cache_test test_shader_object_cache.cpp)
+target_include_directories(shadps4_shader_object_cache_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_shader_object_cache_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_shader_object_cache_test PRIVATE GTest::gtest_main xxHash::xxhash)
+gtest_discover_tests(shadps4_shader_object_cache_test)
+add_executable(shadgt_unique_function_test test_unique_function.cpp)
+target_include_directories(shadgt_unique_function_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadgt_unique_function_test PRIVATE cxx_std_23)
+target_link_libraries(shadgt_unique_function_test PRIVATE GTest::gtest_main Threads::Threads)
+gtest_discover_tests(shadgt_unique_function_test)
+add_executable(shadgt_native_command_ring_test test_native_command_ring.cpp)
+target_include_directories(shadgt_native_command_ring_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadgt_native_command_ring_test PRIVATE cxx_std_23)
+target_link_libraries(shadgt_native_command_ring_test PRIVATE GTest::gtest_main fmt::fmt Boost::headers Vulkan::Headers)
+gtest_discover_tests(shadgt_native_command_ring_test)
+# PERF-GT7-057, FIX-GT7-080/081/087: probe-filter subresource proof.
+add_executable(shadps4_same_texel_test test_same_texel.cpp)
+target_include_directories(shadps4_same_texel_test PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+target_compile_features(shadps4_same_texel_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_same_texel_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_same_texel_test)
+
 gtest_discover_tests(shadps4_stencil_test)
 
-add_executable(shadps4_depth_attachment_test test_depth_attachment.cpp)
-target_include_directories(shadps4_depth_attachment_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_executable(shadps4_depth_attachment_test test_depth_attachment.cpp test_depth_feedback.cpp)
+target_include_directories(shadps4_depth_attachment_test PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(shadps4_depth_attachment_test PRIVATE GTest::gtest_main fmt::fmt Vulkan::Headers)
 gtest_discover_tests(shadps4_depth_attachment_test)
+
+add_executable(shadgt_upload_chunk_trim_test test_upload_chunk_trim.cpp)
+target_include_directories(shadgt_upload_chunk_trim_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadgt_upload_chunk_trim_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadgt_upload_chunk_trim_test)
 
 add_executable(shadps4_color_clear_test test_color_clear.cpp test_color_blend.cpp
     ${CMAKE_SOURCE_DIR}/src/video_core/renderer_vulkan/liverpool_to_vk.cpp
@@ -44,6 +130,24 @@ target_include_directories(shadps4_buffer_copy_test PRIVATE ${CMAKE_SOURCE_DIR}/
 target_link_libraries(shadps4_buffer_copy_test PRIVATE
     GTest::gtest_main fmt::fmt Boost::headers Vulkan::Headers)
 gtest_discover_tests(shadps4_buffer_copy_test)
+
+add_executable(shadps4_tess_lds_test test_tess_lds.cpp)
+target_include_directories(shadps4_tess_lds_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadps4_tess_lds_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_tess_lds_test)
+
+if (WIN32 AND CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_executable(shadgt_tess_lds_gpu tools/tess_lds_gpu.cpp)
+    target_compile_features(shadgt_tess_lds_gpu PRIVATE cxx_std_23)
+    target_link_libraries(shadgt_tess_lds_gpu PRIVATE Vulkan::Headers)
+    add_executable(shadgt_depth_snapshot_gpu tools/depth_snapshot_gpu.cpp)
+    target_compile_features(shadgt_depth_snapshot_gpu PRIVATE cxx_std_23)
+    target_include_directories(shadgt_depth_snapshot_gpu PRIVATE ${CMAKE_SOURCE_DIR})
+    target_link_libraries(shadgt_depth_snapshot_gpu PRIVATE Vulkan::Headers)
+    add_executable(shadgt_depth_feedback_gpu tools/depth_feedback_gpu.cpp)
+    target_compile_features(shadgt_depth_feedback_gpu PRIVATE cxx_std_23)
+    target_link_libraries(shadgt_depth_feedback_gpu PRIVATE Vulkan::Headers)
+endif()
 
 add_executable(shadps4_device_service_test test_device_service.cpp
     ${CMAKE_SOURCE_DIR}/src/core/libraries/device_service/device_service.cpp)
@@ -67,6 +171,16 @@ target_include_directories(shadps4_buffer_resource_test PRIVATE ${CMAKE_SOURCE_D
 target_link_libraries(shadps4_buffer_resource_test PRIVATE GTest::gtest_main fmt::fmt)
 gtest_discover_tests(shadps4_buffer_resource_test)
 
+add_executable(shadgt_imported_view_lease_test test_imported_view_lease.cpp)
+target_include_directories(shadgt_imported_view_lease_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(shadgt_imported_view_lease_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadgt_imported_view_lease_test)
+
+add_executable(shadgt_stable_region_bindings_test test_stable_region_bindings.cpp)
+target_include_directories(shadgt_stable_region_bindings_test PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+target_link_libraries(shadgt_stable_region_bindings_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadgt_stable_region_bindings_test)
+
 add_executable(shadps4_image_resource_test test_image_resource.cpp)
 target_include_directories(shadps4_image_resource_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(shadps4_image_resource_test PRIVATE GTest::gtest_main fmt::fmt Boost::headers)
@@ -78,6 +192,40 @@ target_link_libraries(shadps4_shader_program_test PRIVATE
     GTest::gtest_main fmt::fmt Boost::headers Vulkan::Headers tsl::robin_map xxHash::xxhash
     magic_enum::magic_enum)
 gtest_discover_tests(shadps4_shader_program_test)
+
+add_executable(shadps4_compute_warm_recipe_test test_compute_warm_recipe.cpp)
+target_include_directories(shadps4_compute_warm_recipe_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_compute_warm_recipe_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_compute_warm_recipe_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_compute_warm_recipe_test)
+
+add_executable(shadps4_shader_store_policy_test test_shader_store_policy.cpp)
+target_include_directories(shadps4_shader_store_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_shader_store_policy_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_shader_store_policy_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_shader_store_policy_test)
+
+add_executable(shadps4_shader_store_readers_test test_shader_store_readers.cpp)
+target_include_directories(shadps4_shader_store_readers_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_shader_store_readers_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_shader_store_readers_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_shader_store_readers_test)
+
+if(WIN32)
+    add_executable(shadps4_compile_thread_policy_test test_compile_thread_policy.cpp
+        test_compile_thread_stubs.cpp ${CMAKE_SOURCE_DIR}/src/common/thread.cpp)
+    target_include_directories(shadps4_compile_thread_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_features(shadps4_compile_thread_policy_test PRIVATE cxx_std_23)
+    target_link_libraries(shadps4_compile_thread_policy_test PRIVATE fmt::fmt)
+    add_test(NAME compile_thread_policy_existing COMMAND shadps4_compile_thread_policy_test)
+    add_test(NAME compile_thread_policy_late COMMAND ${CMAKE_COMMAND} -E env RYGT_POLICY_TEST_LATE=1
+        $<TARGET_FILE:shadps4_compile_thread_policy_test>)
+endif()
+add_executable(shadps4_exit_save_registry_test test_exit_save_registry.cpp)
+target_include_directories(shadps4_exit_save_registry_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_exit_save_registry_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_exit_save_registry_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_exit_save_registry_test)
 
 add_executable(shadps4_image_aliasing_test test_image_aliasing.cpp)
 target_include_directories(shadps4_image_aliasing_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -122,6 +270,12 @@ target_compile_features(shadps4_build_queue_test PRIVATE cxx_std_23)
 target_link_libraries(shadps4_build_queue_test PRIVATE GTest::gtest_main)
 gtest_discover_tests(shadps4_build_queue_test)
 
+add_executable(shadps4_spirv_check_test test_spirv_check.cpp)
+target_include_directories(shadps4_spirv_check_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_spirv_check_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_spirv_check_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_spirv_check_test)
+
 add_executable(shadps4_parallel_hasher_test test_parallel_hasher.cpp)
 target_include_directories(shadps4_parallel_hasher_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(shadps4_parallel_hasher_test PRIVATE cxx_std_23)
@@ -149,12 +303,112 @@ target_link_libraries(shadps4_read_capture_test PRIVATE GTest::gtest_main xxHash
 gtest_discover_tests(shadps4_read_capture_test)
 
 add_executable(shadps4_fps_lock_test test_fps_lock.cpp)
-target_include_directories(shadps4_fps_lock_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(shadps4_fps_lock_test PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
+target_compile_definitions(shadps4_fps_lock_test PRIVATE NOMINMAX)
 target_compile_features(shadps4_fps_lock_test PRIVATE cxx_std_23)
 target_link_libraries(shadps4_fps_lock_test PRIVATE GTest::gtest_main)
 gtest_discover_tests(shadps4_fps_lock_test)
 
+add_executable(shadps4_speculative_key_test test_speculative_key.cpp)
+target_include_directories(shadps4_speculative_key_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_speculative_key_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_speculative_key_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_speculative_key_test)
+
+add_executable(shadps4_read_ahead_budget_test test_read_ahead_budget.cpp)
+target_include_directories(shadps4_read_ahead_budget_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_read_ahead_budget_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_read_ahead_budget_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_read_ahead_budget_test)
+
+add_executable(shadps4_translation_age_test test_translation_age.cpp)
+target_include_directories(shadps4_translation_age_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_translation_age_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_translation_age_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_translation_age_test)
+
+add_executable(shadps4_stale_pipeline_builds_test test_stale_pipeline_builds.cpp)
+target_include_directories(shadps4_stale_pipeline_builds_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_stale_pipeline_builds_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_stale_pipeline_builds_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_stale_pipeline_builds_test)
+
+add_executable(shadps4_required_pipeline_wait_test required_pipeline_wait_test.cpp)
+target_include_directories(shadps4_required_pipeline_wait_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_required_pipeline_wait_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_required_pipeline_wait_test PRIVATE GTest::gtest)
+gtest_discover_tests(shadps4_required_pipeline_wait_test)
+
+add_executable(shadps4_pipeline_owner_test pipeline_owner_test.cpp)
+target_include_directories(shadps4_pipeline_owner_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_pipeline_owner_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_pipeline_owner_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_pipeline_owner_test)
+
+add_executable(shadps4_draw_selection_identity_test draw_selection_identity_test.cpp)
+target_include_directories(shadps4_draw_selection_identity_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_draw_selection_identity_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_draw_selection_identity_test PRIVATE GTest::gtest)
+gtest_discover_tests(shadps4_draw_selection_identity_test)
+
+add_executable(shadps4_native_cpu_chunk_policy_test native_cpu_chunk_policy_test.cpp)
+target_include_directories(shadps4_native_cpu_chunk_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_native_cpu_chunk_policy_test PRIVATE cxx_std_23)
+target_compile_definitions(shadps4_native_cpu_chunk_policy_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(shadps4_native_cpu_chunk_policy_test PRIVATE GTest::gtest)
+gtest_discover_tests(shadps4_native_cpu_chunk_policy_test)
+
+add_executable(shadps4_whole_layer_clear_test whole_layer_clear_test.cpp)
+target_include_directories(shadps4_whole_layer_clear_test PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_features(shadps4_whole_layer_clear_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_whole_layer_clear_test PRIVATE GTest::gtest)
+gtest_discover_tests(shadps4_whole_layer_clear_test)
+
+add_executable(shadps4_one_off_observer_test one_off_observer_test.cpp)
+target_include_directories(shadps4_one_off_observer_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_one_off_observer_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_one_off_observer_test PRIVATE GTest::gtest)
+gtest_discover_tests(shadps4_one_off_observer_test)
+
+if(WIN32)
+  add_executable(shadps4_geometry_trace_test geometry_trace_test.cpp)
+  target_include_directories(shadps4_geometry_trace_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_features(shadps4_geometry_trace_test PRIVATE cxx_std_23)
+  target_link_libraries(shadps4_geometry_trace_test PRIVATE GTest::gtest_main)
+  gtest_discover_tests(shadps4_geometry_trace_test)
+endif()
+
+add_executable(shadps4_menu_capture_compile_guard_test menu_capture_compile_guard_test.cpp)
+target_include_directories(shadps4_menu_capture_compile_guard_test PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_features(shadps4_menu_capture_compile_guard_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_menu_capture_compile_guard_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_menu_capture_compile_guard_test)
+
+add_executable(shadps4_guarded_shader_snapshot_test guarded_shader_snapshot_test.cpp)
+target_include_directories(shadps4_guarded_shader_snapshot_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_guarded_shader_snapshot_test PRIVATE cxx_std_23)
+target_compile_definitions(shadps4_guarded_shader_snapshot_test PRIVATE NOMINMAX)
+target_link_libraries(shadps4_guarded_shader_snapshot_test PRIVATE GTest::gtest fmt::fmt)
+gtest_discover_tests(shadps4_guarded_shader_snapshot_test)
+
+add_executable(shadps4_native_fence_batch_test test_native_fence_batch.cpp)
+target_include_directories(shadps4_native_fence_batch_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_native_fence_batch_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_native_fence_batch_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_native_fence_batch_test)
+
 add_executable(shadps4_recycling_pool_test test_recycling_pool.cpp)
+add_executable(shadps4_layer_hash_test test_layer_hash.cpp)
+target_include_directories(shadps4_layer_hash_test PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_features(shadps4_layer_hash_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_layer_hash_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_layer_hash_test)
+
+add_executable(shadps4_mapping_refresh_test test_mapping_refresh.cpp)
+target_include_directories(shadps4_mapping_refresh_test PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_mapping_refresh_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_mapping_refresh_test PRIVATE GTest::gtest_main Boost::headers)
+gtest_discover_tests(shadps4_mapping_refresh_test)
 target_include_directories(shadps4_recycling_pool_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(shadps4_recycling_pool_test PRIVATE cxx_std_23)
 target_link_libraries(shadps4_recycling_pool_test PRIVATE GTest::gtest_main)
@@ -340,6 +594,7 @@ set(GCN_TEST_SOURCES
     ${CMAKE_SOURCE_DIR}/src/video_core/amdgpu/resource.h
 
     # Minimal common support
+    ${CMAKE_SOURCE_DIR}/src/common/read_capture.cpp
     ${CMAKE_SOURCE_DIR}/src/common/path_util.cpp
     ${CMAKE_SOURCE_DIR}/src/common/assert.cpp
     ${CMAKE_SOURCE_DIR}/src/common/error.cpp
@@ -354,6 +609,7 @@ set(GCN_TEST_SOURCES
     # Stubs that replace dependencies
     stubs/common_stub.cpp
     stubs/resource_tracking_pass_stub.cpp
+    stubs/perf_monitor_stub.cpp
     stubs/scm_rev_stub.cpp
     stubs/sdl_stub.cpp
     stubs/core_stub.cpp
@@ -370,6 +626,7 @@ set(GCN_TEST_SOURCES
     test_dynamic_readconst.cpp
     test_resource_patching.cpp
     test_color_export.cpp
+    test_tess_lds_shader.cpp
     test_srt_walker_registry.cpp
     test_number_conversion.cpp
 )
@@ -405,6 +662,7 @@ target_link_libraries(shadps4_ngs2_test PRIVATE
 )
 target_link_libraries(shadps4_gcn_test PRIVATE
     GTest::gtest_main
+    xxHash::xxhash
     fmt::fmt
     tsl::robin_map
     nlohmann_json::nlohmann_json
@@ -542,12 +800,20 @@ gtest_discover_tests(shadps4_http_test
 # ===========================================================================
 file(GLOB_RECURSE WAVE64_INSPECT_RECOMPILER ${CMAKE_SOURCE_DIR}/src/shader_recompiler/*.cpp)
 set(WAVE64_INSPECT_SOURCES ${GCN_TEST_SOURCES})
-list(FILTER WAVE64_INSPECT_SOURCES EXCLUDE REGEX "/shader_recompiler/|gcn/|test_|resource_tracking_pass_stub")
+list(FILTER WAVE64_INSPECT_SOURCES EXCLUDE REGEX "/shader_recompiler/|gcn/|test_|resource_tracking_pass_stub|perf_monitor_stub")
 add_executable(shadgt_wave64_inspect tools/wave64_inspect.cpp ${WAVE64_INSPECT_RECOMPILER}
                ${WAVE64_INSPECT_SOURCES})
+# The guard regression builds hand-written IR. It needs the real lowering pass and
+# IR implementation, not the emulator's logger, guest runtime or translator startup.
+file(GLOB WAVE64_GUARD_IR ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/*.cpp)
+list(FILTER WAVE64_GUARD_IR EXCLUDE REGEX "/program\\.cpp$")
+add_executable(shadgt_wave64_guard_regression tools/wave64_guard_regression.cpp
+    tools/wave64_guard_stubs.cpp ${WAVE64_GUARD_IR}
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/lower_wave64_pass.cpp
+    ${CMAKE_SOURCE_DIR}/src/video_core/amdgpu/pixel_format.cpp)
 target_include_directories(shadgt_wave64_inspect PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR})
 target_compile_features(shadgt_wave64_inspect PRIVATE cxx_std_23)
-target_link_libraries(shadgt_wave64_inspect PRIVATE fmt::fmt nlohmann_json::nlohmann_json
+target_link_libraries(shadgt_wave64_inspect PRIVATE xxHash::xxhash fmt::fmt nlohmann_json::nlohmann_json
     magic_enum::magic_enum toml11::toml11 Boost::headers Vulkan::Headers sirit SDL3::SDL3
     tsl::robin_map
     spdlog::spdlog half::half xbyak::xbyak Zydis::Zydis)
@@ -556,6 +822,16 @@ if (WIN32)
     target_compile_definitions(shadgt_wave64_inspect PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN
         NTDDI_VERSION=0x0A000006 _WIN32_WINNT=0x0A00 WINVER=0x0A00 _CRT_SECURE_NO_WARNINGS)
 endif()
+
+foreach(property INCLUDE_DIRECTORIES COMPILE_FEATURES COMPILE_DEFINITIONS)
+    get_target_property(value shadgt_wave64_inspect ${property})
+    if(value)
+        set_property(TARGET shadgt_wave64_guard_regression PROPERTY ${property} "${value}")
+    endif()
+endforeach()
+target_link_libraries(shadgt_wave64_guard_regression PRIVATE fmt::fmt Boost::headers
+    Vulkan::Headers magic_enum::magic_enum half::half tsl::robin_map)
+add_test(NAME wave64_guard_regression COMMAND shadgt_wave64_guard_regression)
 
 # Standalone CPU checks for immutable Native descriptors and vertex-state reuse.
 foreach(kind grouping vertex_input prepared_keys)

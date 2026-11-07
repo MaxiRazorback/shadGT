@@ -27,6 +27,7 @@
 #include "ryty_gpu/ryty_diag.h"
 #include "video_core/renderdoc.h"
 
+#ifdef RYTY_DIAG
 namespace RyDiag {
 
 namespace {
@@ -1224,6 +1225,7 @@ void FrameShown() {
 }
 
 } // namespace RyDiag
+#endif // RYTY_DIAG
 
 // For Ryty's libraries (resolved with GetProcAddress on libSceVideoOut.prx).
 extern "C" __declspec(dllexport) int RyGtDiagEnabled() {

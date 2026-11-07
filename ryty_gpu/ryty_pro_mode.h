@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -24,19 +25,30 @@ constexpr ProMode ParseProMode(std::string_view value) {
     return ProMode::Base;
 }
 
-// Whether `key` is true in user\custom_configs\CUSA03220.json (the launcher's options).
-inline bool ConfigTrue(std::string_view key) {
+inline std::optional<bool> ParseConfigBool(std::string_view text, std::string_view key) {
+    const std::string quoted = "\"" + std::string{key} + "\"";
+    const size_t found = text.find(quoted);
+    if (found == std::string::npos) return std::nullopt;
+    const size_t value = text.find_first_not_of(" \t\r\n:", found + quoted.size());
+    if (value == std::string::npos) return std::nullopt;
+    if (text.substr(value, 4) == "true") return true;
+    if (text.substr(value, 5) == "false") return false;
+    return std::nullopt;
+}
+
+// The launcher's explicit boolean, if present.
+inline std::optional<bool> ConfigBool(std::string_view key) {
 #ifdef _WIN32
     char path[MAX_PATH];
     const DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
     if (length == 0 || length >= MAX_PATH) {
-        return false;
+        return std::nullopt;
     }
     std::string config{path, length};
     config = config.substr(0, config.find_last_of("\\/") + 1) + "user\\custom_configs\\CUSA03220.json";
     std::FILE* file = std::fopen(config.c_str(), "rb");
     if (!file) {
-        return false;
+        return std::nullopt;
     }
     std::string text;
     char chunk[4096];
@@ -44,17 +56,14 @@ inline bool ConfigTrue(std::string_view key) {
         text.append(chunk, n);
     }
     std::fclose(file);
-    const std::string quoted = "\"" + std::string{key} + "\"";
-    const size_t found = text.find(quoted);
-    if (found == std::string::npos) {
-        return false;
-    }
-    const size_t value = text.find_first_not_of(" \t\r\n:", found + quoted.size());
-    return value != std::string::npos && text.compare(value, 4, "true") == 0;
+    return ParseConfigBool(text, key);
 #else
-    return false;
+    return std::nullopt;
 #endif
 }
+
+// Whether `key` is true in user\custom_configs\CUSA03220.json (the launcher's options).
+inline bool ConfigTrue(std::string_view key) { return ConfigBool(key).value_or(false); }
 
 // The number after `key` in the config (the launcher's options), or `fallback`.
 inline double ConfigNumber(std::string_view key, double fallback) {

@@ -97,8 +97,9 @@ public:
     int ChangeBufferAttribute(VideoOutPort* port, s32 bufferIndex,
                               const BufferAttribute* attribute);
 
-    void AntiLagInput();
-    bool SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
+    u64 AntiLagInput();
+    bool SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false,
+                    u64 anti_lag_frame = 0);
 
 private:
     struct Request {
@@ -107,6 +108,7 @@ private:
         s64 flip_arg;
         s32 index;
         bool eop;
+        u64 anti_lag_frame{};
         Common::FrameQueueTrace::Ticket trace{};
 #ifndef NDEBUG
         std::chrono::steady_clock::time_point submitted{}; // PERF-DIAG-002
@@ -121,7 +123,7 @@ private:
     void DrawBlankFrame(); // Video port out not open
     bool DrawLastFrame();  // Used when there is no flip request
     void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
-                            Common::FrameQueueTrace::Ticket trace);
+                            Common::FrameQueueTrace::Ticket trace, u64 anti_lag_frame);
     void PresentThread(std::stop_token token);
 
     std::mutex mutex;

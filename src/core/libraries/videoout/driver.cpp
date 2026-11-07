@@ -23,6 +23,9 @@
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
+#ifdef RYTY_GPU
+namespace Vulkan { bool NativeModeRequested(); }
+#endif
 
 namespace Libraries::VideoOut {
 
@@ -307,7 +310,7 @@ void VideoOutDriver::Flip(const Request& req) {
 #endif
     {
         Common::Nvtx::Scope nvtx{"present"};
-        presenter->Present(req.frame);
+        presenter->Present(req.frame, false, true, req.anti_lag_frame);
     }
     #ifndef NDEBUG
     {
@@ -389,17 +392,14 @@ bool VideoOutDriver::DrawLastFrame() {
     return false;
 }
 
-void VideoOutDriver::AntiLagInput() {
-    presenter->AntiLagInput(); // PERF-210
+u64 VideoOutDriver::AntiLagInput() {
+    return presenter->AntiLagInput();
 }
 
 bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
-                                bool is_eop /*= false*/) {
+                                bool is_eop, u64 anti_lag_frame) {
     auto trace = Common::FrameQueueTrace::Start();
     RyDiag::Mark(RyDiag::Zone::GameFlip, u64(index));
-    if (!is_eop) {
-        presenter->AntiLagInput(); // PERF-210: on the game's thread, never the command thread
-    }
     {
         std::unique_lock lock{port->port_mutex};
         if (index != -1 && port->flip_status.flip_pending_num > 16) {
@@ -413,20 +413,21 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
         ++port->flip_status.flip_pending_num; // integral GPU and CPU pending flips counter
         port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
     }
+    if (!is_eop) anti_lag_frame = presenter->AntiLagInput();
 
     if (!is_eop) {
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
         liverpool->SendCommand(
-            [=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop, trace); });
+            [=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop, trace, anti_lag_frame); });
     } else {
-        SubmitFlipInternal(port, index, flip_arg, is_eop, trace);
+        SubmitFlipInternal(port, index, flip_arg, is_eop, trace, anti_lag_frame);
     }
 
     return true;
 }
 
 void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop,
-                                        Common::FrameQueueTrace::Ticket trace) {
+                                        Common::FrameQueueTrace::Ticket trace, u64 anti_lag_frame) {
 #ifndef NDEBUG
     if (trace.generation)
         Common::FrameQueueTrace::Prepare(trace);
@@ -453,6 +454,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
             .flip_arg = flip_arg,
             .index = index,
             .eop = is_eop,
+            .anti_lag_frame = anti_lag_frame,
             .trace = trace,
 #ifndef NDEBUG
             .submitted = std::chrono::steady_clock::now(),
@@ -469,17 +471,19 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     // the next vblank, so a 25 ms frame shows after 25 ms rather than 33 ms (GT Sport's races
     // otherwise snap to 30 fps). Enqueue wakes the thread between four scheduled ticks per
     // vblank; the game's vblank events and status still come once per vblank.
-    // GPU.fast_flips in the game's config (the
-    // launcher's option) or RYGT_FAST_FLIPS=1.
+    // The native renderer defaults to this path without frame generation; an explicit
+    // GPU.fast_flips setting or RYGT_FAST_FLIPS overrides that default. The elapsed-time
+    // limit still honors the guest flip rate and the configured FPS lock.
     static const u32 ticks_per_vblank = [] {
-        bool fast = false;
-        if (const char* env = std::getenv("RYGT_FAST_FLIPS")) {
-            fast = env[0] == '1';
-        } else {
+        std::optional<bool> configured;
+        bool native = false;
 #ifdef RYTY_GPU
-            fast = Ryty::ConfigTrue("fast_flips");
+        configured = Ryty::ConfigBool("fast_flips");
+        native = Vulkan::NativeModeRequested();
 #endif
-        }
+        const bool fast = FastFlipsEnabled(std::getenv("RYGT_FAST_FLIPS"), configured, native,
+                                           EmulatorSettings.IsFrameGenEnabled() ||
+                                               EmulatorSettings.IsDlssgEnabled());
         if (fast) {
             LOG_INFO(Lib_VideoOut, "FAST-FLIP: frames flip when ready, between vblanks");
         }
@@ -493,6 +497,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
     using Clock = std::chrono::steady_clock;
     auto next_tick = Clock::now();
+    auto last_flip_time = Clock::time_point{};
     const auto current_flip_rate = [&] {
         static const u32 fps_lock = [] {
             const char* env = std::getenv("SHADGT_FPS_LOCK");
@@ -507,7 +512,10 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     };
     const auto early_allowed = [&] {
         return ticks_per_vblank > 1 && !DebugState.IsGuestThreadsPaused() &&
-               !Common::GuestClock::IsPaused() && current_flip_rate() == 0;
+               !Common::GuestClock::IsPaused();
+    };
+    const auto flip_allowed_at = [&] {
+        return last_flip_time + FastFlipInterval(vblank_period, current_flip_rate());
     };
 
     const auto receive_request = [this] -> Request {
@@ -529,23 +537,30 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         if (now < next_tick) {
             if (early_allowed()) {
                 std::unique_lock lock{mutex};
-                request_cv.wait_until(lock, next_tick,
-                                      [&] { return token.stop_requested() || !requests.empty(); });
+                if (requests.empty()) {
+                    request_cv.wait_until(lock, next_tick,
+                                          [&] { return token.stop_requested() || !requests.empty(); });
+                } else if (const auto allowed = flip_allowed_at(); Clock::now() < allowed) {
+                    request_cv.wait_until(lock, std::min(next_tick, allowed));
+                }
                 lock.unlock();
                 if (token.stop_requested()) {
                     break;
                 }
                 now = Clock::now();
                 if (now < next_tick && early_allowed()) {
-                    if (const auto request = receive_request()) {
+                    if (now >= flip_allowed_at()) {
+                        if (const auto request = receive_request()) {
 #ifndef NDEBUG
-                        {
-                            std::scoped_lock stats_lock{g_flip_stats.mutex};
-                            ++g_flip_stats.early_flips;
-                        }
+                            {
+                                std::scoped_lock stats_lock{g_flip_stats.mutex};
+                                ++g_flip_stats.early_flips;
+                            }
 #endif
-                        Flip(request);
-                        FRAME_END;
+                            Flip(request);
+                            last_flip_time = Clock::now();
+                            FRAME_END;
+                        }
                     }
                     continue; // early wakes do not advance the vblank deadline
                 }
@@ -598,7 +613,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         const bool vblank_tick = tick++ % ticks_per_vblank == 0;
         if (!vblank_tick) {
             // FAST-FLIP: between vblanks, only a ready frame is flipped.
-            if (flip_rate == 0) {
+            if (Clock::now() >= flip_allowed_at()) {
                 if (const auto request = receive_request()) {
 #ifndef NDEBUG
                     {
@@ -607,6 +622,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                     }
 #endif
                     Flip(request);
+                    last_flip_time = Clock::now();
                     FRAME_END;
                 }
             }
@@ -625,7 +641,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 ReportFlipStats();
             }
 #endif
-            const auto request = receive_request();
+            const auto request = ticks_per_vblank == 1 || Clock::now() >= flip_allowed_at()
+                                     ? receive_request() : Request{};
             if (!request) {
                 if (overdue) { // Dont draw too fast
                     if (!main_port.is_open) {
@@ -636,6 +653,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 }
             } else {
                 Flip(request);
+                last_flip_time = Clock::now();
                 FRAME_END;
             }
         }

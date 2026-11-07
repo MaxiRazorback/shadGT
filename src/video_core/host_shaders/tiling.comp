@@ -13,6 +13,10 @@ layout(constant_id = 0) const uint NUM_SAMPLES = 1;
 layout(constant_id = 1) const uint MICRO_TILE_MODE = 1;
 layout(constant_id = 2) const uint MICRO_TILE_THICKNESS = 1;
 layout(constant_id = 3) const uint IS_TILER = 0;
+layout(constant_id = 12) const uint IS_BGR_PACKED_FLOAT = 0;
+layout(constant_id = 13) const uint IS_LINEAR = 0;
+// Native packed downloads must leave row and image padding as guest memory held it.
+layout(constant_id = 14) const uint PRESERVE_PACKED_PADDING = 0;
 #if IS_MACRO_TILED
 layout(constant_id = 4) const uint ARRAY_MODE = 0;
 layout(constant_id = 5) const uint PIPE_CONFIG = 0;
@@ -106,6 +110,8 @@ layout (set = 0, binding = 2, scalar) uniform TilingInfo {
     uint micro_tiled_mips;
     uint num_mips;
     MipInfo mips[16];
+    uint valid_width[16];
+    uint valid_height[16];
 } info;
 
 uint32_t ComputePixelIndexWithinMicroTile(uint32_t x, uint32_t y, uint32_t z, uint32_t thickness) {
@@ -430,38 +436,65 @@ uint32_t ComputeSurfaceAddrFromCoordMacroTiled(uint32_t x, uint32_t y, uint32_t 
 
 uint GetMipLevel(inout uint texel) {
     uint mip = 0;
-    uint mip_size = info.mips[mip].size / BYTES_PER_PIXEL;
-    while (texel >= mip_size && mip < info.num_mips) {
+    while (mip < info.num_mips) {
+        uint mip_size = info.mips[mip].size / BYTES_PER_PIXEL;
+        if (texel < mip_size) return mip;
         texel -= mip_size;
         ++mip;
-        mip_size = info.mips[mip].size / BYTES_PER_PIXEL;
     }
     return mip;
 }
 
 void main() {
     uint texel = gl_GlobalInvocationID.x;
+    if (texel >= linear_data.length()) return;
     uint mip = GetMipLevel(texel);
+    if (mip >= info.num_mips) return;
+    uint linear_index = PRESERVE_PACKED_PADDING != 0
+        ? info.mips[mip].offset / BYTES_PER_PIXEL + texel : gl_GlobalInvocationID.x;
+    if (linear_index >= linear_data.length()) return;
     uint pitch = info.mips[mip].pitch;
     uint height = info.mips[mip].height;
+    if (pitch == 0 || height == 0) return;
     uint tiled_offset = info.mips[mip].offset;
     uint x = texel % pitch;
     uint y = (texel / pitch) % height;
     uint slice = texel / (pitch * height);
+    if (PRESERVE_PACKED_PADDING != 0 &&
+        (x >= info.valid_width[mip] || y >= info.valid_height[mip])) return;
 
-#if IS_MACRO_TILED
-    if ((info.micro_tiled_mips & (1u << mip)) != 0) {
-        tiled_offset += ComputeSurfaceAddrFromCoordMicroTiled(x, y, slice, pitch, height, min(MICRO_TILE_THICKNESS, 4u), 0);
+    if (IS_LINEAR != 0) {
+        tiled_offset += texel * BYTES_PER_PIXEL;
     } else {
-        tiled_offset += ComputeSurfaceAddrFromCoordMacroTiled(x, y, slice, pitch, height, 0);
-    }
+#if IS_MACRO_TILED
+        if ((info.micro_tiled_mips & (1u << mip)) != 0) {
+            tiled_offset += ComputeSurfaceAddrFromCoordMicroTiled(x, y, slice, pitch, height, min(MICRO_TILE_THICKNESS, 4u), 0);
+        } else {
+            tiled_offset += ComputeSurfaceAddrFromCoordMacroTiled(x, y, slice, pitch, height, 0);
+        }
 #else
-    tiled_offset += ComputeSurfaceAddrFromCoordMicroTiled(x, y, slice, pitch, height, MICRO_TILE_THICKNESS, 0);
+        tiled_offset += ComputeSurfaceAddrFromCoordMicroTiled(x, y, slice, pitch, height, MICRO_TILE_THICKNESS, 0);
 #endif
+    }
+    if (tiled_offset / BYTES_PER_PIXEL >= tiled_data.length()) return;
 
     if (IS_TILER != 0) {
-        tiled_data[tiled_offset / BYTES_PER_PIXEL] = linear_data[gl_GlobalInvocationID.x];
+        BLOCK_TYPE value = linear_data[linear_index];
+#if BITS_PER_PIXEL == 32
+        if (IS_BGR_PACKED_FLOAT != 0) {
+            value = (value >> 22) | (((value >> 11) & 0x7ffu) << 10) |
+                    ((value & 0x7ffu) << 21);
+        }
+#endif
+        tiled_data[tiled_offset / BYTES_PER_PIXEL] = value;
     } else {
-        linear_data[gl_GlobalInvocationID.x] = tiled_data[tiled_offset / BYTES_PER_PIXEL];
+        BLOCK_TYPE value = tiled_data[tiled_offset / BYTES_PER_PIXEL];
+#if BITS_PER_PIXEL == 32
+        if (IS_BGR_PACKED_FLOAT != 0) {
+            value = (value >> 21) | (((value >> 10) & 0x7ffu) << 11) |
+                    ((value & 0x3ffu) << 22);
+        }
+#endif
+        linear_data[linear_index] = value;
     }
 }

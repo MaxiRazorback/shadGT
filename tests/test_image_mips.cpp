@@ -10,6 +10,8 @@
 #include <gtest/gtest.h>
 #include "core/libraries/kernel/process.h"
 #include "video_core/amdgpu/tiling.h"
+#include "video_core/amdgpu/regs_color.h"
+#include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/texture_cache/image_info.h"
 
@@ -23,7 +25,12 @@ namespace Common::Log {
 void VLog(Class, Level, const char*, int, const char*, fmt::string_view, fmt::format_args) {}
 } // namespace Common::Log
 namespace Vulkan::LiverpoolToVK {
-const std::array<vk::Format, surface_format_table_size> surface_format_table{};
+const std::array<vk::Format, surface_format_table_size> surface_format_table = [] {
+    std::array<vk::Format, surface_format_table_size> table{};
+    table[GetSurfaceFormatTableIndex(AmdGpu::DataFormat::Format10_11_11,
+                                     AmdGpu::NumberFormat::Float)] = vk::Format::eB10G11R11UfloatPack32;
+    return table;
+}();
 vk::Format DepthFormat(AmdGpu::DepthBuffer::ZFormat, AmdGpu::DepthBuffer::StencilFormat) {
     return vk::Format::eUndefined;
 }
@@ -78,6 +85,47 @@ constexpr MipTarget Targets[] = {
     {0x100a66ad00, 1, 1, Micro},
 };
 } // namespace
+
+TEST(ImageMips, TinyMacroTilesUseModeZero) {
+    for (u32 bits : {1u, 2u, 4u, 8u}) {
+        EXPECT_EQ(AmdGpu::CalculateMacrotileMode(Macro, bits, 1),
+                  AmdGpu::MacroTileMode::Mode_1x4_16);
+    }
+    EXPECT_EQ(AmdGpu::CalculateMacrotileMode(Macro, 16, 1),
+              AmdGpu::MacroTileMode::Mode_1x2_16);
+}
+
+TEST(ImageMips, GuestDescriptorsRetainPackedFloatChannelOrderBeforeRemapping) {
+    AmdGpu::ColorBuffer color{};
+    color.attrib.tile_mode_index = AmdGpu::TileMode::Thin1DThin;
+    color.info.number_type = u32(AmdGpu::NumberFormat::Float);
+    color.info.format = u32(AmdGpu::DataFormat::Format11_11_10);
+    const ImageInfo color_bgr{color, {}};
+    color.info.format = u32(AmdGpu::DataFormat::Format10_11_11);
+    const ImageInfo color_rgb{color, {}};
+    EXPECT_TRUE(color_bgr.props.is_bgr_packed_float);
+    EXPECT_FALSE(color_rgb.props.is_bgr_packed_float);
+
+    auto image = AmdGpu::Image::Null(false);
+    image.width = 7; image.height = 7; image.pitch = 7;
+    image.num_format = u64(AmdGpu::NumberFormat::Float);
+    image.data_format = u64(AmdGpu::DataFormat::Format11_11_10);
+    Shader::ImageResource resource{};
+    const ImageInfo sampled_bgr{image, resource};
+    image.data_format = u64(AmdGpu::DataFormat::Format10_11_11);
+    const ImageInfo sampled_rgb{image, resource};
+    EXPECT_TRUE(sampled_bgr.props.is_bgr_packed_float);
+    EXPECT_FALSE(sampled_rgb.props.is_bgr_packed_float);
+}
+
+TEST(ImageMips, CrossFormatThumbnailExpansionRemainsCompatible) {
+    auto rgba = Color2D(EnvMap, 128, 128, 1, Micro, vk::Format::eR8G8B8A8Unorm);
+    auto packed = Color2D(EnvMap, 128, 128, 4, Micro, vk::Format::eB10G11R11UfloatPack32);
+    packed.props.is_bgr_packed_float = true;
+    EXPECT_TRUE(packed.PackedOrdersCompatible(rgba));
+    EXPECT_TRUE(packed.IsCompatible(rgba));
+    EXPECT_TRUE(packed.ExtendsAcrossFormat(rgba));
+}
 
 TEST(ImageMips, LayoutMatchesTheGameMipAddresses) {
     const auto texture = Color2D(EnvMap, 2048, 1024, 12, Macro);

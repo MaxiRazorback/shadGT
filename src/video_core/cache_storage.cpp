@@ -9,9 +9,11 @@
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
+#include "shader_recompiler/lane_read_policy.h"
 
 #include "video_core/buffer_cache/direct_memory.h"
 #include "video_core/cache_storage.h"
+#include "video_core/shader_store_policy.h"
 #include "video_core/deferred_task_queue.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -66,11 +68,13 @@ void DataBase::Open() {
     if (opened) {
         return;
     }
+    compatible_sibling = false;
 
     const auto& game_info = Common::ElfInfo::Instance();
 
     using namespace Common::FS;
-    if (EmulatorSettings.IsPipelineCacheArchived()) {
+    archived = EmulatorSettings.IsPipelineCacheArchived();
+    if (archived) {
         mz_zip_zero_struct(&zip_ar);
 
         cache_path = GetUserPath(PathType::CacheDir) /
@@ -82,22 +86,22 @@ void DataBase::Open() {
             LOG_INFO(Render, "Cache archive {} is not found or archive is corrupted",
                      cache_path.string().c_str());
             mz_zip_reader_end(&zip_ar);
-            mz_zip_writer_init_file(&zip_ar, cache_path.string().c_str(), 0);
+            // Never let a writer truncate the old archive. Use a directory store.
+            LOG_WARNING(Render, "Preserving unreadable or missing cache archive {}; using a directory store",
+                        cache_path.string());
+            archived = false;
         }
-    } else {
+    }
+    if (!archived) {
         cache_path = GetUserPath(PathType::CacheDir) / game_info.GameSerial();
         // D2: direct-memory shaders differ from the stored ones, which load unchecked.
         if (VideoCore::DirectMemory::Enabled()) {
             // SHD-002: stage descriptor sets: translations of their own.
             cache_path += "-direct-sets";
         }
-        // FIX-213: stored translations load unchecked, so after an update that changes how
-        // shaders are translated, the store kept the old translations and drew with them (a
-        // magenta car and red scenery on an RX 7600 after updating to PR #88, until the folder
-        // was deleted by hand). The store now carries a version: a store without this one is
-        // deleted and starts again, along with any previous <store>.outdated backup. The
-        // launcher's shader pack stamp is removed, so the next Play prepares the new store. Raise the
-        // version whenever a change makes stored translations wrong.
+        // FIX-213: translations from incompatible shader policies must not be reused.
+        // FIX-271 preserves existing stores and opens a compatible sibling instead.
+        // Raise the version whenever a change makes stored translations wrong.
         // AMD-311: each vertex order of AMD's per-vertex reads has a store of its own version.
         // AMD-312: Radeon RX 9000 cards (RDNA4) use store 4: an RX 9060 XT drew the road at
         // Brands Hatch as streaks with a store made earlier and right once it was translated
@@ -128,38 +132,18 @@ void DataBase::Open() {
                     }
                 }
                 return parts;
-            }();
-        const auto version_path = cache_path / "store-version.txt";
-        std::error_code ec;
-        if (std::filesystem::exists(cache_path, ec)) {
-            std::string version;
-            if (std::ifstream file{version_path}; file) {
-                std::getline(file, version);
-            }
-            if (version != StoreVersion) {
-                auto outdated = cache_path;
-                outdated += ".outdated";
-                std::filesystem::remove_all(outdated, ec);
-                if (ec) {
-                    throw std::runtime_error("Could not remove obsolete shader cache: " + ec.message());
-                }
-                std::filesystem::remove_all(cache_path, ec);
-                if (ec) {
-                    throw std::runtime_error("Could not remove incompatible shader cache: " + ec.message());
-                } else {
-                    std::filesystem::remove(GetUserPath(PathType::CacheDir) / "shaders-pack.txt",
-                                            ec);
-                    LOG_WARNING(Render, "FIX-213: shader store of another version ('{}') removed; "
-                                "shaders are translated again", version);
-                }
-            }
+            }() + std::string{Shader::LaneReadStoreSuffix(Shader::LaneReadUnbranchEnabled())};
+        const auto original = cache_path;
+        const auto selected = VideoCore::OpenCompatibleShaderStore(original, StoreVersion);
+        if (!selected) {
+            LOG_WARNING(Render, "No compatible shader-store directory available; preserving existing stores");
+            return;
         }
-        if (!std::filesystem::exists(cache_path)) {
-            std::filesystem::create_directories(cache_path);
-        }
-        if (!std::filesystem::exists(version_path, ec)) {
-            std::ofstream{version_path} << StoreVersion << '\n';
-        }
+        cache_path = *selected;
+        compatible_sibling = cache_path != original;
+        if (cache_path != original)
+            LOG_INFO(Render, "Preserved incompatible shader store {}; using compatible sibling {}",
+                     original.string(), cache_path.string());
     }
 
     io_worker = std::jthread{ProcessIO};
@@ -186,7 +170,7 @@ void DataBase::Close() {
     io_worker.request_stop();
     io_worker.join();
 
-    if (EmulatorSettings.IsPipelineCacheArchived()) {
+    if (archived) {
         mz_zip_writer_finalize_archive(&zip_ar);
         mz_zip_writer_end(&zip_ar);
     }
@@ -196,11 +180,11 @@ void DataBase::Close() {
 }
 
 template <typename T>
-bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector<T>&& v) {
+bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector<T>&& v, bool archived) {
     {
-        auto request = std::packaged_task<void()>{[type, path=std::move(path_), data=std::move(v)]() mutable {
+        auto request = std::packaged_task<void()>{[type, path=std::move(path_), data=std::move(v), archived]() mutable {
             path.replace_extension(GetBlobFileExtension(type));
-            if (EmulatorSettings.IsPipelineCacheArchived()) {
+            if (archived) {
                 ASSERT_MSG(!ar_is_read_only,
                            "The archive is read-only. Did you forget to call `FinishPreload`?");
                 if (!mz_zip_writer_add_mem(&zip_ar, path.string().c_str(), data.data(),
@@ -220,10 +204,10 @@ bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector
 }
 
 template <typename T>
-void LoadVector(BlobType type, std::filesystem::path& path, std::vector<T>& v) {
+void LoadVector(BlobType type, std::filesystem::path& path, std::vector<T>& v, bool archived) {
     using namespace Common::FS;
     path.replace_extension(GetBlobFileExtension(type));
-    if (EmulatorSettings.IsPipelineCacheArchived()) {
+    if (archived) {
         int index{-1};
         index = mz_zip_reader_locate_file(&zip_ar, path.string().c_str(), nullptr, 0);
         if (index < 0) {
@@ -246,9 +230,9 @@ bool DataBase::Save(BlobType type, const std::string& name, std::vector<u8>&& da
         return false;
     }
 
-    auto path = EmulatorSettings.IsPipelineCacheArchived() ? std::filesystem::path{name}
+    auto path = archived ? std::filesystem::path{name}
                                                            : cache_path / name;
-    return WriteVector(type, std::move(path), std::move(data));
+    return WriteVector(type, std::move(path), std::move(data), archived);
 }
 
 bool DataBase::Save(BlobType type, const std::string& name, std::vector<u32>&& data) {
@@ -256,9 +240,9 @@ bool DataBase::Save(BlobType type, const std::string& name, std::vector<u32>&& d
         return false;
     }
 
-    auto path = EmulatorSettings.IsPipelineCacheArchived() ? std::filesystem::path{name}
+    auto path = archived ? std::filesystem::path{name}
                                                            : cache_path / name;
-    return WriteVector(type, std::move(path), std::move(data));
+    return WriteVector(type, std::move(path), std::move(data), archived);
 }
 
 void DataBase::Load(BlobType type, const std::string& name, std::vector<u8>& data) {
@@ -266,9 +250,9 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u8>& dat
         return;
     }
 
-    auto path = EmulatorSettings.IsPipelineCacheArchived() ? std::filesystem::path{name}
+    auto path = archived ? std::filesystem::path{name}
                                                            : cache_path / name;
-    return LoadVector(type, path, data);
+    return LoadVector(type, path, data, archived);
 }
 
 void DataBase::Load(BlobType type, const std::string& name, std::vector<u32>& data) {
@@ -276,16 +260,16 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u32>& da
         return;
     }
 
-    auto path = EmulatorSettings.IsPipelineCacheArchived() ? std::filesystem::path{name}
+    auto path = archived ? std::filesystem::path{name}
                                                            : cache_path / name;
-    return LoadVector(type, path, data);
+    return LoadVector(type, path, data, archived);
 }
 
 bool DataBase::Exists(BlobType type, const std::string& name) const {
     if (!opened) {
         return false;
     }
-    if (EmulatorSettings.IsPipelineCacheArchived()) {
+    if (archived) {
         std::filesystem::path path{name};
         path.replace_extension(GetBlobFileExtension(type));
         return mz_zip_reader_locate_file(&zip_ar, path.string().c_str(), nullptr, 0) >= 0;
@@ -298,7 +282,7 @@ bool DataBase::Exists(BlobType type, const std::string& name) const {
 
 void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u8>&& data)>& func) {
     const auto& ext = GetBlobFileExtension(type);
-    if (EmulatorSettings.IsPipelineCacheArchived()) {
+    if (archived) {
         const auto num_files = mz_zip_reader_get_num_files(&zip_ar);
         for (int index = 0; index < num_files; ++index) {
             std::array<char, MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE> file_name{};
@@ -330,7 +314,7 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
 std::vector<std::pair<std::string, std::filesystem::file_time_type>> DataBase::ListBlobs(
     BlobType type) const {
     std::vector<std::pair<std::string, std::filesystem::file_time_type>> blobs;
-    if (!opened || EmulatorSettings.IsPipelineCacheArchived()) {
+    if (!opened || archived) {
         return blobs;
     }
     const auto ext = "." + GetBlobFileExtension(type);
@@ -348,7 +332,7 @@ std::vector<std::pair<std::string, std::filesystem::file_time_type>> DataBase::L
 }
 
 void DataBase::FinishPreload() {
-    if (EmulatorSettings.IsPipelineCacheArchived()) {
+    if (archived) {
         mz_zip_writer_init_from_reader(&zip_ar, cache_path.string().c_str());
         ar_is_read_only = false;
     }

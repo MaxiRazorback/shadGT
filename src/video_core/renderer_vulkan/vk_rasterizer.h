@@ -87,6 +87,9 @@ public:
         /// PERF-068: a quad list's pipeline when the recorder tessellates its quads (the
         /// triangle one is `pipeline`); the recorder decides which it draws with.
         bool is_quad_list{};
+        bool indirect{};
+        u16 vertex_sgpr_offset{};
+        u32 instance_sgpr_offset{};
         const GraphicsPipeline* quad_tess_pipeline{};
         std::array<SelectedStage, Shader::MaxStageTypes> quad_tess_stages{};
     };
@@ -95,7 +98,7 @@ public:
     bool SelectsPipelinesAhead() const;
     /// PERF-047: on the command thread, for a direct draw it is decoding. Nothing for draws the
     /// recorder filters out or whose pipeline depends on the recorder's state (quad lists).
-    std::optional<SelectedPipeline> SelectPipelineAhead();
+    std::optional<SelectedPipeline> SelectPipelineAhead(const DrawIndirectParams* indirect = nullptr);
     /// PERF-055: the same for a direct dispatch it is decoding (-DisablePerf 66: none).
     std::optional<SelectedPipeline> SelectComputePipelineAhead();
     /// NAT-030: on a game job thread whose registers Liverpool::SetThreadDrawState installed,
@@ -518,7 +521,8 @@ private:
     /// The pipeline of a graphics draw: the one selected ahead when it still fits the memory the
     /// recorder sees, else looked up here. With PERF-047 the draw's infos are the copies.
     const GraphicsPipeline* AcquireGraphicsPipeline(const DrawIndirectParams& params,
-                                                    bool selected_allowed);
+                                                    bool selected_allowed,
+                                                    std::shared_ptr<const void>* owner = nullptr);
     /// Points the pipeline's stages at copies holding the given user data; with `validate`,
     /// false if a stage's flattened user data now differs from what selection used.
     /// PERF-065: the selection's flattened user data is moved into the stage (swapped).
@@ -615,6 +619,7 @@ private:
     std::atomic<u32> deferred_fences{};
     std::atomic<u64> background_readbacks{}; // FIX-070
     std::atomic<s64> last_readback_fence_ns{}; // PERF-063
+    std::atomic<s64> last_native_fence_submit_ns{}; // per renderer, never shared across devices
     /// PERF-014b: deferred fences that will also bring GPU data back to guest memory.
     std::atomic<u32> readback_fences{};
     u32 draws_since_submit{};

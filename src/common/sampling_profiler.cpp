@@ -3,6 +3,7 @@
 
 #include <cstdlib>
 
+#include "common/diagnostics.h"
 #include "common/sampling_profiler.h"
 
 #ifdef _WIN32
@@ -49,7 +50,7 @@ std::string DescribeAddress(u64 address) {
 #ifndef NDEBUG
 bool Enabled() {
     static const bool enabled = [] {
-        const char* env = std::getenv("SHADGT_PROFILE");
+        const char* env = Common::DiagEnv("SHADGT_PROFILE");
         return env && (env[0] == '1' || env[0] == '2');
     }();
     return enabled;
@@ -277,7 +278,7 @@ void RegisterCurrentThread(const char* name) {
 void RegisterGuestThread(const char* name, const void* stack_low, const void* stack_high) {
     // Game threads only with SHADGT_PROFILE=2: sampling them costs time.
     static const bool guests = [] {
-        const char* env = std::getenv("SHADGT_PROFILE");
+        const char* env = Common::DiagEnv("SHADGT_PROFILE");
         return env && env[0] == '2';
     }();
     if (Enabled() && guests) {

@@ -11,6 +11,7 @@
 // NAT-100: native mode (RYGT_NATIVE=1, ryGT builds); see vk_rasterizer_native.cpp.
 
 #pragma once
+#include "video_core/renderer_vulkan/pipeline_owner.h"
 
 #include <array>
 #include <atomic>
@@ -31,6 +32,13 @@
 #include <boost/container/static_vector.hpp>
 
 #include "common/types.h"
+#include "video_core/renderer_vulkan/binding_command_memo.h"
+#include "video_core/amdgpu/regs_depth.h"
+#include "video_core/amdgpu/regs_color.h"
+#include "video_core/amdgpu/cb_db_extent.h"
+#include "ryty_gpu/native/same_texel.h"
+#include "ryty_gpu/native/retired_snapshot_pool.h"
+#include "ryty_gpu/native/writeback_plan.h"
 #include "video_core/renderer_vulkan/pipeline_binding_state.h"
 #include "video_core/renderer_vulkan/descriptor_set_memo.h"
 #include "shader_recompiler/backend/bindings.h"
@@ -42,6 +50,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
+#include "video_core/renderer_vulkan/vk_graphics_pipeline.h" // SO-010
 
 namespace AmdGpu {
 union Regs;
@@ -59,6 +68,7 @@ class DirectMemory;
 namespace Native {
 class ImageEntry;
 class ImageRegistry;
+struct RememberedFillReceipt;
 struct MadeImage;
 namespace Rhi {
 class Buffer;
@@ -66,10 +76,13 @@ class Image;
 class CommandList;
 class Device;
 class Fence;
+class Pipeline;
+class PipelineLayout;
 } // namespace Rhi
 } // namespace Native
 
 namespace Vulkan {
+class OneOffObserver;
 
 template <class Buffer> class AsyncMirrorBuffer;
 
@@ -89,6 +102,9 @@ public:
     NativeRenderer(const NativeRenderer&) = delete;
     NativeRenderer& operator=(const NativeRenderer&) = delete;
 
+    // PERF-GT7-008: prepare a direct list when the serialized recorder goes idle.
+    void BeginAhead();
+
     void Draw(bool is_indexed, u32 index_offset);
     void DispatchDirect();
     void DispatchIndirect(VAddr address, u32 offset, u32 size);
@@ -99,6 +115,8 @@ public:
     bool InlineWrite(VAddr address, std::span<const u8> data);
     /// Guest memory is unmapped: textures over it are uploaded again when next used.
     void OnUnmap(VAddr address, u64 size);
+    /// A successful mapping replaced the old guest pages at this address.
+    void OnNewMapping(VAddr address, u64 size);
     /// NAT-105: the CPU wrote watched memory (a page fault on any thread): the textures there
     /// are uploaded again before their next use, and their pages are no longer watched.
     void OnCpuWrite(VAddr address, u64 size, u64 exact);
@@ -161,6 +179,7 @@ private:
         const Native::ImageEntry* depth = nullptr;
     };
 
+    struct WritebackPlan;
     /// The bindings of one draw or dispatch.
     struct DrawBindings {
         Pipeline::DescriptorWrites writes;
@@ -177,6 +196,7 @@ private:
         Shader::PushData push{};
         std::vector<const Native::ImageEntry*> sampled;
         std::vector<const Native::ImageEntry*> stored;
+        std::vector<const Native::ImageEntry*> image_entries;
         /// NAT-119: guest memory the draw or dispatch writes through storage buffers.
         boost::container::small_vector<std::pair<VAddr, u64>, 8> gpu_writes;
         /// NAT-120: the dispatch is GT Sport's fill shader: what it fills, with what.
@@ -186,18 +206,27 @@ private:
         u64 fill_size = 0;
         bool writes_buffers = false;
         bool failed = false;
+        std::shared_ptr<WritebackPlan> region_writeback;
         void Clear();
     };
 
+    struct LdsReader;
     /// The command list being recorded and its state.
     struct Stream {
         std::unique_ptr<Native::Rhi::CommandList> wrapped_list;
         Native::Rhi::CommandList* list = nullptr;
-        vk::CommandBuffer cmd{};
+        /// PERF-GT7-018: into the command thread's ring for a list it records (RingOn).
+        CmdBuf cmd{};
         bool rendering = false;
         RenderState render{};
         DynamicState dynamic{};
         PipelineBindingState<vk::Pipeline> pipelines;
+        bool so_known{};
+        u64 so_epoch{};
+        GraphicsPipeline::ShaderObjectState so_state{};
+        std::array<vk::ShaderEXT, 4> so_shaders{};
+        BindingCommandMemo<vk::PipelineLayout, vk::DescriptorSet, Shader::PushData,
+                           Shader::Backend::MaxDescriptorSets> binding_commands;
         /// OPT-005: the vertex input layout, vertex buffers and index buffer last recorded in
         /// this list (the same ones are not recorded again).
         bool vertex_state_known = false;
@@ -211,7 +240,32 @@ private:
         u64 index_offset = 0;
         vk::IndexType index_type = vk::IndexType::eUint32;
         std::vector<const Native::ImageEntry*> written; ///< since the last barrier
-        bool buffers_written = false;                   ///< by shaders since the last barrier
+        /// PERF-GT7-043: `foreign` says something else than a dispatch wrote them.
+        struct WrittenFlag {
+            bool value = false;
+            bool foreign = false;
+            WrittenFlag& operator=(bool written) {
+                value = foreign = written;
+                return *this;
+            }
+            WrittenFlag& operator|=(bool written) {
+                value |= written;
+                foreign |= written;
+                return *this;
+            }
+            operator bool() const {
+                return value;
+            }
+        };
+        WrittenFlag buffers_written;                    ///< by shaders since the last barrier
+        /// PERF-GT7-043: the program of the last dispatch, if it is the last command so far.
+        u64 run_program = 0;
+        u32 run_commands = 0;
+        /// PERF-GT7-057: what the run's same-texel dispatches stored since the last barrier:
+        /// (picture, mip << 32 | layer), what they sampled elsewhere (FIX-GT7-087), or that one
+        /// stored without a key (FIX-GT7-081).
+        Native::SameTexelRun run_texels;
+        u64 resource_recording_serial = 0;
         /// NAT-140: attachments drawn since the last pass or global barrier, and pictures
         /// sampled since the last global barrier: what a new pass has to wait for.
         std::vector<const Native::ImageEntry*> attach_dirty;
@@ -230,6 +284,12 @@ private:
         DescriptorSetReserve<u64, vk::DescriptorSet> descriptor_reserve;
         std::vector<vk::DescriptorPool> pools; ///< for pipelines without push descriptors
         std::vector<std::unique_ptr<Native::Rhi::Buffer>> keep; ///< alive until the list ran
+        std::vector<std::shared_ptr<void>> imported_view_leases;
+        std::vector<std::shared_ptr<void>> writeback_plan_leases;
+        std::vector<std::unique_ptr<Native::Rhi::Buffer>> pooled_snapshots;
+        std::vector<std::shared_ptr<Native::RememberedFillReceipt>> remembered_fill_receipts;
+        std::vector<LdsReader> lds_readers;
+        u64 lds_bytes = 0;
         u32 commands = 0;
     };
 
@@ -244,8 +304,18 @@ private:
                        ViewUse use);
     vk::Sampler SamplerFor(const AmdGpu::Sampler& sharp, AmdGpu::BorderColorBuffer border,
                            bool is_depth);
+    vk::Sampler MakeSampler(const AmdGpu::Sampler& sharp, AmdGpu::BorderColorBuffer border,
+                            bool is_depth);
+    size_t TextureMemoSlot(const std::array<u64, 4>& raw_sharp, u32 flags) const;
 
+    void AcquireList(Stream& s);
+    bool RingEnabled();
+    void ApplyRingPriority(bool enabled);
+    CmdBuf CmdOf(Native::Rhi::CommandList& list) const;
     Stream& Begin();
+    std::chrono::steady_clock::time_point ring_ab_start{};
+    u64 ring_ab_window{};
+    bool command_priority_boosted{};
     void EndRendering(u32 reason = 0);
     bool ContinueSmallParallelPass(const RenderState& target, u32 reason, bool safe);
     void BeginRendering(const RenderState& state);
@@ -262,6 +332,7 @@ private:
     /// Upload memory of the stream's list: (buffer, offset, CPU pointer).
     std::tuple<vk::Buffer, u64, u8*> Allocate(u64 size, u64 align, bool* backing_proven = nullptr);
     Chunk TakeChunk(u64 size);
+    void TrimIdleChunks();
     vk::DescriptorBufferInfo UploadFlatData(u32 stage, const u8* source, u32 size, bool* backing_proven = nullptr);
     vk::DescriptorPool TakeDescriptorPool();
 
@@ -273,9 +344,12 @@ private:
         VAddr end = 0;
         std::unique_ptr<Native::Rhi::Buffer> buffer;
         std::vector<VAddr> dirty_pages; ///< written by the CPU since the last use
+        std::unique_ptr<std::unordered_map<VAddr, u64>> cpu_pages = std::make_unique<std::unordered_map<VAddr, u64>>(); ///< last refresh after a CPU write
+        std::unique_ptr<std::unordered_set<VAddr>> gpu_pages = std::make_unique<std::unordered_set<VAddr>>(); ///< recently CPU-written pages changed by GPU work
         bool dirty_sorted = true;
     };
     std::map<VAddr, Region> regions; ///< by begin; guarded by mutex
+    u64 regions_taken_in{}; ///< recorder: incremented whenever region storage is replaced
     std::mutex region_dirty_mutex;   ///< pending_region_writes (CPU write faults: any thread)
     std::vector<std::pair<VAddr, VAddr>> pending_region_writes;
     std::vector<std::pair<VAddr, VAddr>> pending_stack_retirements;
@@ -283,11 +357,56 @@ private:
     /// FIX-173: region pages as guest memory held them before the CPU's first write since they
     /// were last copied in (taken at the write fault; guarded by region_dirty_mutex).
     std::unordered_map<VAddr, std::unique_ptr<std::array<u8, 4096>>> page_snapshots;
+    std::unordered_map<VAddr, u64> cpu_recent_pages; ///< under region_dirty_mutex
+    std::unordered_set<VAddr> ahead_pages; ///< under region_dirty_mutex
+    std::unordered_set<VAddr> remapped_pages; ///< complete newly mapped pages awaiting refresh
+    std::unordered_map<VAddr, u64> fault_chunks; ///< under region_dirty_mutex
+    std::unordered_map<VAddr, std::vector<std::pair<VAddr, VAddr>>> downloaded_ranges;
+    void FaultAhead(VAddr begin, VAddr end);
+    struct WrittenBefore {
+        VAddr address{}, begin{}, end{};
+        u64 size{};
+        std::unique_ptr<Native::Rhi::Buffer> copy;
+        Native::Rhi::Buffer* recorded_copy{};
+    };
+    struct WritebackPlan {
+        struct PageMark {
+            VAddr region_begin{};
+            std::unordered_set<VAddr>::node_type node;
+        };
+        struct Part {
+            VAddr region_begin{}, page{};
+            u64 region_offset{}, before_offset{}, guest_offset{}, size{};
+            Native::Rhi::Buffer* region_buffer{};
+            std::unique_ptr<Native::Rhi::Buffer> guest;
+            std::shared_ptr<void> lease;
+            std::size_t before_index{};
+        };
+        std::vector<WrittenBefore> before;
+        std::vector<Part> parts;
+        std::vector<std::pair<VAddr, VAddr>> forget_pages;
+        bool skipped_listed{};
+        u64 region_generation{};
+        std::vector<PageMark> marks;
+        bool shader{};
+    };
+    bool PrepareRegionWriteback(WritebackPlan& plan,
+        std::span<const std::pair<VAddr, u64>> writes, bool shader);
+    bool PrepareRegionWritebackRange(WritebackPlan& plan,
+        std::span<const std::pair<VAddr, u64>> writes, bool shader);
+    void RecordRegionSnapshots(const std::shared_ptr<WritebackPlan>& plan);
+    void RecordRegionWriteback(const std::shared_ptr<WritebackPlan>& plan);
+    void RetainRegionPlan(const std::shared_ptr<WritebackPlan>& plan);
+    bool RegionPlanValid(const WritebackPlan& plan) const;
+    void ValidateRegionPlan(const WritebackPlan& plan);
+    void ApplyRegionWritebackFallback(WritebackPlan& plan);
+    std::unique_ptr<Native::Rhi::PipelineLayout> writeback_layout;
+    std::unique_ptr<Native::Rhi::Pipeline> writeback_pipeline;
     std::atomic<u32> logged_partial{};
     void SortRegionWrites();
     bool HasImageBacking(VAddr address, u64 size);
     Region* RegionOver(VAddr address, u64 size);
-    Region* MakeRegion(VAddr address, u64 size);
+    Region* MakeRegion(VAddr address, u64 size, bool write);
     void RefreshRegion(Region& region, VAddr address, u64 size);
     /// NAT-150: copies in video memory of guest memory the GPU reads as vertices and indices
     /// and the CPU leaves alone (meshes), instead of reading it over PCIe at every draw. A range
@@ -363,6 +482,8 @@ private:
         u64 size = 0;
         u32 flags = 0;
         u64 generation = ~u64{0};
+        u64 hard_generation = 0;
+        u64 log_seq = 0;
         vk::Buffer buffer{};
         u64 offset = 0;
         Region* region = nullptr;
@@ -371,6 +492,7 @@ private:
     };
     std::array<BufferMemo, 16384> buffer_memos{}; ///< OPT-006: 2048 thrashed
     u64 buffer_generation = 0;
+    u64 buffer_hard_generation = 0;
     /// OPT-003: what the last lookup can be remembered as (set by GuestBufferLookup).
     enum class MemoKind : u8 { None, Region, Mirror, InPlace };
     MemoKind memo_kind = MemoKind::None;
@@ -393,6 +515,10 @@ private:
         u64 generation = ~u64{0};
         Native::ImageEntry* entry = nullptr;
         std::array<vk::ImageView, 4> views{};
+        u64 registry_generation = 0;
+        u64 unmap_generation = 0;
+        VAddr range_begin = 0;
+        VAddr range_end = 0;
     };
     std::array<TextureMemo, 16384> texture_memos{}; ///< OPT-006
     std::atomic<u64> unmap_generation{0}; ///< (OPT-010: read by job threads)
@@ -405,6 +531,29 @@ private:
     std::optional<std::pair<vk::Buffer, u64>> GuestBuffer(VAddr address, u64 size, bool write,
                                                           bool mirror = false);
 
+    /// OPT-013: the targets the previous draw resolved, by the registers that name them, while
+    /// the registry made or dropped no picture and no memory was unmapped. Clears, rewrites,
+    /// depth twins and last uses are still done at every draw.
+    struct TargetsMemo {
+        bool valid = false;
+        u64 generation = 0;
+        u32 mrt_mask = 0;
+        u32 color_mode = 0;
+        u32 target_mask = 0;
+        u32 num_colors = 0;
+        std::array<AmdGpu::ColorBuffer, 8> color_buffers{};
+        std::array<AmdGpu::CbDbExtent, 8> cb_extents{};
+        bool depth_used = false;
+        u32 depth_flags = 0; ///< depth and stencil enable, depth write enable
+        AmdGpu::DepthBuffer depth_buffer{};
+        AmdGpu::DepthView depth_view{};
+        VAddr htile = 0;
+        AmdGpu::CbDbExtent db_extent{};
+        std::array<VAddr, 8> cmasks{};
+        bool htile_meta = false; ///< the depth image has HTILE (FIX-156)
+        Targets targets{};
+    } targets_memo;
+    bool TargetsFromMemo(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline, Targets& out);
     bool ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline, Targets& out);
     bool PrepareUiTarget(Targets& targets, const GraphicsPipeline& pipeline);
     GtsSceneImage TemporalImage(const Native::ImageEntry& entry);
@@ -424,6 +573,8 @@ private:
     void SyncUiRange(VAddr address, u64 size, bool keep);
     void BindStages(std::span<const Shader::Info* const> stages, const AmdGpu::Regs& regs,
                     bool compute, DrawBindings& b);
+    void BindStagesStable(std::span<const Shader::Info* const> stages, const AmdGpu::Regs& regs,
+                          bool compute, DrawBindings& b);
     void BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& regs, bool compute,
                      Shader::Backend::Bindings& binding, DrawBindings& b);
     void BindTextures(const Shader::Info& stage, const AmdGpu::Regs& regs,
@@ -444,12 +595,36 @@ private:
         vk::IndexType index_type = vk::IndexType::eUint32;
         u32 index_count = 0;
     };
+    /// PERF-GT7-060: a FIX-227 draw's reader pass, recorded after its run's barrier: what it
+    /// binds and draws.
+    struct LdsReader {
+        const GraphicsPipeline* pipeline = nullptr;
+        std::shared_ptr<const void> pipeline_owner;
+        DynamicState dynamic{};
+        VertexIndexState vertices{};
+        DrawBindings bindings;
+        std::vector<std::pair<u32, u32>> infos;
+        u64 address = 0;       ///< its scratch
+        const Native::Rhi::Buffer* scratch = nullptr; // owned by stream.keep
+        u64 tail_offset = 0, tail_size = 0;
+        bool indexed = false;
+        u32 count = 0, instances = 0, vertex_offset = 0, first_instance = 0;
+    };
+    /// PERF-GT7-060 (on; RYGT_NATIVE_LDS_BATCH=0 off): the FIX-227 draws of a
+    /// run share one barrier.
+    static bool LdsBatchOn();
+    static bool CaptureLdsReader(LdsReader& reader, const DrawBindings& bindings);
+    /// PERF-GT7-060: the stream's waiting reader passes, after one full barrier, in their pass
+    /// (reason: 0 another draw, 1 the pass ends, 2 the run's limit).
+    void FlushLdsReaders(u32 reason);
     void ResolveVertexBuffers(const GraphicsPipeline& pipeline, const AmdGpu::Regs& regs,
                               VertexIndexState& v);
     bool ResolveIndices(const AmdGpu::Regs& regs, bool is_indexed, u32 index_offset,
                         bool quad_triangles, VertexIndexState& v);
     void RecordVertexIndex(const VertexIndexState& v);
     bool NeedsBarrierFor(const DrawBindings& b) const;
+    bool RunNeedsBarrier(const Stream& s, const DrawBindings& b, u64 program, bool recorded,
+                         std::optional<u64> texel = std::nullopt) const;
     void NoteWrites(const Targets* targets, const DrawBindings& b);
     /// NAT-105: CPU writes to the pages of a range fault (once) from now on.
     void WatchPages(VAddr address, u64 size);
@@ -488,6 +663,15 @@ private:
     /// FIX-157: bytes of pictures kept past their idle time.
     u64 kept_bytes = 0;
     std::vector<Native::ImageEntry*> writebacks;
+    struct PendingLinearDownload;
+    std::unordered_map<const Native::ImageEntry*, std::shared_ptr<PendingLinearDownload>> pending_linear_downloads;
+    // Caller holds the renderer mutex; a mapping change cancels only overlapping plans.
+    void CancelLinearDownloads(VAddr address, u64 size);
+    std::vector<Native::ImageEntry*> frame_writebacks;
+    void QueueWriteback(const Native::ImageEntry* entry);
+    void WritebacksBefore(VAddr address, u64 size);
+    void WritebacksBefore(DrawBindings& b);
+    bool writebacks_due = false;
     std::vector<const Native::ImageEntry*> dump_entries; // NAT-116
     /// NAT-123: GPU-written images the dumped frame sampled, by texture key.
     std::vector<std::pair<std::string, const Native::ImageEntry*>> dump_textures;
@@ -500,7 +684,7 @@ private:
     void ApplyRewrite(Native::ImageEntry& entry);
     /// NAT-132: fills the picture with a 32-bit pattern on the GPU (rows != 0: only those rows
     /// of the first mip and layer); false when it can't (compressed, multisampled).
-    bool FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 rows);
+    bool FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 rows, u32 first_layers = 1);
     /// NAT-134: a device buffer holding the pattern (lo, hi, lo, hi...), at least `bytes` long.
     const Native::Rhi::Buffer* PatternBuffer(u32 lo, u32 hi, u64 bytes);
     struct FillPattern {
@@ -709,6 +893,7 @@ private:
 
     Rasterizer& r;
     std::unique_ptr<Native::Rhi::Device> device;
+    std::shared_ptr<OneOffObserver> one_off_observer;
     std::unique_ptr<AsyncMirrorBuffer<Native::Rhi::Buffer>> mirror_preparation;
     std::unique_ptr<Native::Rhi::Fence> timeline;
     std::unique_ptr<Native::ImageRegistry> registry;
@@ -743,7 +928,12 @@ private:
     } in_place;
     bool InPlaceSampled() const {
 #if !defined(NDEBUG)
-        return (frame & 7) == 0;
+        // PERF-GT7-001: collecting per-binding page coverage is opt-in.
+        static const bool on = [] {
+            const char* env = std::getenv("RYGT_NATIVE_INPLACE_STATS");
+            return env && env[0] == '1';
+        }();
+        return on && (frame & 7) == 0;
 #else
         return false;
 #endif
@@ -755,10 +945,16 @@ private:
 
     std::mutex chunk_mutex;
     std::vector<Chunk> free_chunks;
+    size_t free_chunks_low = 0; // minimum completed/free count since the last trim
+    Native::RetiredSnapshotPool<Native::Rhi::Buffer> snapshot_pool;
+    Native::RetiredWritebackPlans retired_writeback_plans;
+    PipelineOwnerRetirement retired_pipeline_owners;
     std::deque<Chunk> retiring_chunks;
     std::vector<vk::DescriptorPool> free_pools;
     std::deque<std::pair<u64, vk::DescriptorPool>> retiring_pools;
 
+    std::unordered_map<u64, vk::Sampler> sampler_lookup;
+    vk::Sampler last_sampler{};
     std::mutex sampler_mutex;
     std::unordered_map<u64, std::unique_ptr<VideoCore::Sampler>> samplers;
 
@@ -780,6 +976,9 @@ private:
     /// NAT-105: the pages native textures watch (each watched once in the page manager, which
     /// counts at most 255 watchers a page; many textures share pages).
     PageWatchTracker page_watches;
+    // Serializes fill-journal publication with page-unwatch and CPU fault invalidation.
+    std::mutex fill_watch_mutex;
+    std::vector<std::pair<VAddr, VAddr>> fill_watched_ranges;
 
     /// CMASK / HTILE addresses the game cleared: the next pass into their target clears it.
     std::unordered_set<VAddr> cleared_meta;
@@ -805,6 +1004,7 @@ private:
         u64 guest_buffer_calls = 0, guest_buffer_ns = 0;     ///< NAT-145
         u64 rewrite_fills = 0;   ///< NAT-132
         u64 timed_draws = 0;     ///< OPT-001
+        u64 targets_reused = 0;
         u64 vertex_near = 0;     ///< OPT-004
         u64 vertex_skipped = 0;  ///< OPT-005
         /// OPT-010: draws bound from a prepared draw, without one, and prepared draws not used:

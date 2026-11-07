@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/diagnostics.h"
 #include "common/debug.h"
 #include "common/frame_queue_trace.h"
 #include "common/elf_info.h"
@@ -463,7 +464,7 @@ std::atomic<u64> g_prepared_frames{0};
 #ifndef NDEBUG
 static int FlashWatchMode() {
     static const int mode = [] {
-        const char* env = std::getenv("SHADGT_FLASH_WATCH");
+        const char* env = Common::DiagEnv("SHADGT_FLASH_WATCH");
         return env ? std::atoi(env) : 0;
     }();
     return mode;
@@ -510,7 +511,7 @@ static void CheckFlashFrame(const ScreenshotReadback& readback) {
         // SHADGT_FLASH_WATCH=4: every frame is written as it comes, to recorder_all_<time>\, for
         // scripted runs.
         static const bool write_all = [] {
-            const char* env = std::getenv("SHADGT_FLASH_WATCH");
+            const char* env = Common::DiagEnv("SHADGT_FLASH_WATCH");
             return env && std::atoi(env) == 4;
         }();
         if (write_all) {
@@ -807,6 +808,9 @@ Frame* Presenter::PrepareLastFrame() {
         }
         if (result == vk::Result::eTimeout) {
             continue;
+        }
+        if (result == vk::Result::eErrorDeviceLost) {
+            instance.LogDeviceFault();
         }
         ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
                    "Device lost during waiting for a frame");
@@ -1419,7 +1423,7 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread, Frame* frame) {
     return frame;
 }
 
-void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame, u64 anti_lag_frame) {
 #ifndef NDEBUG
     auto* trace = Common::FrameQueueTrace::current;
     struct TracePresentScope {
@@ -1733,7 +1737,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         if (trace)
             trace->lock_acquired = Common::FrameQueueTrace::Now(trace->ticket);
 #endif
-        const bool presented = swapchain.Present();
+        const bool presented = swapchain.Present(anti_lag_frame);
 #ifndef NDEBUG
         if (trace) {
             trace->swapchain_return = Common::FrameQueueTrace::Now(trace->ticket);
@@ -1748,6 +1752,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     free_frame();
     if (!is_reusing_frame && is_game_frame) {
         DebugState.IncFlipFrameNum();
+        Common::NoteGameFrameCadence();
         Common::NoteGameFrame();
         RyDiag::FrameShown();
     }
@@ -1805,6 +1810,9 @@ Frame* Presenter::GetRenderFrame() {
 
     // Wait for the presentation to be finished so all frame resources are free
     while (wait() != vk::Result::eSuccess) {
+        if (result == vk::Result::eErrorDeviceLost) {
+            instance.LogDeviceFault();
+        }
         ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
                    "Device lost during waiting for a frame");
         // Retry if the waiting times out

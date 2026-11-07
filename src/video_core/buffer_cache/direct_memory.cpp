@@ -6,6 +6,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cerrno>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -23,6 +24,8 @@
 #include "video_core/buffer_cache/direct_memory.h"
 #include "video_core/buffer_cache/defer_import_releases.h"
 #include "video_core/buffer_cache/import_cleanup_worker.h"
+#include "video_core/buffer_cache/imported_view_lease.h"
+#include "video_core/buffer_cache/imported_part_plan.h"
 #include "ryty_gpu/native/slow_call_trace.h"
 #include "ryty_gpu/native/direct_coherence_registry.h"
 #include "ryty_gpu/native/parallel_direct_capability.h"
@@ -70,12 +73,6 @@ UnmapAliasFn UnmapAlias() {
 #endif
 }
 
-struct PendingRelease {
-    void* alias;
-    VkDeviceMemory memory;
-    std::shared_ptr<Buffer> wrapper; // owns the VkBuffer (D6)
-};
-
 } // namespace
 
 bool ParallelDirectViewsCoherent(const DirectMemory* owner, std::span<const std::pair<std::uint64_t,std::uint64_t>> ranges) noexcept {
@@ -115,6 +112,9 @@ DirectMemory::DirectMemory(const Vulkan::Instance& instance_, Vulkan::Scheduler&
 DirectMemory::~DirectMemory() {
     if (TrackParallelDirect()) direct_coherence.Erase(this);
     imported_view_epoch.fetch_add(1, std::memory_order_acq_rel);
+    // Active mapped views can still be referenced by the final non-native submission. Their
+    // lease deleters free Vulkan memory when the map is destroyed immediately after this body.
+    if (!views.empty() || !held_native_releases.empty()) scheduler.Finish();
 }
 
 bool DirectMemory::Enabled() {
@@ -235,20 +235,54 @@ std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindBuffer(VAddr addr
     return std::make_pair(static_cast<const Buffer*>(view.wrapper.get()), address - view.begin);
 }
 
-bool DirectMemory::ImportView(VAddr address) {
+namespace {
+// PERF-GT7-022 (Will Scarlett): import a bounded piece when first used rather
+// than pinning a whole multi-GiB allocation in one driver call. Zero restores
+// the original whole-allocation policy. Invalid/overflowing input uses 256 MiB.
+u64 ViewPiece() {
+    static const u64 piece = [] {
+        const char* env = std::getenv("RYGT_D1_VIEW_MB");
+        u64 mb = 256;
+        if (env && *env) {
+            char* end = nullptr;
+            errno = 0;
+            const u64 parsed = std::strtoull(env, &end, 10);
+            if (*env != '-' && end != env && *end == '\0' && errno != ERANGE && parsed <= 4096) {
+                mb = parsed;
+            }
+        }
+        return mb == 0 ? u64{1} << 32 : mb << 20;
+    }();
+    return piece;
+}
+} // namespace
+
+bool DirectMemory::ImportView(VAddr address, VAddr want_end) {
     Native::SlowCallTrace<8> trace{Native::trace_guest_hash_calls, "import-guest-view",
         {"guest-view", "map-alias", "host-properties", "allocate-memory", "create-bind-buffer",
          "device-address", "map-pages", "store-view"}};
     trace.Next(0, address, 0);
 #ifdef _WIN32
-    const VAddr base = GuestViewBase(address);
-    if (base == 0) {
+    const VAddr allocation = GuestViewBase(address);
+    if (allocation == 0) {
         return false;
+    }
+    const u64 piece = ViewPiece();
+    VAddr base = allocation + (address - allocation) / piece * piece;
+    if (auto next = views.upper_bound(address); next != views.begin()) {
+        base = std::max(base, std::prev(next)->second.end);
     }
     if (failed.contains(base)) {
         return false;
     }
-    const VAddr end = GuestViewEnd(base, 1ULL << 32);
+    const VAddr pieces_end = want_end > base + piece
+        ? std::min(base + 2 * piece,
+                   allocation + (want_end - 1 - allocation) / piece * piece + piece)
+        : base + piece;
+    VAddr end = std::min(GuestViewEnd(base, pieces_end - base), pieces_end);
+    if (const auto next = views.upper_bound(base); next != views.end()) {
+        end = std::min(end, next->second.begin);
+    }
     const auto fail = [&](const char* why) {
         // An unmap/remap can leave the allocation temporarily uncommitted or split
         // before the requested page. That is not a permanent import failure.
@@ -265,6 +299,9 @@ bool DirectMemory::ImportView(VAddr address) {
     if (end <= base || end > ImportedPageCoverage<>::Limit ||
         (base & (PageSize - 1)) != 0 || ((end - base) & (PageSize - 1)) != 0) {
         return fail("not whole pages");
+    }
+    if (end <= address) {
+        return fail("the address is past the piece");
     }
     const auto map_alias = MapAlias();
     if (!map_alias) {
@@ -343,10 +380,35 @@ bool DirectMemory::ImportView(VAddr address) {
         return fail("no device address");
     }
     trace.Next(6);
+    const auto vk_device = instance.GetDevice();
+    const auto unmap_alias = UnmapAlias();
+    std::shared_ptr<Buffer> wrapper;
+    std::shared_ptr<ImportedViewLease> lease;
+    try {
+        wrapper = std::make_shared<Buffer>(instance, base, end - base, vk::Buffer{buffer});
+        lease = std::make_shared<ImportedViewLease>(
+            [vk_device, unmap_alias, memory, alias, owned = wrapper]() mutable {
+                owned.reset();
+                VULKAN_HPP_DEFAULT_DISPATCHER.vkFreeMemory(vk_device, memory, nullptr);
+                unmap_alias(alias);
+            });
+        const auto [it, inserted] = views.emplace(
+            base, View{base, end, alias, memory, buffer, device_address, lease, wrapper});
+        if (!inserted) throw std::bad_alloc{};
+    } catch (...) {
+        const bool wrapper_owns_buffer = bool(wrapper);
+        const bool lease_owns_memory = bool(lease);
+        wrapper.reset();
+        lease.reset();
+        if (!wrapper_owns_buffer) d.vkDestroyBuffer(device, buffer, nullptr);
+        if (!lease_owns_memory) {
+            d.vkFreeMemory(device, memory, nullptr);
+            unmap_alias(alias);
+        }
+        return fail("could not retain imported buffer");
+    }
     MapPages(base, end, device_address);
     trace.Next(7);
-    auto wrapper = std::make_shared<Buffer>(instance, base, end - base, vk::Buffer{buffer});
-    views.emplace(base, View{base, end, alias, memory, buffer, device_address, std::move(wrapper)});
     if (TrackParallelDirect()) direct_coherence.Add(this,base,end,
         bool(mem_props.memoryTypes[memory_type_index].propertyFlags & vk::MemoryPropertyFlagBits::eHostCoherent));
     imported_view_epoch.fetch_add(1, std::memory_order_acq_rel);
@@ -380,6 +442,49 @@ bool DirectMemory::ForEachPart(VAddr address, u64 size,
         cursor += bytes;
     }
     return true;
+}
+
+std::optional<std::vector<DirectMemory::LeasedPart>> DirectMemory::PlanLeasedParts(
+    VAddr address, u64 size, u64 alignment, u64 size_alignment) const {
+    std::scoped_lock lock{mutex};
+    return PlanImportedParts<LeasedPart>(views, address, size, alignment, size_alignment,
+        [](const View& view, u64 offset, u64 range_offset, u64 bytes) {
+            return LeasedPart{view.wrapper->Handle(), offset, range_offset, bytes,
+                              view.wrapper->SizeBytes(), view.lease};
+        });
+}
+
+bool DirectMemory::RetireLeasesAfterSplice(std::vector<std::shared_ptr<void>>& leases, u64 tick) {
+    if (!leases.empty() && tick == 0) return false;
+    auto cleanup = import_cleanup;
+    return RetireImportedLeases(leases,
+        [&](auto callback) { scheduler.DeferPriorityOperationAt(tick, std::move(callback)); },
+        [cleanup](auto held) {
+            try { cleanup->Enqueue([held] { held->clear(); }); }
+            catch (...) { held->clear(); } // GPU is already complete here.
+        });
+}
+
+void DirectMemory::HoldNativeReleases() {
+    std::scoped_lock lock{mutex};
+    hold_native_releases = true;
+}
+
+bool DirectMemory::ReleaseHeldAfterSplice(u64 tick, bool stop_holding) {
+    std::scoped_lock lock{mutex};
+    const bool queued = RetireLeasesAfterSplice(held_native_releases, tick);
+    if (queued && stop_holding) hold_native_releases = false;
+    return queued;
+}
+
+void DirectMemory::ReleaseHeldAfterGpuIdle() {
+    std::vector<std::shared_ptr<void>> held;
+    {
+        std::scoped_lock lock{mutex};
+        hold_native_releases = false;
+        held.swap(held_native_releases);
+    }
+    held.clear(); // GPU is idle; no view lock is held during driver destruction.
 }
 
 bool DirectMemory::TryForEachPart(
@@ -464,7 +569,7 @@ void DirectMemory::WarmImported(VAddr address, u64 size) {
         if (!base || view_end <= page || view_end - base > MaxWarmViewBytes) {
             return;
         }
-        if (!ImportView(page)) {
+        if (!ImportView(page, end)) {
             return;
         }
         ++imported;
@@ -532,7 +637,7 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
                 continue;
             }
         }
-        if (!ImportView(page)) {
+        if (!ImportView(page, end)) {
             return false;
         }
     }
@@ -540,24 +645,15 @@ bool DirectMemory::EnsureImported(VAddr address, u64 size) {
 }
 
 void DirectMemory::OnUnmap(VAddr address, u64 size) {
-    std::vector<PendingRelease> releases;
     std::unique_lock lk{mutex};
     imported_view_epoch.fetch_add(1, std::memory_order_acq_rel);
     {
     auto invalidate_coverage = imported_coverage.Invalidate();
     const VAddr end = address + size;
     if (TrackParallelDirect()) direct_coherence.Remove(this,address,end);
-    auto it = views.upper_bound(address);
-    if (it != views.begin()) {
-        --it;
-    }
     const u64 tick = scheduler.CurrentTick();
-    while (it != views.end() && it->first < end) {
-        View& view = it->second;
-        if (view.end <= address) {
-            ++it;
-            continue;
-        }
+    OnUnmapImportedViews(views, address, end, held_native_releases, hold_native_releases,
+        [&](View& view) {
         imported_coverage.Clear(view.begin, view.end);
         UnmapPages(view.begin, view.end);
         imported_bytes -= view.end - view.begin;
@@ -570,9 +666,7 @@ void DirectMemory::OnUnmap(VAddr address, u64 size) {
                         view.begin, view.end - view.begin, address, size, tick,
                         scheduler.CurrentTick(), n);
         }
-        releases.push_back({view.alias, view.memory, std::move(view.wrapper)});
-        it = views.erase(it);
-    }
+        }, [&](auto& held) { RetireLeasesAfterSplice(held, scheduler.CurrentTick()); });
     // Even a partial unmap can replace part of a failed view with importable memory.
     std::erase_if(failed, [&](const auto& view) {
         return view.first < end && (view.second > address || view.first >= address);
@@ -581,23 +675,8 @@ void DirectMemory::OnUnmap(VAddr address, u64 size) {
     // Invalidate the GPU page table and coverage before publishing releases.
     // The runner waits for its captured CurrentTick before invoking callbacks;
     // a later tick is conservative if the recorder advanced during this unmap.
-    lk.unlock();
-    const auto device = instance.GetDevice();
-    const auto unmap_alias = UnmapAlias();
-    DeferImportReleases(std::move(releases),
-        [this, cleanup = import_cleanup](auto callback) {
-            // The scheduler gate establishes GPU completion. Keep its fence
-            // runner free: driver destruction belongs to a separate worker.
-            scheduler.DeferPriorityOperation(
-                [cleanup, callback = std::move(callback)]() mutable {
-                    cleanup->Enqueue(std::move(callback));
-                });
-        },
-        [device, unmap_alias](PendingRelease& release) {
-            release.wrapper.reset();
-            VULKAN_HPP_DEFAULT_DISPATCHER.vkFreeMemory(device, release.memory, nullptr);
-            unmap_alias(release.alias);
-        });
+    // On queue failure the owners remain in held_native_releases until a later
+    // successful retirement or GPU-idle teardown.
 }
 
 DirectMemory::Stats DirectMemory::GetStats() const {
@@ -606,10 +685,8 @@ DirectMemory::Stats DirectMemory::GetStats() const {
 }
 
 void DirectMemory::Release(View& view) {
-    const auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;
     view.wrapper.reset();
-    d.vkFreeMemory(instance.GetDevice(), view.memory, nullptr);
-    UnmapAlias()(view.alias);
+    view.lease.reset();
 }
 
 } // namespace VideoCore

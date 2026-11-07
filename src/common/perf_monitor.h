@@ -10,19 +10,20 @@
 #include <intrin.h>
 #endif
 #include "common/types.h"
+#include "common/diagnostics.h"
 
 namespace Common {
 
 /// PERF-DIAG-007: CPU time used by each thread of this process since the previous call,
 /// as "name pct%" entries for the busiest threads (percent of one core), plus the process total.
 /// Returns an empty string where unsupported.
-#if !defined(NDEBUG)
+#ifdef SHADGT_DIAGNOSTICS
 std::string SampleThreadCpuUsage(size_t max_threads);
 #else
 inline std::string SampleThreadCpuUsage(size_t) { return {}; }
 #endif
 
-#if defined(NDEBUG)
+#ifndef SHADGT_DIAGNOSTICS
 // Reporting counters have no Release readers. Draws remains atomic for boot/save progress.
 struct DiagnosticCounter {
     constexpr u64 operator++() noexcept { return 0; }
@@ -61,7 +62,7 @@ struct WorkCounters {
     DiagnosticCounter file_read_bytes{};
     DiagnosticCounter file_read_us{};
 };
-#if !defined(NDEBUG)
+#ifdef SHADGT_DIAGNOSTICS
 WorkCounters& GetWorkCounters();
 #else
 inline WorkCounters& GetWorkCounters() {
@@ -72,11 +73,7 @@ inline WorkCounters& GetWorkCounters() {
 
 /// Experimental-branch switch: false when the PERF id (e.g. 14 for PERF-014) is listed in the
 /// SHADGT_DISABLE_PERF environment variable (comma separated), for A/B runs without rebuilding.
-#if !defined(NDEBUG)
 bool PerfFeatureEnabled(u32 id);
-#else
-inline constexpr bool PerfFeatureEnabled(u32) noexcept { return true; }
-#endif
 
 /// PERF-DIAG-011: command thread time per step of a draw, in TSC ticks, reported every 2 s.
 enum class Phase : u32 {
@@ -112,13 +109,18 @@ enum class Phase : u32 {
     SelSpec,    ///< DIAG-121: StageSpecialization built during program matching
     Count,
 };
-#if !defined(NDEBUG)
+#ifdef SHADGT_DIAGNOSTICS
 std::array<std::atomic<u64>, size_t(Phase::Count)>& GetPhaseTicks();
 #endif
 
+// Functional frame cadence for compile admission, retained when diagnostics are disabled.
+struct GameFrameTotals { u64 frames; u64 us; };
+void NoteGameFrameCadence();
+GameFrameTotals GetGameFrameTotals();
+
 /// DIAG-033: called for every presented game frame. A frame that took longer than
 /// SHADGT_STALL_MS (default 100) is logged with what the emulator did during it.
-#if !defined(NDEBUG)
+#ifdef SHADGT_DIAGNOSTICS
 void NoteGameFrame();
 #else
 inline void NoteGameFrame() noexcept {}
@@ -126,13 +128,13 @@ inline void NoteGameFrame() noexcept {}
 
 // PERF-026: the draw-step timers run about 14 times per draw, so the counter read and the
 // tick array are inline instead of function calls.
-#if !defined(NDEBUG)
+#ifdef SHADGT_DIAGNOSTICS
 inline std::array<std::atomic<u64>, size_t(Phase::Count)> g_phase_ticks{};
 #endif
 
 /// SHADGT_LEAN=1: no per-draw timing (PhaseTimer) or sampled selection checks (PERF-047),
 /// for the best frame rate a build gives; the 2 s lines then show zero step times.
-#if !defined(NDEBUG)
+#ifdef SHADGT_DIAGNOSTICS
 bool LeanRun();
 #else
 inline constexpr bool LeanRun() noexcept { return true; }
@@ -140,7 +142,7 @@ inline constexpr bool LeanRun() noexcept { return true; }
 
 class PhaseTimer {
 public:
-#if !defined(NDEBUG)
+#ifdef SHADGT_DIAGNOSTICS
     explicit PhaseTimer(Phase phase_) : phase{phase_}, start{Enabled() ? ReadTsc() : 0} {}
     ~PhaseTimer() {
         if (start != 0) {
@@ -170,7 +172,7 @@ private:
     static constexpr u64 ReadTscFallback() noexcept { return 0; }
 #endif
 };
-#if !defined(NDEBUG)
+#ifdef SHADGT_DIAGNOSTICS
 std::string TakeWorkCounters();
 #else
 inline std::string TakeWorkCounters() { return {}; }

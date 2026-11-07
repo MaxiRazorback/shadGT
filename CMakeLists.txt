@@ -26,6 +26,19 @@ option(ENABLE_TESTS "Build unit tests (requires GTest)" OFF)
 set(SHADGT_NVTX_INCLUDE "" CACHE PATH "nvtx3 include directory (Nsight Systems timeline ranges)")
 option(ENABLE_SYSTEM_LIBRARIES "Enable building against system libraries" OFF)
 
+# AUTO retains diagnostics in Debug and RelWithDebInfo; optimized production
+# configurations omit diagnostic-only work. Explicit ON/OFF overrides AUTO.
+set(SHADGT_DIAGNOSTICS "AUTO" CACHE STRING "Diagnostics: AUTO, ON or OFF")
+set_property(CACHE SHADGT_DIAGNOSTICS PROPERTY STRINGS AUTO ON OFF)
+string(TOUPPER "${SHADGT_DIAGNOSTICS}" shadgt_diagnostics_mode)
+if (shadgt_diagnostics_mode STREQUAL "AUTO")
+    set(SHADGT_DIAGNOSTICS_ON "$<NOT:$<CONFIG:Release,MinSizeRel>>")
+elseif (SHADGT_DIAGNOSTICS)
+    set(SHADGT_DIAGNOSTICS_ON 1)
+else()
+    set(SHADGT_DIAGNOSTICS_ON 0)
+endif()
+
 # Determine the target architecture.
 set(BASE_ARCHITECTURE "${CMAKE_SYSTEM_PROCESSOR}")
 
@@ -267,6 +280,7 @@ if (MSVC AND DEFINED CMAKE_MSVC_RUNTIME_LIBRARY AND NOT CMAKE_MSVC_RUNTIME_LIBRA
     shadgt_apply_msvc_runtime("${CMAKE_CURRENT_SOURCE_DIR}/externals")
 endif()
 include_directories(src)
+add_compile_definitions($<${SHADGT_DIAGNOSTICS_ON}:SHADGT_DIAGNOSTICS>)
 
 set(AJM_LIB src/core/libraries/ajm/ajm.cpp
             src/core/libraries/ajm/ajm.h
@@ -794,6 +808,7 @@ set(COMMON src/common/logging/classes.cpp
            src/common/debug.h
            src/common/decoder.cpp
            src/common/decoder.h
+           src/common/diagnostics.h
            src/common/elf_info.h
            src/common/endian.h
            src/common/enum.h

@@ -245,11 +245,15 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       // store of the old value). With exact store sizes it produced corrupted (blue, exploded)
       // vertices around the track in a race, so CPU write faults drain the GPU again.
       split_write_faults{false},
-      // PERF-015 is disabled: without the drain, GPU results near those records (GT Sport's
-      // sparks) no longer reached guest memory before the game's CPU used them, and sparks
-      // came with exploded vertices. The drain's wait for all earlier GPU work is what the game
-      // relies on there.
-      split_gds_write_faults{false} {
+      // PERF-015: enabled by default after the GTS runtime comparison. Keep an
+      // explicit OFF control for the former full-drain write-fault behavior.
+      split_gds_write_faults{[] {
+          const char* env = std::getenv("RYGT_SPLIT_GDS_WRITE_FAULTS");
+          return !(env && env[0] == '0' && env[1] == '\0');
+      }()} {
+    if (split_gds_write_faults) {
+        LOG_INFO(Render_Vulkan, "PERF-015: GDS write-fault splitting enabled (RYGT_SPLIT_GDS_WRITE_FAULTS=0 disables)");
+    }
     if (DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported()) { // D1
         direct_memory = std::make_unique<DirectMemory>(instance, scheduler);
     }
@@ -364,6 +368,32 @@ void BufferCache::NoteArenaMapping(VAddr address, u64 size) {
     unmapped_arena_bytes.Subtract(address, size);
 }
 
+void BufferCache::InvalidateNewMapping(VAddr address, u64 size) {
+    if (!size || address > ~u64{0} - size) return;
+    std::scoped_lock buffer_lock{mutex};
+    NoteCpuChange(address, size);
+    {
+        std::scoped_lock readback_lock{async_readbacks_mutex};
+        mapping_readback_guard.PublishMap(address, size, [&] {
+            InvalidateAsyncReadbacksLocked(address, size);
+            std::erase_if(completed_readback_ranges, [&](const auto& range) {
+                return range.first < address + size && address < range.first + range.second;
+            });
+            num_completed_readback_ranges = static_cast<u32>(completed_readback_ranges.size());
+        });
+    }
+    gpu_modified_ranges.Subtract(address, size);
+    gpu_write_seqs.Subtract(address, size);
+    memory_tracker->UnmarkRegionAsGpuModified(address, size, true);
+    memory_tracker->ForceUpload(address, size);
+}
+
+void BufferCache::MarkMappingUnavailable(VAddr address, u64 size) {
+    if (!size || address > ~u64{0} - size) return;
+    std::scoped_lock lock{async_readbacks_mutex};
+    mapping_readback_guard.BeginUnmap(address, size);
+}
+
 void BufferCache::TickFrame() {
     std::scoped_lock buffer_lock{mutex}; // PERF-067
     if (std::exchange(fault_process_pending, false)) {
@@ -376,6 +406,9 @@ void BufferCache::RecordGdsReadback(VAddr address, u32 gds_offset, u32 size) {
     auto readback = std::make_shared<AsyncReadback>();
     readback->address = address;
     readback->size = size;
+#ifdef RYTY_GPU
+    readback->mapping_token = Common::GuestMappingWritebackGate().Capture(address, size);
+#endif
     readback->is_gds = true;
     ++num_valid_gds_readbacks;
     readback->download = staging_pool.Request(size, MemoryType::HostCached, 4, true);
@@ -513,6 +546,9 @@ bool BufferCache::RecordHotPageReadbacks() {
                 auto readback = std::make_shared<AsyncReadback>();
                 readback->address = start;
                 readback->size = static_cast<u32>(end - start);
+#ifdef RYTY_GPU
+                readback->mapping_token = Common::GuestMappingWritebackGate().Capture(start, end - start);
+#endif
                 readback->download =
                     staging_pool.Request(readback->size, MemoryType::HostCached, 4, true);
                 // FIX-071: the guest bytes now, so the completion keeps them when the CPU has
@@ -730,6 +766,11 @@ void BufferCache::CompleteAsyncReadbacks(
         return std::memcmp(current.data(), readback.snapshot.data(), readback.size) != 0;
     };
     for (const auto& readback : readbacks) {
+        const auto writeback = [&] {
+        if (readback->valid && !mapping_readback_guard.MayComplete(readback->address, readback->size)) {
+            readback->valid = false;
+            if (readback->is_gds) --num_valid_gds_readbacks;
+        }
         if (readback->valid && memory->IsValidMapping(readback->address, readback->size) &&
             !readback->snapshot.empty() && guest_differs(*readback)) {
             // PERF-011: the CPU wrote the range after the fault; its value is newer than the
@@ -771,6 +812,15 @@ void BufferCache::CompleteAsyncReadbacks(
             ++hot_page_stats.invalidated;
             #endif
         }
+        };
+#ifdef RYTY_GPU
+        if (!Common::GuestMappingWritebackGate().Complete(readback->mapping_token, writeback)) {
+            if (readback->is_gds && readback->valid) --num_valid_gds_readbacks;
+            readback->valid = false;
+        }
+#else
+        writeback();
+#endif
         if (readback->is_gds && readback->valid) {
             readback->valid = false;
             --num_valid_gds_readbacks;
@@ -795,6 +845,12 @@ void BufferCache::ReleaseFinishedAsyncReadbacks() {
 }
 
 void BufferCache::InvalidateAsyncReadbacks(VAddr address, u64 size) {
+    if (num_tracked_async_readbacks.load() == 0) return;
+    std::scoped_lock lk{async_readbacks_mutex};
+    InvalidateAsyncReadbacksLocked(address, size);
+}
+
+void BufferCache::InvalidateAsyncReadbacksLocked(VAddr address, u64 size) {
     // A later GPU write to the destination makes the read-back value stale; keep the
     // GPU-modified state so the exact path downloads the newer data.
     if (num_tracked_async_readbacks.load() == 0) {
@@ -805,7 +861,6 @@ void BufferCache::InvalidateAsyncReadbacks(VAddr address, u64 size) {
     constexpr u64 PageSize = 4_KB;
     const VAddr start = Common::AlignDown(address, PageSize);
     const VAddr end = Common::AlignUp(address + size, PageSize);
-    std::scoped_lock lk{async_readbacks_mutex};
     const auto invalidate = [&](const std::shared_ptr<AsyncReadback>& readback) {
         if (!readback->valid) {
             return;
@@ -954,6 +1009,9 @@ bool BufferCache::TrySplitWriteFault(const Buffer* arena, VAddr address, u64 siz
                     auto readback = std::make_shared<AsyncReadback>();
                     readback->address = start;
                     readback->size = static_cast<u32>(end - start);
+#ifdef RYTY_GPU
+                    readback->mapping_token = Common::GuestMappingWritebackGate().Capture(start, end - start);
+#endif
                     readback->download =
                         staging_pool.Request(readback->size, MemoryType::HostCached, 4, true);
                     readback->snapshot.resize(readback->size);
@@ -1567,6 +1625,16 @@ std::shared_ptr<BufferCache::FaultDownload> BufferCache::BeginFaultFlush(VAddr d
     for (auto& copy : fault->copies) {
         copy.dstOffset += fault->download.offset;
     }
+#ifdef RYTY_GPU
+    fault->mapping_window_token = Common::GuestMappingWritebackGate().Capture(
+        fault->window_start, fault->window_end - fault->window_start);
+    if (Common::GuestMappingWritebackGate().ProtocolAvailable()) {
+        fault->mapping_tokens.reserve(fault->copies.size());
+        for (const auto& copy : fault->copies)
+            fault->mapping_tokens.push_back(Common::GuestMappingWritebackGate().Capture(
+                arena_base + copy.srcOffset, copy.size));
+    }
+#endif
     runtime.CopyBuffer(arena, fault->download.buffer, fault->copies);
     fault->snapshots.reserve(fault->copies.size());
     for (const auto& copy : fault->copies) {
@@ -1601,9 +1669,10 @@ std::shared_ptr<BufferCache::FaultDownload> BufferCache::BeginFaultFlush(VAddr d
             if (fault->snapshots[c].empty()) {
                 continue;
             }
+            const auto writeback = [&] {
 #ifdef RYTY_GPU
             if (!Core::RytyMemory::IsGuestReadable(start, copy.size)) {
-                continue;
+                return;
             }
 #endif
             const u8* snapshot = fault->snapshots[c].data();
@@ -1634,6 +1703,13 @@ std::shared_ptr<BufferCache::FaultDownload> BufferCache::BeginFaultFlush(VAddr d
                     run = run_end;
                 }
             }
+            };
+#ifdef RYTY_GPU
+            if (fault->mapping_tokens.empty()) writeback();
+            else Common::GuestMappingWritebackGate().Complete(fault->mapping_tokens[c], writeback);
+#else
+            writeback();
+#endif
         }
         fault->applied.store(true, std::memory_order_release);
         fault->done.release();
@@ -1645,6 +1721,7 @@ std::shared_ptr<BufferCache::FaultDownload> BufferCache::BeginFaultFlush(VAddr d
 
 void BufferCache::FinishFaultFlush(FaultDownload& fault) {
     std::scoped_lock buffer_lock{mutex}; // PERF-067
+    const auto finish_metadata = [&] {
     // The rest of DownloadMemory and of the flush, for the bytes no GPU write has changed since
     // the download: those stay GPU-written and their guest copy is stale, as for any GPU write.
     boost::container::small_vector<std::pair<VAddr, VAddr>, 8> newer;
@@ -1688,6 +1765,12 @@ void BufferCache::FinishFaultFlush(FaultDownload& fault) {
     if (fault.is_write) {
         memory_tracker->MarkRegionAsCpuModified(fault.device_addr, fault.size);
     }
+    };
+#ifdef RYTY_GPU
+    Common::GuestMappingWritebackGate().Complete(fault.mapping_window_token, finish_metadata);
+#else
+    finish_metadata();
+#endif
     staging_pool.FreeDeferred(fault.download);
     std::scoped_lock lk{fault_downloads_mutex};
     std::erase_if(fault_downloads, [&](const auto& f) { return f.get() == &fault; });
@@ -1734,6 +1817,15 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     for (auto& copy : copies) {
         copy.dstOffset += download.offset;
     }
+#ifdef RYTY_GPU
+    std::vector<Common::MappingWritebackGate::Token> mapping_tokens;
+    const auto mapping_window_token = Common::GuestMappingWritebackGate().Capture(device_addr, size);
+    if (Common::GuestMappingWritebackGate().ProtocolAvailable()) {
+        mapping_tokens.reserve(copies.size());
+        for (const auto& copy : copies)
+            mapping_tokens.push_back(Common::GuestMappingWritebackGate().Capture(arena_base + copy.srcOffset, copy.size));
+    }
+#endif
     runtime.CopyBuffer(arena, download.buffer, copies);
     const u64 download_tick = scheduler.CurrentTick();
     scheduler.Finish();
@@ -1745,20 +1837,35 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     InvalidateAsyncReadbacks(device_addr, size);
 
     download.buffer->Invalidate(download.offset, download.size);
-    for (const auto& copy : copies) {
+    for (size_t i = 0; i < copies.size(); ++i) {
+        const auto& copy = copies[i];
         auto* dst_addr = std::bit_cast<u8*>(arena_base + copy.srcOffset);
         NoteWritebackOverCommands(liverpool, "fault download", arena_base + copy.srcOffset,
                                   copy.size);
-        memory->TryWriteBacking(dst_addr, download.mapped + (copy.dstOffset - download.offset),
-                                copy.size);
+        const auto writeback = [&] {
+            memory->TryWriteBacking(dst_addr, download.mapped + (copy.dstOffset - download.offset), copy.size);
+        };
+#ifdef RYTY_GPU
+        if (mapping_tokens.empty()) writeback();
+        else Common::GuestMappingWritebackGate().Complete(mapping_tokens[i], writeback);
+#else
+        writeback();
+#endif
     }
-    memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
-    for (const auto& [s, e] : kept_gpu) {
-        if (!page_manager.IsUnwatched(Common::AlignDown(s, 4_KB))) {
-            gpu_modified_ranges.Add(s, e - s);
-            memory_tracker->MarkRegionAsGpuModified(s, e - s);
+    const auto finish_metadata = [&] {
+        memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
+        for (const auto& [s, e] : kept_gpu) {
+            if (!page_manager.IsUnwatched(Common::AlignDown(s, 4_KB))) {
+                gpu_modified_ranges.Add(s, e - s);
+                memory_tracker->MarkRegionAsGpuModified(s, e - s);
+            }
         }
-    }
+    };
+#ifdef RYTY_GPU
+    Common::GuestMappingWritebackGate().Complete(mapping_window_token, finish_metadata);
+#else
+    finish_metadata();
+#endif
 }
 
 // DIAG-111 (with SHADGT_DIAG_OBTAIN=1): cycles spent in obtains by kind, logged with DIAG-109.
@@ -4119,6 +4226,9 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
     // PERF-084: the scheduler no longer holds the queue lock around its submit callback.
     std::scoped_lock queue_lock{Vulkan::Scheduler::submit_mutex};
     auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
+    if (submit_result == vk::Result::eErrorDeviceLost) {
+        instance.LogDeviceFault();
+    }
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
     pending_binds.clear();

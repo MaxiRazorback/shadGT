@@ -385,7 +385,8 @@ MacroTileMode CalculateMacrotileMode(TileMode tile_mode, u32 bpp, u32 num_sample
     const u32 tile_bytes_1x = bpp * MICROTILE_SIZE * MICROTILE_SIZE * tile_thickness / 8;
     const u32 tilesplic = CalculateTileSplit(tile_mode, array_mode, micro_tile_mode, bpp);
     const u32 tile_bytes = std::min(tilesplic, num_samples * tile_bytes_1x);
-    const u32 mtm_idx = std::bit_width(tile_bytes / 64) - 1;
+    // AddrLib maps tiles smaller than 64 bytes to mode zero.
+    const u32 mtm_idx = std::max<u32>(std::bit_width(tile_bytes / 64), 1) - 1;
     return IsPrt(array_mode) ? MacroTileMode(mtm_idx + 8) : MacroTileMode(mtm_idx);
 }
 

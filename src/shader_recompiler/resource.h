@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdlib>
 #include "common/types.h"
 #include "shader_recompiler/ir/type.h"
 #include "video_core/amdgpu/resource.h"
@@ -16,7 +17,9 @@ static constexpr u32 NUM_USER_DATA_REGS = 16;
 static constexpr u32 NUM_IMAGES = 64;
 static constexpr u32 NUM_BUFFERS = 40;
 static constexpr u32 NUM_SAMPLERS = 16;
-static constexpr u32 NUM_FMASKS = 8;
+// FIX-GT7-043: every read of a T# that looks like an FMask takes a place, not only size queries: one
+// race launch had up to 6 in a program, and a list that overflows ends the process.
+static constexpr u32 NUM_FMASKS = 24;
 
 using SharpLocation = u16;
 
@@ -156,6 +159,15 @@ struct BufferResource {
 };
 using BufferResourceList = boost::container::static_vector<BufferResource, NUM_BUFFERS>;
 
+/// FIX-GT7-043: whether the key tells an FMask from anything else. RYGT_FMASK_KEY=0: as before.
+inline bool FMaskKeyEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_FMASK_KEY");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
+
 enum class MipStorageFallbackMode : u16 {
     None,
     DynamicIndex,
@@ -190,6 +202,11 @@ struct ImageResource {
             image.depth = (image.depth + 1) * 6 - 1;
         }
         if (!image.Valid()) {
+            image = AmdGpu::Image::Null(is_depth);
+        } else if (!image && AmdGpu::IsFmask(image.GetDataFmt()) && FMaskKeyEnabled()) {
+            // FIX-GT7-043: float data GT7 leaves in a slot, not an FMask: an empty slot. As an
+            // FMask, its code would have no address to tell it from a T# that isn't one, and each
+            // such slot would make a variant (27 on one launch instead of 2).
             image = AmdGpu::Image::Null(is_depth);
         } else if (is_depth) {
             const auto data_fmt = image.GetDataFmt();
@@ -261,10 +278,15 @@ struct SamplerResource {
 using SamplerResourceList = boost::container::static_vector<SamplerResource, NUM_SAMPLERS>;
 
 struct FMaskResource {
-    SharpLocation sharp_idx;
+    SharpFetch<AmdGpu::Image> sharp_fetch{};
+    bool is_r128{};
+    bool size_read{};
 
     constexpr AmdGpu::Image GetSharp(const auto& info) const noexcept {
-        return info.template ReadUdSharp<AmdGpu::Image>(sharp_idx);
+        AmdGpu::Image image{};
+        const bool fetched = is_r128 ? sharp_fetch.Fetch<4>(info.flattened_ud_buf.data(), &image)
+                                     : sharp_fetch.Fetch(info.flattened_ud_buf.data(), &image);
+        return fetched ? image : AmdGpu::Image::Null(false);
     }
 };
 using FMaskResourceList = boost::container::static_vector<FMaskResource, NUM_FMASKS>;
@@ -275,15 +297,17 @@ struct PushData {
     static constexpr u32 XScaleIndex = 2;
     static constexpr u32 YScaleIndex = 3;
     static constexpr u32 BufOffsetIndex = 4;
-    /// After the four buffer-offset vectors (SHD-002).
-    static constexpr u32 QuadSampleMaskIndex = 8;
+    /// After the six buffer-offset vectors.
+    static constexpr u32 QuadSampleMaskIndex = 10;
+    // FIX-227: scratch address aliases the all-ones sample mask on eligible draws.
+    static constexpr u32 LdsScratchIndex = QuadSampleMaskIndex;
 
     float xoffset;
     float yoffset;
     float xscale;
     float yscale;
-    /// SHD-002: 64 offsets, each stage with its own range (Backend::StageBufferOffsetBase).
-    std::array<u8, 64> buf_offsets;
+    /// 96 offsets, each stage with its own range (Backend::StageBufferOffsetBase).
+    std::array<u8, 96> buf_offsets;
     std::array<u32, 2> quad_sample_mask{~0u, ~0u};
 
     void AddOffset(u32 binding, u32 offset) {
@@ -291,7 +315,7 @@ struct PushData {
         buf_offsets[binding] = offset;
     }
 };
-static_assert(offsetof(PushData, quad_sample_mask) == 80 && sizeof(PushData) == 88);
+static_assert(offsetof(PushData, quad_sample_mask) == 112 && sizeof(PushData) == 120);
 static_assert(sizeof(PushData) <= 128,
               "PushData size is greater than minimum size guaranteed by Vulkan spec");
 

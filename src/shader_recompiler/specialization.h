@@ -46,6 +46,15 @@ struct BufferSpecialization {
                (!swizzle_enable ||
                 (index_stride == other.index_stride && element_size == other.element_size));
     }
+
+    /// FIX-GT7-024: equal but for addressing (stride, swizzling, thread-id addressing and
+    /// coherence), which reads of a buffer bound empty don't depend on.
+    bool SameButAddressing(const BufferSpecialization& other) const {
+        return is_formatted == other.is_formatted &&
+               (!is_formatted ||
+                (data_format == other.data_format && num_format == other.num_format &&
+                 dst_select == other.dst_select && num_conversion == other.num_conversion));
+    }
 };
 
 struct ImageSpecialization {
@@ -83,10 +92,14 @@ struct SamplerSpecialization {
  */
 struct StageSpecialization {
     static constexpr size_t MaxStageResources = 128;
+    static_assert(NUM_BUFFERS + NUM_IMAGES + NUM_FMASKS <= MaxStageResources);
 
     const Info* info{};
     RuntimeInfo runtime_info{};
     std::bitset<MaxStageResources> bitset{};
+    /// FIX-GT7-024: bound buffers the rasterizer binds empty (IsBoundEmpty). Not stored: only
+    /// a lookup's own (the right side of a comparison) is read.
+    std::bitset<MaxStageResources> bound_empty{};
     Gcn::FetchShaderData fetch_shader_data{};
     SmallVector<VsAttribSpecialization, 32> vs_attribs;
     SmallVector<BufferSpecialization, 16> buffers;
@@ -129,8 +142,7 @@ struct StageSpecialization {
                              // nearly every frame, and those draws were skipped while each built
                              // (the flickering driver figure). Such an attribute counts as plain
                              // floats. -DisablePerf 83 specializes on it.
-                             static const bool plain_garbage = Common::PerfFeatureEnabled(83);
-                             if (plain_garbage && sharp.GetSize() >= (u64{1} << 30)) {
+                             if (Gcn::VertexAttribute::IsGarbage(sharp)) {
                                  spec.num_class = AmdGpu::NumberClass::Float;
                                  spec.dst_select = AmdGpu::CompMapping{
                                      .r = AmdGpu::CompSwizzle::Red,
@@ -150,11 +162,16 @@ struct StageSpecialization {
         // V# translation saw instead of zeros. Thread-id addressing and coherence, which the
         // code also reads from the V#, are added to the key.
         const bool usage_known = info->resource_usage_known;
+        // FIX-GT7-024: -DisablePerf 172 compares buffers bound empty as any other.
+        static const bool empty_without_addressing = Common::PerfFeatureEnabled(172);
         u32 binding{};
         ForEachSharp(
             binding, buffers, info->buffers,
-            [this, usage_known](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
+            [this, usage_known, &binding](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
                 const size_t index = &desc - info->buffers.data();
+                if (empty_without_addressing && !desc.IsSpecial() && IsBoundEmpty(sharp)) {
+                    bound_empty[binding - 1] = true; // ForEachSharp counted it already
+                }
                 spec.stride =
                     !usage_known || info->buffer_stride_used[index] ? sharp.GetStride() : 0;
                 if (usage_known) {
@@ -178,7 +195,12 @@ struct StageSpecialization {
             usage_known);
         ForEachSharp(
             binding, images, info->images, [&](auto& spec, const auto& desc, AmdGpu::Image sharp) {
-                spec.type = sharp.GetViewType(desc.is_array);
+                // FIX-GT7-043: translation has no image for an FMask, so code with one isn't for
+                // this T#. Two translations matching one state would let the read-ahead change the
+                // current draw's key, as the last match decides between them.
+                spec.type = FMaskKeyEnabled() && sharp.Valid() && AmdGpu::IsFmask(sharp.GetDataFmt())
+                                ? AmdGpu::ImageType::Invalid
+                                : sharp.GetViewType(desc.is_array);
                 spec.is_integer = AmdGpu::IsInteger(sharp.GetNumberFmt());
                 spec.is_storage = desc.is_written;
                 if (spec.is_storage) {
@@ -195,8 +217,18 @@ struct StageSpecialization {
             true);
         ForEachSharp(binding, fmasks, info->fmasks,
                      [](auto& spec, const auto& desc, AmdGpu::Image sharp) {
-                         spec.width = sharp.width;
-                         spec.height = sharp.height;
+                         if (!FMaskKeyEnabled()) {
+                             spec.width = sharp.width;
+                             spec.height = sharp.height;
+                             return;
+                         }
+                         // FIX-GT7-043: zero for a T# that isn't an FMask, which this code
+                         // can't read. The size counts only where the code reads it: GT7 leaves
+                         // float data in many slots, which would make a variant per value.
+                         if (sharp.Valid() && AmdGpu::IsFmask(sharp.GetDataFmt())) {
+                             spec.width = desc.size_read ? sharp.width + 1 : 1;
+                             spec.height = desc.size_read ? sharp.height + 1 : 1;
+                         }
                      });
         ForEachSharp(samplers, info->samplers,
                      [](auto& spec, const auto& desc, AmdGpu::Sampler sharp) {
@@ -220,6 +252,125 @@ struct StageSpecialization {
             TessellationDataConstantBuffer tess_constants{};
             info->ReadTessConstantBuffer(tess_constants);
             runtime_info.InitFromTessConstants(tess_constants);
+        }
+    }
+
+    /// PERF-GT7-058: whether PackInputs may stand for a new specialization of this stage. Not
+    /// tessellation stages (their runtime info comes from memory).
+    /// FIX-GT7-082: nor a vertex stage with a fetch shader. Its attributes' V#s are read from guest
+    /// memory at each read, not from the flattened buffer, so the pack recorded after a full
+    /// match could hold another V# than the one that match was made from (a float attribute that
+    /// became integer in between), and later draws would take the float module for it with no
+    /// full comparison. The packed path saved nothing on vertex stages anyway (GT7 race, 11-04:
+    /// 0.58-0.64 us a call without it, 0.63-0.68 with it).
+    static bool Packable(const Info& info) {
+        return info.sw_stage != SwStage::TessellationControl &&
+               info.sw_stage != SwStage::TessellationEval &&
+               !(info.sw_stage == SwStage::Vertex && info.has_fetch_shader);
+    }
+
+    /// PERF-GT7-058: what the constructor above reads of the sharps and of the fetch shader, as the
+    /// values it derives from them, packed into words without making a specialization. A stage
+    /// with equal words, an equal runtime info, start bindings and fetch shader data, and the same
+    /// info makes an equal specialization, for a stage Packable allows. Keep in step with the
+    /// constructor.
+    static void PackInputs(const Info& info, std::vector<u64>& out, Gcn::FetchShaderData& fetch) {
+        const auto mapping = [](const AmdGpu::CompMapping& m) {
+            return u64(m.array[0]) | u64(m.array[1]) << 8 | u64(m.array[2]) << 16 |
+                   u64(m.array[3]) << 24;
+        };
+        fetch = {};
+        if (info.sw_stage == SwStage::Vertex && Gcn::ParseFetchShader(info, fetch)) {
+            for (const auto& desc : fetch.attributes) {
+                const auto sharp = desc.GetSharp(info);
+                if (!sharp) {
+                    out.push_back(0);
+                } else if (Common::PerfFeatureEnabled(83) && sharp.GetSize() >= (u64{1} << 30)) {
+                    out.push_back(1);
+                } else {
+                    out.push_back(2 | u64(AmdGpu::GetNumberClass(sharp.GetNumberFmt())) << 8 |
+                                  mapping(sharp.DstSelect()) << 16);
+                }
+            }
+        }
+        out.push_back(0xb0f5);
+        const bool usage_known = info.resource_usage_known;
+        for (size_t i = 0; i < info.buffers.size(); ++i) {
+            const auto& desc = info.buffers[i];
+            const auto sharp = desc.GetSharp(info);
+            if (!sharp) {
+                out.push_back(0);
+                continue;
+            }
+            u64 w = 1;
+            // Keep empty-address buffers distinct even where directional matching
+            // permits them to reuse an existing specialization.
+            if (!desc.IsSpecial() && sharp.base_address == 0) w |= 2;
+            w |= u64(!usage_known || info.buffer_stride_used[i] ? sharp.GetStride() : 0) << 2;
+            if (usage_known) {
+                w |= u64(sharp.add_tid_enable) << 16;
+                w |= u64(desc.buffer_type == BufferType::SharedMemory || sharp.mtype == 3) << 17;
+            }
+            w |= u64(desc.is_formatted) << 18;
+            w |= u64(sharp.swizzle_enable) << 19;
+            if (desc.is_formatted) {
+                w |= u64(sharp.GetDataFmt()) << 20;
+                w |= u64(sharp.GetNumberFmt()) << 28;
+                w |= mapping(sharp.DstSelect()) << 32;
+            }
+            u64 w2 = desc.is_formatted ? u64(sharp.GetNumberConversion()) : 0;
+            if (sharp.swizzle_enable) {
+                w2 |= u64(sharp.index_stride) << 32 | u64(sharp.element_size) << 40;
+            }
+            out.push_back(w);
+            out.push_back(w2);
+        }
+        out.push_back(0x1a9e);
+        for (size_t i = 0; i < info.images.size(); ++i) {
+            const auto& desc = info.images[i];
+            const auto sharp = desc.GetSharp(info);
+            // Unbound images too: the constructor records what translation saw (SHD-003).
+            u64 w = sharp ? 1 : 0;
+            const auto type = FMaskKeyEnabled() && sharp.Valid() && AmdGpu::IsFmask(sharp.GetDataFmt())
+                                  ? AmdGpu::ImageType::Invalid
+                                  : sharp.GetViewType(desc.is_array);
+            w |= u64(type) << 1;
+            w |= u64(AmdGpu::IsInteger(sharp.GetNumberFmt())) << 8;
+            w |= u64(desc.is_written) << 9;
+            if (desc.is_written) {
+                w |= mapping(sharp.DstSelect()) << 16;
+            } else if (!usage_known || info.image_srgb_used[i]) {
+                w |= u64(sharp.GetNumberFmt() == AmdGpu::NumberFormat::Srgb) << 10;
+            }
+            w |= u64(desc.NumBindings(info)) << 48;
+            out.push_back(w);
+            out.push_back(u64(sharp.GetNumberConversion()));
+        }
+        out.push_back(0xf3a5);
+        for (const auto& desc : info.fmasks) {
+            const auto sharp = desc.GetSharp(info);
+            if (!sharp) {
+                out.push_back(0);
+                continue;
+            }
+            u64 width = sharp.width;
+            u64 height = sharp.height;
+            if (FMaskKeyEnabled()) {
+                width = 0;
+                height = 0;
+                if (sharp.Valid() && AmdGpu::IsFmask(sharp.GetDataFmt())) {
+                    width = desc.size_read ? sharp.width + 1 : 1;
+                    height = desc.size_read ? sharp.height + 1 : 1;
+                }
+            }
+            out.push_back(1 | width << 8 | height << 32);
+        }
+        out.push_back(0x5a3b);
+        for (const auto& desc : info.samplers) {
+            const auto sharp = desc.GetSharp(info);
+            out.push_back(!sharp ? 0
+                                 : 1 | u64(sharp.force_unnormalized) << 1 |
+                                       u64(sharp.force_degamma) << 2);
         }
     }
 
@@ -255,6 +406,28 @@ struct StageSpecialization {
 
     [[nodiscard]] bool Valid() const {
         return info != nullptr;
+    }
+
+    /// FIX-GT7-024: a V# with records that the rasterizer still binds empty, so reads give 0
+    /// and writes are dropped: a base of 0, or a buffer ending past the GPU's 40-bit address
+    /// space (FIX-031). GT7's city shaders leave V#s made of float constants (strides like
+    /// 0x3e2a, terabytes long) in slots a draw doesn't read; their values changed from one run
+    /// to the next, and each one made a new translation and a pipeline compile of up to a second
+    /// (the building drawn black meanwhile). Such a buffer is compared without its addressing.
+    static bool IsBoundEmpty(const AmdGpu::Buffer& sharp) {
+        constexpr u64 GpuAddressLimit = 1ULL << 40;
+        const u64 base = sharp.base_address;
+        const u64 size = sharp.GetSize();
+        return sharp.num_records != 0 &&
+               (base == 0 || (sharp.num_records != UINT32_MAX &&
+                              (size >= GpuAddressLimit || base + size > GpuAddressLimit)));
+    }
+
+    /// The right side's buffer `i` at `binding` matches this one's (FIX-GT7-024: without the
+    /// addressing when the right side binds it empty).
+    bool BufferMatches(const StageSpecialization& other, u32 i, u32 binding) const {
+        return other.bound_empty[binding] ? buffers[i].SameButAddressing(other.buffers[i])
+                                          : buffers[i] == other.buffers[i];
     }
 
     bool operator==(const StageSpecialization& other) const {
@@ -298,8 +471,8 @@ struct StageSpecialization {
         }
 
         u32 binding{};
-        for (u32 i = 0; i < buffers.size(); i++) {
-            if (other.bitset[binding++] && buffers[i] != other.buffers[i]) {
+        for (u32 i = 0; i < buffers.size(); i++, binding++) {
+            if (other.bitset[binding] && !BufferMatches(other, i, binding)) {
                 return false;
             }
         }
@@ -403,10 +576,10 @@ struct StageSpecialization {
             return "start bindings";
         }
         u32 binding{};
-        for (u32 i = 0; i < buffers.size(); i++) {
-            if (other.bitset[binding++] && buffers[i] != other.buffers[i]) {
+        for (u32 i = 0; i < buffers.size(); i++, binding++) {
+            if (other.bitset[binding] && !BufferMatches(other, i, binding)) {
                 index = i;
-                return "buffer";
+                return other.bound_empty[binding] ? "buffer bound empty" : "buffer";
             }
         }
         for (u32 i = 0; i < images.size(); i++) {

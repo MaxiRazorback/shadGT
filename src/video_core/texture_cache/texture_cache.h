@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
+#include "common/mapping_writeback_gate.h"
 
 #include <span>
 #include <source_location>
@@ -458,6 +459,9 @@ private:
         /// FIX-029: the guest bytes when the readback was recorded, to keep only the words the
         /// guest changed since.
         std::shared_ptr<std::vector<u8>> guest_bytes;
+#ifdef RYTY_GPU
+        Common::MappingWritebackGate::Token mapping_token;
+#endif
     };
     std::optional<PendingReadback> RecordImageReadback(ImageId image_id);
 

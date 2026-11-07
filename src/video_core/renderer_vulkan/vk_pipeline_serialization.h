@@ -14,6 +14,7 @@ namespace Vulkan {
 void SetSingleSampleBarycentricCacheEnabled(bool enabled);
 void SetVertexOrderCheckCacheEnabled(bool enabled); // AMD-307
 void SetDiscardKillCacheEnabled(bool enabled);      // FIX-223
+void SetNativeCubeCacheEnabled(bool enabled);
 
 void RegisterPipelineData(const ComputePipelineKey& key,
                           ComputePipeline::SerializationSupport& sdata);

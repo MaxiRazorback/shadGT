@@ -4,6 +4,7 @@
 #pragma once
 
 #include <memory>
+#include <type_traits>
 #include <utility>
 
 #include "common/recycling_pool.h"
@@ -38,11 +39,16 @@ class UniqueFunction {
     template <typename Functor>
     class Callable final : public CallableBase {
     public:
-        Callable(Functor&& functor_) : functor{std::move(functor_)} {}
+        template <typename F>
+        explicit Callable(F&& functor_) : functor{std::forward<F>(functor_)} {}
         ~Callable() override = default;
 
         ResultType operator()(Args&&... args) override {
-            return functor(std::forward<Args>(args)...);
+            if constexpr (std::is_void_v<ResultType>) {
+                functor(std::forward<Args>(args)...);
+            } else {
+                return functor(std::forward<Args>(args)...);
+            }
         }
 
     private:
@@ -53,8 +59,11 @@ public:
     UniqueFunction() = default;
 
     template <typename Functor>
+        requires(!std::is_same_v<std::remove_cvref_t<Functor>, UniqueFunction> &&
+                 std::is_invocable_r_v<ResultType, std::decay_t<Functor>&, Args...>)
     UniqueFunction(Functor&& functor)
-        : callable{std::make_unique<Callable<Functor>>(std::move(functor))} {}
+        : callable{std::make_unique<Callable<std::decay_t<Functor>>>(
+              std::forward<Functor>(functor))} {}
 
     UniqueFunction& operator=(UniqueFunction&& rhs) noexcept = default;
     UniqueFunction(UniqueFunction&& rhs) noexcept = default;

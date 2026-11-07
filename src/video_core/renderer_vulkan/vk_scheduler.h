@@ -400,6 +400,12 @@ public:
         return ring != nullptr;
     }
 
+    /// PERF-GT7-018: the command thread's ring (nullptr without one), for lists the command
+    /// thread makes and records; recorded into from the thread that records, like CommandBuffer.
+    CommandRing* CommandThreadRing() const noexcept {
+        return ring.get();
+    }
+
     /// PERF-084: waits until the command thread replayed everything recorded so far.
     void SyncCommandThread();
 
@@ -491,9 +497,12 @@ public:
 
     /// Runs as soon as possible in another thread.
     void DeferPriorityOperation(Common::UniqueFunction<void>&& func) {
+        DeferPriorityOperationAt(CurrentTick(), std::move(func));
+    }
+    void DeferPriorityOperationAt(u64 tick, Common::UniqueFunction<void>&& func) {
         {
             std::unique_lock lk(priority_pending_ops_mutex);
-            priority_pending_ops.emplace(std::move(func), CurrentTick());
+            priority_pending_ops.emplace(std::move(func), tick);
         }
         priority_pending_ops_cv.notify_one();
     }
@@ -558,6 +567,7 @@ private:
     std::mutex priority_pending_ops_mutex;
     std::condition_variable_any priority_pending_ops_cv;
     std::jthread priority_pending_ops_thread;
+    std::jthread compile_monitor_thread; // Functional compile-core policy, independent of diagnostics.
     RenderState render_state;
     bool is_rendering = false;
     tracy::VkCtxScope* profiler_scope{};

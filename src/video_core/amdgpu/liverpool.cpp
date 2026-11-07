@@ -1,4 +1,5 @@
 #include "common/debug_environment.h"
+#include "common/geometry_trace.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -19,10 +20,12 @@
 #include "common/scope_exit.h"
 #include "common/debug.h"
 #include "common/guest_clock.h"
+#include "common/mapping_writeback_gate.h"
 #include "common/nvtx.h"
 #include "common/perf_monitor.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
+#include "common/native_thread_priority.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/process.h"
@@ -116,9 +119,15 @@ static void WriteDeferredFence(void* address, const void* data, u32 num_bytes) {
     }
 #endif
     auto* memory = Core::Memory::Instance();
-    if (memory->IsValidMapping(reinterpret_cast<VAddr>(address), num_bytes)) {
-        memory->TryWriteBacking(address, data, num_bytes);
-    }
+    const auto writeback = [&] {
+        if (memory->IsValidMapping(reinterpret_cast<VAddr>(address), num_bytes))
+            memory->TryWriteBacking(address, data, num_bytes);
+    };
+#ifdef RYTY_GPU
+    Common::CompleteScopedMappingWriteback(writeback);
+#else
+    writeback();
+#endif
 }
 
 // PERF-095 (opt-in, SHADGT_LAZY_ASC_EPOCH=1): a compute-queue submission or wait only bumps the
@@ -431,7 +440,12 @@ void Liverpool::StartDrawPipe() {
         // A held label may be the very thing the guest waits for before
         // publishing its next command buffer. Submit it before the recorder
         // sleeps instead of requiring another draw or EOP to trigger a flush.
-        if (rasterizer) rasterizer->FlushDeferredFences();
+        if (rasterizer) {
+            rasterizer->FlushDeferredFences();
+#ifdef RYTY_GPU
+            if (auto* native = rasterizer->Native()) native->BeginAhead();
+#endif
+        }
     });
     pipe_report_start = std::chrono::steady_clock::now();
     pipelined.store(true, std::memory_order_release);
@@ -802,9 +816,27 @@ void Liverpool::ReportEarlyFences() {
 // FIX-014 (below): draws the rasterizer filters out.
 static bool FilteredDraw(const Regs& state);
 
-void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bool direct_draw) {
+void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bool direct_draw,
+                           std::optional<IndirectSgprs> indirect) {
+#ifndef NDEBUG
+    GeometryTrace::PollFlush();
+    const auto trace_id = GeometryTrace::Enabled() && GeometryTrace::Get().armed.load()
+        ? GeometryTrace::Get().next.fetch_add(1) : 0;
+    GeometryTrace::Scope trace_scope{trace_id};
+    if (trace_id) GeometryTrace::Record("decode", trace_id, compute, direct_draw,
+        regs.num_indices, regs.num_instances.NumInstances());
+    if (trace_id && !compute) GeometryTrace::Record("decode_index", trace_id,
+        regs.index_base_address.Address<VAddr>(), regs.max_index_size,
+        u64(regs.index_buffer_type.index_type));
+#endif
     if (!draw_pipe) {
+#ifndef NDEBUG
+        if (trace_id) GeometryTrace::Record("direct_begin", trace_id);
+#endif
         draw();
+#ifndef NDEBUG
+        if (trace_id) GeometryTrace::Record("direct_end", trace_id);
+#endif
         return;
     }
     // PERF-056: the delta vectors go back and forth between the threads with their capacity.
@@ -839,8 +871,24 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         selected = compute ? rasterizer->SelectComputePipelineAhead()
                            : rasterizer->SelectPipelineAhead();
     }
+    static const bool indirect_ahead = [] {
+        const char* value = std::getenv("RYGT_INDIRECT_AHEAD");
+        return !value || value[0] != '0';
+    }();
+    bool indirect_selected = false;
+    if (indirect && !compute && indirect_ahead && !selected &&
+        rasterizer->SelectsPipelinesAhead()) {
+        const Vulkan::DrawIndirectParams params{
+            .vertex_sgpr_offset = indirect->vertex,
+            .instance_sgpr_offset = indirect->instance,
+            .tessellate_quads = true,
+            .is_indirect = true,
+        };
+        selected = rasterizer->SelectPipelineAhead(&params);
+        indirect_selected = selected.has_value();
+    }
 #ifdef RYTY_GPU
-    if (!compute && Native::ShadowComparing()) {
+    if (!compute && !indirect_selected && Native::ShadowComparing()) {
         // NAT-030: the pipeline the draw's job looked up on its thread, against this selection.
         Native::ShadowCheckPipeline(selected ? selected->pipeline : nullptr, selected.has_value());
     }
@@ -848,14 +896,14 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     // PERF-062: the upload epoch this draw is decoded in; its pages are hashed now, on this
     // thread, and the recorder uses those hashes for this draw.
     const u32 decode_epoch = VideoCore::g_upload_epoch.load(std::memory_order_acquire);
-    if (selected) {
+    if (selected && !indirect_selected) {
         rasterizer->HashDrawPagesAhead(*selected, decode_epoch);
     }
     // PERF-063: the pages the draw reads that the CPU can rewrite without a fault are copied
     // now; the recorder reads the copies.
     std::shared_ptr<Common::ReadCapture> capture;
     if (early_fences_mode) {
-        if (selected) {
+        if (selected && !indirect_selected) {
             if (!window_capture) {
                 window_capture = TakeCapture();
             }
@@ -902,7 +950,7 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         staged_index_bytes = regs.num_indices * index_size;
     }
     staged_index_offset.reset();
-    if (draw_pipe->HasStage() && selected) {
+    if (draw_pipe->HasStage() && selected && !indirect_selected) {
         staged = std::make_shared<StagedDraw>();
         staged->selected = std::move(selected);
         selected.reset();
@@ -923,6 +971,12 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         filtered_neutral && !staged && direct_draw && !compute && FilteredDraw(regs);
     const auto kind = staged || neutral_filtered ? DrawPipe::JobKind::Neutral
                                                  : DrawPipe::JobKind::Barrier;
+#ifndef NDEBUG
+    if (trace_id) GeometryTrace::Record("queue", trace_id, decode_epoch,
+        bool(staged || selected), prepared_draw, bool(capture));
+    if (trace_id) GeometryTrace::Record("queue_flags", trace_id,
+        u64(kind == DrawPipe::JobKind::Neutral), compute, direct_draw, bool(staged));
+#endif
     if (!staged) {
         // DIAG-069
         DrawPipe::SetPushTag(compute ? (direct_draw ? "dispatch not selected" : "indirect dispatch")
@@ -935,8 +989,21 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     draw_pipe->Push([this, delta = std::move(delta), cs, cb_extent = last_cb_extent,
                      db_extent = last_db_extent, expected = std::move(expected),
                      selected = std::move(selected), draw = std::move(draw),
-                     decode_epoch, capture = std::move(capture), staged]() mutable {
+                     decode_epoch, capture = std::move(capture), staged, indirect_selected
+#ifndef NDEBUG
+                     , trace_id
+#endif
+                     ]() mutable {
+#ifndef NDEBUG
+        GeometryTrace::Scope trace_scope{trace_id};
+        if (trace_id) GeometryTrace::Record("recorder_begin", trace_id);
+#endif
         auto& sel = staged ? staged->selected : selected;
+#ifndef NDEBUG
+        if (trace_id && sel) GeometryTrace::Record("selected", trace_id,
+            reinterpret_cast<std::uintptr_t>(sel->pipeline),
+            reinterpret_cast<std::uintptr_t>(sel->compute), indirect_selected, bool(staged));
+#endif
         auto& state = *recorder;
         RegsDelta<Regs::NumRegs>::Apply(delta, std::span<u32, Regs::NumRegs>{state.regs.reg_array});
         if (cs) {
@@ -948,10 +1015,13 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
             VerifyRecorderRegs(*expected);
         }
         rasterizer->SetSelectedPipeline(sel ? &*sel : nullptr);
-        rasterizer->SetDrawEpoch(sel ? decode_epoch : 0);
+        rasterizer->SetDrawEpoch(sel && !indirect_selected ? decode_epoch : 0);
         rasterizer->SetReadCapture(capture.get());
         rasterizer->SetBufferPlan(staged ? &staged->plan : nullptr);
         draw();
+#ifndef NDEBUG
+        if (trace_id) GeometryTrace::Record("recorder_end", trace_id);
+#endif
         rasterizer->SetBufferPlan(nullptr);
         rasterizer->SetReadCapture(nullptr);
         rasterizer->SetDrawEpoch(0);
@@ -1025,6 +1095,14 @@ void Liverpool::PipeReadAhead() {
     pipe_read_ahead_stats.ms +=
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 #endif
+}
+
+bool Liverpool::WaitsYieldToRecorder() const {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_WAIT_NO_DRAIN");
+        return !(env && env[0] == '0');
+    }();
+    return enabled && draw_pipe;
 }
 
 void Liverpool::SyncRecorder(std::string_view reason) {
@@ -1386,6 +1464,10 @@ void Liverpool::ProcessCommands() {
 }
 
 void Liverpool::Process(std::stop_token stoken) {
+    SCOPE_EXIT { Common::UpdateCoreOwner(0, false); };
+#ifdef RYTY_GPU
+    Common::NativeThreadPriority native_priority;
+#endif
     Common::SetCurrentThreadName("shadGT:GpuCommandProcessor");
     Common::PreferPerformanceCores(); // PERF-088
     Common::GuestClock::MarkGpuCommandThread(); // FIX-044
@@ -1396,9 +1478,13 @@ void Liverpool::Process(std::stop_token stoken) {
 #endif
 
     while (!stoken.stop_requested()) {
+#ifdef RYTY_GPU
+        native_priority.Update(Vulkan::NativeModeRequested() && Common::NativeCpuPriorityRequested());
+#endif
         if (draw_pipe) {
             draw_pipe->ReleaseExclusive(); // PERF-050: idle; urgent work may run on the recorder
         }
+        Common::UpdateCoreOwner(0, true); // PERF-GT7-048
         {
             std::unique_lock lk{submit_mutex};
             const auto has_work = [this] { return num_commands || num_tasks || submit_done; };
@@ -1431,7 +1517,7 @@ void Liverpool::Process(std::stop_token stoken) {
         while (num_tasks || num_commands) {
             ProcessCommands();
 
-            curr_qid = (curr_qid + 1) % num_mapped_queues;
+            curr_qid = (curr_qid + 1) % num_mapped_queues.load(std::memory_order_acquire);
 
             auto& queue = mapped_queues[curr_qid];
 
@@ -1451,6 +1537,7 @@ void Liverpool::Process(std::stop_token stoken) {
                 {
                     std::scoped_lock lock{queue.m_access};
                     queue.submits.pop();
+                    if (curr_qid != GfxQueueId) queue.pending.fetch_sub(1, std::memory_order_relaxed);
                 }
                 --num_tasks;
 #ifndef NDEBUG
@@ -1767,6 +1854,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     u32 num_recent = 0;
     while (!dcb.empty()) {
         ProcessCommands();
+
+        // PERF-GT7-052: let runnable compute submissions decode between graphics packets.
+        static const u32 yield_packets = [] {
+            const char* env = std::getenv("RYGT_GFX_YIELD_PACKETS");
+            return env && *env ? u32(std::strtoul(env, nullptr, 10)) : 32u;
+        }();
+        if (yield_packets && ++gfx_packets_since_yield >= yield_packets) {
+            gfx_packets_since_yield = 0;
+            if (ComputeQueueRunnable()) YIELD_GFX();
+        }
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
@@ -2159,7 +2256,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                          base_vtx_loc, start_inst_loc);
                             });
                     },
-                    false);
+                    false, false, IndirectSgprs{base_vtx_loc, start_inst_loc});
                 break;
             }
             case PM4ItOpcode::DrawIndirectMulti: {
@@ -2188,7 +2285,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                          start_inst_loc);
                             });
                     },
-                    false);
+                    false, false, IndirectSgprs{base_vtx_loc, start_inst_loc});
                 break;
             }
             case PM4ItOpcode::DrawIndexIndirect: {
@@ -2214,7 +2311,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                          base_vtx_loc, start_inst_loc);
                             });
                     },
-                    false);
+                    false, false, IndirectSgprs{base_vtx_loc, start_inst_loc});
                 break;
             }
             case PM4ItOpcode::DrawIndexIndirectMulti: {
@@ -2243,7 +2340,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                         0, base_vtx_loc, start_inst_loc);
                                                 });
                     },
-                    false);
+                    false, false, IndirectSgprs{base_vtx_loc, start_inst_loc});
                 break;
             }
             case PM4ItOpcode::DrawIndexIndirectCountMulti: {
@@ -2275,7 +2372,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                         count_addr, base_vtx_loc, start_inst_loc);
                                                 });
                     },
-                    false);
+                    false, false, IndirectSgprs{base_vtx_loc, start_inst_loc});
                 break;
             }
             case PM4ItOpcode::DispatchDirect: {
@@ -2803,6 +2900,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 #endif
                         break;
                     }
+                    while (WaitsYieldToRecorder() && !wait_reg_mem->Test(regs.reg_array) &&
+                           !draw_pipe->QueueIdle()) {
+                        YIELD_GFX();
+                    }
                     if (!wait_reg_mem->Test(regs.reg_array)) {
                         SyncRecorder("wait reg mem");
                     }
@@ -3133,6 +3234,12 @@ bool Liverpool::ScanAheadForPipelines(const std::function<bool(const Regs&)>& on
     return !scan_finished;
 }
 
+struct ComputeParkedScope {
+    u32& parked;
+    explicit ComputeParkedScope(u32& value) : parked{value} { ++parked; }
+    ~ComputeParkedScope() { --parked; }
+};
+
 template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
@@ -3286,6 +3393,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
             const auto wait_start = FrontendWaitNow();
             const bool waited = !rewind->Valid();
+            ComputeParkedScope parked{mapped_queues[vqid + 1].parked};
             while (!rewind->Valid()) {
                 YIELD_ASC(vqid);
             }
@@ -3444,6 +3552,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     SyncRecorder("mem semaphore");
                 }
                 const bool waited = !mem_semaphore->Signaled();
+                ComputeParkedScope parked{mapped_queues[vqid + 1].parked};
                 while (!mem_semaphore->Signaled()) {
                     YIELD_ASC(vqid);
                 }
@@ -3459,6 +3568,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             const auto wait_start = FrontendWaitNow();
+            ComputeParkedScope parked{mapped_queues[vqid + 1].parked};
             // PERF-048: as for graphics waits, the other queues decode first.
             bool yielded = false;
             for (u32 turn = 0; draw_pipe && WaitTurnsEnabled() && turn < 4 &&
@@ -3474,6 +3584,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 waits_moved_after_turns += yielded;
                 RecordSafe([this, wait = *wait_reg_mem] { RecorderWaitRegMem(wait); });
                 break;
+            }
+            while (WaitsYieldToRecorder() && !wait_reg_mem->Test(regs.reg_array) &&
+                   !draw_pipe->QueueIdle()) {
+                YIELD_ASC(vqid);
             }
             // PERF-031: what is waited on may be written by recorded work; the pending-fence
             // check reads the rasterizer, which only the drained recorder lets the command use.
@@ -3997,11 +4111,13 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     const auto& task = ProcessCompute(acb, vqid);
     {
         std::scoped_lock lock{queue.m_access};
+        queue.pending.fetch_add(1, std::memory_order_relaxed);
         queue.submits.emplace(task.handle);
     }
 
     std::scoped_lock lk{submit_mutex};
-    num_mapped_queues = std::max(num_mapped_queues, gnm_vqid + 1);
+    num_mapped_queues.store(std::max(num_mapped_queues.load(std::memory_order_relaxed),
+                                     gnm_vqid + 1), std::memory_order_release);
     ++num_submits;
     ++num_tasks;
     submit_cv.notify_one();

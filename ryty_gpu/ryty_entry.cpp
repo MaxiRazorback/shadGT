@@ -14,7 +14,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include "common/diagnostics.h"
 #include "common/guest_clock.h"
+#include "common/mapping_writeback_gate.h"
 #include "common/logging/log.h"
 #include "common/perf_monitor.h"
 #include "common/scm_rev.h"
@@ -110,10 +112,8 @@ void RunWindowThread() {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(50)); // Flush queued HID releases.
     try {
-        if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
-            LOG_INFO(Render_Vulkan, "CACHE-EXIT: saving driver pipelines before process termination");
-            rasterizer->GetPipelineCache().PersistDriverCacheForExit();
-        }
+        if (Vulkan::SaveDriverCacheAtExit())
+            LOG_INFO(Render_Vulkan, "CACHE-EXIT: driver pipeline save attempted before process termination");
     } catch (const std::exception& error) {
         LOG_WARNING(Render_Vulkan, "CACHE-EXIT: save failed: {}", error.what());
     }
@@ -338,7 +338,7 @@ void DrawFpsCounter() {
 // first bytes of one block of each size. The walk holds the heap's lock, so nothing it does may
 // allocate: the table is allocated before.
 void StartHeapReport() {
-    const char* env = std::getenv("SHADGT_HEAP_REPORT");
+    const char* env = Common::DiagEnv("SHADGT_HEAP_REPORT");
     if (env == nullptr) {
         return;
     }
@@ -438,7 +438,10 @@ void StartHeapReport() {
 #endif
 } // namespace
 
+static bool SerializedMapProtocolAvailable();
+
 void Ryty::RytyLibraryInitialize() {
+    Common::GuestMappingWritebackGate().FreezeProtocol(SerializedMapProtocolAvailable());
     InitializeCommon("shadgt_ryty.log");
     // Camera file I/O, executable validation and hook setup belong to library startup,
     // before the game runs camera callbacks, never to the per-frame overlay draw.
@@ -543,7 +546,7 @@ void Ryty::RytyLibraryInitialize() {
     // DIAG-075: SHADGT_WATCH_WRITE=<hex address>:<seconds>:<ms>[;...] logs the writes to a guest
     // address (thread, code address, value) for ms milliseconds, seconds after the renderer
     // starts; several watches run one after another.
-    if (const char* watch = std::getenv("SHADGT_WATCH_WRITE"); watch != nullptr && *watch != 0) {
+    if (const char* watch = Common::DiagEnv("SHADGT_WATCH_WRITE"); watch != nullptr && *watch != 0) {
         std::thread([list = std::string(watch)] {
             const auto start = std::chrono::steady_clock::now();
             for (std::size_t pos = 0; pos < list.size();) {
@@ -599,7 +602,16 @@ void Ryty::RytyLibraryInitialize() {
 // Ryty's libkernel maps and unmaps guest memory, so it reports those changes here; shadGT's own
 // memory manager would otherwise do this. Without them the renderer keeps cached GPU copies and
 // page tracking for memory the game has freed and reused, and its watcher counts go wrong.
+static bool SerializedMapProtocolAvailable() {
+    const auto module = GetModuleHandleA("libkernel.prx");
+    using Version = unsigned (*)();
+    const auto version = module ? reinterpret_cast<Version>(GetProcAddress(module, "RytySerializedMapProtocolVersion")) : nullptr;
+    return version && version() >= 1;
+}
+
 extern "C" __declspec(dllexport) void RytyGpuUnmapMemory(u64 address, u64 size) {
+    auto& gate = Common::GuestMappingWritebackGate();
+    if (gate.ProtocolAvailable()) gate.BeginUnmap(address, size);
 #ifndef NDEBUG
     if (Native::WatchedTexture(address, address + size)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: Ryty unmaps {:#x}+{:#x}", address, size);
@@ -635,6 +647,7 @@ extern "C" __declspec(dllexport) void RytyGpuProtectionChanged(u64 address, u64 
 }
 
 extern "C" __declspec(dllexport) void RytyGpuMapMemory(u64 address, u64 size) {
+    auto& gate = Common::GuestMappingWritebackGate();
     Native::ForgetReadable(address, size);
 #ifndef NDEBUG
     if (Native::WatchedTexture(address, address + size)) {
@@ -650,6 +663,7 @@ extern "C" __declspec(dllexport) void RytyGpuMapMemory(u64 address, u64 size) {
         // protection back, or writes to them would go unseen while they count as tracked.
         rasterizer->GetPageManager().ReapplyProtection(address, size);
     }
+    if (gate.ProtocolAvailable()) gate.PublishMap(address, size);
 }
 
 void RytyProtectGuestRedZones(); // ryty_red_zone.cpp

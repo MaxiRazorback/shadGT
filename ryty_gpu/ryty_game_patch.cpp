@@ -27,12 +27,14 @@
 #include <windows.h>
 #include <fmt/format.h>
 
+#include "common/diagnostics.h"
 #include "common/perf_monitor.h"
 #include "common/types.h"
 #include "core/debug_state.h"
 #include "core/memory.h"
 #include "ryty_gpu/native/entry_hook.h"
 #include "ryty_gpu/native/menu_snapshot_session.h"
+#include "ryty_gpu/native/menu_capture_compile_guard.h"
 #include "ryty_gpu/native/scene_history_origin.h"
 #include "input/trigger_feedback.h"
 #include "ryty_gpu/ryty_dlssg.h"
@@ -173,7 +175,7 @@ void MiscMonitor() {
     // RYGT_ENV_AB=<seconds>: the scale is on and off for alternating periods of the same run,
     // with draws per frame and frame rate logged for each state (run-to-run differences of the
     // test race are larger than the effects measured).
-    const char* ab_env = std::getenv("RYGT_ENV_AB");
+    const char* ab_env = Common::DiagEnv("RYGT_ENV_AB");
     const u32 ab_ticks = ab_env ? static_cast<u32>(std::atof(ab_env) * 10.0) : 0;
     struct AbTotals {
         u64 draws, frames, ticks;
@@ -323,7 +325,7 @@ void MiscMonitor() {
             }
             // RYGT_ENV_WATCH=<hex offset>: which code reads that field of the first instance that
             // gets a course's values (a hardware read/write watch, at once and again 40 s later).
-            static const char* watch_env = std::getenv("RYGT_ENV_WATCH");
+            static const char* watch_env = Common::DiagEnv("RYGT_ENV_WATCH");
             static const u32 watch_offset =
                 watch_env ? static_cast<u32>(std::strtoul(watch_env, nullptr, 16)) : 0;
             static u8* watched = nullptr;
@@ -366,7 +368,7 @@ void RecordMisc(void* self, int site) {
     // EnvironmentSetting for its first 1.5 s (skipped while another watch runs).
     // (Not during boot: the watch logs through the renderer's log, which starts later.)
     static const auto first_record = std::chrono::steady_clock::now();
-    if (const char* env = std::getenv("RYGT_ENV_WATCH_NEW");
+    if (const char* env = Common::DiagEnv("RYGT_ENV_WATCH_NEW");
         env && site == 0 && std::chrono::steady_clock::now() - first_record > std::chrono::seconds{30}) {
         const u32 offset = static_cast<u32>(std::strtoul(env, nullptr, 16));
         Vulkan::RytyWatchWrites(reinterpret_cast<u64>(self) + offset, 1500,
@@ -822,7 +824,7 @@ void InstallScriptPatches(u8* base) {
 
 void InstallMiscHooks(u8* base) {
 #ifndef NDEBUG
-    const char* diag = std::getenv("RYGT_ENV_DIAG");
+    const char* diag = Common::DiagEnv("RYGT_ENV_DIAG");
 #else
     constexpr const char* diag = nullptr;
 #endif
@@ -1394,6 +1396,152 @@ void InstallMenuSnapshotSessionGuard(u8* base) {
     g_snapshot_session_ready = g_snapshot_start && g_snapshot_end;
 }
 
+// The icon capture script calls Begin before scheduling any image/mask work and
+// End in its cleanup. End alone is not completion: the PNG save runs on a job.
+// Keep every producer required until that job has returned with terminal state 12.
+// Unknown/aborted captures retain the previous conservative menu policy.
+using IconCaptureFn = void(PS4_SYSV_ABI*)(u64);
+Native::MenuCaptureCompileGuard g_capture_compiles;
+IconCaptureFn g_icon_begin{}, g_icon_end{}, g_icon_save{};
+bool g_scoped_menu_compiles = false; // Set before game threads start.
+u64 g_icon_capture_vtable{};
+u64 g_icon_owner_vtable{};
+std::mutex g_icon_lifecycle_mutex;
+
+bool RetainIconCapture(u64 owner) {
+    u64 vtable{};
+    u32 strong{};
+    if (!owner || !Core::RytyMemory::GuardedCopy(&vtable, reinterpret_cast<void*>(owner), sizeof(vtable)) ||
+        vtable != g_icon_owner_vtable ||
+        !Core::RytyMemory::GuardedCopy(&strong, reinterpret_cast<void*>(owner + 8), sizeof(strong)) ||
+        strong == 0 || strong >= (1u << 30)) return false;
+    // The controller owns this shared block throughout its Begin callback.
+    std::atomic_ref<u32>{*reinterpret_cast<u32*>(owner + 8)}.fetch_add(1, std::memory_order_seq_cst);
+    return true;
+}
+
+void ReleaseIconCapture(u64 owner) {
+    // Matches the verified game's shared-owner release sequence. The retained
+    // strong reference keeps both the object and this control block alive.
+    const auto* vtable = *reinterpret_cast<const u64* const*>(owner);
+    if (std::atomic_ref<u32>{*reinterpret_cast<u32*>(owner + 8)}.fetch_sub(1, std::memory_order_seq_cst) == 1) {
+        reinterpret_cast<IconCaptureFn>(vtable[0])(owner);
+        if (std::atomic_ref<u32>{*reinterpret_cast<u32*>(owner + 12)}.fetch_sub(1, std::memory_order_seq_cst) == 1)
+            reinterpret_cast<IconCaptureFn>(vtable[1])(owner);
+    }
+}
+
+void PS4_SYSV_ABI IconCaptureBegin(u64 controller) {
+    // End and a replacing Begin must not drop the controller's shared owner
+    // between copying the pair and taking our reference. Save completion does
+    // not acquire this mutex, so a waiting End cannot block the save worker.
+    std::scoped_lock lifecycle_lock{g_icon_lifecycle_mutex};
+    const bool tracked = g_capture_compiles.Begin(reinterpret_cast<void*>(controller));
+    g_icon_begin(controller);
+    std::array<u64, 2> capture{};
+    u64 vtable{};
+    bool pinned = false;
+    if (tracked && Core::RytyMemory::GuardedCopy(capture.data(),
+            reinterpret_cast<void*>(controller + 0x2950), sizeof(capture)) && capture[0] &&
+        Core::RytyMemory::GuardedCopy(&vtable, reinterpret_cast<void*>(capture[0]), sizeof(vtable)) &&
+        vtable == g_icon_capture_vtable) {
+        pinned = RetainIconCapture(capture[1]);
+    }
+    if (tracked && !g_capture_compiles.Attach(reinterpret_cast<void*>(controller),
+            pinned ? reinterpret_cast<void*>(capture[0]) : nullptr,
+            pinned ? reinterpret_cast<void*>(capture[1]) : nullptr) && pinned) {
+        ReleaseIconCapture(capture[1]);
+    }
+#ifndef NDEBUG
+    std::fprintf(stderr, "[capture-compile] begin controller=%llx object=%llx retained=%d\n",
+                 controller, capture[0], pinned);
+#endif
+}
+
+void PS4_SYSV_ABI IconCaptureSave(u64 object) {
+    const auto token = g_capture_compiles.StartSave(reinterpret_cast<void*>(object));
+    g_icon_save(object);
+    // A tracked Begin retained an engine owner. Even an early/cancelled End
+    // cannot destroy it underneath this final read. Early worker returns do
+    // not write state 12 and must keep the conservative policy.
+    u32 state{};
+    const bool saved = token && Core::RytyMemory::GuardedCopy(&state,
+        reinterpret_cast<void*>(object + 0x3f8), sizeof(state)) && state == 12;
+    g_capture_compiles.CompleteSave(reinterpret_cast<void*>(object), token, saved);
+#ifndef NDEBUG
+    std::fprintf(stderr, "[capture-compile] save object=%llx generation=%llu state=%u\n", object, token, state);
+#endif
+}
+
+void PS4_SYSV_ABI IconCaptureEnd(u64 controller) {
+    std::scoped_lock lifecycle_lock{g_icon_lifecycle_mutex};
+    // The game can observe state 12 just before the save wrapper publishes its
+    // completion. Keep its owner alive until that publication; never wait forever
+    // if this is an interrupted capture or an unsupported scheduling path.
+    const bool saved = g_capture_compiles.WaitForSave(reinterpret_cast<void*>(controller),
+                                                     std::chrono::milliseconds{250});
+    std::array<u64, 2> capture{};
+    if (!Core::RytyMemory::GuardedCopy(capture.data(),
+            reinterpret_cast<void*>(controller + 0x2950), sizeof(capture)) || !capture[0] || !capture[1])
+        g_capture_compiles.Attach(nullptr, nullptr); // Uncertain owner: retain the pin and wait policy.
+    g_icon_end(controller);
+    if (g_capture_compiles.End(reinterpret_cast<void*>(controller), reinterpret_cast<void*>(capture[0]),
+                              reinterpret_cast<void*>(capture[1])))
+        ReleaseIconCapture(capture[1]);
+#ifndef NDEBUG
+    std::fprintf(stderr, "[capture-compile] end controller=%llx saved=%d continuing=%d\n",
+                 controller, saved, g_capture_compiles.CanContinue());
+#else
+    (void)saved;
+#endif
+}
+
+void InstallScopedMenuCompiles(u8* base) {
+    const char* enabled = std::getenv("RYGT_CAPTURE_SCOPED_MENUS");
+    if (enabled && std::strcmp(enabled, "0") == 0) return;
+    // Verify implementation-specific fields and virtual entries, not just the
+    // common function prologue. Unsupported game versions retain menu waits.
+    const auto matches = [&](u64 rva, std::span<const u8> expected) {
+        std::array<u8, 64> actual{};
+        return expected.size() <= actual.size() &&
+               Core::RytyMemory::GuardedCopy(actual.data(), base + rva, expected.size()) &&
+               std::equal(expected.begin(), expected.end(), actual.begin());
+    };
+    constexpr u8 begin_field[]{0x48,0x8d,0xb7,0x6c,0x29,0,0};
+    constexpr u8 end_field[]{0xc7,0x87,0x68,0x29,0,0,3,0,0,0};
+    constexpr u8 save_field[]{0x48,0x8b,0x87,0x80,3,0,0,0x48,0x3b,0x87,0x88,3,0,0};
+    constexpr u8 terminal[]{0x41,0xc7,0x84,0x24,0xf8,3,0,0,12,0,0,0};
+    constexpr u8 prologue[]{0x55,0x48,0x89,0xe5,0x41,0x57};
+    u64 save_entry{};
+    std::array<u64, 2> owner_entries{};
+    if (!matches(0x5652b0, prologue) || !matches(0x5651e0, prologue) ||
+        !matches(0x56c7e0, prologue) || !matches(0x5652cb, begin_field) ||
+        !matches(0x565202, end_field) || !matches(0x56c802, save_field) ||
+        !matches(0x56d69e, terminal) ||
+        !Core::RytyMemory::GuardedCopy(&save_entry, base + 0x28443d0 + 0x40, sizeof(save_entry)) ||
+        save_entry != reinterpret_cast<u64>(base + 0x56c400) ||
+        !Core::RytyMemory::GuardedCopy(owner_entries.data(), base + 0x2844398, sizeof(owner_entries)) ||
+        owner_entries[0] != reinterpret_cast<u64>(base + 0x56e4b0) ||
+        owner_entries[1] != reinterpret_cast<u64>(base + 0x56e4c0)) {
+        g_capture_compiles.ConfigureReady(false);
+        std::fprintf(stderr, "[capture-compile] unsupported capture implementation; retaining menu waits\n");
+        return;
+    }
+    Native::NearCode code{base};
+    g_icon_begin = reinterpret_cast<IconCaptureFn>(Native::HookEntry(code, base, 0x5552b0,
+        prologue, reinterpret_cast<void*>(&IconCaptureBegin), "icon capture compile begin"));
+    g_icon_end = reinterpret_cast<IconCaptureFn>(Native::HookEntry(code, base, 0x5551e0,
+        prologue, reinterpret_cast<void*>(&IconCaptureEnd), "icon capture compile end"));
+    g_icon_save = reinterpret_cast<IconCaptureFn>(Native::HookEntry(code, base, 0x55c7e0,
+        prologue, reinterpret_cast<void*>(&IconCaptureSave), "icon capture save completion"));
+    g_icon_capture_vtable = reinterpret_cast<u64>(base + 0x28443d0);
+    g_icon_owner_vtable = reinterpret_cast<u64>(base + 0x2844398);
+    g_scoped_menu_compiles = g_icon_begin && g_icon_end && g_icon_save;
+    g_capture_compiles.ConfigureReady(g_scoped_menu_compiles);
+    std::fprintf(stderr, "[capture-compile] scoped menu compiles %s\n",
+                 g_scoped_menu_compiles ? "ready" : "unavailable; retaining menu waits");
+}
+
 // Diagnostic comparison: keep output/UI at 1080p while the allocator experiment
 // supplies 540p scene targets. This scoped helper already supports separate scene
 // scale inputs; its default 1:1 scale otherwise expands scene logical viewports.
@@ -1493,6 +1641,7 @@ void InstallPhotoExport(); // GTS-010, gts_photo_export.cpp
 
 void RytyApplyGamePatches() {
     InstallPhotoExport();
+    InstallScopedMenuCompiles(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallExperimentalSceneViewport(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallMenuSnapshotSessionGuard(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
     InstallIdleKeyboardClose(reinterpret_cast<u8*>(GetModuleHandleA(nullptr)));
@@ -1543,6 +1692,12 @@ namespace Vulkan {
 // FIX-110: true while a race project runs (see NoteProjectScript).
 bool RytyGtsInRace() {
     return g_in_race.load(std::memory_order_relaxed);
+}
+bool RytyGtsMenuCaptureCanContinue() {
+    return g_scoped_menu_compiles && g_capture_compiles.CanContinue();
+}
+bool RytyGtsMenuCaptureAvailable() {
+    return g_scoped_menu_compiles;
 }
 bool RytyGtsMenuSnapshotsAllowed() {
     return g_snapshot_session_ready && g_snapshot_session.Idle() && !RytyGtsInRace();

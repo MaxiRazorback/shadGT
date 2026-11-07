@@ -236,6 +236,7 @@ void TextureCache::CompleteReadbacks(std::span<const PendingReadback> readbacks)
     static const bool merge_words = Common::PerfFeatureEnabled(38);
     auto* memory = Core::Memory::Instance();
     for (const auto& readback : readbacks) {
+        const auto writeback = [&] {
         if (check_guest_bytes && merge_words && readback.guest_bytes &&
             memory->IsValidMapping(readback.address, readback.size)) {
             std::vector<u8> merged(readback.size);
@@ -288,7 +289,7 @@ void TextureCache::CompleteReadbacks(std::span<const PendingReadback> readbacks)
 #endif
             memory->TryWriteBacking(std::bit_cast<u8*>(readback.address), merged.data(),
                                     readback.size);
-            continue;
+            return;
         }
         if (check_guest_bytes && memory->IsValidMapping(readback.address, readback.size) &&
             HashGuestBytes(readback.address, readback.size) != readback.guest_hash) {
@@ -299,13 +300,19 @@ void TextureCache::CompleteReadbacks(std::span<const PendingReadback> readbacks)
                             "that memory after it was recorded",
                             n, readback.address, readback.size);
             }
-            continue;
+            return;
         }
         if (memory->IsValidMapping(readback.address, readback.size)) {
             readback.download.Invalidate();
             memory->TryWriteBacking(std::bit_cast<u8*>(readback.address), readback.download.mapped,
                                     readback.size);
         }
+        };
+#ifdef RYTY_GPU
+        Common::GuestMappingWritebackGate().Complete(readback.mapping_token, writeback);
+#else
+        writeback();
+#endif
     }
     std::scoped_lock lk{finished_readbacks_mutex};
     for (const auto& readback : readbacks) {
@@ -355,6 +362,9 @@ std::optional<TextureCache::PendingReadback> TextureCache::RecordImageReadback(I
     if (download_size == 0 || download_size > image.info.guest_size) {
         return std::nullopt;
     }
+#ifdef RYTY_GPU
+    auto mapping_token = Common::GuestMappingWritebackGate().Capture(image.info.guest_address, download_size);
+#endif
     const auto download =
         runtime.GetStagingPool().Request(download_size, MemoryType::HostCached, 16, true);
     const vk::BufferImageCopy image_download = {
@@ -388,7 +398,11 @@ std::optional<TextureCache::PendingReadback> TextureCache::RecordImageReadback(I
     return PendingReadback{image.info.guest_address, download, download_size,
                            HashGuestBytes(image.info.guest_address, download_size),
                            merge_words ? CopyGuestBytes(image.info.guest_address, download_size)
-                                       : nullptr};
+                                       : nullptr
+#ifdef RYTY_GPU
+                           , std::move(mapping_token)
+#endif
+                           };
 }
 
 static u32 ImageDownloadSize(const Image& image) {
@@ -465,6 +479,9 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     }
     const u32 download_size = ImageDownloadSize(image);
     ASSERT(download_size <= image.info.guest_size);
+#ifdef RYTY_GPU
+    auto mapping_token = Common::GuestMappingWritebackGate().Capture(image.info.guest_address, download_size);
+#endif
     const auto download =
         runtime.GetStagingPool().Request(download_size, MemoryType::HostCached, 16, !sync);
     const vk::BufferImageCopy image_download = {
@@ -486,15 +503,27 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     if (sync) {
         scheduler.Finish();
         download.Invalidate();
-        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
-                                                  download.mapped, download_size);
+        const auto writeback = [&] {
+            Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
+                                                      download.mapped, download_size);
+        };
+#ifdef RYTY_GPU
+        Common::GuestMappingWritebackGate().Complete(mapping_token, writeback);
+#else
+        writeback();
+#endif
     } else {
         // FIX-024: the image is freed (and its pages unprotected) before this write lands, so
         // a guest write in between goes unseen; skip the write if the bytes changed meanwhile.
         const u64 guest_hash =
             skip_written_back ? HashGuestBytes(image.info.guest_address, download_size) : 0;
         scheduler.DeferPriorityOperation([this, device_addr = image.info.guest_address, download,
-                                          download_size, guest_hash] {
+                                          download_size, guest_hash
+#ifdef RYTY_GPU
+                                          , mapping_token = std::move(mapping_token)
+#endif
+                                          ] {
+            const auto writeback = [&] {
             if (skip_written_back && HashGuestBytes(device_addr, download_size) != guest_hash) {
                 LOG_WARNING(Render_Vulkan,
                             "FIX-024: download to {:#x}+{:#x} skipped: the guest changed that "
@@ -505,6 +534,12 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
                 Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
                                                           download.mapped, download_size);
             }
+            };
+#ifdef RYTY_GPU
+            Common::GuestMappingWritebackGate().Complete(mapping_token, writeback);
+#else
+            writeback();
+#endif
             runtime.GetStagingPool().FreeDeferred(download);
         });
     }

@@ -6,6 +6,7 @@
 #include <semaphore>
 #include <thread>
 #include <random>
+#include <utility>
 #include <vector>
 #include <gtest/gtest.h>
 
@@ -50,10 +51,11 @@ TEST(RegsDelta, SendsOnlyTheWrittenBlocks) {
     delta.Mark(0x2C00 + 5, 1);
     std::vector<u32> packet;
     delta.Collect(std::span<const u32, NumDwords>{regs.data(), NumDwords}, packet);
-    ASSERT_EQ(packet.size(), 3 * Delta::RecordDwords);
+    ASSERT_EQ(packet.size(), 3 * 32u + 4u); // two runs: blocks 0..1 and the distant block
     EXPECT_EQ(packet[0], 0u);
-    EXPECT_EQ(packet[Delta::RecordDwords], 1u);
-    EXPECT_EQ(packet[2 * Delta::RecordDwords], 0x2C00u / 32);
+    EXPECT_EQ(packet[1], 2u);
+    EXPECT_EQ(packet[2 + 2 * 32], 0x2C00u / 32);
+    EXPECT_EQ(packet[3 + 2 * 32], 1u);
     packet.clear();
     delta.Collect(std::span<const u32, NumDwords>{regs.data(), NumDwords}, packet);
     EXPECT_TRUE(packet.empty());
@@ -69,7 +71,8 @@ TEST(RegsDelta, MarkAllSendsEveryBlockAndIgnoresWritesPastTheEnd) {
     delta.MarkAll();
     std::vector<u32> packet;
     delta.Collect(std::span<const u32, NumDwords>{regs.data(), NumDwords}, packet);
-    EXPECT_EQ(packet.size(), Delta::NumBlocks * Delta::RecordDwords);
+    // Collect emits at most one contiguous run per 64-block bitmap word.
+    EXPECT_EQ(packet.size(), NumDwords + 2u * ((Delta::NumBlocks + 63u) / 64u));
     Delta::Apply(packet, std::span<u32, NumDwords>{copy.data(), NumDwords});
     EXPECT_EQ(copy, regs);
 }
@@ -116,6 +119,36 @@ TEST(DrawPipe, DrainWaitsForWorkAlreadyRunning) {
     });
     pipe.Drain();
     EXPECT_EQ(done.load(), 9);
+}
+
+TEST(DrawPipe, DrainWaitsForAnIdleHookAlreadyUsingTheCaches) {
+    using namespace std::chrono_literals;
+    std::binary_semaphore entered{0}, release{0}, drained{0};
+    bool armed = false;
+    AmdGpu::DrawPipe pipe{nullptr, AmdGpu::DrawPipe::DefaultMaxPending, [&] {
+        if (std::exchange(armed, false)) { entered.release(); release.acquire(); }
+    }};
+    pipe.Push([&] { armed = true; });
+    entered.acquire();
+    EXPECT_FALSE(pipe.QueueIdle());
+    std::jthread caller{[&] { pipe.Drain(); drained.release(); }};
+    EXPECT_FALSE(drained.try_acquire_for(100ms));
+    release.release();
+}
+
+TEST(DrawPipe, IdleWorkCompletesAfterReleaseWithoutAnotherPush) {
+    using namespace std::chrono_literals;
+    bool pending = false;
+    std::binary_semaphore done{0};
+    AmdGpu::DrawPipe pipe{nullptr, AmdGpu::DrawPipe::DefaultMaxPending, [&] {
+        if (std::exchange(pending, false)) done.release();
+    }};
+    for (int i = 0; i < 100; ++i) {
+        pipe.Push([&] { pending = true; });
+        pipe.Drain();
+        pipe.ReleaseExclusive();
+        ASSERT_TRUE(done.try_acquire_for(2s));
+    }
 }
 
 TEST(DrawPipe, BoundsTheQueueAndKeepsOrderUnderBackpressure) {

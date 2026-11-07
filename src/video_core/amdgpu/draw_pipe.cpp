@@ -11,7 +11,9 @@
 #include "common/logging/log.h"
 #include "common/nvtx.h"
 #include "common/perf_monitor.h"
+#include "common/scope_exit.h"
 #include "common/thread.h"
+#include "common/native_thread_priority.h"
 #include "video_core/buffer_cache/direct_memory.h"
 #include "video_core/amdgpu/draw_pipe.h"
 
@@ -437,11 +439,15 @@ void DrawPipe::RunUrgentIfExclusive() {
     }
 }
 
+bool DrawPipe::QueueIdle() {
+    std::scoped_lock lk{mutex};
+    return finished == pushed && !urgent_running;
+}
+
 void DrawPipe::ReleaseExclusive() {
     std::scoped_lock lk{mutex};
-    exclusive = false;
-    if (!urgent.empty()) {
-        work_cv.notify_all();
+    if (std::exchange(exclusive, false) && recorder_waiting) {
+        work_cv.notify_one();
     }
 }
 
@@ -460,6 +466,10 @@ DrawPipe::Stats DrawPipe::TakeStats() {
 }
 
 void DrawPipe::Run(std::stop_token stop) {
+    SCOPE_EXIT { Common::UpdateCoreOwner(1, false); };
+#ifdef RYTY_GPU
+    Common::NativeThreadPriority native_priority;
+#endif
     if (thread_init) {
         thread_init();
     }
@@ -471,25 +481,27 @@ void DrawPipe::Run(std::stop_token stop) {
 
     std::deque<Work> batch;
     while (true) {
+#ifdef RYTY_GPU
+        native_priority.Update(Vulkan::NativeModeRequested() && Common::NativeCpuPriorityRequested());
+#endif
         RunUrgent();
-        if (idle_hook) {
-            bool run_idle;
-            {
-                std::scoped_lock lk{mutex};
-                run_idle = queue.empty() && !exclusive && !stop.stop_requested();
-                // Drain must not hand rasterizer ownership to the command
-                // processor while this hook is submitting recorded work.
-                if (run_idle) urgent_running = true;
-            }
-            if (run_idle) {
-                idle_hook(); // D5
-                std::scoped_lock lk{mutex};
-                urgent_running = false;
-                done_cv.notify_all();
-            }
-        }
         {
             std::unique_lock lk{mutex};
+            if (idle_hook && queue.empty()) {
+                if (exclusive) {
+                    recorder_waiting = true;
+                    work_cv.wait(lk, [&] { return !exclusive || stop.stop_requested(); });
+                    recorder_waiting = false;
+                }
+                if (queue.empty() && !stop.stop_requested()) {
+                    urgent_running = true;
+                    lk.unlock();
+                    idle_hook();
+                    lk.lock();
+                    urgent_running = false;
+                    done_cv.notify_all();
+                }
+            }
             if (queue.empty()) {
                 recorder_waiting = true;
                 const auto idle_from = std::chrono::steady_clock::now();
@@ -516,6 +528,7 @@ void DrawPipe::Run(std::stop_token stop) {
                 done_cv.notify_all(); // A producer may wait for space.
             }
         }
+        Common::UpdateCoreOwner(1, true); // PERF-GT7-048
         const auto start = std::chrono::steady_clock::now();
         u64 ran = 0;
         Common::Nvtx::Scope nvtx{"recording"}; // DIAG-056

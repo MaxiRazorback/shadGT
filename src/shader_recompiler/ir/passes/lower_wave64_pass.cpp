@@ -1,13 +1,18 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstdlib>
+#include <iterator>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <fmt/format.h>
 #include <magic_enum/magic_enum.hpp>
 #include "common/logging/classes.h"
 #include "common/perf_monitor.h"
 #include "shader_recompiler/info.h"
+#include "shader_recompiler/lane_read_policy.h"
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/breadth_first_search.h"
 #include "shader_recompiler/ir/ir_emitter.h"
@@ -15,6 +20,66 @@
 #include "shader_recompiler/profile.h"
 
 namespace Shader::Optimization {
+
+// A global X index in a workgroup whose X dimension is a multiple of 64 has
+// the form 64 * wave + lane. Comparing it with a wave-aligned boundary cannot
+// split a guest wave, even though the index itself varies between invocations.
+static bool IsWaveIndex(const IR::Value& value, const RuntimeInfo& runtime) {
+    if (value.IsImmediate()) {
+        return false;
+    }
+    const auto* inst = value.Inst();
+    if (inst->GetOpcode() == IR::Opcode::GetAttributeU32) {
+        const auto attr = inst->Arg(0).Attribute();
+        return attr == IR::Attribute::LocalInvocationIndex ||
+               (attr == IR::Attribute::LocalInvocationId && inst->Arg(1).IsImmediate() &&
+                inst->Arg(1).U32() == 0 && runtime.hw.cs.workgroup_size[0] % 64 == 0);
+    }
+    if (inst->GetOpcode() != IR::Opcode::IAdd32) {
+        return false;
+    }
+    const auto aligned_group_offset = [](const IR::Value& v) {
+        if (v.IsImmediate()) {
+            return v.U32() % 64 == 0;
+        }
+        const auto* shift = v.Inst();
+        if (shift->GetOpcode() != IR::Opcode::ShiftLeftLogical32 ||
+            !shift->Arg(1).IsImmediate() || shift->Arg(1).U32() < 6 ||
+            shift->Arg(1).U32() >= 32 || shift->Arg(0).IsImmediate()) {
+            return false;
+        }
+        const auto* group = shift->Arg(0).Inst();
+        return group->GetOpcode() == IR::Opcode::GetAttributeU32 &&
+               group->Arg(0).Attribute() == IR::Attribute::WorkgroupId;
+    };
+    return (aligned_group_offset(inst->Arg(0)) && IsWaveIndex(inst->Arg(1), runtime)) ||
+           (aligned_group_offset(inst->Arg(1)) && IsWaveIndex(inst->Arg(0), runtime));
+}
+
+static bool IsWaveUniformComparison(const IR::Inst& inst, const RuntimeInfo& runtime) {
+    const auto& wg = runtime.hw.cs.workgroup_size;
+    // The lowering exchanges the two halves through workgroup barriers. A guard
+    // that selects whole waves can still split a workgroup containing several waves.
+    if (wg[0] * wg[1] * wg[2] != 64) {
+        return false;
+    }
+    using IR::Opcode;
+    const auto op = inst.GetOpcode();
+    if (op != Opcode::ULessThan32 && op != Opcode::ULessThanEqual32 &&
+        op != Opcode::UGreaterThan32 && op != Opcode::UGreaterThanEqual32) {
+        return false;
+    }
+    const bool constant_left = inst.Arg(0).IsImmediate();
+    const IR::Value boundary = inst.Arg(constant_left ? 0 : 1);
+    const IR::Value index = inst.Arg(constant_left ? 1 : 0);
+    if (!boundary.IsImmediate() || !IsWaveIndex(index, runtime)) {
+        return false;
+    }
+    const bool starts_wave = constant_left
+                                ? op == Opcode::UGreaterThan32 || op == Opcode::ULessThanEqual32
+                                : op == Opcode::ULessThan32 || op == Opcode::UGreaterThanEqual32;
+    return (boundary.U32() & 63) == (starts_wave ? 0u : 63u);
+}
 
 static bool IsDivergentCondition(const IR::U1& condition) {
     if (condition.IsImmediate()) {
@@ -57,7 +122,7 @@ static bool TraceDivergence(const IR::Inst* inst) {
     return true;
 }
 
-static bool IsDivergentLoopCondition(const IR::U1& condition) {
+static bool IsDivergentLoopCondition(const IR::U1& condition, const RuntimeInfo& runtime) {
     if (condition.IsImmediate()) {
         return false;
     }
@@ -75,6 +140,9 @@ static bool IsDivergentLoopCondition(const IR::U1& condition) {
     while (!stack.empty()) {
         const IR::Inst* inst = stack.back();
         stack.pop_back();
+        if (IsWaveUniformComparison(*inst, runtime)) {
+            continue;
+        }
         switch (inst->GetOpcode()) {
         case IR::Opcode::LaneId:
         case IR::Opcode::MaskedBitCount32:
@@ -130,7 +198,8 @@ static bool IsDivergentLoopCondition(const IR::U1& condition) {
     return false;
 }
 
-static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program) {
+static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program,
+                                               const RuntimeInfo& runtime) {
     using Type = IR::AbstractSyntaxNode::Type;
     static const bool uniform_loops_enabled = Common::PerfFeatureEnabled(31);
 
@@ -148,7 +217,7 @@ static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program) {
             *g_wave64_trace += repeat ? "Repeat:" : "Break:";
         }
         const IR::U1 cond = repeat ? node.data.repeat.cond : node.data.break_node.cond;
-        const bool divergent = !uniform_loops_enabled || IsDivergentLoopCondition(cond);
+        const bool divergent = !uniform_loops_enabled || IsDivergentLoopCondition(cond, runtime);
         if (g_wave64_trace) {
             *g_wave64_trace += divergent ? " divergent;" : " uniform;";
         }
@@ -176,7 +245,7 @@ static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program) {
                 *g_wave64_trace += "If:";
             }
             const bool divergent = uniform_loops_enabled
-                                       ? IsDivergentLoopCondition(node.data.if_node.cond)
+                                       ? IsDivergentLoopCondition(node.data.if_node.cond, runtime)
                                        : IsDivergentCondition(node.data.if_node.cond);
             if (g_wave64_trace) {
                 *g_wave64_trace += divergent ? " divergent;" : " uniform;";
@@ -233,6 +302,162 @@ static IR::Inst* FindBallotForMaskedBitCount(const IR::Inst& mbcnt) {
     return inst->GetOpcode() == IR::Opcode::Ballot ? inst : nullptr;
 }
 
+// FIX-GT7-028: a read of a lane past the host's subgroup (subgroupBroadcast of lane 32 on NVIDIA) has
+// an undefined result, and its lowering needs a barrier, which control flow that differs between
+// invocations cannot hold. GT7's occlusion pyramid reads lane 32 inside ifs on the invocation's
+// position, when it makes a level from an 8x8 tile: the second row of the 4x2 level was lost, so the
+// two coarsest levels said the whole screen was covered and buildings in view were eliminated (black,
+// with the depth of their occluder). Those ifs are GCN EXEC scopes around arithmetic: without the
+// branch every invocation runs the arithmetic, which nothing else sees, the ifs directly inside test
+// the removed condition as well, and the lane read is in uniform control flow. A branch whose own
+// blocks ask which invocations are active is kept: without it, more of them are. Only EXEC scopes
+// qualify, since V_READLANE ignores EXEC: a guard on anything else decides whether the guest reads the
+// lane at all. And only in a group of 64 invocations, the one wave the lowering can exchange: a guard
+// on a 64-lane boundary stays what it is (crowd fix, f35c61f8), and any if around the read that is not
+// an EXEC scope leaves the read as it was.
+// RYGT_LANE_READ_UNBRANCH=0: as before.
+static bool ReadsActiveLanes(const IR::Inst& inst) {
+    switch (inst.GetOpcode()) {
+    case IR::Opcode::ReadFirstLane:
+    case IR::Opcode::Ballot:
+    case IR::Opcode::GroupAny:
+    case IR::Opcode::GetExec:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void UnbranchUpperLaneReads(IR::Program& program, const RuntimeInfo& runtime,
+                                   const Profile& profile) {
+    const bool enabled = Shader::LaneReadUnbranchEnabled();
+    const auto [size_x, size_y, size_z] = runtime.hw.cs.workgroup_size;
+    if (!enabled || size_x * size_y * size_z != 64) {
+        return;
+    }
+    using Type = IR::AbstractSyntaxNode::Type;
+    auto& list = program.syntax_list;
+    const auto differs = [&](size_t scope) {
+        return IsDivergentLoopCondition(list[scope].data.if_node.cond, runtime);
+    };
+    // The EXEC scopes that differ between invocations around a read of an upper lane.
+    std::vector<size_t> open;
+    std::unordered_set<size_t> scopes;
+    u32 loops = 0;
+    for (size_t i = 0; i < list.size(); ++i) {
+        switch (list[i].type) {
+        case Type::If:
+            open.push_back(i);
+            break;
+        case Type::EndIf:
+            open.pop_back();
+            break;
+        case Type::Loop:
+            ++loops;
+            break;
+        case Type::Repeat:
+            --loops;
+            break;
+        case Type::Block:
+            if (loops == 0 && !open.empty() &&
+                std::ranges::any_of(list[i].data.block->Instructions(), [&](const IR::Inst& inst) {
+                    return inst.GetOpcode() == IR::Opcode::ReadLane && inst.Arg(1).IsImmediate() &&
+                           inst.Arg(1).U32() >= profile.subgroup_size;
+                }) &&
+                std::ranges::none_of(open, [&](size_t scope) {
+                    return differs(scope) && !list[scope].data.if_node.exec_scope;
+                })) {
+                std::ranges::copy_if(open, std::inserter(scopes, scopes.end()), differs);
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    if (scopes.empty()) {
+        return;
+    }
+    // Without their branch they must change nothing: no side effects in their own blocks and no phi
+    // after them. The ifs directly inside get the conditions that were around them.
+    open.clear();
+    const auto refuse = [&](std::string_view why) {
+        LOG_WARNING(Render_Recompiler,
+                    "FIX-GT7-028: shader {:#x}: upper lane read left in its branch: {}",
+                    program.info.pgm_hash, why);
+    };
+    struct InnerIf {
+        size_t node;
+        std::vector<size_t> around;
+    };
+    std::vector<InnerIf> inner_ifs;
+    for (size_t i = 0; i < list.size(); ++i) {
+        const bool inside =
+            std::ranges::any_of(open, [&](size_t scope) { return scopes.contains(scope); });
+        switch (list[i].type) {
+        case Type::If:
+            if (scopes.contains(i)) {
+                if (std::ranges::any_of(list[i].data.if_node.merge->Instructions(),
+                                        [](const IR::Inst& inst) { return IR::IsPhi(inst); })) {
+                    return refuse("a value leaves the branch");
+                }
+            } else if (!open.empty() && scopes.contains(open.back())) {
+                if (i == 0 || list[i - 1].type != Type::Block) {
+                    return refuse("an inner if has no block before it");
+                }
+                InnerIf inner{i, {}};
+                std::ranges::copy_if(open, std::back_inserter(inner.around),
+                                     [&](size_t scope) { return scopes.contains(scope); });
+                inner_ifs.push_back(std::move(inner));
+            }
+            open.push_back(i);
+            break;
+        case Type::EndIf:
+            open.pop_back();
+            break;
+        case Type::Block:
+            if (!open.empty() && scopes.contains(open.back()) &&
+                std::ranges::any_of(list[i].data.block->Instructions(), [](const IR::Inst& inst) {
+                    return inst.MayHaveSideEffects() &&
+                           inst.GetOpcode() != IR::Opcode::ConditionRef;
+                })) {
+                return refuse("the branch has side effects");
+            }
+            if (!open.empty() && scopes.contains(open.back()) &&
+                std::ranges::any_of(list[i].data.block->Instructions(), ReadsActiveLanes)) {
+                return refuse("the branch reads which lanes are active");
+            }
+            break;
+        case Type::Loop:
+        case Type::Repeat:
+        case Type::Break:
+        case Type::Return:
+        case Type::Unreachable:
+            if (inside) {
+                return refuse("the branch has other control flow");
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    for (const InnerIf& inner : inner_ifs) {
+        IR::Block* const before = list[inner.node - 1].data.block;
+        IR::IREmitter ir{*before, before->end()};
+        IR::U1 condition = list[inner.node].data.if_node.cond;
+        for (const size_t scope : inner.around) {
+            condition = ir.LogicalAnd(list[scope].data.if_node.cond, condition);
+        }
+        list[inner.node].data.if_node.cond = ir.ConditionRef(condition);
+    }
+    for (const size_t scope : scopes) {
+        list[scope].data.if_node.cond = IR::U1{IR::Value{true}};
+    }
+    LOG_WARNING(Render_Recompiler,
+                "FIX-GT7-028: shader {:#x}: {} branches removed for an upper lane read, {} inner ifs "
+                "test their conditions",
+                program.info.pgm_hash, scopes.size(), inner_ifs.size());
+}
+
 void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info,
                            const Profile& profile) {
     if (program.info.hw_stage != HwStage::Compute || profile.subgroup_size == 64) {
@@ -245,8 +470,10 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
         return;
     }
 
+    UnbranchUpperLaneReads(program, runtime_info, profile);
+
     std::vector<IR::Inst*> worklist;
-    const auto uniform_blocks = FindUniformBlocks(program);
+    const auto uniform_blocks = FindUniformBlocks(program, runtime_info);
     for (IR::Block* block : program.blocks) {
         const bool is_uniform = std::ranges::contains(uniform_blocks, block);
         const auto push_worklist = [&](IR::Inst& inst) {

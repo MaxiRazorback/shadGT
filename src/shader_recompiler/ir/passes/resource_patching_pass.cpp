@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <limits>
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/basic_block.h"
@@ -132,7 +133,7 @@ public:
 
     u32 Add(const FMaskResource& desc) {
         u32 index = Add(fmask_resources, desc, [&desc](const auto& existing) {
-            return desc.sharp_idx == existing.sharp_idx;
+            return desc.sharp_fetch == existing.sharp_fetch && desc.is_r128 == existing.is_r128;
         });
         return index;
     }
@@ -296,8 +297,25 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
     }
 
     // Patch image instruction if image is FMask.
+    const FMaskResource fmask_res{.sharp_fetch = image_res.sharp_fetch, .is_r128 = image_res.is_r128};
     if (AmdGpu::IsFmask(image.GetDataFmt())) {
         ASSERT_MSG(!is_written, "FMask storage instructions are not supported");
+
+        // FIX-GT7-043: every instruction below leaves no image for this T#, so without a record
+        // here the key doesn't look at it again and this code matches any T# in that slot. GT7's
+        // lamp halos (vs 0x59b5b0b6) leave float data in their cube's slot on draws that don't read
+        // it; the rare time it looked like an FMask, the cube's read became these constants, and
+        // the draws with a real cube took that code for the rest of the session: light of 1e33,
+        // the long pink rays. RYGT_FMASK_KEY=0: as before.
+        const bool size_read = inst.GetOpcode() == IR::Opcode::ImageQueryDimensions;
+        if (FMaskKeyEnabled() || size_read) {
+            const u32 index = descriptors.Add(fmask_res);
+            info.fmasks[index].size_read |= size_read;
+            LOG_WARNING(Render_Recompiler,
+                        "FIX-GT7-043: program {:#x}: the T# at {} ({:#x}) is an FMask, its reads are "
+                        "constants",
+                        info.pgm_hash, image_res.sharp_fetch.offsets[0], image.Address());
+        }
 
         IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
         switch (inst.GetOpcode()) {
@@ -320,11 +338,6 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
                                                    ir.Imm32(static_cast<u32>(image.height)), // y
                                                    ir.Imm32(1), ir.Imm32(1)); // depth, mip
             inst.ReplaceUsesWith(dims);
-
-            // Track FMask resource to do specialization.
-            descriptors.Add(FMaskResource{
-                .sharp_idx = SharpLocationFromSource(resource.sharps[0].dwords[0].Inst()),
-            });
             return;
         }
         default:
@@ -776,6 +789,34 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
     const auto dimensions =
         needs_dimentions ? ir.ImageQueryDimension(handle, ir.Imm32(0u), ir.Imm1(false), inst_info)
                          : IR::Value{};
+    // FIX-228: GCN's unnormalized coordinates with an explicit LOD are texels of that mip; they
+    // were divided by the base mip's dimensions, so a sample at LOD n read 2^n times nearer the
+    // origin. GT7's car hull shaders cull patches against an occlusion depth pyramid that way (the
+    // cell at (x >> n) + 0.5 of mip n, n from the patch's size on screen); with FIX-227 they no
+    // longer culled patches in view in the race start's close-ups. RYGT_UNNORMALIZED_MIP=0: as
+    // before. Hull shaders only (where it was verified; their stored translations have their own
+    // version).
+    static const bool mip_unnormalized_on = [] {
+        const char* env = std::getenv("RYGT_UNNORMALIZED_MIP");
+        return !(env && env[0] == '0');
+    }();
+    const bool mip_unnormalized =
+        mip_unnormalized_on && info.sw_stage == SwStage::TessellationControl;
+    const auto is_slice = [&](u32 dim_idx) {
+        return (view_type == AmdGpu::ImageType::Color1DArray && dim_idx == 1) ||
+               (view_type == AmdGpu::ImageType::Color2DArray && dim_idx == 2);
+    };
+    const u32 num_coords = view_type == AmdGpu::ImageType::Color1D ? 1u
+                           : (view_type == AmdGpu::ImageType::Color1DArray ||
+                              view_type == AmdGpu::ImageType::Color2D ||
+                              view_type == AmdGpu::ImageType::Color2DMsaa)
+                               ? 2u
+                               : 3u;
+    const IR::U32 unnormalized_lod =
+        mip_unnormalized && unnormalized && !is_msaa && inst_info.has_lod
+            ? ir.UMin(IR::U32{ir.ConvertFToU(32, get_addr_reg(addr_reg + num_coords))},
+                      ir.Imm32(15u))
+            : IR::U32{ir.Imm32(0u)};
     const auto get_coord = [&](u32 coord_idx, u32 dim_idx) -> IR::Value {
         const auto coord = get_addr_reg(coord_idx);
         if (is_msaa) {
@@ -790,9 +831,13 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
         }
         if (unnormalized) {
             // Normalize the coordinate for sampling, dividing by its corresponding dimension.
-            const auto dim =
-                ir.ConvertUToF(32, 32, IR::U32{ir.CompositeExtract(dimensions, dim_idx)});
-            return ir.FPDiv(coord, dim);
+            IR::U32 dim = IR::U32{ir.CompositeExtract(dimensions, dim_idx)};
+            if (mip_unnormalized && inst_info.has_lod && !is_slice(dim_idx) &&
+                view_type != AmdGpu::ImageType::Cube) {
+                // FIX-228: by the dimension of the mip the explicit LOD picks.
+                dim = ir.UMax(IR::U32{ir.ShiftRightLogical(dim, unnormalized_lod)}, ir.Imm32(1u));
+            }
+            return ir.FPDiv(coord, ir.ConvertUToF(32, 32, dim));
         }
         return coord;
     };

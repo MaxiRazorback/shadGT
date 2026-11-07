@@ -35,6 +35,10 @@ struct TilingInfo {
     u32 micro_tiled_mips;
     u32 num_mips;
     std::array<MipInfo, MAX_MIPS> mips;
+    // Keep the descriptor range compatible with the shared shader's optional
+    // native packed-padding fields. Legacy pipelines leave that option off.
+    std::array<u32, MAX_MIPS> valid_width;
+    std::array<u32, MAX_MIPS> valid_height;
 };
 
 TileManager::TileManager(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,

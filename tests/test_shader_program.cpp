@@ -7,6 +7,7 @@
 #include "video_core/renderer_vulkan/spirv_check.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 
+
 namespace {
 
 Shader::StageSpecialization MakeSpec(const Shader::Info& info) {
@@ -206,6 +207,78 @@ TEST(ShaderSpecialization, StrideOfABufferWithoutIndexedAddressingDoesNotSplitPe
     EXPECT_FALSE(indexed == KeyFor(info));
 }
 
+TEST(ShaderSpecialization, FmaskKeyTracksTypeAndOnlyRequiredDimensions) {
+    Shader::Info info;
+    info.hw_stage = Shader::HwStage::Fragment;
+    info.sw_stage = Shader::SwStage::Fragment;
+    auto& resource = info.fmasks.emplace_back();
+    auto image = AmdGpu::Image::Null(false);
+    image.base_address = 0x100;
+    image.data_format = u64(AmdGpu::DataFormat::FormatFmask64_S16_F8);
+    auto bind = [&] { std::memcpy(resource.sharp_fetch.immediates.data(), &image, sizeof(image)); };
+    bind();
+    const auto original = KeyFor(info);
+    image.width = 23;
+    bind();
+    EXPECT_TRUE(original == KeyFor(info));
+    resource.size_read = true;
+    const auto sized = KeyFor(info);
+    image.width = 42;
+    bind();
+    EXPECT_FALSE(sized == KeyFor(info));
+    image.data_format = u64(AmdGpu::DataFormat::Format32);
+    bind();
+    EXPECT_FALSE(original == KeyFor(info));
+}
+
+TEST(ShaderSpecialization, PinnedFetchDescriptorIsUsedForCode) {
+    Shader::Info info;
+    auto original = BoundBuffer(16);
+    info.pinned_fetch_sharps.push_back({2, 4, original});
+    Shader::Gcn::VertexAttribute attrib{};
+    attrib.sgpr_base = 2;
+    attrib.dword_offset = 4;
+    EXPECT_EQ(attrib.GetSharpFromMemory(info).GetStride(), original.GetStride());
+}
+
+TEST(ShaderSpecialization, EmptyBoundBufferIgnoresUnusedAddressing) {
+    auto info = TranslatedFragmentWithBuffer(true);
+    auto buffer = BoundBuffer(16);
+    buffer.base_address = 0;
+    Bind(info.buffers[0], buffer);
+    const auto first = KeyFor(info);
+    buffer.stride = 48;
+    Bind(info.buffers[0], buffer);
+    EXPECT_TRUE(first == KeyFor(info));
+}
+
+TEST(ShaderSpecialization, AmbiguousAheadMatchKeepsDrawSearchState) {
+    auto info = TranslatedFragmentWithBuffer(true);
+    info.buffer_stride_used.set(0);
+    Bind(info.buffers[0], BoundBuffer(16));
+    const auto first = KeyFor(info);
+    Bind(info.buffers[0], BoundBuffer(48));
+    const auto second = KeyFor(info);
+    auto empty = BoundBuffer(16);
+    empty.base_address = 0;
+    Bind(info.buffers[0], empty);
+    const auto lookup = KeyFor(info);
+    ASSERT_TRUE(first == lookup);
+    ASSERT_TRUE(second == lookup);
+
+    Vulkan::Program program;
+    program.SearchLastMatch(false) = 0;
+    program.SearchMemo(false).valid = true;
+    program.SearchMemo(false).perm = 0;
+    program.SearchLastMatch(true) = 1;
+    program.SearchMemo(true).valid = true;
+    program.SearchMemo(true).perm = 1;
+    EXPECT_EQ(program.SearchLastMatch(false), 0u);
+    EXPECT_EQ(program.SearchMemo(false).perm, 0u);
+    EXPECT_EQ(program.SearchLastMatch(true), 1u);
+    EXPECT_EQ(program.SearchMemo(true).perm, 1u);
+}
+
 TEST(ShaderSpecialization, KeepsEveryBufferPropertyWhenTranslationUsageIsUnknown) {
     // A shader loaded from storage carries no usage flags.
     auto info = TranslatedFragmentWithBuffer(false);
@@ -377,4 +450,209 @@ void unreachable_impl() {
 bool Shader::Gcn::ParseFetchShader(const Shader::Info&, Shader::Gcn::FetchShaderData&) {
     ADD_FAILURE() << "Unexpected fetch shader parse";
     return false;
+}
+
+namespace {
+
+// PERF-GT7-058: what StageSpecialization::PackInputs packs for a stage.
+std::vector<u64> PackFor(const Shader::Info& info) {
+    std::vector<u64> words;
+    Shader::Gcn::FetchShaderData fetch;
+    Shader::StageSpecialization::PackInputs(info, words, fetch);
+    return words;
+}
+
+} // namespace
+
+TEST(ShaderSpecialization, PackedInputsIgnoreAddressesAndKeepWhatSplitsPermutations) {
+    auto info = TranslatedFragmentWithBuffer(true);
+    info.buffer_stride_used.set(0);
+    Bind(info.buffers[0], BoundBuffer(16));
+    const auto compiled = KeyFor(info);
+    const auto packed = PackFor(info);
+
+    // Another address and size: the same pack and the same specialization.
+    auto moved = BoundBuffer(16);
+    moved.base_address = 0x7650000;
+    moved.num_records = 4096;
+    Bind(info.buffers[0], moved);
+    EXPECT_EQ(packed, PackFor(info));
+    EXPECT_TRUE(compiled == KeyFor(info));
+
+    // What splits permutations changes the pack.
+    auto stride = BoundBuffer(48);
+    auto add_tid = BoundBuffer(16);
+    add_tid.add_tid_enable = 1;
+    auto coherent = BoundBuffer(16);
+    coherent.mtype = 3;
+    auto swizzled = BoundBuffer(16);
+    swizzled.swizzle_enable = 1;
+    for (const auto& changed : {stride, add_tid, coherent, swizzled}) {
+        Bind(info.buffers[0], changed);
+        EXPECT_FALSE(compiled == KeyFor(info));
+        EXPECT_NE(packed, PackFor(info));
+    }
+
+    // Unbound, or bound empty by its address (FIX-GT7-024): another pack.
+    auto unbound = BoundBuffer(16);
+    unbound.num_records = 0;
+    Bind(info.buffers[0], unbound);
+    EXPECT_NE(packed, PackFor(info));
+    auto empty = BoundBuffer(16);
+    empty.base_address = 0;
+    Bind(info.buffers[0], empty);
+    EXPECT_NE(packed, PackFor(info));
+}
+
+TEST(ShaderSpecialization, PackedImageInputsIgnoreAddressesAndKeepTheFormat) {
+    Shader::Info info;
+    info.hw_stage = Shader::HwStage::Fragment;
+    info.sw_stage = Shader::SwStage::Fragment;
+    info.images.emplace_back();
+    info.resource_usage_known = true;
+    auto image = AmdGpu::Image::Null(false);
+    image.base_address = 0x1000;
+    Bind(info.images[0], image);
+    const auto compiled = KeyFor(info);
+    const auto packed = PackFor(info);
+
+    auto moved = image;
+    moved.base_address = 0x9876;
+    Bind(info.images[0], moved);
+    EXPECT_EQ(packed, PackFor(info));
+    EXPECT_TRUE(compiled == KeyFor(info));
+
+    auto integer = image;
+    integer.num_format = static_cast<u64>(AmdGpu::NumberFormat::Uint);
+    Bind(info.images[0], integer);
+    EXPECT_FALSE(compiled == KeyFor(info));
+    EXPECT_NE(packed, PackFor(info));
+
+    auto unbound = image;
+    unbound.base_address = 0;
+    Bind(info.images[0], unbound);
+    EXPECT_NE(packed, PackFor(info));
+}
+
+// FIX-GT7-082: a vertex stage reads its attributes' V#s from guest memory each time, not from the
+// flattened buffer: a pack recorded after a full match could hold a V# that changed in between
+// (float to integer), and later draws would take the float module with no full comparison. Such
+// stages always get a full comparison.
+TEST(ShaderSpecialization, PackedFmaskAndEmptyBufferInputsRespectIntegratedKeys) {
+    Shader::Info info;
+    info.hw_stage = Shader::HwStage::Fragment;
+    info.sw_stage = Shader::SwStage::Fragment;
+    info.images.emplace_back();
+    auto& fmask = info.fmasks.emplace_back();
+    auto image = AmdGpu::Image::Null(false);
+    image.base_address = 0x100;
+    image.data_format = u64(AmdGpu::DataFormat::FormatFmask64_S16_F8);
+    auto bind = [&] { Bind(info.images[0], image); std::memcpy(fmask.sharp_fetch.immediates.data(), &image, sizeof(image)); };
+    bind();
+    const auto key = KeyFor(info);
+    const auto packed = PackFor(info);
+    image.width = 23;
+    bind();
+    EXPECT_EQ(packed, PackFor(info));
+    EXPECT_TRUE(key == KeyFor(info));
+    fmask.size_read = true;
+    const auto sized = KeyFor(info);
+    const auto sized_pack = PackFor(info);
+    image.width = 42;
+    bind();
+    EXPECT_NE(sized_pack, PackFor(info));
+    EXPECT_FALSE(sized == KeyFor(info));
+    image.data_format = u64(AmdGpu::DataFormat::Format32);
+    bind();
+    EXPECT_NE(packed, PackFor(info));
+    EXPECT_FALSE(key == KeyFor(info));
+
+    auto buffers = TranslatedFragmentWithBuffer(true);
+    buffers.buffer_stride_used.set(0);
+    auto empty = BoundBuffer(16);
+    empty.base_address = 0;
+    Bind(buffers.buffers[0], empty);
+    const auto empty_key = KeyFor(buffers);
+    const auto empty_pack = PackFor(buffers);
+    empty.stride = 48;
+    Bind(buffers.buffers[0], empty);
+    EXPECT_TRUE(empty_key == KeyFor(buffers));
+    EXPECT_NE(empty_pack, PackFor(buffers)); // Conservative for the asymmetric empty rule.
+}
+
+TEST(ShaderSpecialization, EqualPackedBuffersAlwaysMatchDirectionalSpecialization) {
+    for (bool formatted : {false, true}) {
+        for (bool known : {false, true}) {
+            auto info = TranslatedFragmentWithBuffer(known);
+            info.buffers[0].is_formatted = formatted;
+            info.buffer_stride_used.set(0);
+            std::vector<Shader::StageSpecialization> keys;
+            std::vector<std::vector<u64>> packs;
+            for (u32 n = 0; n < 256; ++n) {
+                auto b = BoundBuffer((n & 1) ? 16 : 48);
+                b.base_address = (n & 2) ? 0 : 0x10000;
+                b.num_records = (n & 4) ? 0 : 256;
+                b.swizzle_enable = (n >> 3) & 1;
+                b.add_tid_enable = (n >> 4) & 1;
+                b.mtype = (n & 32) ? 3 : 0;
+                b.data_format = u32((n & 64) ? AmdGpu::DataFormat::Format32 : AmdGpu::DataFormat::Format8_8_8_8);
+                b.num_format = u32((n & 128) ? AmdGpu::NumberFormat::Uint : AmdGpu::NumberFormat::Unorm);
+                b.index_stride = n & 3;
+                b.element_size = (n >> 2) & 3;
+                b.dst_sel_x = (n & 8) ? 4 : 5;
+                Bind(info.buffers[0], b);
+                keys.push_back(KeyFor(info));
+                packs.push_back(PackFor(info));
+            }
+            for (size_t a = 0; a < keys.size(); ++a)
+                for (size_t b = 0; b < keys.size(); ++b)
+                    if (packs[a] == packs[b]) EXPECT_TRUE(keys[a] == keys[b]) << a << ',' << b;
+        }
+    }
+}
+
+TEST(ShaderSpecialization, EqualPackedImagesAlwaysMatchDirectionalSpecialization) {
+    for (bool written : {false, true}) {
+        for (bool srgb_used : {false, true}) {
+            Shader::Info info;
+            info.hw_stage = Shader::HwStage::Fragment;
+            info.sw_stage = Shader::SwStage::Fragment;
+            info.images.emplace_back();
+            info.images[0].is_written = written;
+            info.resource_usage_known = true;
+            info.image_srgb_used.set(0, srgb_used);
+            std::vector<Shader::StageSpecialization> keys;
+            std::vector<std::vector<u64>> packs;
+            for (u32 n = 0; n < 64; ++n) {
+                auto img = AmdGpu::Image::Null(false);
+                img.base_address = (n & 1) ? 0 : 0x100;
+                img.data_format = u64((n & 2) ? AmdGpu::DataFormat::FormatFmask64_S16_F8 : AmdGpu::DataFormat::Format32);
+                img.num_format = u64((n & 4) ? AmdGpu::NumberFormat::Uint : AmdGpu::NumberFormat::Srgb);
+                img.dst_sel_x = (n & 8) ? 4 : 5;
+                img.width = (n & 16) ? 10 : 30;
+                img.last_level = (n & 32) ? 2 : 0;
+                Bind(info.images[0], img);
+                keys.push_back(KeyFor(info));
+                packs.push_back(PackFor(info));
+            }
+            for (size_t a = 0; a < keys.size(); ++a)
+                for (size_t b = 0; b < keys.size(); ++b)
+                    if (packs[a] == packs[b]) EXPECT_TRUE(keys[a] == keys[b]) << a << ',' << b;
+        }
+    }
+}
+
+TEST(ShaderSpecialization, PackedInputsNeverStandForVertexAttributesReadFromMemory) {
+    Shader::Info info;
+    info.hw_stage = Shader::HwStage::Vertex;
+    info.sw_stage = Shader::SwStage::Vertex;
+    info.has_fetch_shader = true;
+    EXPECT_FALSE(Shader::StageSpecialization::Packable(info));
+    info.has_fetch_shader = false;
+    EXPECT_TRUE(Shader::StageSpecialization::Packable(info));
+    info.hw_stage = Shader::HwStage::Fragment;
+    info.sw_stage = Shader::SwStage::Fragment;
+    EXPECT_TRUE(Shader::StageSpecialization::Packable(info));
+    info.sw_stage = Shader::SwStage::TessellationControl;
+    EXPECT_FALSE(Shader::StageSpecialization::Packable(info));
 }

@@ -57,6 +57,29 @@ TEST(ColorClear, PackedHalfFloatComponentsKeepMemoryOrder) {
               (std::array<float, 4>{1.0f, 2.0f, 3.0f, 4.0f}));
 }
 
+TEST(ColorClear, BgrPackedFloatUsesPhysicalRgbChannels) {
+    ColorBuffer buffer{};
+    buffer.info.format = u32(DataFormat::Format11_11_10);
+    buffer.info.number_type = u32(NumberFormat::Float);
+    // R=1, G=2, B=4 in 11/11/10-bit unsigned floating point.
+    buffer.clear_word0 = (0x3c0u << 21) | (0x400u << 10) | 0x220u;
+    const auto clear = ColorBufferClearValue(buffer).color.float32;
+    EXPECT_FLOAT_EQ(clear[0], 1.0f);
+    EXPECT_FLOAT_EQ(clear[1], 2.0f);
+    EXPECT_FLOAT_EQ(clear[2], 4.0f);
+}
+
+TEST(ColorClear, RgbPackedFloatKeepsItsOriginalChannelOrder) {
+    ColorBuffer buffer{};
+    buffer.info.format = u32(DataFormat::Format10_11_11);
+    buffer.info.number_type = u32(NumberFormat::Float);
+    buffer.clear_word0 = (0x220u << 22) | (0x400u << 11) | 0x3c0u;
+    const auto clear = ColorBufferClearValue(buffer).color.float32;
+    EXPECT_FLOAT_EQ(clear[0], 1.0f);
+    EXPECT_FLOAT_EQ(clear[1], 2.0f);
+    EXPECT_FLOAT_EQ(clear[2], 4.0f);
+}
+
 TEST(ColorClear, SingleChannelClearDoesNotSelectUnusedExportComponent) {
     ColorBuffer buffer{};
     buffer.info.format = u32(DataFormat::Format8);

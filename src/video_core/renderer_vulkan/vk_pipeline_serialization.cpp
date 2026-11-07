@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 
@@ -23,27 +24,33 @@ namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 // Synthetic dual-source exports change the fragment shader interface. Version 13 adds the
 // general swizzled factor blend, which also changes the runtime color-buffer layout.
-static constexpr u32 ShaderBinaryVersion = 271u;
+static constexpr u32 ShaderBinaryVersion = 271u + Shader::Backend::PushDataLayoutRevision;
 // Only masked fragment permutations need the extra push constants. Keep ordinary cached
 // shaders compatible; older renderers must skip the new permutations on rollback.
-static constexpr u32 ShaderBinaryVersionQuadSampleMask = 272u;
-static constexpr u32 ShaderBinaryVersionMsaaRead = 273u;
-static constexpr u32 ShaderBinaryVersionMsaaReadQuadSampleMask = 274u;
+static constexpr u32 ShaderBinaryVersionQuadSampleMask = 272u + Shader::Backend::PushDataLayoutRevision;
+static constexpr u32 ShaderBinaryVersionMsaaRead = 273u + Shader::Backend::PushDataLayoutRevision;
+static constexpr u32 ShaderBinaryVersionMsaaReadQuadSampleMask = 274u + Shader::Backend::PushDataLayoutRevision;
 // Scalar-pointer compute loads support bounded prefixes and prologue table loads.
-static constexpr u32 ShaderBinaryVersionScalarPrefix = 275u;
-static constexpr u32 ShaderBinaryVersionScalarPrefixMsaaRead = 276u;
+static constexpr u32 ShaderBinaryVersionScalarPrefix = 275u + Shader::Backend::PushDataLayoutRevision;
+static constexpr u32 ShaderBinaryVersionScalarPrefixMsaaRead = 276u + Shader::Backend::PushDataLayoutRevision;
 // Vertex fetch conversion/swizzles must agree with the invalid-descriptor cache policy.
-static constexpr u32 ShaderBinaryVersionVertexFetch = 277u;
+static constexpr u32 ShaderBinaryVersionVertexFetch = 277u + Shader::Backend::PushDataLayoutRevision;
 // Shader semantic revision 0x100 invalidates binaries emitted before the MED3 quiet-NaN fix.
 // Fragment reflections use cube views; other stages keep their existing array path.
-static constexpr u32 ShaderBinaryVersionNativeCube = 279u;
+static constexpr u32 ShaderBinaryVersionNativeCube = 279u + Shader::Backend::PushDataLayoutRevision;
 // AMD single-sample KHR barycentrics change the fragment interface and interpolation.
-static constexpr u32 ShaderBinaryVersionSingleSampleBarycentric = 282u;
+static constexpr u32 ShaderBinaryVersionSingleSampleBarycentric = 282u + Shader::Backend::PushDataLayoutRevision;
 // Tessellation modules and keys must use the same translation-time layout.
-static constexpr u32 ShaderBinaryVersionTessellationLayout = 283u;
+static constexpr u32 ShaderBinaryVersionTessellationLayout = 283u + Shader::Backend::PushDataLayoutRevision;
+static constexpr u32 ShaderBinaryVersionTessellationMip = 286u + Shader::Backend::PushDataLayoutRevision;
+static constexpr u32 ShaderBinaryVersionTessellationNoMip = 287u + Shader::Backend::PushDataLayoutRevision;
+// FIX-335: LDS readers branch before input loads and use bounded, padded scratch.
+// Only emulated TCS modules change; unrelated stored shaders remain compatible.
+static constexpr u32 ShaderBinaryVersionTessellationLdsBoundsMip = 288u + Shader::Backend::PushDataLayoutRevision;
+static constexpr u32 ShaderBinaryVersionTessellationLdsBoundsNoMip = 289u + Shader::Backend::PushDataLayoutRevision;
 // FIX-223: fragment shaders whose discards end the pixel (AMD). 285: FIX-GTS-011 keeps some
 // shaders' discarded pixels as helpers again.
-static constexpr u32 ShaderBinaryVersionDiscardKill = 285u;
+static constexpr u32 ShaderBinaryVersionDiscardKill = 285u + Shader::Backend::PushDataLayoutRevision;
 
 static bool UsesScalarPrefix(const Shader::Info& info) {
     return info.hw_stage == Shader::HwStage::Compute &&
@@ -61,7 +68,8 @@ static_assert(sizeof(Shader::HwFragmentRuntimeInfo) == 248 && sizeof(Shader::Run
 // 16: the resource usage FIX-043 keys permutations by follows the Info. Versions 14 and 15
 // still load, as translations of unknown usage (keyed on every resource property, as stored).
 // 17: worker translations own resolved descriptor inputs and compile-time keys.
-static constexpr u32 ShaderMetaVersion = 17u;
+// FMask descriptors now store their complete fetch and size-use flag.
+static constexpr u32 ShaderMetaVersion = 18u;
 static constexpr u32 ShaderMetaVersionWithoutResourceUsage = 15u;
 static constexpr u32 ShaderMetaVersionWithoutAttributeFlags = 14u;
 // 9: rect/quad-list helper shaders built from complete attribute info (FIX-012). Version 8
@@ -81,6 +89,10 @@ static std::atomic<bool> single_sample_barycentric_cache_enabled{false};
 // except AMD's older compiler) it is cleared on load, so old stores keep matching; where it is on,
 // the shader store has its own version (cache_storage.cpp) and holds no older entries.
 static std::atomic<bool> vertex_order_check_cache_enabled{false};
+static std::atomic<bool> native_cube_cache_enabled{false};
+void SetNativeCubeCacheEnabled(bool enabled) {
+    native_cube_cache_enabled.store(enabled, std::memory_order_relaxed);
+}
 void SetVertexOrderCheckCacheEnabled(bool enabled) {
     vertex_order_check_cache_enabled.store(enabled, std::memory_order_relaxed);
 }
@@ -103,26 +115,37 @@ static bool HasMsaaImage(const Shader::StageSpecialization& spec) {
 
 static u32 ShaderBinaryVersionFor(const Shader::StageSpecialization& spec,
                                   bool scalar_prefix = false) {
+    if (spec.runtime_info.sw_stage == Shader::SwStage::TessellationControl) {
+        static const bool mip = [] {
+            const char* env = std::getenv("RYGT_UNNORMALIZED_MIP");
+            return !(env && env[0] == '0');
+        }();
+        if (spec.runtime_info.sw.tcs.lds_emulation) {
+            return mip ? Serialization::ShaderBinaryVersionTessellationLdsBoundsMip
+                       : Serialization::ShaderBinaryVersionTessellationLdsBoundsNoMip;
+        }
+        return mip ? Serialization::ShaderBinaryVersionTessellationMip
+                   : Serialization::ShaderBinaryVersionTessellationNoMip;
+    }
     if (spec.runtime_info.sw_stage == Shader::SwStage::TessellationControl ||
         spec.runtime_info.sw_stage == Shader::SwStage::TessellationEval) {
         return Serialization::ShaderBinaryVersionTessellationLayout;
     }
-    if (spec.runtime_info.hw_stage == Shader::HwStage::Fragment &&
-        discard_kill_cache_enabled.load(std::memory_order_relaxed)) {
-        return Serialization::ShaderBinaryVersionDiscardKill;
-    }
-    if (spec.runtime_info.hw_stage == Shader::HwStage::Fragment &&
-        spec.runtime_info.hw.fs.single_sample_barycentric) {
-        return Serialization::ShaderBinaryVersionSingleSampleBarycentric;
-    }
+    if (spec.runtime_info.hw_stage == Shader::HwStage::Fragment) {
+        bool native_cube = false;
 #ifdef RYTY_GPU
-    if (NativeModeRequested() && spec.runtime_info.hw_stage == Shader::HwStage::Fragment &&
-        std::ranges::any_of(spec.images, [](const auto& image) {
+        native_cube = native_cube_cache_enabled.load(std::memory_order_relaxed) && std::ranges::any_of(spec.images, [](const auto& image) {
             return image.type == AmdGpu::ImageType::Cube;
-        })) {
-        return Serialization::ShaderBinaryVersionNativeCube;
-    }
+        });
 #endif
+        const u32 fragment = FragmentBinaryVersion(
+            discard_kill_cache_enabled.load(std::memory_order_relaxed),
+            spec.runtime_info.hw.fs.single_sample_barycentric, native_cube,
+            Serialization::ShaderBinaryVersionDiscardKill,
+            Serialization::ShaderBinaryVersionSingleSampleBarycentric,
+            Serialization::ShaderBinaryVersionNativeCube);
+        if (fragment) return fragment;
+    }
     if (!spec.fetch_shader_data.Empty()) {
         return Serialization::ShaderBinaryVersionVertexFetch;
     }
@@ -143,7 +166,15 @@ static u32 ShaderBinaryVersionFor(const Shader::StageSpecialization& spec,
 static bool IsKnownShaderBinaryVersion(u32 version) {
     // Recognize old metadata for prewarm discovery, but LoadShaderMeta below rejects its
     // binary revision and retranslates it. Never relabel an old binary as corrected.
+    version = UntagCubeVersion(version);
     version |= 0x100u;
+    // Old metadata remains discoverable for prewarm and index reservation. The
+    // exact comparison in LoadShaderMeta still rejects its incompatible SPIR-V.
+    version |= Shader::Backend::PushDataLayoutRevision;
+    if (version == Serialization::ShaderBinaryVersionTessellationLdsBoundsMip ||
+        version == Serialization::ShaderBinaryVersionTessellationLdsBoundsNoMip ||
+        version == Serialization::ShaderBinaryVersionTessellationMip ||
+        version == Serialization::ShaderBinaryVersionTessellationNoMip) return true;
     if (version == Serialization::ShaderBinaryVersionTessellationLayout) return true;
     if (version == Serialization::ShaderBinaryVersionDiscardKill) {
         return discard_kill_cache_enabled.load(std::memory_order_relaxed);
@@ -371,7 +402,8 @@ void RegisterShaderMeta(const Shader::Info& info,
     Serialization::Writer meta{ar};
 
     meta.Write(Serialization::ShaderMetaVersion);
-    meta.Write(ShaderBinaryVersionFor(spec, Serialization::UsesScalarPrefix(info)));
+    meta.Write(CubeVersionFor(ShaderBinaryVersionFor(spec, Serialization::UsesScalarPrefix(info)),
+                              spec, native_cube_cache_enabled.load(std::memory_order_relaxed)));
 
     meta.Write(perm_hash);
     meta.Write(perm_idx);
@@ -406,6 +438,8 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 binary_version{};
     meta.Read(binary_version);
+    const bool face_cubes = (binary_version & ClassicCubeTag) != 0;
+    binary_version = UntagCubeVersion(binary_version);
     if (!IsKnownShaderBinaryVersion(binary_version)) {
         return false;
     }
@@ -431,6 +465,8 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     }
     info.Deserialize(ar, perm_hash_ar,
                      meta_version != Serialization::ShaderMetaVersionWithoutAttributeFlags);
+    if (!StoredCubesFit(spec, info, face_cubes,
+                        native_cube_cache_enabled.load(std::memory_order_relaxed))) return false;
     if (binary_version != ShaderBinaryVersionFor(spec, Serialization::UsesScalarPrefix(info))) {
         return false;
     }

@@ -1,4 +1,5 @@
 #include "common/debug_environment.h"
+#include "common/geometry_trace.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -15,6 +16,7 @@
 #include <boost/container/small_vector.hpp>
 #include <fmt/ranges.h>
 #include "common/debug.h"
+#include "common/mapping_writeback_gate.h"
 #include "common/path_util.h"
 #include "common/perf_monitor.h"
 #include "ryty_gpu/native/slow_call_trace.h"
@@ -36,6 +38,9 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/pipeline_owner.h"
+#include "video_core/renderer_vulkan/draw_selection_identity.h"
+#include "video_core/renderer_vulkan/native_fence_batch.h"
 #ifdef RYTY_GPU
 #include "ryty_gpu/native/image_registry.h"
 #include "ryty_gpu/native/shadow.h"
@@ -249,15 +254,20 @@ void Rasterizer::CopySelectedStages(std::array<SelectedStage, Shader::MaxStageTy
         ASSERT(selected.num_user_data <= selected.user_data.size());
         std::ranges::copy(info->user_data, selected.user_data.begin());
         selected.flattened = info->flattened_ud_buf;
+#ifndef NDEBUG
+        if (GeometryTrace::current) GeometryTrace::Record("stage_cpu_flat", GeometryTrace::current,
+            stage, info->pgm_hash, selected.flattened.size(), GeometryTrace::Hash(selected.flattened));
+#endif
     }
 }
 
-std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead() {
+std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead(
+    const DrawIndirectParams* indirect) {
     // The command thread's registers are those of the draw it is decoding.
     const auto& regs = liverpool->DrawRegs();
     bool depth_copy;
     bool stencil_copy;
-    const bool quad_list = regs.primitive_type == AmdGpu::PrimitiveType::QuadList;
+    const bool quad_list = !indirect && regs.primitive_type == AmdGpu::PrimitiveType::QuadList;
     // PERF-068: a quad list's pipeline depends on whether its indices are GPU-written, which
     // only the recorder's buffer cache knows: both are selected, the recorder takes its one.
     // -DisablePerf 75 leaves quad lists to the recorder.
@@ -271,23 +281,26 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead() {
     selected.is_compute = false;
     selected.compute = nullptr;
     selected.is_quad_list = quad_list;
+    selected.indirect = indirect != nullptr;
+    selected.vertex_sgpr_offset = indirect ? indirect->vertex_sgpr_offset : 0;
+    selected.instance_sgpr_offset = indirect ? indirect->instance_sgpr_offset : 0;
     selected.quad_tess_pipeline = nullptr;
-    std::scoped_lock lk{pipeline_cache.LookupMutex()};
-    selected.pipeline = pipeline_cache.GetGraphicsPipeline({
+    std::unique_lock lk{pipeline_cache.LookupMutex()};
+    selected.pipeline = pipeline_cache.GetGraphicsPipelineUnlocked(indirect ? *indirect : DrawIndirectParams{
         .vertex_sgpr_offset = 0,
         .instance_sgpr_offset = 0,
         .tessellate_quads = false,
-    });
+    }, lk);
     selected.keepalive[0] = pipeline_cache.KeepAlive(selected.pipeline);
     if (selected.pipeline) {
         CopySelectedStages(selected.stages);
     }
     if (quad_list) {
-        selected.quad_tess_pipeline = pipeline_cache.GetGraphicsPipeline({
+        selected.quad_tess_pipeline = pipeline_cache.GetGraphicsPipelineUnlocked({
             .vertex_sgpr_offset = 0,
             .instance_sgpr_offset = 0,
             .tessellate_quads = true,
-        });
+        }, lk);
         selected.keepalive[2] = pipeline_cache.KeepAlive(selected.quad_tess_pipeline);
         if (selected.quad_tess_pipeline) {
             CopySelectedStages(selected.quad_tess_stages);
@@ -316,6 +329,10 @@ void Rasterizer::CopyComputeStage(std::array<SelectedStage, Shader::MaxStageType
     ASSERT(selected.num_user_data <= selected.user_data.size());
     std::ranges::copy(info->user_data, selected.user_data.begin());
     selected.flattened = info->flattened_ud_buf;
+#ifndef NDEBUG
+    if (GeometryTrace::current) GeometryTrace::Record("stage_cpu_flat", GeometryTrace::current,
+        u32(Shader::SwStage::Compute), info->pgm_hash, selected.flattened.size(), GeometryTrace::Hash(selected.flattened));
+#endif
 }
 
 const GraphicsPipeline* Rasterizer::LookupJobPipeline(std::shared_ptr<const void>& keepalive,
@@ -386,6 +403,7 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectComputePipelineAhe
     Common::PhaseTimer timer{Common::Phase::SelectAhead};
     SelectedPipeline selected = selected_recycler.Take(); // PERF-056
     selected.pipeline = nullptr;
+    selected.indirect = false;
     selected.is_compute = true;
     std::scoped_lock lk{pipeline_cache.LookupMutex()};
     selected.compute = pipeline_cache.GetComputePipeline();
@@ -402,6 +420,7 @@ const ComputePipeline* Rasterizer::AcquireComputePipeline() {
         if (!pipeline) {
 #ifndef NDEBUG
             ++select_stats.compute_ahead;
+            if (GeometryTrace::current) GeometryTrace::Record("compute_no_pipeline", GeometryTrace::current, 1);
 #endif
             return nullptr;
         }
@@ -456,6 +475,9 @@ const ComputePipeline* Rasterizer::AcquireComputePipeline() {
         std::scoped_lock lk{pipeline_cache.LookupMutex()};
         pipeline = pipeline_cache.GetComputePipeline();
         if (!pipeline) {
+#ifndef NDEBUG
+            if (GeometryTrace::current) GeometryTrace::Record("compute_no_pipeline", GeometryTrace::current, 2);
+#endif
             return nullptr;
         }
         if (install) {
@@ -1107,9 +1129,21 @@ bool Rasterizer::InstallDrawStages(const Pipeline* pipeline,
             // The sharps are read again from the memory as the recorder sees it now.
             info.RefreshFlatBuf();
             if (validate && info.flattened_ud_buf != selected.flattened) {
+#ifndef NDEBUG
+                if (GeometryTrace::current) GeometryTrace::Record("stage_rejected", GeometryTrace::current,
+                    stage, info.pgm_hash, info.flattened_ud_buf.size(), GeometryTrace::Hash(info.flattened_ud_buf));
+#endif
                 return false;
             }
         }
+#ifndef NDEBUG
+        if (GeometryTrace::current) {
+            GeometryTrace::Record("stage_installed", GeometryTrace::current, stage, info.pgm_hash,
+                info.flattened_ud_buf.size(), GeometryTrace::Hash(info.flattened_ud_buf));
+            GeometryTrace::Record("stage_mode", GeometryTrace::current, stage, validate, trust_selection,
+                reinterpret_cast<std::uintptr_t>(pipeline));
+        }
+#endif
         draw_stages[stage] = &info;
     }
     pipeline->SetDrawStages(draw_stages);
@@ -1117,19 +1151,22 @@ bool Rasterizer::InstallDrawStages(const Pipeline* pipeline,
 }
 
 const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectParams& params,
-                                                            bool selected_allowed) {
+                                                            bool selected_allowed,
+                                                            std::shared_ptr<const void>* owner) {
+    if (owner) owner->reset();
     if (!SelectsPipelinesAhead()) {
         // A cached pipeline may still point at a per-race shadow. Reinstall a
         // recorder-owned stage from the current lookup after leaving race mode.
         std::array<SelectedStage, Shader::MaxStageTypes> stages{};
         const GraphicsPipeline* pipeline;
         {
-            std::scoped_lock lk{pipeline_cache.LookupMutex()};
-            pipeline = pipeline_cache.GetGraphicsPipeline(params);
+            std::unique_lock lk{pipeline_cache.LookupMutex()};
+            pipeline = pipeline_cache.GetGraphicsPipelineUnlocked(params, lk);
             if (!pipeline) return nullptr;
+            if (owner) *owner = pipeline_cache.KeepAlive(pipeline);
             CopySelectedStages(stages);
         }
-        if (!InstallDrawStages(pipeline, stages, false)) return nullptr;
+        if (!InstallDrawStages(pipeline, stages, false)) { if (owner) owner->reset(); return nullptr; }
         return pipeline;
     }
 #ifndef NDEBUG
@@ -1169,17 +1206,21 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
 #endif
     // PERF-068: a quad list's selection holds both of its pipelines.
     const bool quad_selection = selected_pipeline && selected_pipeline->is_quad_list;
-    if ((selected_allowed || quad_selection) && selected_pipeline) {
+    if (selected_pipeline && CanUseDrawSelection(
+            selected_pipeline->indirect, quad_selection, selected_pipeline->vertex_sgpr_offset,
+            selected_pipeline->instance_sgpr_offset, params.is_indirect,
+            params.vertex_sgpr_offset, params.instance_sgpr_offset, selected_allowed)) {
         const bool tess = quad_selection && params.tessellate_quads;
         const auto* pipeline =
             tess ? selected_pipeline->quad_tess_pipeline : selected_pipeline->pipeline;
+        const auto& selected_owner = selected_pipeline->keepalive[tess ? 2 : 0];
         if (!pipeline) {
 #ifndef NDEBUG
             ++stats.ahead;
 #endif
             return nullptr;
         }
-        if (InstallDrawStages(pipeline,
+        if (PipelineOwnerMatches(pipeline, selected_owner) && InstallDrawStages(pipeline,
                               tess ? selected_pipeline->quad_tess_stages : selected_pipeline->stages,
                               true)) {
 #ifndef NDEBUG
@@ -1190,6 +1231,7 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
             static const bool verify = !Common::LeanRun();
             // PERF-063: not for captured work; the game may have rewritten the memory.
             if (!verify || read_capture || ++select_verify_count % 64 != 0) {
+                if (owner) *owner = selected_owner;
                 return pipeline;
             }
 #ifndef NDEBUG
@@ -1201,10 +1243,12 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
                 // FIX-077: skipped while the command thread holds the lock, as for compute.
                 std::unique_lock lk{pipeline_cache.LookupMutex(), std::try_to_lock};
                 if (!lk.owns_lock()) {
+                    if (owner) *owner = selected_owner;
                     return pipeline;
                 }
                 own_pipeline = pipeline_cache.GetGraphicsPipeline(params);
                 if (own_pipeline) {
+                    if (owner) *owner = pipeline_cache.KeepAlive(own_pipeline);
                     CopySelectedStages(own);
                 }
             }
@@ -1242,14 +1286,18 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
     std::array<SelectedStage, Shader::MaxStageTypes> stages{};
     const GraphicsPipeline* pipeline;
     {
-        std::scoped_lock lk{pipeline_cache.LookupMutex()};
-        pipeline = pipeline_cache.GetGraphicsPipeline(params);
+        std::unique_lock lk{pipeline_cache.LookupMutex()};
+        pipeline = pipeline_cache.GetGraphicsPipelineUnlocked(params, lk);
         if (!pipeline) {
             return nullptr;
         }
+        if (owner) *owner = pipeline_cache.KeepAlive(pipeline);
         CopySelectedStages(stages);
     }
-    InstallDrawStages(pipeline, stages, false);
+    if (!InstallDrawStages(pipeline, stages, false)) {
+        if (owner) owner->reset();
+        return nullptr;
+    }
     return pipeline;
 }
 
@@ -2454,6 +2502,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         .instance_sgpr_offset = instance_sgpr_offset,
         // PERF-028: the vertex count is in GPU memory, so quads cannot be expanded here.
         .tessellate_quads = true,
+        .is_indirect = true,
     };
     const GraphicsPipeline* pipeline = AcquireGraphicsPipeline(params, false);
     if (!pipeline || !pipeline->Handle()) {
@@ -2952,9 +3001,25 @@ std::optional<std::pair<const VideoCore::Buffer*, u64>> Rasterizer::DirectReadBu
     return found;
 }
 
+#ifdef RYTY_GPU
+static s64 NativeFenceBatchInterval() {
+    static const s64 interval = [] {
+        const char* value = std::getenv("RYGT_NATIVE_FENCE_BATCH_MS");
+        return NativeFenceBatchNs(value ? value : "");
+    }();
+    return interval;
+}
+#endif
+
 void Rasterizer::FlushDeferredFences() {
     if (deferred_unflushed.exchange(false, std::memory_order_acq_rel)) {
         scheduler.Flush();
+#ifdef RYTY_GPU
+        if (native && NativeFenceBatchInterval() > 0) last_native_fence_submit_ns.store(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count(),
+            std::memory_order_relaxed);
+#endif
     }
 }
 
@@ -3104,8 +3169,14 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
 #ifndef NDEBUG
     const auto deferred_at = std::chrono::steady_clock::now();
 #endif
+#ifdef RYTY_GPU
+    auto mapping_token = Common::GuestMappingWritebackGate().Capture(address, value.empty() ? 8 : value.size());
+#endif
     scheduler.DeferPriorityOperation(
         [this, address,
+#ifdef RYTY_GPU
+         mapping_token = std::move(mapping_token),
+#endif
 #ifndef NDEBUG
          deferred_at,
 #endif
@@ -3113,6 +3184,9 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
          async_readbacks = std::move(async_readbacks), signal = std::move(signal)]() mutable {
             texture_cache.CompleteReadbacks(readbacks);
             buffer_cache.CompleteAsyncReadbacks(async_readbacks);
+#ifdef RYTY_GPU
+            Common::ScopedMappingWritebackToken mapping_scope{mapping_token};
+#endif
             signal();
 #ifndef NDEBUG
             RecordDeferredFenceLatency(deferred_at);
@@ -3139,7 +3213,20 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
         const char* env = std::getenv("SHADGT_DIRECT_HOLD_FLUSH");
         return env && env[0] == '1';
     }();
-    if (flush || hold_flush || readbacks_pending || address_pending || !direct_hold) {
+    bool submit_now = flush || hold_flush || readbacks_pending || address_pending || !direct_hold;
+#ifdef RYTY_GPU
+    if (native && NativeFenceBatchInterval() > 0 && (submit_now || flush)) {
+        const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        submit_now = SubmitNativeFence(liverpool && liverpool->Pipelined(), flush, hold_flush, readbacks_pending, address_pending,
+            direct_hold, now, last_native_fence_submit_ns.load(std::memory_order_relaxed), NativeFenceBatchInterval());
+        if (submit_now) last_native_fence_submit_ns.store(now, std::memory_order_relaxed);
+        // This is submission batching only: callbacks remain deferred to GPU completion.
+        // Recorder idle and WaitRegMem still force submission. The source's two GT7-only
+        // spun-label addresses must not be transplanted into the GT Sport address space.
+    }
+#endif
+    if (submit_now) {
         scheduler.Flush();
         deferred_unflushed.store(false, std::memory_order_relaxed);
     } else {
@@ -3824,6 +3911,12 @@ void Rasterizer::FlushForDeferredFences() {
     // any recorded work so the deferred operations can complete instead of deadlocking.
     if (deferred_fences.load() != 0) {
         scheduler.Flush();
+#ifdef RYTY_GPU
+        if (native && NativeFenceBatchInterval() > 0) last_native_fence_submit_ns.store(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count(),
+            std::memory_order_relaxed);
+#endif
     }
 }
 
@@ -6213,6 +6306,15 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
 }
 
 void Rasterizer::MapMemory(VAddr addr, u64 size) {
+    if (size && Common::GuestMappingWritebackGate().ProtocolAvailable()) {
+        tsharp_epoch.fetch_add(1, std::memory_order_release);
+#ifdef RYTY_GPU
+        if (native) native->OnNewMapping(addr, size);
+        else
+#endif
+        if (auto* direct = buffer_cache.GetDirectMemory()) direct->OnUnmap(addr, size);
+        buffer_cache.InvalidateNewMapping(addr, size);
+    }
     buffer_cache.NoteArenaMapping(addr, size);
     {
         std::scoped_lock lock{mapped_ranges_mutex};
@@ -6243,6 +6345,7 @@ bool Rasterizer::IsMappedStart(VAddr address) {
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
+    if (Common::GuestMappingWritebackGate().ProtocolAvailable()) buffer_cache.MarkMappingUnavailable(addr, size);
     Native::SlowCallTrace<5> trace{true, "guest-unmap",
         {"native-invalidate", "import-invalidate", "buffer-invalidate", "gpu-command-sync", "mapped-ranges"}};
     trace.Next(0, addr, size);

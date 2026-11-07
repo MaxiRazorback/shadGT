@@ -148,7 +148,8 @@ ryty_add_library(ryty_gpu libSceVideoOut
 if (CMAKE_C_COMPILER_ID MATCHES "Clang|GNU" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i.86)$")
     set_source_files_properties(ryty_gpu/native/native_xxh512.c PROPERTIES COMPILE_OPTIONS "-march=x86-64")
 endif()
-target_compile_definitions(ryty_gpu PRIVATE RYTY_HAS_CPU_PATCHES=1 RYTY_DIAG=1)
+target_compile_definitions(ryty_gpu PRIVATE RYTY_HAS_CPU_PATCHES=1
+    $<${SHADGT_DIAGNOSTICS_ON}:RYTY_DIAG=1>)
 
 # Discord Rich Presence is linked into the renderer library only.
 if (ENABLE_DISCORD_RPC)

@@ -1,5 +1,7 @@
 #include <exception>
 #include "ryty_gpu/native/cpu_stack_registry.h"
+#include "ryty_gpu/native/cube_view_policy.h"
+#include "ryty_gpu/native/readable_binding.h"
 #include "ryty_gpu/native/ahead_descriptor_pools.h"
 #include "ryty_gpu/native/per_draw_view_proof.h"
 #include "ryty_gpu/native/adaptive_xxh3.h"
@@ -10,12 +12,16 @@
 #include "ryty_gpu/native/rhi/completed_owner_release.h"
 #include "ryty_gpu/native/prepared_direct_slot.h"
 #include "ryty_gpu/native/readonly_hint.h"
+#include "ryty_gpu/native/high_cpu_writeback.h"
+#include "ryty_gpu/native/linear_image_download.h"
 #include "ryty_gpu/native/parallel_direct_capability.h"
 #include "ryty_gpu/native/parallel_gate_histogram.h"
 #include "core/emulator_settings.h"
 #include "ryty_gpu/native/parallel_rotate_segment.h"
 #include "ryty_gpu/native/natural_scope_boundary.h"
 #include "ryty_gpu/native/attachment_alias.h"
+#include "ryty_gpu/native/attachment_feedback.h"
+#include "ryty_gpu/native/depth_snapshot_copies.h"
 #include "ryty_gpu/native/prepared_index_bounds.h"
 #include "ryty_gpu/native/prepared_direct_absent.h"
 #include "ryty_gpu/native/per_draw_stage_proof.h"
@@ -28,6 +34,10 @@
 #include "ryty_gpu/native/descriptor_update_batch.h"
 #include "ryty_gpu/native/upload_phase_trace.h"
 #include "ryty_gpu/native/region_init_gaps.h"
+#include "ryty_gpu/native/mapping_refresh.h"
+#include "ryty_gpu/native/writeback_plan.h"
+#include "ryty_gpu/native/page_download_ranges.h"
+#include "ryty_gpu/native/safe_page_snapshot.h"
 #include "ryty_gpu/native/upload_cause.h"
 #include "ryty_gpu/native/local_tiled_source.h"
 #include "video_core/renderer_vulkan/async_mirror_buffer.h"
@@ -36,6 +46,7 @@
 #include "video_core/renderer_vulkan/immutable_upload_memo.h"
 #include "video_core/renderer_vulkan/freshness_range_search.h"
 #include "video_core/renderer_vulkan/draw_preparation_options.h"
+#include "video_core/renderer_vulkan/tess_lds_scratch.h"
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -51,9 +62,18 @@
 // own threads with this code (ryty_gpu/native/DESIGN.md, N4).
 
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
+#include "common/geometry_trace.h"
+#include "video_core/renderer_vulkan/pipeline_owner.h"
+#include "video_core/renderer_vulkan/upload_memory_recovery.h"
+#include "video_core/host_shaders/native_region_writeback_comp.h"
+#include "video_core/renderer_vulkan/stable_region_bindings.h"
 #include "video_core/renderer_vulkan/scene_region_scale.h"
 #include "video_core/renderer_vulkan/upload_chunk_tail.h"
+#include "ryty_gpu/native/whole_layer_clear.h"
+#include "video_core/renderer_vulkan/native_chunk_policy.h"
 #include "video_core/renderer_vulkan/upload_chunk_cache.h"
+#include "video_core/renderer_vulkan/native_ring_policy.h"
+#include "common/thread.h"
 
 #include <fstream>
 #include <algorithm>
@@ -61,10 +81,14 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <immintrin.h>
 #include <map>
 
 #include <fmt/ranges.h>
 #include <magic_enum/magic_enum.hpp>
+#include <vulkan/vulkan_format_traits.hpp>
+#include "video_core/texture_cache/host_compatibility.h"
+#include "video_core/texture_cache/packed_float.h"
 #include <xxhash.h>
 
 #include "ryty_gpu/ryty_upscaler_status.h"
@@ -72,6 +96,8 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "common/elf_info.h"
+#include "video_core/renderer_vulkan/one_off_regs.h"
 #include "common/perf_monitor.h"
 #include "common/ryty_config.h"
 // (ryty_config.h brings in windows.h, whose `near` and `far` macros would rename variables here.)
@@ -121,6 +147,11 @@ vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type);
 #endif
 
 namespace Vulkan {
+
+struct NativeRenderer::PendingLinearDownload {
+    std::vector<VideoCore::DirectMemory::LeasedPart> imports;
+    std::vector<Native::LinearDownloadCopy> copies;
+};
 namespace {
 enum MirrorDiagnosticReason : u32 { MirrorCandidateNew,MirrorCandidateSameFrame,MirrorCandidateDynamic,
     MirrorCandidateQueued,MirrorPromotionRegion,MirrorPromotionDynamic,MirrorPromotionBudget,
@@ -859,7 +890,10 @@ struct RecordPartitionEndGuard {
 };
 #endif
 
-constexpr u64 ChunkSize = 8_MB;
+u64 ChunkSize() {
+    static const u64 size = NativeChunkBytes(std::getenv("RYGT_NATIVE_CHUNK_MB"));
+    return size;
+}
 constexpr u32 SpliceAfter = 512; ///< commands per list before it is run and submitted
 
 } // namespace
@@ -912,7 +946,9 @@ void NativeRenderer::DrawBindings::Clear() {
     push = {};
     sampled.clear();
     stored.clear();
+    image_entries.clear();
     gpu_writes.clear();
+    region_writeback.reset();
     fill_pattern.reset();
     fill_arguments_snapshot.reset();
     fill_address = 0;
@@ -1117,6 +1153,20 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
     device->UseExternalTimeline(timeline.get(), [this] { return r.scheduler.CurrentTick(); });
     LOG_INFO(Render_Vulkan, "DRAW-PREP: mask {} (1 range union, 2 region dedup, 4 thread-local stats, 8 batched diagnostic polling)", DrawPreparationMask());
     registry = std::make_unique<Native::ImageRegistry>(*device);
+    {
+        const std::array<Native::Rhi::BindingSlot, 3> slots{{
+            {0, Native::Rhi::BindingType::StorageBuffer, Native::Rhi::StageCompute},
+            {1, Native::Rhi::BindingType::StorageBuffer, Native::Rhi::StageCompute},
+            {2, Native::Rhi::BindingType::StorageBuffer, Native::Rhi::StageCompute},
+        }};
+        writeback_layout = device->CreatePipelineLayout({.bindings = slots,
+            .push_constant_bytes = sizeof(u32), .push_constant_stages = Native::Rhi::StageCompute});
+        if (writeback_layout) {
+            writeback_pipeline = device->CreateComputePipeline({.layout = writeback_layout.get(),
+                .shader = {Native::Rhi::ShaderStage::Compute, NATIVE_REGION_WRITEBACK_COMP},
+                .name = "native region write-back"});
+        }
+    }
     registry->SetImageFactory([this](const VideoCore::ImageInfo& info, bool render_target) {
         return MakeImage(info, render_target);
     });
@@ -1277,7 +1327,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
         if (!gathered) {
             return source;
         }
-        const vk::CommandBuffer cmd{Handle<VkCommandBuffer_T>(list.NativeHandle())};
+        const CmdBuf cmd = CmdOf(list);
         const vk::Buffer dst{Handle<VkBuffer_T>(gathered->NativeHandle())};
         trace.Next(6);
         const bool all = direct->ForEachPart(
@@ -1367,12 +1417,45 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
     }
     LOG_INFO(Render_Vulkan, "NAT-100: native mode: draws, dispatches and copies are recorded with "
                             "native images and guest memory read in place");
+    if (auto* direct = r.buffer_cache.GetDirectMemory()) direct->HoldNativeReleases();
+    static const bool learn = [] {
+        const char* value = std::getenv("RYGT_ONE_OFF_LEARN");
+        // A sampled skipped output may be an ordinary multi-pass frame, not a
+        // persistent bake. Learning is investigative and must not silently turn
+        // subsequent Keep Going misses into required waits at reused addresses.
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    if (learn) {
+        try {
+            std::string serial{Common::ElfInfo::Instance().GameSerial()};
+            for (auto& c : serial) {
+                if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                      (c >= '0' && c <= '9') || c == '-' || c == '_')) c = '_';
+            }
+            if (serial.empty()) serial = "unknown";
+            const auto path = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+                              fmt::format("{}.one_off_harmful_v1.txt", serial);
+            one_off_observer = std::make_shared<OneOffObserver>(path);
+            g_one_off_observer.store(one_off_observer, std::memory_order_release);
+        } catch (...) {
+            LOG_WARNING(Render_Vulkan, "One-off observation unavailable; existing wait policy remains active");
+        }
+    }
 }
 
 NativeRenderer::~NativeRenderer() {
+    auto expected_observer = one_off_observer;
+    g_one_off_observer.compare_exchange_strong(expected_observer, {}, std::memory_order_acq_rel);
     if(PreparedSampledProofRequested())prepared_proof_contexts.Close(this);
     auto ahead_shutdown=BeginAheadShutdown(this);
     if(ahead_shutdown)while(ahead_shutdown->active.load(std::memory_order_acquire) || !ahead_shutdown->pools.Quiescent())std::this_thread::yield();
+    // Finish all deferred recording before resources referenced by replay are destroyed.
+    if (!ParallelRecordingRequested()) {
+        Splice();
+        ApplyRingPriority(false);
+        r.scheduler.Finish();
+        r.scheduler.SyncCommandThread();
+    }
     scene_indirect_buffer.reset();scene_indirect_args.clear();
     if(SceneTrace::state.pool){const auto pool=SceneTrace::state.pool;const auto device=r.instance.GetDevice();r.scheduler.DeferOperation([device,pool]{device.destroyQueryPool(pool);});SceneTrace::state={};}
     mirror_preparation.reset(); // Join before any device or direct-memory teardown.
@@ -1402,6 +1485,18 @@ NativeRenderer::~NativeRenderer() {
         while(!ahead_shutdown->pools.DestroyReady(timeline->Completed()))std::this_thread::yield();
 
     }
+    if (stream.list) Splice();
+    // Snapshot owners also need GPU retirement when direct imports are unavailable.
+    r.scheduler.Finish();
+    retired_pipeline_owners.ClearAfterGpuIdle();
+    stream.writeback_plan_leases.clear();
+    retired_writeback_plans.ClearAfterGpuIdle();
+    if (auto* direct = r.buffer_cache.GetDirectMemory()) {
+        // Teardown must also cover an earlier enqueue failure and any pending scheduler
+        // callback that has not yet run, before either device or imported backing dies.
+        stream.imported_view_leases.clear();
+        direct->ReleaseHeldAfterGpuIdle();
+    }
     const vk::Device vk_device = r.instance.GetDevice();
     for (const auto pool : free_pools) {
         vk_device.destroyDescriptorPool(pool);
@@ -1416,7 +1511,24 @@ NativeRenderer::~NativeRenderer() {
     samplers.clear();
 }
 
+static bool FaultAheadEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_FAULT_AHEAD");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+
 Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bool) {
+    constexpr u64 GuestLimit = u64{1} << 40;
+    if (FaultAheadEnabled() && info.guest_size && info.guest_address < GuestLimit &&
+        info.guest_size <= GuestLimit - info.guest_address) {
+        const auto begin = VideoCore::PageManager::GetPageAddr(info.guest_address);
+        const auto end = VideoCore::PageManager::GetNextPageAddr(info.guest_address + info.guest_size - 1);
+        page_watches.ExcludeAndTrack(begin, end, [&](VAddr page, u64 size) {
+            r.page_manager.UpdatePageWatchers(page, size, VideoCore::PageOp::Track);
+        });
+    }
     Native::MadeImage made{};
     if (info.pixel_format == vk::Format::eUndefined) {
         return made;
@@ -1579,6 +1691,11 @@ vk::ImageView NativeRenderer::View(const Native::ImageEntry& entry,
     }
     vk::ImageViewType view_type = VideoCore::ConvertImageViewType(info.type);
     if (use == ViewUse::CubeSampled) {
+        const auto whole_layers = Native::CubeViewLayers(r.instance.IsImageCubeArraySupported(),
+            volume, image_desc.width, image_desc.height,
+            image_desc.layers, image_desc.samples, info.range.extent.layers);
+        if (!whole_layers) return {};
+        info.range.extent.layers = whole_layers;
         view_type = vk::ImageViewType::eCubeArray;
     }
     if (volume) {
@@ -1621,21 +1738,254 @@ vk::ImageView NativeRenderer::View(const Native::ImageEntry& entry,
     return handle;
 }
 
-vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& sharp,
+namespace {
+bool NextMemoEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_NEXT");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+u64 MemoHash(const u64* words, size_t count, u64 seed) {
+    u64 h = seed ^ 0x9E3779B97F4A7C15ULL;
+    for (size_t i = 0; i < count; ++i) {
+        h = (h ^ words[i]) * 0xFF51AFD7ED558CCDULL;
+        h ^= h >> 32;
+    }
+    h *= 0xC4CEB9FE1A85EC53ULL;
+    return h ^ (h >> 29);
+}
+} // namespace
+
+vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& original,
                                        AmdGpu::BorderColorBuffer border, bool is_depth) {
+    auto sharp = original;
+    // PERF-GT7-015 (C): the samplers this thread looked up last, by raw S#, without the lock and
+    // the hash map (a draw binds ~4; samplers live as long as the renderer).
+    struct CachedSampler {
+        std::array<u64, 2> sharp;
+        u64 extra;
+        vk::Sampler sampler;
+        const NativeRenderer* owner = nullptr;
+        u64 epoch = 0;
+    };
+    static thread_local std::array<CachedSampler, 256> cached{};
+    static_assert(sizeof(AmdGpu::Sampler) == sizeof(std::array<u64, 2>));
+    CachedSampler* cache = nullptr;
+    std::array<u64, 2> raw;
+    std::memcpy(raw.data(), &sharp, sizeof(raw));
+    const bool custom = sharp.border_color_type == AmdGpu::BorderColor::Custom;
+    const u64 extra = (is_depth ? 1u : 0u) | (custom ? u64(border.Address()) << 1 : 0);
+    if (NextMemoEnabled()) {
+        cache = &cached[MemoHash(raw.data(), raw.size(), extra) & (cached.size() - 1)];
+        if (cache->sampler && cache->owner == this &&
+            cache->epoch == sampler_cache_epoch.load(std::memory_order_acquire) &&
+            cache->sharp == raw && cache->extra == extra) {
+            return cache->sampler;
+        }
+    }
+    const vk::Sampler sampler = MakeSampler(sharp, border, is_depth);
+    if (cache) {
+        *cache = {raw, extra, sampler, this, sampler_cache_epoch.load(std::memory_order_acquire)};
+    }
+    return sampler;
+}
+
+vk::Sampler NativeRenderer::MakeSampler(const AmdGpu::Sampler& sharp,
+                                        AmdGpu::BorderColorBuffer border, bool is_depth) {
+    const bool custom = sharp.border_color_type == AmdGpu::BorderColor::Custom;
     const u64 hash = XXH3_64bits(&sharp, sizeof(sharp)) ^
-                     (is_depth ? 0x9E3779B97F4A7C15ULL : 0) ^ (u64(border.Address()) << 1);
+                     (is_depth ? 0x9E3779B97F4A7C15ULL : 0) ^
+                     (custom ? u64(border.Address()) << 1 : 0);
     static thread_local Native::EpochValueMemo<vk::Sampler> memo;
     const auto epoch = sampler_cache_epoch.load(std::memory_order_acquire);
     if (const auto found = memo.Find(this, epoch, hash)) return *found;
     std::scoped_lock lock{sampler_mutex};
-    auto& slot = samplers[hash];
-    if (!slot) {
-        slot = std::make_unique<VideoCore::Sampler>(r.instance, sharp, border, is_depth);
+    if (const auto it = sampler_lookup.find(hash); it != sampler_lookup.end()) {
+        memo.Store(this, epoch, hash, it->second);
+        return it->second;
     }
-    const auto handle = slot->Handle();
-    memo.Store(this, epoch, hash, handle);
-    return handle;
+    // FIX-GT7-002: one Vulkan sampler per state the device sees. GT7's S#s differ in bits the
+    // sampler doesn't use (performance hints, unused bits, the border colour table when the
+    // colour isn't custom), and a sampler per raw S# passed the driver's limit (4000 on NVIDIA):
+    // "Failed to create sampler: ErrorOutOfDeviceMemory" ended the game.
+    AmdGpu::Sampler state{};
+    state.clamp_x.Assign(sharp.clamp_x.Value());
+    state.clamp_y.Assign(sharp.clamp_y.Value());
+    state.clamp_z.Assign(sharp.clamp_z.Value());
+    state.xy_mag_filter.Assign(sharp.xy_mag_filter.Value());
+    state.xy_min_filter.Assign(sharp.xy_min_filter.Value());
+    state.mip_filter.Assign(sharp.mip_filter.Value());
+    if (AmdGpu::IsAnisoFilter(sharp.xy_mag_filter) || AmdGpu::IsAnisoFilter(sharp.xy_min_filter)) {
+        state.max_aniso.Assign(sharp.max_aniso.Value());
+    }
+    if (is_depth) {
+        state.depth_compare_func.Assign(sharp.depth_compare_func.Value());
+    }
+    state.border_color_type.Assign(sharp.border_color_type.Value());
+    std::array<float, 4> custom_color{};
+    if (custom) {
+        state.border_color_ptr.Assign(sharp.border_color_ptr.Value());
+        if (border.Address() != 0) {
+            custom_color = border.Address<std::array<float, 4>*>()[sharp.border_color_ptr.Value()];
+        }
+    }
+    const u32 limit = r.instance.GetMaxSamplerAllocationCount();
+    if (samplers.size() >= limit / 4 * 3) {
+        // Close to the limit: levels of detail in quarter steps.
+        const auto quarter = [](float lod) { return std::round(lod * 4.0f) * 64.0f; };
+        state.min_lod.Assign(u64(quarter(sharp.MinLod())));
+        state.max_lod.Assign(u64(quarter(sharp.MaxLod())));
+        state.lod_bias.Assign(u64(s64(quarter(sharp.LodBias()))) & 0x3fff);
+    } else {
+        state.min_lod.Assign(sharp.min_lod.Value());
+        state.max_lod.Assign(sharp.max_lod.Value());
+        state.lod_bias.Assign(sharp.lod_bias.Value());
+    }
+    // GFX-GT7-001 (the launcher's Texture sharpness, RYGT_TEXTURE_LOD_BIAS=<levels>): added to every
+    // sampler's bias, negative for sharper textures. Compare samplers keep theirs: a bias sharpens
+    // nothing in a shadow test.
+    static const float texture_lod_bias = [this] {
+        const char* env = std::getenv("RYGT_TEXTURE_LOD_BIAS");
+        const float bias = env && *env ? std::strtof(env, nullptr) : 0.0f;
+        if (!std::isfinite(bias) || bias == 0.0f) {
+            return 0.0f;
+        }
+        LOG_INFO(Render_Vulkan, "GFX-GT7-001: LOD bias {} on every sampler, device limit +-{}",
+                 bias, r.instance.MaxSamplerLodBias());
+        return bias;
+    }();
+    if (texture_lod_bias != 0.0f && !is_depth) {
+        // Vulkan bounds the bias's absolute value; sampler.cpp only bounds it from above.
+        const float max_bias = r.instance.MaxSamplerLodBias();
+        const float bias = std::clamp(state.LodBias() + texture_lod_bias, -max_bias, max_bias);
+        state.lod_bias.Assign(u64(s64(std::round(bias * 256.0f))) & 0x3fff);
+    }
+    struct Key {
+        AmdGpu::Sampler state;
+        std::array<float, 4> color;
+        u64 depth;
+    };
+    const Key key{state, custom_color, is_depth ? 1u : 0u};
+    const u64 state_hash = XXH3_64bits(&key, sizeof(key));
+    auto& slot = samplers[state_hash];
+    if (!slot) {
+        if (samplers.size() + 64 > limit && !samplers.empty()) {
+            // At the limit: the last sampler made stands in (logged), rather than a failure.
+            static std::atomic<u32> logged{};
+            if (Sample(logged)) {
+                LOG_ERROR(Render_Vulkan, "FIX-GT7-002: {} samplers, the device's limit is {}",
+                          samplers.size(), limit);
+            }
+            samplers.erase(state_hash);
+              memo.Store(this, epoch, hash, last_sampler);
+            return last_sampler;
+        }
+        slot = std::make_unique<VideoCore::Sampler>(r.instance, state, border, is_depth);
+        last_sampler = slot->Handle();
+    }
+    if (sampler_lookup.size() > (1u << 20)) {
+        sampler_lookup.clear();
+    }
+    sampler_lookup.emplace(hash, slot->Handle());
+    memo.Store(this, epoch, hash, slot->Handle());
+    return slot->Handle();
+}
+
+
+bool NativeRenderer::RingEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("RYGT_NATIVE_RING");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+#ifndef NDEBUG
+    static const bool compare = [] {
+        const char* value = std::getenv("RYGT_NATIVE_AB");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    if (enabled && compare) {
+        const auto now = std::chrono::steady_clock::now();
+        if (ring_ab_start == std::chrono::steady_clock::time_point{}) {
+            ring_ab_start = now;
+            LOG_INFO(Render_Vulkan, "Native ring comparison window 0: direct");
+        }
+        const auto window = u64(std::chrono::duration_cast<std::chrono::seconds>(now - ring_ab_start).count() / 10);
+        if (window != ring_ab_window) {
+            ring_ab_window = window;
+            LOG_INFO(Render_Vulkan, "Native ring comparison window {}: {}", window,
+                     window % 2 ? "deferred" : "direct");
+        }
+        return NativeRingWindow(enabled, true, compare, window);
+    }
+#endif
+    return NativeRingWindow(enabled, false, false, 0);
+}
+
+void NativeRenderer::ApplyRingPriority(bool enabled) {
+    // The scheduler's main ring has exactly one producer. A worker's private
+    // chunk must never enqueue a control operation onto that ring directly.
+    if (Scheduler::ThreadRing()) return;
+    static const bool boost = [] {
+        const char* value = std::getenv("RYGT_NATIVE_GPU_PRIORITY");
+        return !(value && value[0] == '0');
+    }();
+    const bool wanted = enabled && boost;
+    if (wanted == command_priority_boosted) return;
+    if (auto* ring = r.scheduler.CommandThreadRing()) {
+        command_priority_boosted = wanted;
+        ring->RecordControl([wanted](Scheduler&) {
+            Common::SetCurrentThreadPriority(wanted ? Common::ThreadPriority::High
+                                                    : Common::ThreadPriority::Normal);
+        });
+    }
+}
+
+void NativeRenderer::AcquireList(Stream& s) {
+    const bool enabled = RingEnabled();
+    static const bool logged = [enabled] {
+        if (enabled && ParallelRecordingRequested())
+            LOG_INFO(Render_Vulkan, "Native command ring disabled while parallel recording is requested");
+        return true;
+    }();
+    (void)logged;
+    // ImageRegistry's optional checkpoint path records a raw Vulkan handle.
+    // Keep that diagnostic on the direct path until it can enqueue its markers.
+    if (enabled && !ParallelRecordingRequested() && !Native::GpuCheckpoints::Requested() &&
+        !Scheduler::ThreadRing()) {
+        if (CommandRing* ring = r.scheduler.CommandThreadRing()) {
+            if (auto* list = device->AcquireDeferredCommandList(ring)) {
+                ApplyRingPriority(true);
+                s.list = list;
+                list->Begin();
+                s.cmd = CmdBuf{ring, reinterpret_cast<const vk::CommandBuffer*>(list->NativeHandleSlot())};
+                return;
+            }
+        }
+    }
+    ApplyRingPriority(false);
+    s.list = device->AcquireCommandList(Native::Rhi::CommandListLevel::Secondary);
+    s.list->Begin();
+    s.cmd = CmdBuf{vk::CommandBuffer{Handle<VkCommandBuffer_T>(s.list->NativeHandle())}};
+}
+
+void NativeRenderer::BeginAhead() {
+    static const bool reuse = [] {
+        const char* value = std::getenv("RYGT_NATIVE_REUSE");
+        return !(value && value[0] == '0');
+    }();
+    const bool intel = r.instance.IsIntel(), parallel = ParallelRecordingRequested();
+    const bool worker = Scheduler::ThreadRing() != nullptr;
+    if (!reuse || intel || parallel || worker) return;
+    std::scoped_lock lock{mutex};
+    const bool ring_available = RingEnabled() && r.scheduler.CommandThreadRing() && !Native::GpuCheckpoints::Requested();
+    if (!NativeBeginAheadAllowed(reuse, intel, parallel, worker, stream.list != nullptr, ring_available)) return;
+    Begin();
+}
+
+CmdBuf NativeRenderer::CmdOf(Native::Rhi::CommandList& list) const {
+    if (stream.list == &list) return stream.cmd;
+    ASSERT_MSG(list.NativeHandleSlot() == nullptr, "Deferred list is not the active stream");
+    return CmdBuf{vk::CommandBuffer{Handle<VkCommandBuffer_T>(list.NativeHandle())}};
 }
 
 NativeRenderer::Stream& NativeRenderer::Begin() {
@@ -1650,27 +2000,121 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     if (r.instance.IsIntel()) {
         // FIX-188: Intel Arc (#65) records into the scheduler's own command buffer.
         r.scheduler.EndRendering();
-        s.cmd = r.scheduler.DirectCommandBuffer();
+        const vk::CommandBuffer direct = r.scheduler.DirectCommandBuffer();
+        s.cmd = CmdBuf{direct};
         s.wrapped_list = device->WrapCommandBuffer(
-            reinterpret_cast<u64>(static_cast<VkCommandBuffer>(s.cmd)));
+            reinterpret_cast<u64>(static_cast<VkCommandBuffer>(direct)));
         s.list = s.wrapped_list.get();
     } else {
-        s.list = device->AcquireCommandList(Native::Rhi::CommandListLevel::Secondary);
-        s.list->Begin();
-        s.cmd = vk::CommandBuffer{Handle<VkCommandBuffer_T>(s.list->NativeHandle())};
+        AcquireList(s); // PERF-GT7-018
     }
     s.rendering = false;
     s.dynamic.Invalidate();
     s.pipelines.Invalidate();
     s.vertex_state_known = false; // OPT-005
     s.commands = 0;
+    s.run_program = 0;
+    s.run_texels.Clear();
     // What was recorded before this list (earlier lists, the presenter) is finished first.
     GlobalBarrier();
     MakePendingMirrors(); // NAT-150: behind the barrier the list starts with anyway
     return s;
 }
 
+bool NativeRenderer::LdsBatchOn() {
+    static const bool on = [] { const char* p = std::getenv("RYGT_NATIVE_LDS_BATCH");
+                                return !(p && p[0] == '0'); }();
+    return on;
+}
+
+bool NativeRenderer::CaptureLdsReader(LdsReader& reader, const DrawBindings& b) {
+    auto& out = reader.bindings;
+    out.buffers.assign(b.buffers.begin(), b.buffers.end());
+    out.images.assign(b.images.begin(), b.images.end());
+    out.writes = b.writes;
+    out.write_sets = b.write_sets;
+    out.push = b.push;
+    const auto index_of = [](const auto* info, u32 count, const auto& from) {
+        if (!info) return u32{~0u};
+        const auto at = reinterpret_cast<uintptr_t>(info);
+        const auto begin = reinterpret_cast<uintptr_t>(from.data());
+        using Info = std::remove_cvref_t<decltype(*info)>;
+        if (at < begin || (at - begin) % sizeof(Info) != 0 ||
+            (at - begin) / sizeof(Info) > from.size() ||
+            count > from.size() - (at - begin) / sizeof(Info)) return u32{~0u - 1};
+        return u32((at - begin) / sizeof(Info));
+    };
+    for (auto& write : out.writes) {
+        if (write.pNext || write.pTexelBufferView) return false;
+        const u32 buffer = index_of(write.pBufferInfo, write.descriptorCount, b.buffers);
+        const u32 image = index_of(write.pImageInfo, write.descriptorCount, b.images);
+        if (buffer == ~0u - 1 || image == ~0u - 1) return false;
+        reader.infos.emplace_back(buffer, image);
+        write.pBufferInfo = nullptr;
+        write.pImageInfo = nullptr;
+    }
+    return true;
+}
+
+void NativeRenderer::FlushLdsReaders(u32) {
+    Stream& s = stream;
+    if (s.lds_readers.empty()) return;
+    auto readers = std::move(s.lds_readers);
+    s.lds_readers.clear();
+    s.lds_bytes = 0;
+    const RenderState current = s.render;
+    RenderState resumed = current;
+    for (u32 i = 0; i < resumed.num_color_attachments; ++i)
+        resumed.color_attachments[i].is_clear = false;
+    resumed.depth_stencil_attachment.depth_clear = false;
+    resumed.depth_stencil_attachment.stencil_clear = false;
+    if (s.rendering) { s.cmd.endRendering(); s.rendering = false; }
+    for (const auto& reader : readers) {
+        if (reader.tail_size) s.list->FillBuffer(reader.scratch, reader.tail_offset, reader.tail_size, 0);
+    }
+    const vk::MemoryBarrier2 barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+    };
+    s.cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount=1,.pMemoryBarriers=&barrier});
+    BeginRendering(resumed);
+    s.render = current;
+    s.pipelines.Invalidate();
+    s.vertex_state_known = false;
+    for (auto& reader : readers) {
+        const auto& pipeline = *reader.pipeline;
+        s.pipelines.Graphics(pipeline.Handle(), [&] {
+            s.cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.Handle());
+        });
+        s.dynamic = reader.dynamic;
+        s.dynamic.Invalidate();
+        s.dynamic.Commit(r.instance, CmdBuf{s.cmd});
+        RecordVertexIndex(reader.vertices);
+        auto& bound = reader.bindings;
+        for (size_t i = 0; i < bound.writes.size(); ++i) {
+            const auto [buffer, image] = reader.infos[i];
+            bound.writes[i].pBufferInfo = buffer != ~0u ? bound.buffers.data() + buffer : nullptr;
+            bound.writes[i].pImageInfo = image != ~0u ? bound.images.data() + image : nullptr;
+        }
+        PushBindings(pipeline, vk::PipelineBindPoint::eGraphics, bound);
+        const std::array<u32, 2> words{u32(reader.address), u32(reader.address >> 32)};
+        s.cmd.pushConstants(pipeline.GetLayout(), AllGraphicsStageBits,
+                           u32(offsetof(Shader::PushData, quad_sample_mask)), 8u, words.data());
+        if (reader.indexed) {
+            if (reader.count) s.cmd.drawIndexed(reader.count, reader.instances, 0,
+                                                s32(reader.vertex_offset), reader.first_instance);
+        } else s.cmd.draw(reader.count, reader.instances, reader.vertex_offset, reader.first_instance);
+        r.scheduler.DeferOperation([owner=std::move(reader.pipeline_owner)] {});
+    }
+    s.pipelines.Invalidate();
+    s.dynamic.Invalidate();
+    s.vertex_state_known = false;
+}
+
 void NativeRenderer::EndRendering(u32 reason) {
+    if (!stream.lds_readers.empty()) FlushLdsReaders(reason);
     RecordPartitionClock end_partition{t_record_partition_end};
     auto* sidecar=FindParallelRuntime(this);
     if(sidecar)sidecar->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::EndPass);
@@ -1688,7 +2132,7 @@ void NativeRenderer::EndRendering(u32 reason) {
             sidecar->coordinator->FinishStream(ticket);
             stream.list=sidecar->coordinator->StreamReplacement(ticket);
             ASSERT_MSG(stream.list,"stream replacement command list missing");
-            stream.cmd=vk::CommandBuffer{reinterpret_cast<VkCommandBuffer>(stream.list->NativeHandle())};
+            stream.cmd=CmdBuf{vk::CommandBuffer{reinterpret_cast<VkCommandBuffer>(stream.list->NativeHandle())}};
             stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;
             sidecar->sync_pins.Queued(sidecar->pin_slot);
             NATIVE_DIAGNOSTIC(++sidecar->queued);
@@ -1705,14 +2149,16 @@ void NativeRenderer::EndRendering(u32 reason) {
         bool queued=false;
         if((pass.draws.size()>=8 || ParallelSmallPassBatchEnabled()) && !sidecar->closing) {
             const auto reset=[&]() noexcept {stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;};
+            auto direct_cmd = stream.cmd.Direct();
             if(Native::Parallel::RotateSegment(*sidecar->coordinator,*device,sidecar->epoch,
-                    stream.list,stream.cmd,sidecar->lease,64*1024,reset,
+                    stream.list,direct_cmd,sidecar->lease,64*1024,reset,
 #if !defined(NDEBUG)
                     &sidecar->rotation_diag
 #else
                     nullptr
 #endif
                     )) {
+                stream.cmd = CmdBuf{direct_cmd};
                 std::size_t bytes=sizeof(pass)+pass.draws.capacity()*sizeof(Native::Parallel::Draw);
                 for(const auto& draw:pass.draws) bytes+=draw.descriptor_bytes;
                 try {queued=pass.draws.size()>=8 ? (sidecar->transfer_applied_mode.Enabled() ? sidecar->coordinator->TryPassTransfer(sidecar->epoch,pass,bytes) : sidecar->coordinator->TryPass(sidecar->epoch,pass,bytes)) : sidecar->coordinator->TrySmallPass(sidecar->epoch,pass,bytes);}
@@ -1721,7 +2167,7 @@ void NativeRenderer::EndRendering(u32 reason) {
         }
         if(queued) {NATIVE_DIAGNOSTIC(++sidecar->queued);sidecar->sync_pins.Queued(sidecar->pin_slot);} else {
             NATIVE_DIAGNOSTIC(++sidecar->synchronous);
-            ASSERT_MSG(Native::Parallel::RecordPass(stream.cmd,r.instance,pass),"parallel pass synchronous fallback failed");
+            ASSERT_MSG(Native::Parallel::RecordPass(stream.cmd.Direct(),r.instance,pass),"parallel pass synchronous fallback failed");
             ASSERT_MSG(sidecar->sync_pins.Tag(sidecar->pin_slot,sidecar->epoch),"parallel synchronous owner pin failed");
             stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;
         }
@@ -1746,7 +2192,7 @@ bool NativeRenderer::ContinueSmallParallelPass(const RenderState& target,u32 rea
     auto& pass=*sidecar->active;
     if(!CanInlineContinuation(pass.draws.size(),ParallelSmallPassBatchEnabled(),sidecar->closing,
             stream.rendering,stream.render==target && pass.target==target,
-            stream.list==sidecar->active_list,stream.cmd==sidecar->active_cmd,
+            stream.list==sidecar->active_list,stream.cmd.Direct()==sidecar->active_cmd,
             r.scheduler.CurrentTick()==sidecar->epoch,safe))return false;
     // Trace state can change during preflight; an open scope would suppress
     // SceneTrace::Prepare at the common serial tail.
@@ -1758,7 +2204,7 @@ bool NativeRenderer::ContinueSmallParallelPass(const RenderState& target,u32 rea
     NATIVE_DIAGNOSTIC(++sidecar->pass_size_hist[std::min<std::size_t>(8,draws)]);
     u64 begin=0,end=0;const bool timed=ParallelGateDiagEnabled() && DescriptorThreadCpu100ns(begin);
     vk::Pipeline last{};
-    ASSERT_MSG(Native::Parallel::RecordPassInline(stream.cmd,r.instance,pass,stream.dynamic,last),
+    ASSERT_MSG(Native::Parallel::RecordPassInline(stream.cmd.Direct(),r.instance,pass,stream.dynamic,last),
                "parallel pass inline continuation failed");
     ASSERT_MSG(sidecar->sync_pins.Tag(sidecar->pin_slot,sidecar->epoch),"parallel synchronous owner pin failed");
     NATIVE_DIAGNOSTIC(++sidecar->synchronous);NATIVE_DIAGNOSTIC(++sidecar->inline_continuations);
@@ -1794,19 +2240,21 @@ void NativeRenderer::BeginRendering(const RenderState& state) {
         };
     }
     const auto& db = state.depth_stencil_attachment;
+    const bool read_only_depth = db.image_layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
+                                 db.image_layout == vk::ImageLayout::eDepthReadOnlyOptimal;
     const vk::RenderingAttachmentInfo depth{
         .imageView = db.image_view,
-        .imageLayout = vk::ImageLayout::eGeneral,
+        .imageLayout = db.image_layout,
         .loadOp = db.depth_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
-        .storeOp = vk::AttachmentStoreOp::eStore,
+        .storeOp = read_only_depth ? vk::AttachmentStoreOp::eNone : vk::AttachmentStoreOp::eStore,
         .clearValue = vk::ClearValue{.depthStencil = vk::ClearDepthStencilValue{
                                          .depth = std::bit_cast<float>(db.clear_value[0])}},
     };
     const vk::RenderingAttachmentInfo stencil{
         .imageView = db.image_view,
-        .imageLayout = vk::ImageLayout::eGeneral,
+        .imageLayout = db.image_layout,
         .loadOp = db.stencil_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
-        .storeOp = vk::AttachmentStoreOp::eStore,
+        .storeOp = read_only_depth ? vk::AttachmentStoreOp::eNone : vk::AttachmentStoreOp::eStore,
         .clearValue = vk::ClearValue{.depthStencil =
                                          vk::ClearDepthStencilValue{.stencil = db.clear_value[1]}},
     };
@@ -1826,6 +2274,7 @@ void NativeRenderer::BeginRendering(const RenderState& state) {
 void NativeRenderer::GlobalBarrier() {
     Stream& s = stream;
     EndRendering();
+    ++s.resource_recording_serial;
     const vk::MemoryBarrier2 barrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
@@ -1840,6 +2289,7 @@ void NativeRenderer::GlobalBarrier() {
     s.buffers_written = false;
     s.attach_dirty.clear();
     s.read.clear();
+    s.run_texels.Clear();
     NATIVE_DIAGNOSTIC(++stats.barriers);
     FlushWritebacks();
 }
@@ -1868,6 +2318,145 @@ void NativeRenderer::PassBarrier() {
     NATIVE_DIAGNOSTIC(++stats.pass_barriers);
 }
 
+// PERF-GT7-044: NAT-112 writes a small picture back to guest memory once a frame, when the frame
+// ends, for the CPU to read (GT Sport's auto exposure), and not after every draw into it. GT7 draws
+// ~100 such pictures a frame: on its pre-race screens ~210 write-backs a frame, nearly all tiled (a
+// copy, a tiling dispatch and their barriers each) took 17% of the GPU's time in a GPU Trace.
+// RYGT_NATIVE_WRITEBACK_EACH=1: after each draw, as before.
+void NativeRenderer::QueueWriteback(const Native::ImageEntry* entry) {
+    static const bool each = [] {
+        const char* env = std::getenv("RYGT_NATIVE_WRITEBACK_EACH");
+        return env && env[0] == '1';
+    }();
+    if (each || entry->info.guest_size > 64_KB) {
+        if (std::ranges::find(writebacks, entry) == writebacks.end()) {
+            writebacks.push_back(const_cast<Native::ImageEntry*>(entry));
+        }
+        return;
+    }
+    // Pictures of the same size at the same memory each write all of it: only the last one drawn
+    // counts, and goes last.
+    std::erase_if(frame_writebacks, [&](const Native::ImageEntry* other) {
+        return other->info.guest_address == entry->info.guest_address &&
+               other->info.guest_size == entry->info.guest_size;
+    });
+    frame_writebacks.push_back(const_cast<Native::ImageEntry*>(entry));
+}
+
+// PERF-GT7-044: work that writes memory a waiting picture covers comes after that picture, as the
+// game ordered them; written back at the frame's end, the picture would overwrite the newer bytes.
+// It goes at the next global barrier, before that work, and the bytes the work leaves stay right.
+void NativeRenderer::WritebacksBefore(VAddr address, u64 size) {
+    std::erase_if(frame_writebacks, [&](Native::ImageEntry* entry) {
+        const VAddr begin = entry->info.guest_address;
+        if (address + std::max<u64>(size, 1) <= begin || begin + entry->info.guest_size <= address) {
+            return false;
+        }
+        if (std::ranges::find(writebacks, entry) == writebacks.end()) {
+            writebacks.push_back(entry);
+        }
+        writebacks_due = true;
+        return true;
+    });
+}
+
+static bool NativeRegionWritebackEnabled();
+static bool NativeInplaceWritebackEnabled();
+static const std::vector<std::pair<VAddr, VAddr>>& NativeInplaceRanges();
+
+void NativeRenderer::WritebacksBefore(DrawBindings& b) {
+    if (b.failed) return;
+    if (b.gpu_writes.empty()) return;
+    bool needs_region_writeback = false;
+    if (NativeRegionWritebackEnabled()) for (const auto [address, size] : b.gpu_writes) {
+        if (!size) continue;
+        if (address > UINT64_MAX - size) {
+            ASSERT_MSG(false, "native writeback range overflow");
+            b.failed = true;
+            return;
+        }
+        const VAddr end = address + size;
+        auto it = regions.upper_bound(address);
+        if (it != regions.begin() && std::prev(it)->second.end > address) --it;
+        for (; it != regions.end() && it->second.begin < end && !needs_region_writeback; ++it) {
+            const Region& region = it->second;
+            const VAddr from = std::max(address, region.begin), to = std::min(end, region.end);
+            if (from >= to) continue;
+            if (NativeInplaceWritebackEnabled() && std::ranges::any_of(NativeInplaceRanges(),
+                    [&](const auto& range) { return from < range.second && range.first < to; })) {
+                needs_region_writeback = true;
+                break;
+            }
+            const VAddr first_page = Common::AlignDown(from, 4096);
+            if ((to - first_page) / 4096 > region.cpu_pages->size()) {
+                needs_region_writeback = std::ranges::any_of(*region.cpu_pages, [&](const auto& entry) {
+                    return entry.first < to && entry.first + 4096 > from && frame >= entry.second &&
+                           frame - entry.second <= 600;
+                });
+                continue;
+            }
+            for (VAddr page = Common::AlignDown(from, 4096); from < to && page < to; page += 4096) {
+                const auto known = region.cpu_pages->find(page);
+                const bool recent = known != region.cpu_pages->end() && frame >= known->second &&
+                                    frame - known->second <= 600;
+                if (recent) { needs_region_writeback = true; break; }
+            }
+        }
+        if (needs_region_writeback) break;
+    }
+    if (needs_region_writeback) {
+      b.region_writeback = std::make_shared<WritebackPlan>();
+      if (!PrepareRegionWriteback(*b.region_writeback,
+            std::span<const std::pair<VAddr, u64>>{b.gpu_writes.data(), b.gpu_writes.size()}, true)) {
+        ASSERT_MSG(false, "native region writeback preflight failed before draw/dispatch");
+        b.failed = true;
+        return;
+      }
+    }
+    for (const auto& [address, size] : b.gpu_writes) {
+        WritebacksBefore(address, size);
+    }
+}
+
+static bool PlanDirectLinearDownload(const Native::ImageEntry& entry,
+    const std::vector<VideoCore::DirectMemory::LeasedPart>& imports,
+    std::vector<Native::LinearDownloadCopy>& copies) {
+    const auto& info = entry.info;
+    // These formats have the same byte layout as the guest's 8_8_8_8 data.
+    // Other format remaps need an independent byte-representation proof.
+    const bool byte_exact = info.pixel_format == vk::Format::eR8G8B8A8Unorm ||
+        info.pixel_format == vk::Format::eR8G8B8A8Snorm ||
+        info.pixel_format == vk::Format::eR8G8B8A8Uint ||
+        info.pixel_format == vk::Format::eR8G8B8A8Sint ||
+        info.pixel_format == vk::Format::eR8G8B8A8Srgb;
+    if (!entry.image) return false;
+    const auto& desc = entry.image->Desc();
+    if (info.props.is_tiled || info.props.is_bgr_packed_float || info.props.is_depth ||
+        info.props.is_block || info.props.is_volume || info.num_samples != 1 ||
+        !byte_exact ||
+        desc.format != Native::Rhi::FormatFromVk(u32(info.pixel_format)) ||
+        !Native::LinearImageShapeMatches(
+            {info.size.width, info.size.height, info.size.depth, info.resources.levels,
+             info.resources.layers, info.num_samples},
+            {desc.width, desc.height, desc.depth, desc.mips, desc.layers, desc.samples},
+            desc.dim == Native::Rhi::ImageDim::D2) ||
+        vk::blockSize(info.pixel_format) != info.num_bits / 8 ||
+        info.num_bits == 0 || info.num_bits % 8 || info.size.depth != 1 ||
+        !info.resources.levels || info.resources.levels > VideoCore::MAX_MIPS ||
+        !info.resources.layers) return false;
+    std::vector<Native::LinearDownloadPart> parts;
+    std::vector<Native::LinearDownloadMip> mips;
+    parts.reserve(imports.size()); mips.reserve(info.resources.levels);
+    for (const auto& p : imports) parts.push_back({p.range_offset, p.size, p.view_offset, p.view_size});
+    for (u32 m = 0; m < info.resources.levels; ++m) {
+        const auto& layout = info.mips_layout[m];
+        mips.push_back({layout.offset, layout.pitch, layout.height,
+            std::max(info.size.width >> m, 1u), std::max(info.size.height >> m, 1u),
+            info.resources.layers});
+    }
+    return Native::PlanLinearImageDownload(mips, parts, info.guest_size, info.num_bits / 8, copies);
+}
+
 void NativeRenderer::FlushWritebacks() {
     if (writebacks.empty() || !stream.list) {
         return;
@@ -1875,22 +2464,250 @@ void NativeRenderer::FlushWritebacks() {
     Stream& s = stream;
     auto* direct = r.buffer_cache.GetDirectMemory();
     const u64 alignment = r.instance.StorageMinAlignment();
-    for (auto* entry : writebacks) {
+    struct DownloadCopy { vk::Buffer destination; u64 source_offset, destination_offset, size; };
+    struct LinearRegionCopy { vk::Buffer source, destination; u64 source_offset, destination_offset, size; };
+    struct DownloadPlan {
+        Native::ImageEntry* entry;
+        std::unique_ptr<Native::Rhi::Buffer> out;
+        std::vector<VideoCore::DirectMemory::LeasedPart> imports;
+        u64 offset;
+        std::vector<DownloadCopy> scatter;
+        std::vector<DownloadCopy> copies;
+        std::vector<Native::LinearDownloadCopy> linear;
+        std::vector<LinearRegionCopy> linear_regions;
+    };
+    std::vector<DownloadPlan> plans;
+    try {
+        plans.reserve(writebacks.size());
+        for (auto* entry : writebacks) {
+            const VAddr address = entry->info.guest_address;
+            const u64 size = entry->info.guest_size;
+            std::optional<std::vector<VideoCore::DirectMemory::LeasedPart>> parts;
+            std::vector<Native::LinearDownloadCopy> linear;
+            const bool chunked = size > 256_MB;
+            if (chunked) {
+                const auto pending = pending_linear_downloads.find(entry);
+                if (pending == pending_linear_downloads.end()) continue;
+                if (entry->reused.load(std::memory_order_acquire)) {
+                    pending_linear_downloads.erase(pending);
+                    continue;
+                }
+                try {
+                    parts = pending->second->imports;
+                    linear = pending->second->copies;
+                } catch (...) {
+                    pending_linear_downloads.erase(pending);
+                    continue; // Optional extension: retain the prior fallback.
+                }
+            }
+            if (!size || address > UINT64_MAX - size) {
+                UNREACHABLE_MSG("native image download range overflow");
+                return;
+            }
+            if (!chunked && (!direct || !direct->EnsureImported(address, size))) {
+                UNREACHABLE_MSG("native image download import failed");
+                return;
+            }
+            if (!chunked) parts = direct->PlanLeasedParts(address, size, alignment, 1);
+            const bool direct_output = !chunked && parts && parts->size() == 1;
+            if (!chunked && !direct_output) parts = direct->PlanLeasedParts(address, size, 4, 4);
+            if (!parts) {
+                UNREACHABLE_MSG("native image download import coverage or alignment failed");
+                return;
+            }
+            auto out = chunked ? nullptr : direct_output ? device->WrapBuffer(
+                reinterpret_cast<u64>(static_cast<VkBuffer>(parts->front().buffer)), parts->front().view_size)
+                : device->CreateBuffer({.size = size,
+                    .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageTransferSrc |
+                             Native::Rhi::BufferUsageTransferDst,
+                    .memory = Native::Rhi::MemoryKind::DeviceLocal, .name = "native image download scatter"});
+            if (!out && !chunked) {
+                UNREACHABLE_MSG("native image download wrapper allocation failed");
+                return;
+            }
+            const u64 offset = direct_output ? parts->front().view_offset : 0;
+            DownloadPlan plan{entry, std::move(out), std::move(*parts), offset, {}, {},
+                              std::move(linear), {}};
+            if (!direct_output && !chunked) {
+                for (const auto& part : plan.imports)
+                    plan.scatter.push_back({part.buffer, part.range_offset, part.view_offset, part.size});
+            }
+            bool valid_linear_regions = true;
+            for (auto& [base, region] : regions) {
+                if (chunked) {
+                    const u64 texel_bytes = entry->info.num_bits / 8;
+                    for (const auto& copy : plan.linear) for (u32 row = 0; row < copy.height; ++row) {
+                        const VAddr from = address + copy.range_offset + u64(row) * copy.pitch * texel_bytes;
+                        const VAddr to = from + u64(copy.width) * texel_bytes;
+                        const VAddr begin = std::max(from, region.begin), end = std::min(to, region.end);
+                        if (begin >= end) continue;
+                        const u64 src = copy.buffer_offset + u64(row) * copy.pitch * texel_bytes + begin - from;
+                        const u64 dst = begin - region.begin;
+                        if ((src | dst | (end - begin)) & 3u) {
+                            valid_linear_regions = false;
+                            break;
+                        }
+                        const vk::Buffer source = plan.imports[copy.part].buffer;
+                        const vk::Buffer destination{Handle<VkBuffer_T>(region.buffer->NativeHandle())};
+                        if (!plan.linear_regions.empty()) {
+                            auto& last = plan.linear_regions.back();
+                            if (last.source == source && last.destination == destination &&
+                                last.source_offset + last.size == src &&
+                                last.destination_offset + last.size == dst) {
+                                last.size += end - begin;
+                                continue;
+                            }
+                        }
+                        plan.linear_regions.push_back({source, destination, src, dst, end - begin});
+                    }
+                    if (!valid_linear_regions) break;
+                    continue;
+                }
+                const VAddr begin = std::max(address, region.begin);
+                const VAddr end = std::min(address + size, region.end);
+                if (begin >= end) continue;
+                const u64 src = offset + begin - address;
+                const u64 dst = begin - region.begin;
+                if (src % 4 || dst % 4 || (end - begin) % 4) {
+                    UNREACHABLE_MSG("native image download region copy is unaligned");
+                    return;
+                }
+                plan.copies.push_back({vk::Buffer{Handle<VkBuffer_T>(region.buffer->NativeHandle())},
+                                       src, dst, end - begin});
+            }
+            if (chunked) {
+                pending_linear_downloads.erase(entry);
+                if (!valid_linear_regions || entry->reused.load(std::memory_order_acquire)) continue;
+            }
+            plans.push_back(std::move(plan));
+        }
+        Native::ReserveAdditional(s.keep, plans.size());
+        size_t lease_count = 0;
+        for (const auto& plan : plans) lease_count += plan.imports.size();
+        Native::ReserveAdditional(s.imported_view_leases, lease_count);
+    } catch (...) {
+        UNREACHABLE_MSG("native image download preflight allocation failed");
+        return;
+    }
+    static const bool batched = [] {
+        const char* env = std::getenv("RYGT_NATIVE_WRITEBACK_BATCH");
+        return !(env && env[0] == '0');
+    }();
+    Native::DownloadBatch batch;
+    std::vector<std::pair<VAddr, VAddr>> batch_ranges;
+    try { batch_ranges.reserve(plans.size()); }
+    catch (...) { UNREACHABLE_MSG("native image download batch planning failed"); }
+    bool use_batch = false;
+    if (batched) {
+        const u64 step_alignment = std::max<u64>(alignment, 256);
+        u64 bytes = 0;
+        for (const auto& plan : plans) {
+            const auto& info = plan.entry->info;
+            if (!info.props.is_tiled && !info.props.is_bgr_packed_float) continue;
+            bytes += 2 * Common::AlignUp(u64(info.guest_size), step_alignment);
+        }
+        use_batch = bytes != 0 && registry->BeginDownloads(batch, bytes, alignment);
+    }
+    for (auto& plan : plans) {
+        auto* entry = plan.entry;
         const VAddr address = entry->info.guest_address;
         const u64 size = entry->info.guest_size;
-        if (!direct || !direct->EnsureImported(address, size)) {
-            continue;
+        if (use_batch && std::ranges::any_of(batch_ranges, [&](const auto& range) {
+                return address < range.second && range.first < address + size;
+            })) {
+            registry->FinishDownloads(*s.list, batch);
+            batch_ranges.clear();
         }
-        const auto found = direct->FindBuffer(address, size);
-        if (!found || found->second % alignment != 0) {
-            continue;
-        }
-        auto out = device->WrapBuffer(
-            reinterpret_cast<u64>(static_cast<VkBuffer>(found->first->Handle())),
-            found->first->SizeBytes());
-        if (registry->RecordDownload(*s.list, *entry, *out, found->second)) {
+        if (!plan.linear.empty()) {
+            if (entry->reused.load(std::memory_order_acquire)) continue;
+            if (use_batch) { registry->FinishDownloads(*s.list, batch); batch_ranges.clear(); }
+            // Capacity was reserved for all plans above. Transfer ownership before
+            // the first command, including when later metadata allocation fails.
+            Native::TransferLinearDownloadLeases(s.imported_view_leases, plan.imports);
+            const vk::Image image{Handle<VkImage_T>(entry->image->NativeHandle())};
+            for (const auto& copy : plan.linear) {
+                const vk::BufferImageCopy region{
+                    .bufferOffset = copy.buffer_offset,
+                    .bufferRowLength = copy.pitch,
+                    .imageSubresource = {vk::ImageAspectFlagBits::eColor, copy.mip, copy.layer, 1},
+                    .imageOffset = {s32(copy.x), s32(copy.y), 0},
+                    .imageExtent = {copy.width, copy.height, 1},
+                };
+                s.cmd.copyImageToBuffer(image, vk::ImageLayout::eGeneral,
+                                        plan.imports[copy.part].buffer, region);
+            }
+            if (!plan.linear_regions.empty()) {
+                const vk::MemoryBarrier2 copied{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+                    .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+                    .dstAccessMask = vk::AccessFlagBits2::eTransferRead};
+                s.cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &copied});
+                for (const auto& copy : plan.linear_regions)
+                    s.cmd.copyBuffer(copy.source, copy.destination,
+                        vk::BufferCopy{copy.source_offset, copy.destination_offset, copy.size});
+            }
+            s.list->Barrier(Native::Rhi::ScopeTransfer, Native::Rhi::ScopeTransfer |
+                            Native::Rhi::ScopeCompute | Native::Rhi::ScopeHost);
+            // Only pixels were copied: do not mark guest padding as downloaded.
+            const u64 texel_bytes = entry->info.num_bits / 8;
+            try {
+              {
+                std::scoped_lock lock{region_dirty_mutex};
+                for (const auto& copy : plan.linear) for (u32 row = 0; row < copy.height; ++row) {
+                    const VAddr from = address + copy.range_offset + u64(row) * copy.pitch * texel_bytes;
+                    const VAddr to = from + u64(copy.width) * texel_bytes;
+                    for (auto& [base, region] : regions) {
+                        const VAddr begin = std::max(from, region.begin), end = std::min(to, region.end);
+                        for (VAddr page = Common::AlignDown(begin, 4096); begin < end && page < end; page += 4096) {
+                            region.dirty_pages.push_back(page);
+                            Native::AddPageDownloadRange(downloaded_ranges[page], std::max(begin, page),
+                                                         std::min(end, page + 4096));
+                        }
+                        if (begin < end) region.dirty_sorted = false;
+                    }
+                }
+              }
+                for (const auto& copy : plan.linear) for (u32 row = 0; row < copy.height; ++row) {
+                    const VAddr from = address + copy.range_offset + u64(row) * copy.pitch * texel_bytes;
+                    const VAddr to = from + u64(copy.width) * texel_bytes;
+                    for (auto it = FirstMirror(from); it != mirrors.end() && it->second.begin < to; ++it) {
+                        Mirror& mirror = it->second;
+                        for (VAddr page = Common::AlignDown(std::max(from, mirror.begin), 4096);
+                             page < std::min(to, mirror.end); page += 4096) mirror.dirty_pages.push_back(page);
+                    }
+                }
+            } catch (...) {
+                // The command stream is already mutated and cannot safely be resumed.
+                std::terminate();
+            }
             NATIVE_DIAGNOSTIC(++stats.writebacks);
-            if (RegionOver(address, size)) {
+            continue;
+        }
+        if (!plan.scatter.empty()) {
+            const vk::Buffer scratch{Handle<VkBuffer_T>(plan.out->NativeHandle())};
+            for (const auto& part : plan.imports)
+                s.cmd.copyBuffer(part.buffer, scratch,
+                    vk::BufferCopy{.srcOffset = part.view_offset, .dstOffset = part.range_offset,
+                                   .size = part.size});
+            const vk::MemoryBarrier2 copied{
+                .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite};
+            s.cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &copied});
+        }
+        if (registry->RecordDownload(*s.list, *entry, *plan.out, plan.offset,
+                                     use_batch ? &batch : nullptr)) {
+            batch_ranges.emplace_back(address, address + size);
+            NATIVE_DIAGNOSTIC(++stats.writebacks);
+            if (!plan.scatter.empty() || !plan.copies.empty()) {
+                if (use_batch) {
+                    // GTS consumes the downloaded bytes in its native region now.
+                    // Complete this batch before recording that ordered copy-in.
+                    registry->FinishDownloads(*s.list, batch);
+                    batch_ranges.clear();
+                }
                 // Image writes are authoritative for their entire byte range. A CPU-page
                 // delta cannot represent them: its saved baseline can already contain the
                 // same image bytes while an older native region contains something else.
@@ -1906,27 +2723,29 @@ void NativeRenderer::FlushWritebacks() {
                     .memoryBarrierCount = 1,
                     .pMemoryBarriers = &downloaded,
                 });
-                for (auto& [base, region] : regions) {
-                    const VAddr begin = std::max(address, region.begin);
-                    const VAddr end = std::min(address + size, region.end);
-                    if (begin >= end) {
-                        continue;
-                    }
-                    s.cmd.copyBuffer(found->first->Handle(),
-                                     vk::Buffer{Handle<VkBuffer_T>(region.buffer->NativeHandle())},
-                                     vk::BufferCopy{.srcOffset = found->second + begin - address,
-                                                    .dstOffset = begin - region.begin,
-                                                    .size = end - begin});
-                }
+                for (const auto& copy : plan.scatter)
+                    s.cmd.copyBuffer(vk::Buffer{Handle<VkBuffer_T>(plan.out->NativeHandle())}, copy.destination,
+                                     vk::BufferCopy{.srcOffset = copy.source_offset,
+                                                    .dstOffset = copy.destination_offset, .size = copy.size});
+                for (const auto& copy : plan.copies)
+                    s.cmd.copyBuffer(vk::Buffer{Handle<VkBuffer_T>(plan.out->NativeHandle())}, copy.destination,
+                                     vk::BufferCopy{.srcOffset = copy.source_offset,
+                                                    .dstOffset = copy.destination_offset, .size = copy.size});
 
             }
             // NAT-146: regions over the picture's memory copy it in before their next use.
-            if (Region* region = RegionOver(address, size)) {
-                for (VAddr page = Common::AlignDown(std::max<VAddr>(address, region->begin), 4096);
-                     page < std::min<VAddr>(address + size, region->end); page += 4096) {
-                    region->dirty_pages.push_back(page);
+            if (RegionOver(address, size)) {
+                std::scoped_lock lock{region_dirty_mutex};
+                for (auto& [base, region] : regions) {
+                    const VAddr from = std::max(address, region.begin);
+                    const VAddr to = std::min(address + size, region.end);
+                    for (VAddr page = Common::AlignDown(from, 4096); from < to && page < to; page += 4096) {
+                        region.dirty_pages.push_back(page);
+                        Native::AddPageDownloadRange(downloaded_ranges[page], std::max(from, page),
+                                                     std::min(to, page + 4096));
+                    }
+                    if (from < to) region.dirty_sorted = false;
                 }
-                region->dirty_sorted = false;
             }
             // NAT-150: so do mirrors.
             for (auto it = FirstMirror(address);
@@ -1937,10 +2756,15 @@ void NativeRenderer::FlushWritebacks() {
                     mirror.dirty_pages.push_back(page);
                 }
             }
+        } else {
+            UNREACHABLE_MSG("native image download recording failed");
         }
-        s.keep.push_back(std::move(out));
+        s.keep.push_back(std::move(plan.out));
+        for (auto& part : plan.imports) s.imported_view_leases.push_back(std::move(part.lease));
     }
+    if (use_batch) registry->FinishDownloads(*s.list, batch);
     writebacks.clear();
+    writebacks_due = false;
     s.pipelines.Invalidate(); // the re-tiling binds its own pipeline
     // What reads guest memory next (shaders, the CPU after the GPU) sees the pictures.
     const vk::MemoryBarrier2 barrier{
@@ -1986,7 +2810,43 @@ void NativeRenderer::ChunkFlushCheck() {
     if (stream.commands >= SpliceAfter) {
         Splice();
         r.scheduler.Flush();
+        return;
     }
+    static const u32 feed_min = [] {
+        const char* on = std::getenv("RYGT_FEED_GPU");
+        if (on && on[0] == '0') {
+            return 0u;
+        }
+        const char* env = std::getenv("RYGT_FEED_GPU_MIN");
+        if (!env || !*env) return 32u;
+        char* end = nullptr;
+        const auto value = std::strtoull(env, &end, 10);
+        if (*env == '-' || end == env || *end || value > UINT32_MAX) return 32u;
+        return std::max<u32>(u32(value), 1u);
+    }();
+    if (feed_min == 0 || stream.commands < feed_min || (stream.commands & 15) != 0) {
+        return;
+    }
+    const u64 tick = r.scheduler.CurrentTick();
+    if (tick > 1 && r.scheduler.IsFree(tick - 1)) {
+        Splice();
+        r.scheduler.Flush();
+    }
+}
+
+void NativeRenderer::TrimIdleChunks() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_CHUNK_TRIM");
+        return !(env && env[0] == '0');
+    }();
+    if (!enabled || frame % 150 != 0) return;
+    std::vector<Chunk> dropped;
+    {
+        std::scoped_lock lock{chunk_mutex};
+        try { TrimIdleUploadChunks(free_chunks, free_chunks_low, dropped); }
+        catch (const std::bad_alloc&) { return; } // optional trim leaves the pool intact
+    }
+    // Release completed buffers outside the pool mutex.
 }
 
 NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
@@ -2010,6 +2870,7 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
     trace.Next(2);
     trace.Next(3);
     CacheCompletedUploadChunks(free_chunks, retiring_chunks, known);
+    free_chunks_low = std::min(free_chunks_low, free_chunks.size());
     trace.Next(4);
     auto fit = free_chunks.end();
     for (auto it = free_chunks.begin(); it != free_chunks.end(); ++it) {
@@ -2019,18 +2880,38 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
     if (fit != free_chunks.end()) {
         Chunk chunk = std::move(*fit);
         free_chunks.erase(fit);
+        free_chunks_low = std::min(free_chunks_low, free_chunks.size());
         return chunk;
     }
     Chunk chunk;
     trace.Next(5);
-    chunk.buffer = device->CreateBuffer({
-        .size = UploadChunkCapacity(size, ChunkSize),
+    const auto create = [&] {
+        Chunk result;
+        result.buffer = device->CreateBuffer({
+        .size = UploadChunkCapacity(size, ChunkSize()),
         .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageUniform |
                  Native::Rhi::BufferUsageIndex | Native::Rhi::BufferUsageVertex |
                  Native::Rhi::BufferUsageIndirect | Native::Rhi::BufferUsageTransferSrc,
         .memory = Native::Rhi::MemoryKind::Upload,
         .name = "native upload",
-    });
+        });
+        return result;
+    };
+    chunk = create();
+    if (!chunk.buffer || !chunk.buffer->Mapped()) {
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-276: reclaiming completed upload allocations for {} bytes", size);
+        device->DestroyCompletedBuffer(std::move(chunk.buffer)); // Never submitted.
+        chunk = RecoverUploadMemory(
+            size, r.scheduler.CurrentTick(), true, free_chunks, retiring_chunks,
+            [&] { semaphore->Refresh(); return semaphore->KnownGpuTick(); },
+            [&](u64 tick) { r.scheduler.Wait(tick); },
+            [&](std::unique_ptr<Native::Rhi::Buffer> buffer) {
+                device->DestroyCompletedBuffer(std::move(buffer));
+            },
+            [&] { device->Collect(); return create(); });
+        free_chunks_low = std::min(free_chunks_low, free_chunks.size());
+    }
     ASSERT_MSG(chunk.buffer && chunk.buffer->Mapped(), "NAT-100: no upload memory ({} bytes)",
                size);
     return chunk;
@@ -2164,32 +3045,50 @@ NativeRenderer::Region* NativeRenderer::RegionOver(VAddr address, u64 size) {
     return nullptr;
 }
 
-NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
-    ++buffer_generation; // OPT-003: regions are taken in or made
+NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool write) {
     auto* direct = r.buffer_cache.GetDirectMemory();
     // The new region takes in every region it overlaps (their GPU-written contents kept).
     VAddr begin = Common::AlignDown(address, 4096);
     VAddr end = Common::AlignUp(address + size, 4096);
     std::vector<Region> merged;
+    static_assert(std::is_nothrow_move_constructible_v<Region>);
+    Region region;
+    size_t region_count;
+    {
+        std::shared_lock map_lock{buffer_map_mutex};
+        region_count = regions.size();
+    }
+    merged.reserve(region_count);
+    retired_watch_ranges.reserve(retired_watch_ranges.size() + region_count);
     {
         std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
-        for (auto it = regions.begin(); it != regions.end();) {
-            if (it->second.begin < end && it->second.end > begin) {
-                begin = std::min(begin, it->second.begin);
-                end = std::max(end, it->second.end);
-                retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
-                merged.push_back(std::move(it->second));
-                it = regions.erase(it);
-            } else {
-                ++it;
-            }
-        }
+        const auto action = Native::ReplaceOverlappingRegions(
+            regions, begin, end, write, size, 1_GB,
+            [&](VAddr from, VAddr to) {
+                return direct && to - from <= 1_GB && r.IsMappedStart(from) &&
+                       r.memory->IsValidGpuMapping(from, to - from);
+            }, [&](VAddr from, VAddr to) {
+            region.begin = from;
+            region.end = to;
+            // NativeRenderer::mutex serializes region map writers; only hold the
+            // map lock for planning and the non-throwing removal pass.
+            map_lock.unlock();
+            region.buffer = device->CreateBuffer({.size = to - from,
+                .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageVertex |
+                         Native::Rhi::BufferUsageIndex | Native::Rhi::BufferUsageIndirect |
+                         Native::Rhi::BufferUsageTransferSrc | Native::Rhi::BufferUsageTransferDst,
+                .memory = Native::Rhi::MemoryKind::DeviceLocal, .name = "native region"});
+            map_lock.lock();
+            return bool(region.buffer);
+        }, [&](Region&& old) {
+                retired_watch_ranges.emplace_back(old.begin, old.end);
+                merged.push_back(std::move(old));
+                ++regions_taken_in;
+        });
+        if (action == Native::RegionMergeDisposition::Preserve) return nullptr;
     }
+    ++buffer_generation;
     buffer_log.Note(begin, end); // OPT-010
-    if (!direct || end - begin > 1_GB || !r.IsMappedStart(begin) ||
-        !r.memory->IsValidGpuMapping(begin, end - begin)) {
-        return nullptr;
-    }
     // GPU-only guest allocations need not have CPU-importable backing. They still need
     // storage for shader writes (including the terrain's persistent shadow map).
     std::vector<Native::RegionInitRange> covered;
@@ -2198,21 +3097,6 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
     const auto gaps = Native::RegionInitGaps(begin,end,covered);
     u64 guest_init_bytes = 0;
     for (const auto gap : gaps) guest_init_bytes += gap.end-gap.begin;
-    Region region;
-    region.begin = begin;
-    region.end = end;
-    region.buffer = device->CreateBuffer({.size = end - begin,
-                                          .usage = Native::Rhi::BufferUsageStorage |
-                                                   Native::Rhi::BufferUsageVertex |
-                                                   Native::Rhi::BufferUsageIndex |
-                                                   Native::Rhi::BufferUsageIndirect |
-                                                   Native::Rhi::BufferUsageTransferSrc |
-                                                   Native::Rhi::BufferUsageTransferDst,
-                                          .memory = Native::Rhi::MemoryKind::DeviceLocal,
-                                          .name = "native region"});
-    if (!region.buffer) {
-        return nullptr;
-    }
     Stream& s = Begin();
     GlobalBarrier();
     const vk::Buffer dst{Handle<VkBuffer_T>(region.buffer->NativeHandle())};
@@ -2233,7 +3117,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
             // before the complete sparse fallback for this gap.
             s.list->Barrier(Native::Rhi::ScopeTransfer,Native::Rhi::ScopeTransfer);
             for (u64 offset=0;offset<gap_size;) {
-                const u64 bytes=std::min<u64>(4_MB,gap_size-offset);
+                const u64 bytes=NativeRegionUploadStep(gap_size-offset, ChunkSize());
                 const auto [upload,upload_offset,data]=Allocate(bytes,4);
                 r.memory->CopySparseMemory(gap.begin+offset,data,bytes);
                 s.cmd.copyBuffer(upload,dst,vk::BufferCopy{
@@ -2256,6 +3140,8 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size) {
         // FIX-173: CPU writes to it not copied in yet are copied in at the new one's next use.
         region.dirty_pages.insert(region.dirty_pages.end(), old.dirty_pages.begin(),
                                   old.dirty_pages.end());
+        region.cpu_pages->merge(*old.cpu_pages);
+        region.gpu_pages->merge(*old.gpu_pages);
         region.dirty_sorted = false;
     }
     s.buffers_written = true;
@@ -2290,7 +3176,12 @@ void NativeRenderer::SortRegionWrites() {
     }
     for (const auto& [begin, end] : stack_retirements) DropMirrors(begin, end - begin);
     for (const auto& [begin, end] : writes) {
-        for (auto& [base, region] : regions) {
+        // PERF-GT7-003/006: regions do not overlap; start at the possible
+        // predecessor and stop at the write's end instead of scanning the map.
+        auto first = regions.upper_bound(begin);
+        if (first != regions.begin() && std::prev(first)->second.end > begin) --first;
+        for (auto it = first; it != regions.end() && it->second.begin < end; ++it) {
+            Region& region = it->second;
             if (region.begin < end && region.end > begin) {
                 for (VAddr page = std::max(begin, region.begin); page < std::min(end, region.end);
                      page += 4096) {
@@ -2780,6 +3671,288 @@ void NativeRenderer::DropMirrors(VAddr address, u64 size, u32 diagnostic_reason)
     }
 }
 
+static const std::vector<std::pair<VAddr, VAddr>>& NativeInplaceRanges() {
+    static const auto ranges = [] {
+        std::vector<std::pair<VAddr, VAddr>> result;
+        const char* configured = std::getenv("RYGT_NATIVE_INPLACE_RANGES");
+        const char* extra = std::getenv("RYGT_NATIVE_INPLACE_EXTRA");
+        for (const char* source : {configured, extra}) {
+            for (const char* at = source; at && *at;) {
+                char* end = nullptr;
+                const VAddr begin = std::strtoull(at, &end, 16);
+                if (end == at || *end != '+') break;
+                at = end + 1;
+                const u64 length = std::strtoull(at, &end, 16);
+                if (end == at || begin > UINT64_MAX - std::max<u64>(length, 1)) break;
+                result.emplace_back(begin, begin + std::max<u64>(length, 1));
+                at = *end == ',' ? end + 1 : end;
+            }
+        }
+        return result;
+    }();
+    return ranges;
+}
+
+static bool NativeInplaceWritebackEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_INPLACE_WRITEBACK");
+        return !env || env[0] != '0';
+    }();
+    return enabled;
+}
+
+static bool NativeRegionWritebackEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_REGION_WRITEBACK");
+        return !env || env[0] != '0';
+    }();
+    return enabled;
+}
+
+bool NativeRenderer::PrepareRegionWriteback(WritebackPlan& plan,
+    std::span<const std::pair<VAddr, u64>> writes, bool shader) {
+    return Native::PrepareWritebackOperation(plan, writes, [&](auto& candidate, const auto& range) {
+        candidate.region_generation = regions_taken_in;
+        return PrepareRegionWritebackRange(candidate, std::span{&range, 1}, shader);
+    });
+}
+
+bool NativeRenderer::PrepareRegionWritebackRange(WritebackPlan& plan,
+    std::span<const std::pair<VAddr, u64>> writes, bool shader) {
+    plan.shader = shader;
+    if (!NativeRegionWritebackEnabled()) return true;
+    auto* direct = r.buffer_cache.GetDirectMemory();
+    const u64 alignment = r.instance.StorageMinAlignment();
+    try {
+        for (const auto [address, size] : writes) {
+            if (!size) continue;
+            if (address > UINT64_MAX - size) return false;
+            const VAddr end = address + size;
+            auto it = regions.upper_bound(address);
+            if (it != regions.begin() && std::prev(it)->second.end > address) --it;
+            for (; it != regions.end() && it->second.begin < end; ++it) {
+                Region& region = it->second;
+                const VAddr from = std::max(address, region.begin), to = std::min(end, region.end);
+                if (from >= to) continue;
+                if (to - from > 4_MB) {
+                    for (const auto [page, recent_frame] : *region.cpu_pages) {
+                        if (page < to && page + 4096 > from && frame >= recent_frame &&
+                            frame - recent_frame <= 600)
+                            plan.forget_pages.emplace_back(region.begin, page);
+                    }
+                    if (NativeInplaceWritebackEnabled())
+                        plan.skipped_listed |= std::ranges::any_of(NativeInplaceRanges(),
+                            [&](const auto& range) { return from < range.second && range.first < to; });
+                    continue;
+                }
+                std::size_t before_index = plan.before.size();
+                for (VAddr page = Common::AlignDown(from, 4096); page < to; page += 4096) {
+                    const auto known = region.cpu_pages->find(page);
+                    const bool recent = known != region.cpu_pages->end() && frame >= known->second &&
+                                        frame - known->second <= 600;
+                    const bool listed = NativeInplaceWritebackEnabled() &&
+                        std::ranges::any_of(NativeInplaceRanges(), [&](const auto& range) {
+                            return page < range.second && range.first < page + 4096 &&
+                                   from < range.second && range.first < to;
+                        });
+                    if (!recent && !listed) continue;
+                    if (shader && Native::WritebackPageAlreadyPlanned(plan.parts, region.begin, page)) continue;
+                    const auto forget = [&] {
+                        if (recent && std::ranges::find(plan.forget_pages, std::pair{region.begin, page}) == plan.forget_pages.end())
+                            plan.forget_pages.emplace_back(region.begin, page);
+                        plan.skipped_listed |= listed;
+                    };
+                    if (Native::RegionWritebackNeedsFallback(to - from, direct != nullptr, shader,
+                        writeback_pipeline != nullptr, device->Caps().max_push_bindings >= 3,
+                        page >= region.begin && page + 4096 <= region.end)) {
+                        forget();
+                        continue;
+                    }
+                    const VAddr part_begin = shader ? page : std::max(page, from);
+                    const VAddr part_end = shader ? page + 4096 : std::min(page + 4096, to);
+                    const u64 part_size = part_end - part_begin;
+                    if (!direct->EnsureImported(part_begin, part_size)) { forget(); continue; }
+                    auto parts = direct->PlanLeasedParts(part_begin, part_size,
+                                                        shader ? alignment : 4, shader ? 16 : 4);
+                    if (!parts) { forget(); continue; }
+                    if (shader && before_index == plan.before.size()) {
+                        const VAddr snapshot_begin = Common::AlignDown(from, 4096);
+                        if (to > UINT64_MAX - 4095) { forget(); continue; }
+                        const VAddr snapshot_end = Common::AlignUp(to, 4096);
+                        if (snapshot_begin < region.begin || snapshot_end > region.end ||
+                            (snapshot_begin - region.begin) % 4) { forget(); continue; }
+                        const u64 class_size = std::max<u64>(std::bit_ceil(snapshot_end - snapshot_begin), 64_KB);
+                        auto* semaphore = r.scheduler.GetWorkSemaphore();
+                        auto copy = snapshot_pool.Take(class_size, semaphore->KnownGpuTick());
+                        if (!copy) copy = device->CreateBuffer({.size = class_size,
+                            .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageTransferDst,
+                            .memory = Native::Rhi::MemoryKind::DeviceLocal, .name = "native write-back before"});
+                        if (!copy) { forget(); continue; }
+                        plan.before.push_back({.address = address, .begin = snapshot_begin,
+                            .end = snapshot_end, .size = size, .copy = std::move(copy)});
+                    }
+                    const auto first_part = plan.parts.size();
+                    bool complete = true;
+                    for (auto& part : *parts) {
+                        const u64 region_offset = part_begin - region.begin + part.range_offset;
+                        const u64 before_offset = shader ? part_begin - plan.before[before_index].begin + part.range_offset : 0;
+                        if (region_offset % (shader ? alignment : 4) ||
+                            (shader && before_offset % alignment)) { complete = false; break; }
+                        auto guest = device->WrapBuffer(reinterpret_cast<u64>(static_cast<VkBuffer>(part.buffer)), part.view_size);
+                        if (!guest) { complete = false; break; }
+                        plan.parts.push_back({region.begin, page, region_offset, before_offset,
+                            part.view_offset, part.size, region.buffer.get(), std::move(guest),
+                            std::move(part.lease), before_index});
+                    }
+                    if (!complete) {
+                        plan.parts.resize(first_part);
+                        if (shader && plan.before.size() == before_index + 1 &&
+                            std::ranges::none_of(plan.parts, [&](const auto& item) { return item.before_index == before_index; }))
+                            plan.before.pop_back();
+                        forget();
+                    }
+                }
+            }
+        }
+        std::erase_if(plan.forget_pages, [&](const auto& page) {
+            return Native::WritebackPageAlreadyPlanned(plan.parts, page.first, page.second);
+        });
+        Native::ReserveAdditional(stream.writeback_plan_leases, 2);
+        Native::ReserveAdditional(stream.pooled_snapshots, plan.before.size());
+        std::unordered_set<VAddr> pending_nodes;
+        for (const auto& part : plan.parts) {
+            auto found = regions.find(part.region_begin);
+            if (found == regions.end() || found->second.buffer.get() != part.region_buffer) return false;
+            auto& gpu_pages = *found->second.gpu_pages;
+            const auto needed = gpu_pages.size() + plan.parts.size();
+            if (needed > gpu_pages.bucket_count() * gpu_pages.max_load_factor())
+                gpu_pages.reserve(std::max(needed, gpu_pages.size() * 2 + 8));
+            const bool already_planned = std::ranges::any_of(plan.marks, [&](const auto& mark) {
+                return mark.region_begin == part.region_begin && mark.node.value() == part.page;
+            });
+            if (!already_planned) {
+                pending_nodes.insert(part.page);
+                plan.marks.push_back({part.region_begin, pending_nodes.extract(part.page)});
+            }
+        }
+        return true;
+    } catch (...) { return false; }
+}
+
+void NativeRenderer::RecordRegionSnapshots(const std::shared_ptr<WritebackPlan>& owner) {
+    auto& plan = *owner;
+    if (plan.before.empty()) return;
+    Stream& s = Begin();
+    GlobalBarrier();
+    try { Native::ReserveAdditional(s.writeback_plan_leases, 2); }
+    catch (...) { UNREACHABLE_MSG("native writeback stream retention allocation failed"); }
+    RetainRegionPlan(owner);
+    try { Native::ReserveAdditional(s.pooled_snapshots, plan.before.size()); }
+    catch (...) { UNREACHABLE_MSG("native region snapshot retention allocation failed"); }
+    for (auto& before : plan.before) {
+        auto* region = RegionOver(before.begin, before.end - before.begin);
+        if (!region || before.begin < region->begin || before.end > region->end)
+            UNREACHABLE_MSG("native writeback region changed after preflight");
+        s.cmd.copyBuffer(vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
+            vk::Buffer{Handle<VkBuffer_T>(before.copy->NativeHandle())},
+            vk::BufferCopy{.srcOffset = before.begin - region->begin, .dstOffset = 0,
+                           .size = before.end - before.begin});
+        before.recorded_copy = before.copy.get();
+    }
+    const vk::MemoryBarrier2 copied{
+        .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite};
+    s.cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &copied});
+}
+
+void NativeRenderer::RetainRegionPlan(const std::shared_ptr<WritebackPlan>& plan) {
+    if (!plan || plan->parts.empty()) return;
+    ValidateRegionPlan(*plan);
+    Stream& s = Begin();
+    if (s.writeback_plan_leases.size() == s.writeback_plan_leases.capacity())
+        UNREACHABLE_MSG("native region writeback retention was not preallocated");
+    s.writeback_plan_leases.push_back(plan);
+}
+
+bool NativeRenderer::RegionPlanValid(const WritebackPlan& plan) const {
+    if (plan.region_generation != regions_taken_in) return false;
+    for (const auto& part : plan.parts) {
+        const auto found = regions.find(part.region_begin);
+        if (found == regions.end() || found->second.buffer.get() != part.region_buffer) return false;
+    }
+    for (const auto [base, page] : plan.forget_pages) {
+        const auto found = regions.find(base);
+        if (found == regions.end() || page < found->second.begin || page >= found->second.end) return false;
+    }
+    return true;
+}
+
+void NativeRenderer::ValidateRegionPlan(const WritebackPlan& plan) {
+    if (!RegionPlanValid(plan)) UNREACHABLE_MSG("native region changed after writeback preflight");
+}
+
+void NativeRenderer::ApplyRegionWritebackFallback(WritebackPlan& plan) {
+    if (!plan.forget_pages.empty()) {
+        std::scoped_lock lock{region_dirty_mutex};
+        Native::ForgetWritebackPages(plan.forget_pages, [&](const auto& entry) {
+            const auto [base, page] = entry;
+            if (auto found = regions.find(base); found != regions.end()) found->second.cpu_pages->erase(page);
+            cpu_recent_pages.erase(page);
+        });
+    }
+    if (plan.skipped_listed) {
+        static std::atomic<u32> skipped{};
+        if (Sample(skipped)) LOG_WARNING(Render_Vulkan, "native listed-region writeback unavailable for this operation");
+        plan.skipped_listed = false;
+    }
+}
+
+void NativeRenderer::RecordRegionWriteback(const std::shared_ptr<WritebackPlan>& owner) {
+    if (!owner) return;
+    auto& plan = *owner;
+    if (plan.parts.empty()) return;
+    Stream& s = Begin();
+    RetainRegionPlan(owner);
+    GlobalBarrier();
+    for (auto& mark : plan.marks) {
+        auto found = regions.find(mark.region_begin);
+        if (found == regions.end()) UNREACHABLE_MSG("native writeback region changed after preflight");
+        found->second.gpu_pages->insert(std::move(mark.node));
+    }
+    for (auto& part : plan.parts) {
+        auto found = regions.find(part.region_begin);
+        if (found == regions.end() || found->second.buffer.get() != part.region_buffer)
+            UNREACHABLE_MSG("native writeback region changed after preflight");
+        if (plan.shader) {
+            auto* snapshot = plan.before[part.before_index].recorded_copy;
+            const std::array<Native::Rhi::Binding, 3> inputs{{
+                {.slot = 0, .type = Native::Rhi::BindingType::StorageBuffer, .buffer = part.region_buffer,
+                 .offset = part.region_offset, .size = part.size},
+                {.slot = 1, .type = Native::Rhi::BindingType::StorageBuffer, .buffer = snapshot,
+                 .offset = part.before_offset, .size = part.size},
+                {.slot = 2, .type = Native::Rhi::BindingType::StorageBuffer, .buffer = part.guest.get(),
+                 .offset = part.guest_offset, .size = part.size}}};
+            const u32 count = static_cast<u32>(part.size / 16);
+            s.list->BindPipeline(writeback_pipeline.get());
+            s.list->PushBindings(inputs);
+            s.list->PushConstants(0, std::span<const u8>{reinterpret_cast<const u8*>(&count), sizeof(count)});
+            s.list->Dispatch((count + 63) / 64, 1, 1);
+        } else {
+            s.cmd.copyBuffer(vk::Buffer{Handle<VkBuffer_T>(part.region_buffer->NativeHandle())},
+                vk::Buffer{Handle<VkBuffer_T>(part.guest->NativeHandle())},
+                vk::BufferCopy{.srcOffset = part.region_offset, .dstOffset = part.guest_offset, .size = part.size});
+        }
+    }
+    s.pipelines.Invalidate();
+    s.buffers_written = true;
+    for (auto& before : plan.before) {
+        if (s.pooled_snapshots.size() == s.pooled_snapshots.capacity()) break;
+        s.pooled_snapshots.push_back(std::move(before.copy));
+    }
+}
+
 void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
     SortRegionWrites();
     auto& dirty = region.dirty_pages;
@@ -2802,7 +3975,6 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         return;
     }
     std::vector<VAddr> pages(first, last);
-    dirty.erase(first, last);
 #if !defined(NDEBUG)
     const auto refresh_start = std::chrono::steady_clock::now();
     struct Timed {
@@ -2819,55 +3991,160 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
 #endif
     auto* direct = r.buffer_cache.GetDirectMemory();
     if (!direct) {
+        UNREACHABLE_MSG("native region refresh requires imported guest memory");
         return;
     }
+    struct RefreshPagePlan {
+        std::vector<VideoCore::DirectMemory::LeasedPart> whole;
+        std::vector<std::pair<VAddr, VAddr>> downloads;
+        std::vector<std::vector<VideoCore::DirectMemory::LeasedPart>> download_parts;
+        vk::Buffer upload{};
+        u64 upload_offset{};
+        u8* mapped{};
+        bool remapped{};
+    };
+    std::vector<RefreshPagePlan> refresh(pages.size());
+    {
+        std::scoped_lock lock{region_dirty_mutex};
+        for (size_t i = 0; i < pages.size(); ++i) {
+            refresh[i].remapped = remapped_pages.contains(pages[i]);
+            if (auto it = downloaded_ranges.find(pages[i]); it != downloaded_ranges.end())
+                refresh[i].downloads = it->second;
+        }
+    }
+    size_t lease_count = 0;
+    for (size_t i = 0; i < pages.size(); ++i) {
+        const VAddr page = pages[i];
+        if (page < region.begin || page >= region.end) {
+            UNREACHABLE_MSG("native region refresh page outside region");
+            return;
+        }
+        const u64 page_bytes = std::min<u64>(4096, region.end - page);
+        if ((page - region.begin) % 4 || page_bytes % 4 ||
+            !direct->EnsureImported(page, page_bytes)) {
+            UNREACHABLE_MSG("native region refresh page import or alignment failed");
+            return;
+        }
+        auto whole = direct->PlanLeasedParts(page, page_bytes, 4, 4);
+        if (!whole) {
+            UNREACHABLE_MSG("native region refresh page preflight failed");
+            return;
+        }
+        refresh[i].whole = std::move(*whole);
+        lease_count += refresh[i].whole.size();
+        for (const auto [from, to] : refresh[i].downloads) {
+            if (from < page || to > page + page_bytes || from >= to ||
+                (from - region.begin) % 4 || (to - from) % 4 ||
+                !direct->EnsureImported(from, to - from)) {
+                UNREACHABLE_MSG("native image download range cannot be copied safely");
+                return;
+            }
+            auto parts = direct->PlanLeasedParts(from, to - from, 4, 4);
+            if (!parts) {
+                UNREACHABLE_MSG("native image download preflight failed");
+                return;
+            }
+            lease_count += parts->size();
+            refresh[i].download_parts.push_back(std::move(*parts));
+        }
+    }
     Stream& s = Begin();
-    GlobalBarrier();
+    try {
+        Native::ReserveAdditional(s.imported_view_leases, lease_count);
+        for (size_t i = 0; i < pages.size(); ++i) {
+            if (refresh[i].remapped) continue;
+            bool valid = false;
+            std::tie(refresh[i].upload, refresh[i].upload_offset, refresh[i].mapped) =
+                Allocate(std::min<u64>(4096, region.end - pages[i]), 4, &valid);
+            if (!valid) {
+                UNREACHABLE_MSG("native region refresh upload allocation failed");
+                return;
+            }
+        }
+    } catch (...) {
+        UNREACHABLE_MSG("native region refresh allocation failed");
+        return;
+    }
+    for (size_t i = 0; i < pages.size(); ++i) {
+        if (refresh[i].remapped) continue;
+        const u64 bytes = std::min<u64>(4096, region.end - pages[i]);
+        if (!Core::RytyMemory::GuardedCopy(refresh[i].mapped,
+                reinterpret_cast<const void*>(pages[i]), bytes)) {
+            UNREACHABLE_MSG("native region refresh cannot safely read guest page");
+            return;
+        }
+    }
     const vk::Buffer dst{Handle<VkBuffer_T>(region.buffer->NativeHandle())};
     // The selected dirty pages are already sorted and unique. Detach their old snapshots
     // before rearming protection: a write fault after that must save a new snapshot for the
     // next refresh, rather than have its snapshot consumed by this one.
     std::vector<std::unique_ptr<std::array<u8, 4096>>> snapshots(pages.size());
+    std::vector<bool> opened_ahead(pages.size());
+    std::vector<std::vector<std::pair<VAddr, VAddr>>> downloads(pages.size());
     {
         std::scoped_lock lock{region_dirty_mutex};
+        for (size_t i = 0; i < pages.size(); ++i) {
+            auto it = downloaded_ranges.find(pages[i]);
+            if (remapped_pages.contains(pages[i]) != refresh[i].remapped ||
+                (it == downloaded_ranges.end() && !refresh[i].downloads.empty()) ||
+                (it != downloaded_ranges.end() && it->second != refresh[i].downloads)) {
+                UNREACHABLE_MSG("native image download changed during refresh preflight");
+                return;
+            }
+        }
         for (size_t i = 0; i < pages.size(); ++i) {
             if (const auto it = page_snapshots.find(pages[i]); it != page_snapshots.end()) {
                 snapshots[i] = std::move(it->second);
                 page_snapshots.erase(it);
             }
+            opened_ahead[i] = ahead_pages.erase(pages[i]) != 0;
+            if (refresh[i].remapped) remapped_pages.erase(pages[i]);
+            if (auto it = downloaded_ranges.find(pages[i]); it != downloaded_ranges.end()) {
+                downloads[i] = std::move(it->second);
+                downloaded_ranges.erase(it);
+            }
         }
     }
+    dirty.erase(first, last);
+    for (size_t first = 0; first < pages.size();) {
+        size_t last = first + 1;
+        while (last < pages.size() && pages[last] == pages[last - 1] + 4096) ++last;
+        const VAddr watched_end = std::min(region.end, pages[last - 1] + 4096);
+        WatchPages(pages[first], watched_end - pages[first]);
+        first = last;
+    }
+    for (size_t i = 0; i < pages.size(); ++i) {
+        if (refresh[i].remapped) continue;
+        const u64 bytes = std::min<u64>(4096, region.end - pages[i]);
+        if (!Core::RytyMemory::GuardedCopy(refresh[i].mapped,
+                reinterpret_cast<const void*>(pages[i]), bytes)) {
+            UNREACHABLE_MSG("native region refresh cannot safely read guest page");
+            return;
+        }
+    }
+    for (auto& page : refresh) {
+        for (auto& part : page.whole) s.imported_view_leases.push_back(part.lease);
+        for (auto& group : page.download_parts)
+            for (auto& part : group) s.imported_view_leases.push_back(part.lease);
+    }
+    GlobalBarrier();
     // One protection operation per contiguous run, instead of one per dirty page. All pages
     // are watched before comparing guest bytes, so writes racing with the comparison still
     // fault and remain pending for the next use.
-    for (size_t first = 0; first < pages.size();) {
-        size_t last = first + 1;
-        while (last < pages.size() && pages[last] == pages[last - 1] + 4096) {
-            ++last;
-        }
-        const VAddr end = std::min(region.end, pages[last - 1] + 4096);
-        WatchPages(pages[first], end - pages[first]);
-        first = last;
-    }
-    const auto copy_imported = [&](VAddr from, u64 size) {
-        direct->ForEachPart(from, size,
-                            [&](const VideoCore::Buffer& view, u64 view_offset, u64 offset,
-                                u64 bytes) {
-                                s.cmd.copyBuffer(view.Handle(), dst,
-                                                 vk::BufferCopy{.srcOffset = view_offset,
-                                                                .dstOffset = from - region.begin +
-                                                                             offset,
-                                                                .size = bytes});
-                            });
+    const auto copy_imported = [&](VAddr from, const auto& parts) {
+        for (const auto& part : parts)
+            s.cmd.copyBuffer(part.buffer, dst,
+                vk::BufferCopy{.srcOffset = part.view_offset,
+                               .dstOffset = from - region.begin + part.range_offset,
+                               .size = part.size});
     };
-    const auto copy_snapshot = [&](VAddr from, const u8* data, u64 bytes) {
+    const auto copy_snapshot = [&](size_t index, VAddr from, u64 bytes) {
         // The CPU can rewrite/reuse the imported guest pages before a queued
         // copy executes. Upload exactly the bytes compared below from storage
         // retained by this stream until GPU completion, not from the live pages.
-        const auto [buffer, offset, upload] = Allocate(bytes, 4);
-        std::memcpy(upload, data, bytes);
-        s.cmd.copyBuffer(buffer, dst,
-                         vk::BufferCopy{.srcOffset = offset,
+        const u64 offset = from - pages[index];
+        s.cmd.copyBuffer(refresh[index].upload, dst,
+                         vk::BufferCopy{.srcOffset = refresh[index].upload_offset + offset,
                                         .dstOffset = from - region.begin,
                                         .size = bytes});
     };
@@ -2876,17 +4153,40 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         if (page < region.begin || page >= region.end) {
             continue;
         }
+        const auto recent = region.cpu_pages->find(page);
+        const bool was_recent = recent != region.cpu_pages->end() && frame >= recent->second &&
+                                frame - recent->second <= 600;
+        const bool gpu_wrote = region.gpu_pages->erase(page) != 0;
+        static const bool compare_all = [] {
+            const char* env = std::getenv("RYGT_NATIVE_REGION_COMPARE");
+            return env && env[0] == '1';
+        }();
+        static const bool force_whole = [] {
+            const char* env = std::getenv("RYGT_NATIVE_REGION_WHOLE");
+            return env && env[0] == '1';
+        }();
         const u64 page_bytes = std::min<u64>(4096, region.end - page);
         const auto& before = snapshots[i];
-        std::array<u8, 4096> now;
-        if (!Core::RytyMemory::GuardedCopy(now.data(), reinterpret_cast<const void*>(page),
-                                         page_bytes)) {
-            // GPU-only/unreadable memory must continue to use its GPU backing.
-            copy_imported(page, page_bytes);
-            continue;
-        }
-        if (!before) {
-            copy_snapshot(page, now.data(), page_bytes);
+        if (!refresh[i].remapped && !opened_ahead[i] && (downloads[i].empty() || before))
+            (*region.cpu_pages)[page] = frame;
+        const auto copy_downloads = [&] {
+            if (downloads[i].empty()) return;
+            const vk::MemoryBarrier2 after_cpu_copy{
+                .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite};
+            s.cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &after_cpu_copy});
+            for (size_t n = 0; n < downloads[i].size(); ++n)
+                copy_imported(downloads[i][n].first, refresh[i].download_parts[n]);
+        };
+        if (refresh[i].remapped) { copy_imported(page, refresh[i].whole); copy_downloads(); continue; }
+        if (opened_ahead[i] && !was_recent && !before) { copy_downloads(); continue; }
+        const u8* now = refresh[i].mapped;
+        if (force_whole || !before || (NativeRegionWritebackEnabled() && !opened_ahead[i] &&
+                                      (!was_recent || (!gpu_wrote && !compare_all)))) {
+            copy_snapshot(i, page, page_bytes);
+            copy_downloads();
             continue;
         }
         // The runs of 16-byte pieces the CPU changed (gaps under 64 bytes joined).
@@ -2895,7 +4195,7 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         bool in_run = false;
         for (u64 at = 0; at < page_bytes; at += Piece) {
             const u64 n = std::min(Piece, page_bytes - at);
-            if (std::memcmp(now.data() + at, before->data() + at, n) == 0) {
+            if (std::memcmp(now + at, before->data() + at, n) == 0) {
                 continue;
             }
             if (in_run && at - run_end < 64) {
@@ -2903,7 +4203,7 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
                 continue;
             }
             if (in_run) {
-                copy_snapshot(page + run_begin, now.data() + run_begin, run_end - run_begin);
+                copy_snapshot(i, page + run_begin, run_end - run_begin);
                 changed += run_end - run_begin;
             }
             in_run = true;
@@ -2911,11 +4211,21 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
             run_end = at + n;
         }
         if (in_run) {
-            copy_snapshot(page + run_begin, now.data() + run_begin, run_end - run_begin);
+            copy_snapshot(i, page + run_begin, run_end - run_begin);
             changed += run_end - run_begin;
         }
+        if (changed) (*region.cpu_pages)[page] = frame;
+        copy_downloads();
         NATIVE_DIAGNOSTIC(++stats.region_partial_pages);
         NATIVE_DIAGNOSTIC(stats.region_partial_bytes += changed);
+    }
+    {
+        std::scoped_lock lock{region_dirty_mutex};
+        if (cpu_recent_pages.size() >= 1'000'000) cpu_recent_pages.clear();
+        for (VAddr page : pages) {
+            const auto it = region.cpu_pages->find(page);
+            if (it != region.cpu_pages->end()) cpu_recent_pages[page] = it->second;
+        }
     }
     s.buffers_written = true;
     NATIVE_DIAGNOSTIC(++stats.region_refreshes);
@@ -2949,8 +4259,26 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
     // OPT-003: the range's last result, when nothing it depends on changed.
     const u32 flags = u32(write) | (u32(mirror) << 1);
     const std::array<u64, 3> memo_key{address, size, flags};
-    BufferMemo& memo =
-        buffer_memos[XXH3_64bits(memo_key.data(), sizeof(memo_key)) & (buffer_memos.size() - 1)];
+    const u64 slot = NextMemoEnabled() ? MemoHash(memo_key.data(), memo_key.size(), 0)
+                                      : XXH3_64bits(memo_key.data(), sizeof(memo_key));
+    BufferMemo& memo = buffer_memos[slot & (buffer_memos.size() - 1)];
+    // PERF-GT7-047 (Will Scarlett): unrelated region/mirror changes do not
+    // invalidate owned-range memos. In-place reads still take the full lookup.
+    if (memo.address == address && memo.size == size && memo.flags == flags &&
+        memo.generation != buffer_generation) {
+        static const bool revalidate = [] {
+            const char* env = std::getenv("RYGT_NATIVE_BUFFER_REVALIDATE");
+            return !(env && env[0] == '0');
+        }();
+        const std::pair<VAddr, VAddr> range{address, address + size};
+        if (revalidate && (memo.region || memo.mirror) &&
+            memo.hard_generation == buffer_hard_generation &&
+            buffer_log.Seq() - memo.log_seq <= 64 &&
+            buffer_log.Untouched(memo.log_seq, {&range, 1})) {
+            memo.generation = buffer_generation;
+            memo.log_seq = buffer_log.Seq();
+        }
+    }
     if (memo.generation == buffer_generation && memo.address == address && memo.size == size &&
         memo.flags == flags) {
         if (memo.region || memo.mirror) {
@@ -2990,6 +4318,8 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
             .size = size,
             .flags = flags,
             .generation = buffer_generation,
+            .hard_generation = buffer_hard_generation,
+            .log_seq = buffer_log.Seq(),
             .buffer = result->first,
             .offset = result->second,
             .region = memo_region,
@@ -3000,6 +4330,14 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
     return result;
 }
 
+static VAddr NativeInplaceFrom() {
+    static const VAddr from = [] {
+        const char* env = std::getenv("RYGT_NATIVE_INPLACE_FROM");
+        return env ? static_cast<VAddr>(std::strtoull(env, nullptr, 16)) : VAddr{0xf000000000};
+    }();
+    return from;
+}
+
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAddr address, u64 size,
                                                                             bool write,
                                                                             bool mirror) {
@@ -3007,7 +4345,12 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     // NAT-114: ranges in (or reaching into) a region use it.
     if (Region* region = RegionOver(address, size)) {
         if (address < region->begin || address + size > region->end) {
-            region = MakeRegion(address, size);
+            region = MakeRegion(address, size, write);
+            if (!region && RegionOver(address, size)) {
+                // The failed merge left GPU-authoritative bytes in an overlapping region.
+                // A direct guest-memory fallback would observe or overwrite stale data.
+                return std::nullopt;
+            }
         }
         if (region) {
             RefreshRegion(*region, address, size);
@@ -3031,33 +4374,15 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     // to read back (in a region the CPU never saw them: no rain drops on the windshield); written
     // ranges there stay in guest memory. RYGT_NATIVE_INPLACE_FROM=<hex address> moves the limit
     // (ffffffffffffffff: every written range gets a region, as before).
-    static const VAddr inplace_from = [] {
-        const char* env = std::getenv("RYGT_NATIVE_INPLACE_FROM");
-        return env ? static_cast<VAddr>(std::strtoull(env, nullptr, 16)) : VAddr{0xf000000000};
-    }();
+    const VAddr inplace_from = NativeInplaceFrom();
     // FIX-172 (diagnosis, RYGT_NATIVE_INPLACE_RANGES=<hex address>+<hex size>,...): written
     // ranges meeting one of these stay in guest memory too.
-    static const std::vector<std::pair<VAddr, VAddr>> inplace_ranges = [] {
-        std::vector<std::pair<VAddr, VAddr>> list;
-        const char* env = std::getenv("RYGT_NATIVE_INPLACE_RANGES");
-        for (const char* at = env; at && *at;) {
-            char* end = nullptr;
-            const VAddr begin = std::strtoull(at, &end, 16);
-            if (end == at || *end != '+') {
-                break;
-            }
-            at = end + 1;
-            const u64 length = std::strtoull(at, &end, 16);
-            list.emplace_back(begin, begin + std::max<u64>(length, 1));
-            at = *end == ',' ? end + 1 : end;
-        }
-        return list;
-    }();
+    const auto& inplace_ranges = NativeInplaceRanges();
     const bool listed_in_place = std::ranges::any_of(inplace_ranges, [&](const auto& range) {
         return address < range.second && address + size > range.first;
     });
     if (write && write_regions && size <= 256_MB && address < inplace_from && !listed_in_place) {
-        if (Region* region = MakeRegion(address, size)) {
+        if (Region* region = MakeRegion(address, size, true)) {
             NATIVE_DIAGNOSTIC(++stats.region_binds);
             memo_kind = MemoKind::Region; // OPT-003
             memo_region = region;
@@ -3096,7 +4421,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
         }
     }
     if (write) {
-        if (Region* region = MakeRegion(address, size)) {
+        if (Region* region = MakeRegion(address, size, true)) {
             NATIVE_DIAGNOSTIC(++stats.region_binds);
             return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
                              u64{address - region->begin}};
@@ -3391,8 +4716,96 @@ bool NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
     return !ui_layer;
 }
 
+bool NativeRenderer::TargetsFromMemo(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline,
+                                     Targets& out) {
+    TargetsMemo& m = targets_memo;
+    const auto& key = pipeline.GetGraphicsKey();
+    if (!m.valid ||
+        m.generation != registry->Generation() + unmap_generation.load(std::memory_order_relaxed) ||
+        m.mrt_mask != key.mrt_mask || m.color_mode != u32(regs.color_control.mode) ||
+        m.target_mask != regs.color_target_mask.raw) {
+        return false;
+    }
+    for (u32 cb = 0; cb < m.num_colors; ++cb) {
+        if (std::memcmp(&m.color_buffers[cb], &regs.color_buffers[cb], sizeof(AmdGpu::ColorBuffer)) !=
+                0 ||
+            m.cb_extents[cb].raw != r.liverpool->DrawCbExtent(cb).raw) {
+            return false;
+        }
+    }
+    const bool depth_used = (regs.depth_control.depth_enable && regs.depth_buffer.DepthValid()) ||
+                            (regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid());
+    if (depth_used != m.depth_used) {
+        return false;
+    }
+    if (depth_used &&
+        (m.depth_flags != (u32(regs.depth_control.depth_enable) |
+                           (u32(regs.depth_control.stencil_enable) << 1) |
+                           (u32(regs.depth_control.depth_write_enable) << 2)) ||
+         std::memcmp(&m.depth_buffer, &regs.depth_buffer, sizeof(AmdGpu::DepthBuffer)) != 0 ||
+         std::memcmp(&m.depth_view, &regs.depth_view, sizeof(AmdGpu::DepthView)) != 0 ||
+         m.htile != regs.depth_htile_data_base.GetAddress() ||
+         m.db_extent.raw != r.liverpool->DrawDbExtent().raw)) {
+        return false;
+    }
+    // The pictures, views and ranges are the ones the lookups would give; what each draw does
+    // to them (pending rewrites, depth twins, clears of their metadata, their last use) is done
+    // as without the memo.
+    out = m.targets;
+    for (u32 cb = 0; cb < m.num_colors; ++cb) {
+        auto* entry = const_cast<Native::ImageEntry*>(out.colors[cb]);
+        if (!entry) {
+            continue;
+        }
+        entry->last_use.store(frame, std::memory_order_relaxed);
+        ApplyRewrite(*entry); // NAT-120
+        auto& attachment = out.state.color_attachments[cb];
+        const bool is_clear = m.cmasks[cb] != 0 && cleared_meta.erase(m.cmasks[cb]) != 0;
+        attachment.clear_value =
+            is_clear ? LiverpoolToVK::ColorBufferClearValue(regs.color_buffers[cb]).color.uint32
+                     : std::array<u32, 4>{};
+        attachment.is_clear = is_clear;
+    }
+    if (auto* entry = const_cast<Native::ImageEntry*>(out.depth)) {
+        entry->last_use.store(frame, std::memory_order_relaxed);
+        ApplyRewrite(*entry); // NAT-120
+        bool meta_clear = false;
+        if (m.htile != 0) {
+            meta_clear = cleared_meta.erase(m.htile) != 0;
+            if (!meta_clear && m.htile_meta && !entry->from_cpu &&
+                entry->write_version.load(std::memory_order_relaxed) == 0) {
+                meta_clear = true; // FIX-156
+                NATIVE_DIAGNOSTIC(++stats.meta_clears);
+            }
+        }
+        const auto aspects = DepthStencilClearAspects(regs.depth_buffer, regs.depth_control,
+                                                      regs.depth_render_control, meta_clear);
+        const bool depth_clear = bool(aspects & vk::ImageAspectFlagBits::eDepth);
+        const bool stencil_clear = bool(aspects & vk::ImageAspectFlagBits::eStencil);
+        auto& db = out.state.depth_stencil_attachment;
+        if (db.has_depth) {
+            db.clear_value[0] = depth_clear ? std::bit_cast<u32>(regs.depth_clear) : 0u;
+            db.depth_clear = depth_clear;
+        }
+        if (db.has_stencil) {
+            db.clear_value[1] = stencil_clear ? regs.stencil_clear : 0u;
+            db.stencil_clear = stencil_clear;
+        }
+    }
+    NATIVE_DIAGNOSTIC(++stats.targets_reused);
+    return true;
+}
+
 bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline,
                                     Targets& out) {
+    static const bool reuse = [] {
+        const char* env = std::getenv("RYGT_NATIVE_REUSE");
+        return !(env && env[0] == '0');
+    }();
+    const bool memo = reuse && Native::WatchedTextures().empty() && !r.FrameDumpActive();
+    if (memo && TargetsFromMemo(regs, pipeline, out)) return true;
+    const u64 generation = registry->Generation() + unmap_generation.load(std::memory_order_relaxed);
+    bool htile_meta = false;
     const auto& key = pipeline.GetGraphicsKey();
     RenderState& state = out.state;
     state = {};
@@ -3465,6 +4878,7 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
         const VideoCore::TextureCache::ImageDesc desc{regs.depth_buffer, regs.depth_view,
                                                       regs.depth_control, htile,
                                                       r.liverpool->DrawDbExtent()};
+        htile_meta = desc.info.meta_info.htile_addr != 0;
         Native::ImageEntry* entry = registry->Find(desc.info, true, frame);
         const vk::ImageView view =
             entry ? View(*entry, desc.view_info, ViewUse::Attachment) : vk::ImageView{};
@@ -3550,7 +4964,55 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
     state.height = static_cast<u16>(std::min<u32>(height, 0xffff));
     state.num_layers = static_cast<u16>(
         num_layers == std::numeric_limits<u16>::max() ? 1u : std::max(num_layers, 1u));
+    TargetsMemo& m = targets_memo; // OPT-013
+    m.valid = memo;
+    if (memo) {
+        m.generation = generation;
+        m.mrt_mask = key.mrt_mask;
+        m.color_mode = u32(regs.color_control.mode);
+        m.target_mask = regs.color_target_mask.raw;
+        m.num_colors = state.num_color_attachments;
+        for (u32 cb = 0; cb < m.num_colors; ++cb) {
+            m.color_buffers[cb] = regs.color_buffers[cb];
+            m.cb_extents[cb] = r.liverpool->DrawCbExtent(cb);
+            m.cmasks[cb] = regs.color_buffers[cb].CmaskAddress();
+        }
+        m.depth_used = (regs.depth_control.depth_enable && regs.depth_buffer.DepthValid()) ||
+                       (regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid());
+        m.depth_flags = u32(regs.depth_control.depth_enable) |
+                        (u32(regs.depth_control.stencil_enable) << 1) |
+                        (u32(regs.depth_control.depth_write_enable) << 2);
+        m.depth_buffer = regs.depth_buffer;
+        m.depth_view = regs.depth_view;
+        m.htile = regs.depth_htile_data_base.GetAddress();
+        m.db_extent = r.liverpool->DrawDbExtent();
+        m.htile_meta = htile_meta;
+        m.targets = out;
+    }
     return true;
+}
+
+void NativeRenderer::BindStagesStable(std::span<const Shader::Info* const> stages,
+                                      const AmdGpu::Regs& regs, bool compute, DrawBindings& b) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_STABLE_BINDINGS");
+        return !env || env[0] != '0';
+    }();
+    if (!enabled) {
+        BindStages(stages, regs, compute, b);
+        return;
+    }
+    if (BindRegionsStable([&] { return regions_taken_in; }, [&] {
+            BindStages(stages, regs, compute, b);
+            return !b.failed;
+        }, [&] {
+            b.Clear();
+            b.push = UserData(regs);
+        })) return;
+    if (b.failed) return;
+    // Do not submit descriptors that might refer to a retired region.
+    b.failed = true;
+    LOG_WARNING(Render_Vulkan, "FIX-GT7-090: region bindings did not stabilize");
 }
 
 void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
@@ -3789,8 +5251,19 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                  (sharp_size >= 1_GB && base != 0 && !r.memory->IsValidMapping(base)));
             const bool unmapped =
                 !impossible && base != 0 && sharp_size != 0 && !r.IsMappedStart(base);
-            if (base != 0 && sharp_size != 0 && !impossible && !unmapped) {
-                const u64 size = r.memory->ClampRangeSize(base, sharp_size);
+            const bool bindable = base != 0 && sharp_size != 0 && !impossible && !unmapped;
+            u64 size = bindable ? r.memory->ClampRangeSize(base, sharp_size) : 0;
+            static const bool readable_cut = [] {
+                const char* env = std::getenv("RYGT_NATIVE_READABLE_CUT");
+                return !(env && env[0] == '0');
+            }();
+            auto* readable_direct = r.buffer_cache.GetDirectMemory();
+            if (bindable) size = Native::ReadableBindingSize(base, size, desc.is_written,
+                readable_cut, readable_direct != nullptr,
+                [&](u64 a, u64 n) { std::shared_lock lock{buffer_map_mutex}; return RegionOver(a, n) != nullptr; },
+                [&](u64 a, u64 n) { return readable_direct->EnsureImported(a, n); },
+                [&](u64 a, u64 n) { return Native::ReadablePrefix(reinterpret_cast<const void*>(a), n); });
+            if (bindable && size != 0) {
 #if !defined(NDEBUG)
                 // FIX-174 (diagnosis, RYGT_NATIVE_WATCH_BUFFER=<hex address>+<hex size>): the
                 // shaders that bind a buffer over that range (the first ones, then now and then).
@@ -3847,7 +5320,32 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                     (size == 12 || size == 16 ||
                      desc.post_op == Shader::SharpFetchPostOp::ReadConstPointer) &&
                     !RegionOver(base, 12);
-                if (!freeze_fill_args && direct &&
+                // 1848e4ed: keep bounded, read-only storage in a reusable device-local
+                // mirror. The first direct view avoids a cross-piece gather while warming it.
+                static const u64 mirror_storage = [] {
+                    const char* env = std::getenv("RYGT_NATIVE_MIRROR_STORAGE");
+                    if (!env || !*env) return u64{64} * 1_MB;
+                    char* end = nullptr;
+                    const auto mb = std::strtoull(env, &end, 10);
+                    if (*env == '-' || end == env || *end || mb > 4096) return u64{64} * 1_MB;
+                    return u64{mb} * 1_MB;
+                }();
+                const bool mirrored_read = !freeze_fill_args && !desc.is_written &&
+                    size <= mirror_storage && size > SnapshotBelow() &&
+                    vsharp.num_records != UINT32_MAX;
+                bool mirror_bound = mirrored_read;
+                std::optional<std::pair<vk::Buffer, u64>> in_view;
+                if (mirrored_read && !RegionOver(base, size) && !MirrorHolding(base, size)) {
+                    std::ignore = MirrorBuffer(base, size);
+                    mirror_bound = false;
+                    if (direct && direct->EnsureImported(base, size)) {
+                        if (const auto view = direct->FindBuffer(base, size)) {
+                            in_view = std::pair{view->first->Handle(), view->second};
+                            last_bound = Bound::InPlace;
+                        }
+                    }
+                }
+                if (!freeze_fill_args && !mirror_bound && !in_view && direct &&
                     !(descriptor_postprocess && !desc.is_written) &&
                     desc.IsDirectEligible() && size < (u64{1} << 32) &&
                     (desc.is_written || size > SnapshotBelow()) && // FIX-170
@@ -3868,6 +5366,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                         if (prefix) {
                             EndRendering();
                             const vk::Buffer target{Handle<VkBuffer_T>(prefix->NativeHandle())};
+                            ++stream.resource_recording_serial;
                             stream.cmd.copyBuffer(source, target,
                                 vk::BufferCopy{.srcOffset = offset, .dstOffset = 0,
                                                .size = PrefixSize});
@@ -3904,7 +5403,8 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                     log_buffer("in place through the page table (D3)");
                 } else if (const auto found = freeze_fill_args
                                                   ? SnapshotRange(base, 12)
-                                                  : GuestBuffer(base, size, desc.is_written)) {
+                                                  : (in_view ? in_view : GuestBuffer(
+                                                        base, size, desc.is_written, mirror_bound))) {
                     log_buffer(last_bound == Bound::Region   ? "region"
                                : last_bound == Bound::Mirror ? "mirror"
                                                              : "in place");
@@ -3936,6 +5436,10 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                     if (desc.is_written) {
                         b.gpu_writes.emplace_back(base, size); // NAT-119
                     }
+                } else if (RegionOver(base, size)) {
+                    // A failed overlapping merge cannot fall back to a null descriptor:
+                    // the work must not read stale guest bytes or silently drop its writes.
+                    b.failed = true;
                 }
             }
         }
@@ -3955,8 +5459,36 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
     (void)compute;
 }
 
+size_t NativeRenderer::TextureMemoSlot(const std::array<u64, 4>& raw_sharp, u32 flags) const {
+    const u64 hash = NextMemoEnabled() ? MemoHash(raw_sharp.data(), raw_sharp.size(), flags)
+        : XXH3_64bits_withSeed(raw_sharp.data(), sizeof(raw_sharp), flags);
+    return hash & (texture_memos.size() - 1);
+}
+
 void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs& regs,
                                   Shader::Backend::Bindings& binding, DrawBindings& b) {
+    if (NextMemoEnabled() && stage.images.size() > 1 && !r.FrameDumpCollecting()) {
+        // PERF-GT7-014 (C): the stage's texture memo slots are fetched into the cache first;
+        // each slot's first touch was the costliest line of BindTextures (a 1.4 MB table).
+        for (const auto& image_desc : stage.images) {
+            const auto tsharp = image_desc.GetSharp(stage);
+            if (tsharp.Address() == 0) {
+                continue;
+            }
+            std::array<u64, 4> raw_sharp{};
+            std::memcpy(raw_sharp.data(), &tsharp, sizeof(raw_sharp));
+            const u32 memo_flags = u32(image_desc.is_written) | (u32(image_desc.is_array) << 1) |
+                                   (u32(image_desc.is_depth) << 2) |
+                                   (u32(image_desc.mip_fallback_mode) << 3) |
+                                   ((image_desc.constant_mip_index & 0xff) << 6) |
+                                   (image_desc.NumBindings(stage) << 16) |
+                                   (u32(image_desc.post_op == Shader::SharpFetchPostOp::NativeCubeSampling) << 31);
+            const char* line =
+                reinterpret_cast<const char*>(&texture_memos[TextureMemoSlot(raw_sharp, memo_flags)]);
+            _mm_prefetch(line, _MM_HINT_T0);
+            _mm_prefetch(line + 64, _MM_HINT_T0);
+        }
+    }
     if(SceneTrace::Id()) {
         std::string constants;
         for(size_t i=0;i<std::min<size_t>(stage.flattened_ud_buf.size(),128);++i)constants+=fmt::format(" {}:{:08x}",i,stage.flattened_ud_buf[i]);
@@ -4024,6 +5556,12 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
         const u32 num_bindings = image_desc.NumBindings(stage);
         const u32 first = static_cast<u32>(b.images.size());
         const bool storage = image_desc.is_written;
+        const auto note_entry = [&](const Native::ImageEntry* entry) {
+            if (stage.sw_stage != Shader::SwStage::Compute) return;
+            const size_t index = size_t(&image_desc - stage.images.data());
+            if (b.image_entries.size() <= index) b.image_entries.resize(index + 1, nullptr);
+            b.image_entries[index] = entry;
+        };
         const auto add_write = [&] {
             b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
             b.writes.push_back(vk::WriteDescriptorSet{
@@ -4069,9 +5607,25 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                                ((image_desc.constant_mip_index & 0xff) << 6) |
                                (num_bindings << 16) | (u32(cube_sampling) << 31);
         if (num_bindings <= 4 && stage.pgm_hash != 0xaa3822a3 && !r.FrameDumpCollecting()) {
-            memo = &texture_memos[XXH3_64bits_withSeed(raw_sharp.data(), sizeof(raw_sharp),
-                                                       memo_flags) &
-                                  (texture_memos.size() - 1)];
+            memo = &texture_memos[TextureMemoSlot(raw_sharp, memo_flags)];
+            // Revalidate the complete lookup/returned-image range before ever
+            // dereferencing the old entry. Unmaps always invalidate it.
+            if (memo->entry && memo->flags == memo_flags && memo->sharp == raw_sharp &&
+                memo->generation != registry->Generation() + unmap_generation) {
+                static const bool revalidate = [] {
+                    const char* env = std::getenv("RYGT_NATIVE_TEXTURE_REVALIDATE");
+                    return !(env && env[0] == '0');
+                }();
+                const u64 registry_now = registry->Generation();
+                const u64 unmap_now = unmap_generation.load(std::memory_order_acquire);
+                const std::pair<VAddr, VAddr> range{memo->range_begin, memo->range_end};
+                if (revalidate && memo->unmap_generation == unmap_now &&
+                    registry_now - memo->registry_generation <= 256 &&
+                    registry->Untouched(memo->registry_generation, {&range, 1})) {
+                    memo->generation = registry_now + unmap_now;
+                    memo->registry_generation = registry_now;
+                }
+            }
             if (memo->entry && memo->flags == memo_flags && memo->sharp == raw_sharp &&
                 memo->generation == registry->Generation() + unmap_generation) {
                 Native::ImageEntry* entry = memo->entry;
@@ -4082,6 +5636,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                     WatchBind(*entry, tsharp, storage, true, stage.pgm_hash); // FIX-157
                 }
 #endif
+                if (!storage && entry->from_cpu) registry->LayersRewritten(*entry, frame);
                 ApplyRewrite(*entry); // NAT-120
                 if (!storage && entry->from_cpu) {
                     RefreshSources(*entry); // NAT-104
@@ -4090,6 +5645,8 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                     b.images.push_back({VK_NULL_HANDLE, memo->views[i], vk::ImageLayout::eGeneral});
                 }
                 (storage ? b.stored : b.sampled).push_back(entry);
+                if (!storage && one_off_observer) one_off_observer->Sampled(entry->info.guest_address);
+                note_entry(entry);
                 add_write();
                 NATIVE_DIAGNOSTIC(++stats.texture_memo_hits);
                 continue;
@@ -4110,8 +5667,27 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             bind_null(2);
             continue;
         }
-        if (VideoCore::CheckImageDescriptorGeometry(tsharp, r.instance.GetImageLimits()) !=
-            VideoCore::ImageDescriptorGeometryError::None) {
+        if (const auto geometry_error =
+                VideoCore::CheckImageDescriptorGeometry(tsharp, r.instance.GetImageLimits());
+            geometry_error != VideoCore::ImageDescriptorGeometryError::None) {
+            // FIX-GT7-076 (diagnosis): the first rejected sample counts, to tell a garbage T#
+            // from a real 16-sample texture.
+            if (geometry_error == VideoCore::ImageDescriptorGeometryError::SampleCount) {
+                static std::atomic<u32> sample_rejects{0};
+                if (sample_rejects.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    std::array<u64, 4> words{};
+                    std::memcpy(words.data(), &tsharp, sizeof(words));
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-GT7-076: T# with {} samples bound empty, shader {:#x}, "
+                                "address {:#x}, {}x{} type {} tile {} fmt {}/{}, words {:016x} "
+                                "{:016x} {:016x} {:016x}",
+                                tsharp.NumSamples(), stage.pgm_hash, tsharp.Address(),
+                                tsharp.width + 1, tsharp.height + 1, u32(tsharp.GetType()),
+                                u32(tsharp.GetTileMode()), u32(tsharp.GetDataFmt()),
+                                u32(tsharp.GetNumberFmt()), words[0], words[1], words[2],
+                                words[3]);
+                }
+            }
             bind_null(3);
             continue;
         }
@@ -4211,6 +5787,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             WatchBind(*entry, tsharp, storage, false, stage.pgm_hash); // FIX-157 (diagnosis)
         }
 #endif
+        if (!storage && entry->from_cpu) registry->LayersRewritten(*entry, frame);
         ApplyRewrite(*entry); // NAT-120 (NAT-133: textures too)
         if (!storage && r.FrameDumpCollecting()) {
             // FIX-152 (diagnosis): RYGT_FRAME_DUMP_ALL_TEXTURES=1 dumps uploaded ones too.
@@ -4272,9 +5849,17 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             for (u32 i = 0; i < num_bindings; ++i) {
                 memo->views[i] = b.images[first + i].imageView;
             }
-            memo->generation = registry->Generation() + unmap_generation;
+            memo->registry_generation = registry->Generation();
+            memo->unmap_generation = unmap_generation.load(std::memory_order_acquire);
+            memo->generation = memo->registry_generation + memo->unmap_generation;
+            memo->range_begin = std::min(desc.info.guest_address, entry->info.guest_address);
+            memo->range_end =
+                std::max(desc.info.guest_address + std::max<u64>(desc.info.guest_size, 1),
+                         entry->info.guest_address + std::max<u64>(entry->info.guest_size, 1));
         }
         (storage ? b.stored : b.sampled).push_back(entry);
+        if (!storage && one_off_observer) one_off_observer->Sampled(entry->info.guest_address);
+        note_entry(entry);
         add_write();
     }
     for (const auto& sampler : stage.samplers) {
@@ -4308,9 +5893,23 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
          "copy-writes", "update-descriptors", "store-key", "bind-set"}};
     Stream& s = stream;
     const CmdBuf cmdbuf{s.cmd};
+    static const bool reuse_enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_REUSE");
+        return !(env && env[0] == '0');
+    }();
+    const bool reuse = reuse_enabled && !parallel_binding_capture;
+    if (reuse) {
+        s.binding_commands.Prepare(pipeline.GetLayout(), u32(bind_point),
+            registry->Generation() + unmap_generation.load(std::memory_order_acquire) +
+                buffer_generation,
+            s.pipelines.InvalidationEpoch());
+    }
     const auto stage_flags =
         pipeline.IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
-    if(!parallel_binding_capture) cmdbuf.pushConstants(pipeline.GetLayout(), stage_flags, 0u, sizeof(b.push), &b.push);
+    if (!parallel_binding_capture && (!reuse || !s.binding_commands.SamePush(b.push))) {
+        cmdbuf.pushConstants(pipeline.GetLayout(), stage_flags, 0u, sizeof(b.push), &b.push);
+        if (reuse) s.binding_commands.NotePush(b.push);
+    }
     if (b.writes.empty()) {
         return;
     }
@@ -4487,15 +6086,50 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         cmdbuf.bindDescriptorSets(bind_point, pipeline.GetLayout(), bind_first,
                                   vk::ArrayProxy<const vk::DescriptorSet>{bind_count, bind_run.data()}, {});
         if (alloc_diag) { descriptor_bind_sets[alloc_kind] += bind_count; ++descriptor_bind_runs[alloc_kind]; if (bind_count > 1) ++descriptor_bind_multi[alloc_kind]; }
+        if (reuse) {
+            for (u32 i = 0; i < bind_count; ++i)
+                s.binding_commands.NoteSet(bind_first + i, bind_run[i]);
+        }
         bind_count = 0;
     };
     Native::CommitDescriptorBatch(updates,sets,pipeline.PushSet(),by_set,
         [&](const auto& all) {trace.Next(6);vk_device.updateDescriptorSets(all,{});},
         [&](u32 index,const auto& writes) {
+            static thread_local std::vector<u64> signature;
+            signature.clear();
+            bool cacheable = reuse;
+            if (reuse) for (const auto& write : writes) {
+                if (write.pNext || write.pTexelBufferView ||
+                    (bool(write.pBufferInfo) == bool(write.pImageInfo))) {
+                    cacheable = false;
+                    break;
+                }
+                signature.push_back(write.dstBinding);
+                signature.push_back(write.dstArrayElement);
+                signature.push_back(u64(write.descriptorType));
+                signature.push_back(write.descriptorCount);
+                for (u32 n = 0; n < write.descriptorCount; ++n) {
+                    if (write.pBufferInfo) {
+                        const auto& info = write.pBufferInfo[n];
+                        signature.push_back(u64(VkBuffer(info.buffer)));
+                        signature.push_back(info.offset);
+                        signature.push_back(info.range);
+                    } else {
+                        const auto& info = write.pImageInfo[n];
+                        signature.push_back(u64(VkSampler(info.sampler)));
+                        signature.push_back(u64(VkImageView(info.imageView)));
+                        signature.push_back(u64(info.imageLayout));
+                    }
+                }
+            }
+            if (cacheable && s.binding_commands.SamePushed(index, signature)) return;
             flush_bind_run();
             trace.Next(2);cmdbuf.pushDescriptorSetKHR(bind_point,pipeline.GetLayout(),index,writes);
+            if (cacheable) s.binding_commands.NotePushed(index, signature);
+            else if (reuse) s.binding_commands.ForgetSet(index);
         },
         [&](u32 index,vk::DescriptorSet set) {
+            if (reuse && s.binding_commands.SameSet(index, set)) return;
             if (bind_count && index != bind_first + bind_count) flush_bind_run();
             if (!bind_count) bind_first = index;
             bind_run[bind_count++] = set;
@@ -4530,6 +6164,13 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
         u64 size = 0;
         const VAddr base = guest.base_address;
         const u64 sharp_size = guest.GetSize();
+#ifndef NDEBUG
+        if (GeometryTrace::current) {
+            GeometryTrace::Record("vertex_guest", GeometryTrace::current,
+                pipeline.GetStage(Shader::SwStage::Vertex).pgm_hash, base, sharp_size,
+                (u64(index) << 32) | guest.GetStride());
+        }
+#endif
         // FIX-178 (diagnosis, RYGT_NATIVE_VERTEX_NEAR=0): every attribute looked up.
         static const bool near_on = [] {
             const char* env = std::getenv("RYGT_NATIVE_VERTEX_NEAR");
@@ -4560,6 +6201,15 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
         v.offsets.push_back(found ? found->second : 0);
         v.sizes.push_back(found ? size : 0);
         v.strides.push_back(guest.GetStride());
+#ifndef NDEBUG
+        if (GeometryTrace::current) {
+            GeometryTrace::Record("vertex_resolved", GeometryTrace::current,
+                index, found ? GeometryTrace::HandleIdentity(static_cast<VkBuffer>(found->first)) : 0,
+                found ? found->second : 0, buffer_generation);
+            GeometryTrace::Record("vertex_extent", GeometryTrace::current,
+                index, found ? size : 0, frame, r.scheduler.CurrentTick());
+        }
+#endif
         Mirror* bound_mirror = found && near && base >= near->begin &&
                                        base + std::max<u64>(size, 1) <= near->end
                                    ? near
@@ -4866,9 +6516,166 @@ void NativeRenderer::RecordVertexIndex(const VertexIndexState& v) {
     }
 }
 
+// PERF-GT7-043: dispatches in a row of a listed program run without a barrier between them when
+// none of them writes buffers and none samples or stores a picture over memory another touched.
+// GT7's probe filter 0x490b6362 runs ~8 such dispatches at a time, each of a few groups: without
+// the barriers it takes 3.8 times less GPU time. A listed program must store into its images
+// without loading from them, and must not store the same texels twice in a run: their order is no
+// longer defined. RYGT_NATIVE_OVERLAP_PROGRAMS=<hex>[,...] sets the list (empty: none).
+bool NativeRenderer::RunNeedsBarrier(const Stream& s, const DrawBindings& b, u64 program,
+                                     bool recorded, std::optional<u64> texel) const {
+    static const std::vector<u64> listed = [] {
+        std::vector<u64> list;
+        const char* env = std::getenv("RYGT_NATIVE_OVERLAP_PROGRAMS");
+        for (const char* at = env ? env : "490b6362"; *at;) {
+            char* end = nullptr;
+            const u64 value = std::strtoull(at, &end, 16);
+            if (end == at) {
+                break;
+            }
+            list.push_back(value);
+            at = *end == ',' ? end + 1 : end;
+        }
+        return list;
+    }();
+    if ((std::ranges::find(listed, program) == listed.end() && !texel) ||
+        s.run_program != program || s.run_commands != s.commands || s.buffers_written.foreign ||
+        recorded || !writebacks.empty() || b.writes_buffers || !s.attach_dirty.empty()) {
+        return true;
+    }
+    const auto meets = [](const std::vector<const Native::ImageEntry*>& pictures,
+                          const Native::ImageEntry* entry) {
+        return std::ranges::any_of(pictures, [&](const Native::ImageEntry* picture) {
+            return picture && entry->info.guest_address < picture->info.guest_address +
+                                                              picture->info.guest_size &&
+                   picture->info.guest_address < entry->info.guest_address + entry->info.guest_size;
+        });
+    };
+    // PERF-GT7-057: a same-texel program (SameTexelKey) may read the picture it stores where the
+    // run wrote it, if the run hasn't stored that mip and layer since its last barrier: each of
+    // its dispatches reads only the texels it then stores. FIX-GT7-080: the key says no other of
+    // its pictures meets the stored one, so the sampled picture let through below is the one the
+    // code reads at the texel it stores. FIX-GT7-081: not after a dispatch of the run stored
+    // without a key. FIX-GT7-087: nor onto a picture the run sampled elsewhere.
+    const Native::ImageEntry* self = texel && b.stored.size() == 1 ? b.stored[0] : nullptr;
+    const auto same_picture = [&](const Native::ImageEntry* entry) {
+        return self && entry && entry->info.guest_address == self->info.guest_address &&
+               entry->info.guest_size == self->info.guest_size;
+    };
+    const bool texel_new =
+        self && s.run_texels.IsNew(self->info.guest_address, self->info.guest_size, *texel);
+    // The pictures of a list that meet an entry, but for the picture this dispatch stores.
+    const auto meets_other = [&](const std::vector<const Native::ImageEntry*>& pictures,
+                                 const Native::ImageEntry* entry) {
+        return std::ranges::any_of(pictures, [&](const Native::ImageEntry* picture) {
+            return picture && !same_picture(picture) &&
+                   entry->info.guest_address <
+                       picture->info.guest_address + picture->info.guest_size &&
+                   picture->info.guest_address < entry->info.guest_address + entry->info.guest_size;
+        });
+    };
+    for (const auto* entry : b.sampled) {
+        if (entry && meets(s.written, entry) &&
+            !(texel_new && same_picture(entry) && !meets_other(s.written, entry))) {
+            return true; // reads what the run wrote
+        }
+    }
+    for (const auto* entry : b.stored) {
+        if (entry && meets(s.read, entry) &&
+            !(texel_new && same_picture(entry) && !meets_other(s.read, entry))) {
+            return true; // writes what the run read
+        }
+    }
+    return false;
+}
+
+// PERF-GT7-057 (RYGT_NATIVE_SAME_TEXEL=0 turns it off): programs that read a picture they store
+// only at the texel they store, at the mip and layer words of their user data name. GT7's probe
+// filter 0xa8d4b6cd took 30-40% of the GPU's time in races: one run per probe cube, a dispatch per
+// mip [65] and face [66] (layer face + 6 * probe [67]), 42 or 48 of them, each reading cs_img3
+// with texelFetch at the texel it then stores into cs_img4[mip] (its decompiled code, all four
+// variants), and sampling cs_img0 to 2 with textureLod at other coordinates, pictures the run
+// doesn't write. Each waited for the one before at a global barrier, with 1 to 256 groups of 8x8
+// threads on the whole GPU.
+// FIX-GT7-080: the key is the level and layer the two views reach in the picture (Native::
+// SameTexelKey), from the pictures and views bound to the fetched and stored descriptors, which the
+// list names; any other descriptor that meets the stored picture keeps the barrier.
+namespace {
+struct SameTexelProgram {
+    u64 program;
+    u32 mip_word;
+    u32 face_word;
+    u32 probe_word;
+    u32 faces;
+    u32 fetch_image; ///< the descriptor read with texelFetch at the texel stored
+    u32 store_image;
+};
+constexpr SameTexelProgram SameTexelPrograms[] = {{0xa8d4b6cd, 65, 66, 67, 6, 3, 4}};
+
+bool IsSameTexelProgram(u64 program) {
+    return std::ranges::find(SameTexelPrograms, program, &SameTexelProgram::program) !=
+           std::end(SameTexelPrograms);
+}
+} // namespace
+
+static std::optional<u64> SameTexelKey(const Shader::Info& cs,
+                                       std::span<const Native::ImageEntry* const> entries) {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_NATIVE_SAME_TEXEL");
+        return !(env && env[0] == '0');
+    }();
+    if (!on) {
+        return std::nullopt;
+    }
+    const auto it = std::ranges::find(SameTexelPrograms, cs.pgm_hash, &SameTexelProgram::program);
+    if (it == std::end(SameTexelPrograms)) {
+        return std::nullopt;
+    }
+    const auto& words = cs.flattened_ud_buf;
+    if (std::max({it->mip_word, it->face_word, it->probe_word}) >= words.size() ||
+        std::max(it->fetch_image, it->store_image) >= cs.images.size() ||
+        cs.images[it->store_image].mip_fallback_mode ==
+            Shader::MipStorageFallbackMode::ConstantIndex) {
+        return std::nullopt;
+    }
+    boost::container::small_vector<Native::SameTexelImage, 8> images;
+    for (size_t i = 0; i < cs.images.size(); ++i) {
+        const auto& desc = cs.images[i];
+        const Native::ImageEntry* entry = i < entries.size() ? entries[i] : nullptr;
+        Native::SameTexelImage& image = images.emplace_back();
+        image.written = desc.is_written;
+        if (!entry) {
+            continue;
+        }
+        image.address = entry->info.guest_address;
+        image.size = std::max<u64>(entry->info.guest_size, 1);
+        if (i != it->fetch_image && i != it->store_image) {
+            continue;
+        }
+        // The view as BindTextures asks for it, and the picture View keeps it in.
+        const VideoCore::ImageViewInfo view{desc.GetSharp(cs), desc};
+        const auto& picture = entry->image->Desc();
+        image.base_level = view.range.base.level;
+        image.base_layer = view.range.base.layer;
+        image.layers = view.range.extent.layers;
+        image.image_mips = std::max<u32>(picture.mips, 1);
+        image.image_layers =
+            picture.dim == Native::Rhi::ImageDim::D3 ? 1u : std::max<u32>(picture.layers, 1);
+        image.level_per_binding =
+            desc.mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex;
+        image.levels = image.level_per_binding ? desc.NumBindings(cs) : view.range.extent.levels;
+    }
+    const u64 layer = u64(words[it->face_word]) + u64(it->faces) * words[it->probe_word];
+    if (layer > ~u32{0}) {
+        return std::nullopt;
+    }
+    return Native::SameTexelKey(images, it->fetch_image, it->store_image, words[it->mip_word],
+                                u32(layer));
+}
+
 bool NativeRenderer::NeedsBarrierFor(const DrawBindings& b) const {
     const Stream& s = stream;
-    if (s.buffers_written) {
+    if (s.buffers_written || writebacks_due) {
         return true;
     }
     for (const auto* entry : b.sampled) {
@@ -5067,6 +6874,7 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
         }
         if (entry && std::ranges::find(s.written, entry) == s.written.end()) {
             s.written.push_back(entry);
+            registry->ForgetFillHistory(entry->info.guest_address, entry->info.guest_size, entry);
         }
     };
     // NAT-112: small pictures go back to guest memory. FIX-GTS-001: untiled ones up to 256 KB,
@@ -5082,6 +6890,10 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
         }
         return entry.info.guest_address >= 0xf000000000ULL ? 16_MB : 256_KB;
     };
+    static const bool extra_cpu_writebacks = [] {
+        const char* env = std::getenv("RYGT_NATIVE_WRITEBACK_CPU");
+        return !(env && env[0] == '0');
+    }();
     for (const auto* entry : b.sampled) {
         if (entry && std::ranges::find(s.read, entry) == s.read.end()) {
             s.read.push_back(entry); // NAT-140
@@ -5099,10 +6911,56 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
         attached(targets->depth);
         for (const auto* entry : targets->colors) {
             note(entry);
-            if (entry && entry->info.guest_size <= writeback_size(*entry) &&
-                entry->info.num_samples == 1 &&
-                std::ranges::find(writebacks, entry) == writebacks.end()) {
-                writebacks.push_back(const_cast<Native::ImageEntry*>(entry));
+            if (entry && entry->info.num_samples == 1) {
+                const u64 size = entry->info.guest_size;
+                const auto initial = Native::ClassifyHighCpuWriteback(entry->info.guest_address,
+                    size, NativeInplaceFrom(), 0, 0, extra_cpu_writebacks, writeback_size(*entry));
+                if (initial == Native::HighCpuWriteback::Existing) {
+                    QueueWriteback(entry); // Preserve all pre-existing GTS cases.
+                } else if (initial == Native::HighCpuWriteback::Admit &&
+                           std::ranges::find(writebacks, entry) == writebacks.end()) {
+                    auto* direct = r.buffer_cache.GetDirectMemory();
+                    if (!direct || !direct->EnsureImported(entry->info.guest_address, size) ||
+                        !direct->PlanLeasedParts(entry->info.guest_address, size, 4, 4)) continue;
+                    const u64 budget = r.instance.GetTotalMemoryBudget();
+                    u64 usage = budget ? r.instance.GetDeviceMemoryUsage() : 0;
+                    // Pending downloads have not allocated their scatter/batch
+                    // scratch yet; reserve their worst-case GPU footprint too.
+                    if (budget) for (const auto* pending : writebacks) {
+                        const u64 bytes = pending->info.guest_size;
+                        if (bytes > (budget - std::min(usage, budget)) / 3) {
+                            usage = budget;
+                            break;
+                        }
+                        usage += bytes * 3;
+                    }
+                    if (Native::ClassifyHighCpuWriteback(entry->info.guest_address, size,
+                            NativeInplaceFrom(), budget, usage, true) == Native::HighCpuWriteback::Admit) {
+                        QueueWriteback(entry);
+                    }
+                } else if (initial == Native::HighCpuWriteback::OverLimit &&
+                           size <= ~u64{0} - entry->info.guest_address &&
+                           std::ranges::find(writebacks, entry) == writebacks.end()) {
+                    // Large plain linear images can be written directly into
+                    // leased views in bounded row rectangles, without a full-image scratch.
+                    try {
+                        auto* direct = r.buffer_cache.GetDirectMemory();
+                        if (direct && direct->EnsureImported(entry->info.guest_address, size)) {
+                            auto parts = direct->PlanLeasedParts(entry->info.guest_address, size, 4, 4);
+                            std::vector<Native::LinearDownloadCopy> copies;
+                            if (parts && !entry->reused.load(std::memory_order_acquire) &&
+                                PlanDirectLinearDownload(*entry, *parts, copies)) {
+                                auto pending = std::make_shared<PendingLinearDownload>();
+                                pending->imports = std::move(*parts);
+                                pending->copies = std::move(copies);
+                                pending_linear_downloads.insert_or_assign(entry, std::move(pending));
+                                QueueWriteback(entry);
+                            }
+                        }
+                    } catch (...) {
+                        // Keep the prior behavior when a plan cannot be prepared.
+                    }
+                }
             }
         }
         note(targets->depth);
@@ -5112,12 +6970,12 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
         // FIX-GTS-006: the photo is a color target; stored images keep the 256 KB limit.
         if (entry->info.guest_size <= std::min<u64>(writeback_size(*entry), 256_KB) &&
             entry->info.num_samples == 1 &&
-            !entry->info.props.is_depth &&
-            std::ranges::find(writebacks, entry) == writebacks.end()) {
-            writebacks.push_back(const_cast<Native::ImageEntry*>(entry));
+            !entry->info.props.is_depth) {
+            QueueWriteback(entry);
         }
     }
     s.buffers_written |= b.writes_buffers;
+    if (b.region_writeback) RecordRegionWriteback(b.region_writeback);
     // NAT-119: images the shader overwrote in memory are uploaded again (after this work, in
     // GPU order: the next PrepareImages records the uploads behind a barrier).
     for (const auto& [address, size] : b.gpu_writes) {
@@ -5381,10 +7239,13 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     // OPT-012: when the command thread didn't select (it saw the prepared draw), the job
     // thread's selection is installed and trusted.
     bool trusted = false;
+    std::shared_ptr<const void> pipeline_owner;
     const GraphicsPipeline* pipeline = [&]() -> const GraphicsPipeline* {
         PhaseClock clock{stats.phase_ns[0]};
-        if (prepared && !quad_list && r.selected_pipeline == nullptr && prepared->pipeline) {
+        if (prepared && !quad_list && r.selected_pipeline == nullptr && prepared->pipeline &&
+            PipelineOwnerMatches(prepared->pipeline, prepared->pipeline_keepalive)) {
             if (const GraphicsPipeline* installed = InstallPrepared(*prepared)) {
+                pipeline_owner = prepared->pipeline_keepalive;
                 trusted = true;
                 return installed;
             }
@@ -5395,12 +7256,21 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 .instance_sgpr_offset = 0,
                 .tessellate_quads = quad_list && !quad_triangles,
             },
-            !quad_list);
+            !quad_list, &pipeline_owner);
     }();
     if (!pipeline) {
+        if (one_off_observer) {
+            const auto outputs = GetOneOffOutputs(regs);
+            for (size_t i = 0; i < outputs.count; ++i) one_off_observer->Skipped(outputs.keys[i]);
+        }
         NATIVE_DIAGNOSTIC(++stats.no_pipeline);
+#ifndef NDEBUG
+        if (GeometryTrace::current)
+            GeometryTrace::Record("draw_no_pipeline", GeometryTrace::current);
+#endif
         return;
     }
+    ASSERT_MSG(PipelineOwnerMatches(pipeline, pipeline_owner), "Graphics pipeline owner mismatch");
 #if !defined(NDEBUG)
     // DIAG-152 (RYGT_NATIVE_SKIP_PS=<hex,...>): draws with these pixel shaders are skipped.
     static const std::vector<u64> skip_ps = [] {
@@ -5509,8 +7379,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     if (!from_prepared) {
         b.Clear();
         b.push = UserData(regs);
-        BindStages(pipeline->GetStages(), regs, false, b);
+        BindStagesStable(pipeline->GetStages(), regs, false, b);
     }
+    WritebacksBefore(b); // includes worker-prepared bindings
     if (b.failed) {
         NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
@@ -5541,11 +7412,119 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
+    for (unsigned attempt = 0; b.region_writeback && !RegionPlanValid(*b.region_writeback) && attempt < 4; ++attempt) {
+        b.Clear();
+        b.push = UserData(regs);
+        BindStagesStable(pipeline->GetStages(), regs, false, b);
+        if (b.failed) return;
+        vertex_index = {};
+        ResolveVertexBuffers(*pipeline, regs, vertex_index);
+        if (!ResolveIndices(regs, is_indexed, index_offset, quad_triangles, vertex_index)) return;
+        vi = &vertex_index;
+        WritebacksBefore(b);
+        if (b.failed) return;
+        PrepareImages();
+    }
+    const bool sampled_depth = targets.depth &&
+        std::ranges::find(b.sampled, targets.depth) != b.sampled.end();
+    const auto& db_feedback = targets.state.depth_stencil_attachment;
+    const bool depth_writes = db_feedback.depth_clear || db_feedback.stencil_clear ||
+        (regs.depth_control.depth_enable && regs.depth_control.depth_write_enable) ||
+        (db_feedback.has_stencil && regs.depth_control.stencil_enable);
+    const auto depth_feedback = Native::DecideDepthFeedback(
+        sampled_depth, depth_writes, r.instance.IsAttachmentFeedbackLoopLayoutSupported());
+    struct DepthSnapshot {
+        std::unique_ptr<Native::Rhi::Image> image;
+        std::vector<vk::UniqueImageView> views;
+    };
+    std::shared_ptr<DepthSnapshot> depth_snapshot;
+    std::vector<std::pair<vk::ImageView, vk::ImageView>> snapshot_views;
+    if (depth_feedback.unsupported) {
+        // Without feedback-loop support, sample an immutable copy of the attachment
+        // as it stood before this draw. The original remains the writable target.
+        depth_snapshot = std::make_shared<DepthSnapshot>();
+        auto desc = targets.depth->image->Desc();
+        desc.usage = Native::Rhi::ImageUsageSampled | Native::Rhi::ImageUsageTransferDst |
+                     (desc.usage & Native::Rhi::ImageUsageCube);
+        desc.name = "Depth attachment feedback snapshot";
+        depth_snapshot->image = device->CreateImage(desc);
+        if (!depth_snapshot->image) std::terminate();
+        const vk::Image snapshot_image{Handle<VkImage_T>(depth_snapshot->image->NativeHandle())};
+        std::scoped_lock view_lock{views_mutex};
+        const auto found = views.find(targets.depth);
+        if (found == views.end()) std::terminate();
+        for (const auto& record : found->second) {
+            if (record.use != ViewUse::Sampled && record.use != ViewUse::CubeSampled) continue;
+            if (std::ranges::none_of(b.images, [&](const auto& image) { return image.imageView == *record.view; })) continue;
+            auto info = record.info;
+            const u32 mips = std::max(desc.mips, 1u);
+            const u32 layers = std::max(desc.layers, 1u);
+            info.range.base.level = std::min<u32>(info.range.base.level, mips - 1);
+            info.range.extent.levels = std::clamp<u32>(info.range.extent.levels, 1, mips - info.range.base.level);
+            info.range.base.layer = std::min<u32>(info.range.base.layer, layers - 1);
+            info.range.extent.layers = std::clamp<u32>(info.range.extent.layers, 1, layers - info.range.base.layer);
+            auto type = VideoCore::ConvertImageViewType(info.type);
+            if (record.use == ViewUse::CubeSampled) {
+                info.range.extent.layers = Native::CubeViewLayers(r.instance.IsImageCubeArraySupported(),
+                    false, desc.width, desc.height, desc.layers, desc.samples, info.range.extent.layers);
+                if (!info.range.extent.layers) std::terminate();
+                type = vk::ImageViewType::eCubeArray;
+            } else if (type == vk::ImageViewType::e2D && info.range.extent.layers > 1) {
+                type = vk::ImageViewType::e2DArray;
+            }
+            const auto aspect = targets.depth->info.props.has_stencil &&
+                !LiverpoolToVK::IsFormatDepthCompatible(info.format) && LiverpoolToVK::IsFormatStencilCompatible(info.format)
+                ? vk::ImageAspectFlagBits::eStencil : vk::ImageAspectFlagBits::eDepth;
+            vk::ImageViewMinLodCreateInfoEXT min_lod{};
+            if (info.min_lod && r.instance.IsImageViewMinLodSupported())
+                min_lod.minLod = std::min(float(info.min_lod) / 256.f,
+                    float(info.range.base.level + info.range.extent.levels - 1));
+            const vk::ImageViewCreateInfo ci{
+                .pNext = info.min_lod && r.instance.IsImageViewMinLodSupported() ? &min_lod : nullptr,
+                .image = snapshot_image, .viewType = type,
+                .format = static_cast<vk::Format>(desc.format),
+                .components = info.mapping == AmdGpu::IdentityMapping ? vk::ComponentMapping{}
+                    : LiverpoolToVK::ComponentMapping(info.mapping),
+                .subresourceRange{aspect, info.range.base.level, info.range.extent.levels,
+                                  info.range.base.layer, info.range.extent.layers}};
+            auto [result, view] = r.instance.GetDevice().createImageViewUnique(ci);
+            if (result != vk::Result::eSuccess) std::terminate();
+            snapshot_views.emplace_back(*record.view, *view);
+            depth_snapshot->views.push_back(std::move(view));
+        }
+        if (snapshot_views.empty()) std::terminate();
+        Native::ReserveAdditional(s.writeback_plan_leases, 1);
+    }
+    if (b.region_writeback) ValidateRegionPlan(*b.region_writeback);
+    if (b.region_writeback) {
+        ApplyRegionWritebackFallback(*b.region_writeback);
+        RecordRegionSnapshots(b.region_writeback);
+    }
     Begin();
-    // A color image sampled while this draw writes it is a feedback attachment. Native
+    if (depth_snapshot) {
+        // Earlier parallel nodes must be submitted before this pre-draw copy.
+        Splice();
+        Begin();
+        PrepareImages();
+        GlobalBarrier();
+        Native::ReserveAdditional(s.writeback_plan_leases, 1);
+        s.writeback_plan_leases.push_back(depth_snapshot);
+        const auto& desc = targets.depth->image->Desc();
+        const auto copies = Native::DepthSnapshotCopies(desc.width, desc.height, desc.mips,
+                                                        desc.layers, targets.depth->info.props.has_stencil);
+        s.cmd.copyImage(vk::Image{Handle<VkImage_T>(targets.depth->image->NativeHandle())},
+                        vk::ImageLayout::eGeneral,
+                        vk::Image{Handle<VkImage_T>(depth_snapshot->image->NativeHandle())},
+                        vk::ImageLayout::eGeneral, copies);
+        GlobalBarrier();
+        for (auto& image : b.images) for (const auto& [old_view, new_view] : snapshot_views)
+            if (image.imageView == old_view) image.imageView = new_view;
+        b.key_layout = nullptr; // cached descriptor keys named the original views
+    }
+    // An image sampled while this draw uses it as an attachment is a feedback attachment. Native
     // images normally stay in GENERAL, but that does not make an overlapping attachment
     // read legal. Enter the feedback layout for this draw and restore GENERAL afterward.
-    boost::container::small_vector<const Native::ImageEntry*, 8> feedback;
+    boost::container::small_vector<const Native::ImageEntry*, 9> feedback;
     if (r.instance.IsAttachmentFeedbackLoopLayoutSupported()) {
         for (u32 cb = 0; cb < targets.colors.size(); ++cb) {
             const auto* target = targets.colors[cb];
@@ -5564,21 +7543,30 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             }
         }
     }
+    if (depth_feedback.active || depth_feedback.read_only) feedback.push_back(targets.depth);
+    const bool has_feedback = Native::BlocksParallelFeedback(!feedback.empty(), bool(depth_snapshot));
+    const auto depth_read_layout = vk::ImageLayout::eDepthStencilReadOnlyOptimal;
     const auto feedback_layout = [&](vk::ImageLayout from, vk::ImageLayout to) {
-        boost::container::static_vector<vk::ImageMemoryBarrier2, 8> barriers;
+        boost::container::static_vector<vk::ImageMemoryBarrier2, 9> barriers;
         for (const auto* entry : feedback) {
+            const vk::ImageAspectFlags aspects = entry->info.props.is_depth
+                ? vk::ImageAspectFlagBits::eDepth |
+                      (entry->info.props.has_stencil ? vk::ImageAspectFlagBits::eStencil : vk::ImageAspectFlags{})
+                : vk::ImageAspectFlagBits::eColor;
             barriers.push_back(vk::ImageMemoryBarrier2{
                 .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
                 .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
                 .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
                 .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-                .oldLayout = from,
-                .newLayout = to,
+                .oldLayout = entry == targets.depth && depth_feedback.read_only && from != vk::ImageLayout::eGeneral
+                    ? depth_read_layout : from,
+                .newLayout = entry == targets.depth && depth_feedback.read_only && to != vk::ImageLayout::eGeneral
+                    ? depth_read_layout : to,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .image = vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())},
                 .subresourceRange{
-                    .aspectMask = vk::ImageAspectFlagBits::eColor,
+                    .aspectMask = aspects,
                     .baseMipLevel = 0,
                     .levelCount = VK_REMAINING_MIP_LEVELS,
                     .baseArrayLayer = 0,
@@ -5601,6 +7589,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                     vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
             }
         }
+        if (depth_feedback.active || depth_feedback.read_only) {
+            targets.state.depth_stencil_attachment.image_layout =
+                depth_feedback.read_only ? depth_read_layout : vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
+        }
         std::scoped_lock lock{views_mutex};
         for (const auto* entry : feedback) {
             const auto found = views.find(entry);
@@ -5613,11 +7605,13 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 }
                 for (auto& image : b.images) {
                     if (image.imageView == *view.view) {
-                        image.imageLayout = vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
+                        image.imageLayout = entry == targets.depth && depth_feedback.read_only
+                            ? depth_read_layout : vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
                     }
                 }
             }
         }
+        b.key_layout = nullptr; // attachment layout changes descriptor image layouts
     }
     PhaseClock record_clock{stats.phase_ns[7]};
     {
@@ -5678,11 +7672,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         probe.single_color+=targets.state.num_color_attachments==1;
         probe.no_clear+=targets.state.num_color_attachments==1 && !targets.state.color_attachments[0].is_clear;
         probe.no_depth+=!depth.has_depth && !depth.has_stencil; probe.no_descriptors+=b.writes.empty();
-        probe.no_storage+=!b.writes_buffers && b.stored.empty(); probe.no_feedback+=feedback.empty();
+        probe.no_storage+=!b.writes_buffers && b.stored.empty(); probe.no_feedback+=!has_feedback;
         const bool eligible=in_race && !r.FrameDumpActive() && !quad_list && !is_indexed &&
             targets.state.num_color_attachments==1 && !targets.state.color_attachments[0].is_clear &&
             !depth.has_depth && !depth.has_stencil && b.writes.empty() && !b.writes_buffers &&
-            b.stored.empty() && feedback.empty();
+            b.stored.empty() && !has_feedback;
         if (eligible) {++probe.eligible;++probe.current;} else probe.Flush();
     }
     // Experimental first subset: a complete, descriptor-free, vertexless color
@@ -5759,7 +7753,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         const bool prohibited_clear=any_clear;
         const bool fast_race=RytyGtsInRace(),fast_patch=EmulatorSettings.IsPatchShaders();
         const bool fast_trace=r.FrameDumpActive() || SceneTrace::Id() || Native::GpuCheckpoints::Requested();
-        const bool inline_safe=bool(parallel->active) && fast_race && !fast_trace && !prohibited_clear && feedback.empty() &&
+        const bool inline_safe=bool(parallel->active) && pipeline->LdsEmulation()==0 && fast_race && !fast_trace && !prohibited_clear && !has_feedback &&
             !scale_composition && !native_fsr_composition;
 #if !defined(NDEBUG)
         static const bool serial_audit=[] {const char* p=std::getenv("RYGT_PARALLEL_SERIAL_AUDIT");return p && p[0]=='1' && p[1]=='\0';}();
@@ -5776,11 +7770,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         // Do not build a captured pass when even its prefix and pass nodes
         // cannot fit. Recheck on later serial draws as retired nodes may free.
         const bool no_pass_room=!parallel->active && !parallel->coordinator->HasRoomForPass();
-        bool fast_reject=no_pass_room || serial_scope_bypass || !fast_race || fast_patch || fast_trace || quad_list || quad_triangles ||
+        bool fast_reject=pipeline->LdsEmulation()!=0 || no_pass_room || serial_scope_bypass || !fast_race || fast_patch || fast_trace || quad_list || quad_triangles ||
             (!extended && is_indexed) || scale_composition || native_fsr_composition ||
             (!extended && targets.state.num_color_attachments!=1) || targets.state.num_color_attachments>8 || prohibited_clear ||
             (!extended && (fast_depth.has_depth || fast_depth.has_stencil || bool(vi->index_buffer))) ||
-            !feedback.empty() || !prepared || !from_prepared ||
+            has_feedback || !prepared || !from_prepared ||
             prepared->pipeline!=pipeline || !prepared->pipeline_keepalive ||
             b.writes_buffers || !b.gpu_writes.empty() || !b.stored.empty();
         // UI/stream preparation may retire mirrors after vertex commit. Do not
@@ -5795,7 +7789,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             if(ParallelGateDiagEnabled()) {
                 // Bit 25 means deeper stage/view/alias/descriptor checks were not examined.
                 u64 mask=u64{1}<<25;if(serial_scope_bypass)mask|=u64{1}<<26;const auto fail=[&](u32 bit,bool bad){if(bad)mask|=u64{1}<<bit;};
-                fail(27,no_pass_room);fail(0,!fast_race);fail(1,fast_patch);fail(2,fast_trace);fail(4,!feedback.empty());
+                fail(27,no_pass_room);fail(0,!fast_race);fail(1,fast_patch);fail(2,fast_trace);fail(4,has_feedback);
                 fail(5,!extended && targets.state.num_color_attachments!=1);fail(6,prohibited_clear);
                 fail(7,!extended && (fast_depth.has_depth || fast_depth.has_stencil));fail(8,quad_list || quad_triangles || (!extended && is_indexed));
                 fail(9,scale_composition || native_fsr_composition);fail(12,!extended && bool(vi->index_buffer));
@@ -5820,7 +7814,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         const bool vertex_preflight= !quad_list && !quad_triangles && (extended || !is_indexed) &&
             !scale_composition && !native_fsr_composition && (extended || targets.state.num_color_attachments==1) &&
             !prohibited_clear && (extended || (!db.has_depth && !db.has_stencil && !vi->index_buffer)) &&
-            feedback.empty() && prepared && from_prepared &&
+            !has_feedback && prepared && from_prepared &&
             prepared->pipeline==pipeline && prepared->pipeline_keepalive;
         const bool vertex_requested=ParallelVertexEnabled();
         const bool has_vertex_input=!vi->buffers.empty() || !vi->input_bindings.empty() || !vi->attributes.empty();
@@ -6013,7 +8007,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             !r.FrameDumpActive() && !SceneTrace::Id() && !Native::GpuCheckpoints::Requested() &&
             !quad_list && !quad_triangles && (extended || !is_indexed) && !scale_composition && !native_fsr_composition &&
             (extended || targets.state.num_color_attachments==1) && !prohibited_clear &&
-            (extended || (!db.has_depth && !db.has_stencil)) && feedback.empty() && vertex_safe && index_safe &&
+            (extended || (!db.has_depth && !db.has_stencil)) && !has_feedback && vertex_safe && index_safe &&
             prepared && from_prepared && prepared->pipeline==pipeline && prepared->pipeline_keepalive && stages_safe;
         bool descriptor_safe=cheap_eligible && !b.writes_buffers && b.gpu_writes.empty() && b.stored.empty();
         u32 descriptor_fail_reason=0;
@@ -6051,7 +8045,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 const auto note_view_cardinality=[&](std::size_t n) {if(sample_view)NATIVE_DIAGNOSTIC(++parallel->view_sample.cardinality[n==0?0:n==1?1:n==2?2:n<=4?3:n<=8?4:n<=16?5:n<=32?6:n<=64?7:n<=128?8:9]);};
                 const bool known_structure=worker_identity && worker_result->descriptor_structure;
                 const bool image_batch=known_structure && (worker_result->image_seal_mask[0] || worker_result->image_seal_mask[1]) &&
-                    worker_result->image_seal_owner==this && feedback.empty() && prepared->proof_context &&
+                    worker_result->image_seal_owner==this && !has_feedback && prepared->proof_context &&
                     prepared->proof_context==parallel->prepared_proof_context &&
                     prepared->proof_context->Valid(prepared->proof_mode_state) &&
                     sampler_cache_epoch.load(std::memory_order_acquire)==worker_result->image_seal_epoch;
@@ -6534,7 +8528,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                     if(push<b.grouped_writes.size() && !b.grouped_writes[push].empty()) {
                         SampledProofTimer phase{parallel->proof_phases[3],phase_sample};
                         const auto snapshot_matches=[&] {
-                            if(!worker_identity || !known_structure || !feedback.empty() || !worker_result->push_snapshot || worker_result->push_index!=push ||
+                            if(!worker_identity || !known_structure || has_feedback || !worker_result->push_snapshot || worker_result->push_index!=push ||
                                worker_result->push_data!=b.grouped_writes[push].data() || worker_result->push_size!=b.grouped_writes[push].size()) return false;
                             // Producer group rows and image values remain immutable after publication; feedback is excluded above.
                             return true;
@@ -6591,7 +8585,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             u64 mask=0;const auto fail=[&](u32 bit,bool bad){if(bad)mask|=u64{1}<<bit;};
             fail(0,!RytyGtsInRace());fail(1,EmulatorSettings.IsPatchShaders());
             fail(2,r.FrameDumpActive() || SceneTrace::Id() || Native::GpuCheckpoints::Requested());
-            fail(3,!native_attachment);fail(4,sampled_alias || !feedback.empty());
+            fail(3,!native_attachment);fail(4,sampled_alias || has_feedback);
             fail(5,!extended && targets.state.num_color_attachments!=1);fail(6,prohibited_clear);
             fail(7,!extended && (db.has_depth || db.has_stencil));fail(8,quad_list || quad_triangles || (!extended && is_indexed));
             fail(9,scale_composition || native_fsr_composition);fail(10,vertex_preflight && !vertex_safe && !vi->buffers.empty());
@@ -6611,7 +8605,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         }
         // A streaming reservation covers each descriptor snapshot before its
         // immutable slot becomes visible to the recording worker.
-        const bool eligible=descriptor_safe && parallel_descriptor_bytes<=
+        const bool eligible=!pipeline->UsesShaderObjects() && descriptor_safe && parallel_descriptor_bytes<=
             Native::Parallel::PassCoordinator::StreamDescriptorBytesPerDraw;
         if(eligible) {NATIVE_DIAGNOSTIC(++parallel->eligible);
             if(parallel->active)NATIVE_DIAGNOSTIC(++parallel->eligible_in_active_scope);
@@ -6659,7 +8653,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                     bool prebind_ok=true;
                     if(split_now) {
                         const auto* prebind_list=s.list;
-                        const auto prebind_cmd=s.cmd;
+                        const auto prebind_cmd=s.cmd.Direct();
                         parallel_bindings.write_structure_proven=true;
                         set_count_proof();
                         {ScopedParallelBindingCapture capture{parallel_bindings};PushBindings(*pipeline,vk::PipelineBindPoint::eGraphics,b);}
@@ -6669,7 +8663,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                             if(!parallel_bindings.sets[i])prebind_ok=false;
                         }
                         prebind_ok=prebind_ok && s.rendering && !parallel->active && s.render==targets.state &&
-                            s.list==prebind_list && s.cmd==prebind_cmd && r.scheduler.CurrentTick()==epoch;
+                            s.list==prebind_list && s.cmd.Direct()==prebind_cmd && r.scheduler.CurrentTick()==epoch;
                         if(!prebind_ok)parallel->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::Abandoned);
                     }
                     if(prebind_ok) {
@@ -6679,7 +8673,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                         if(split_now) {EndRendering();PassBarrier();serial_split_started=true;NATIVE_DIAGNOSTIC(++parallel->serial_split_success);serial_split_prebound=true;}
                         parallel->epoch=epoch;parallel->lease=std::move(lease);parallel->active=std::move(active);
                         parallel->stream_attempted=false;
-                        parallel->active_list=s.list;parallel->active_cmd=s.cmd;
+                        parallel->active_list=s.list;parallel->active_cmd=s.cmd.Direct();
                         NATIVE_DIAGNOSTIC(parallel->pass_closure.origin=split_now?0:preclosed_serial_scope?1:2);
                         reserved_pin.committed=true;
                         s.rendering=true;s.render=targets.state;NATIVE_DIAGNOSTIC(++stats.passes);NATIVE_DIAGNOSTIC(++parallel->passes);
@@ -6716,6 +8710,41 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             r.instance.GetPhysicalDevice().getProperties().limits.timestampPeriod);
     }
     admission_partition.Finish();
+    // Deferred readers own their pipeline and copy descriptor metadata; GPU objects
+    // remain alive under the stream's existing graphics retirement policy.
+    const auto lds_proposed_size = pipeline->LdsEmulation() ? TessLdsScratchLayout(regs.num_indices,
+        regs.num_instances.NumInstances(), regs.ls_hs_config.hs_input_control_points,
+        pipeline->LdsVertexBytes(), pipeline->LdsGroupPatches(), pipeline->LdsEmulation()) : std::optional<TessLdsLayout>{};
+    const bool lds_readonly_stages = !pipeline->LdsEmulation() || std::ranges::all_of(pipeline->GetStages(), [](const Shader::Info* stage) {
+        return !stage || (stage->resource_usage_known && !stage->uses_dma && !stage->uses_direct &&
+            !stage->has_storage_images && !stage->uses_shader_clock &&
+            std::ranges::none_of(stage->buffers, [](const auto& buffer) { return buffer.is_written; }));
+    });
+    const auto lds_owned_buffer = [&](vk::Buffer handle) {
+        if (!handle) return true;
+        const auto matches = [handle](const auto& buffer) {
+            return buffer && vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())} == handle;
+        };
+        // s.keep can also contain non-owning wrappers over imported guest memory.
+        if (std::ranges::any_of(s.chunks, [&](const auto& chunk) { return matches(chunk.buffer); })) return true;
+        for (const auto& [_, region] : regions) if (matches(region.buffer)) return true;
+        for (const auto& [_, mirror] : mirrors) if (matches(mirror.buffer)) return true;
+        return false;
+    };
+    const bool lds_owned_buffers = !pipeline->LdsEmulation() ||
+        (std::ranges::all_of(b.buffers, [&](const auto& descriptor) { return lds_owned_buffer(descriptor.buffer); }) &&
+         std::ranges::all_of(vi->buffers, lds_owned_buffer) && lds_owned_buffer(vi->index_buffer));
+    const bool lds_safe_draw = pipeline->LdsEmulation() &&
+        TessLdsSafeShape(regs.num_instances.NumInstances(), quad_triangles, lds_readonly_stages && lds_owned_buffers,
+                         !b.stored.empty() || !b.gpu_writes.empty() || b.writes_buffers,
+                         regs.reg_array[0xa30e] == ~0u && regs.reg_array[0xa30f] == ~0u) && !has_feedback &&
+        !r.FrameDumpActive() && !SceneTrace::Id() && !Native::GpuCheckpoints::Requested() &&
+        !scale_composition && !native_fsr_composition &&
+        b.push.quad_sample_mask[0] == ~0u && b.push.quad_sample_mask[1] == ~0u;
+    const bool lds_batch_candidate = lds_proposed_size && LdsBatchOn() && lds_safe_draw &&
+                                     !pipeline->UsesShaderObjects();
+    if (!s.lds_readers.empty() && (!lds_batch_candidate || s.lds_readers.size() >= 1024 ||
+        s.lds_bytes + lds_proposed_size->size > (32ull << 20))) FlushLdsReaders(0);
     {
         PhaseClock part{stats.record_ns[1]};
         if(!parallel_draw) BeginRendering(targets.state);
@@ -6726,8 +8755,18 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         PhaseClock part{stats.record_ns[2]};
         DynamicState* const saved = Rasterizer::t_dynamic_state;
         Rasterizer::t_dynamic_state = &s.dynamic;
-        r.ctx->attachment_feedback_loop = feedback.empty() ? vk::ImageAspectFlags{}
-                                                           : vk::ImageAspectFlagBits::eColor;
+        vk::ImageAspectFlags feedback_aspects{};
+        for (const auto* entry : feedback) {
+            if (entry == targets.depth && depth_feedback.read_only) {
+                continue;
+            } else if (entry->info.props.is_depth) {
+                feedback_aspects |= vk::ImageAspectFlagBits::eDepth;
+                if (entry->info.props.has_stencil) feedback_aspects |= vk::ImageAspectFlagBits::eStencil;
+            } else {
+                feedback_aspects |= vk::ImageAspectFlagBits::eColor;
+            }
+        }
+        r.ctx->attachment_feedback_loop = feedback_aspects;
         r.UpdateViewportScissorState();
         r.UpdateDepthStencilState();
         r.UpdatePrimitiveState(is_indexed, quad_triangles);
@@ -6775,11 +8814,34 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     }
     const u32 index_count = vi->index_count;
     const CmdBuf cmdbuf{s.cmd};
+    retired_pipeline_owners.Hold(pipeline_owner);
     {
         PhaseClock part{stats.record_ns[4]};
-        if(!parallel_draw) s.pipelines.Graphics(pipeline->Handle(), [&] {
-            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
-        });
+        if (!parallel_draw && pipeline->UsesShaderObjects()) {
+            auto owner = pipeline_owner;
+            ASSERT_MSG(owner, "Shader object pipeline must outlive deferred recording");
+            static const bool delta = [] {
+                const char* env = std::getenv("RYGT_SO_DELTA");
+                std::error_code ec;
+                return !(env && env[0] == '0') && !std::filesystem::exists("so_delta.off", ec) && !ec;
+            }();
+            const bool known = delta && s.so_known && s.so_epoch == s.pipelines.InvalidationEpoch();
+            const auto previous = s.so_state;
+            const auto shaders = s.so_shaders;
+            cmdbuf.Run([pipeline, owner = std::move(owner), known, previous, shaders](vk::CommandBuffer cmd) {
+                pipeline->BindShaderObjects(cmd, known ? &previous : nullptr, known ? &shaders : nullptr);
+            });
+            if (!known) s.pipelines.Invalidate();
+            s.so_epoch = s.pipelines.InvalidationEpoch();
+            s.so_known = true;
+            s.so_state = pipeline->GetShaderObjectState();
+            s.so_shaders = pipeline->ShaderObjects();
+        } else if (!parallel_draw) {
+            s.so_known = false;
+            s.pipelines.Graphics(pipeline->Handle(), [&] {
+                cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+            });
+        }
     }
     {
         PhaseClock part{stats.record_ns[5]};
@@ -6841,6 +8903,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 return;
             }
         } else PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
+        if (one_off_observer && one_off_observer->HasWatches()) {
+            const auto outputs = GetOneOffOutputs(regs);
+            for (size_t i = 0; i < outputs.count; ++i) one_off_observer->Redrawn(outputs.keys[i]);
+        }
     }
     {
         PhaseClock part{stats.record_ns[6]};
@@ -6915,8 +8981,23 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             }
         } else {
         SceneTrace::GpuBegin(s.cmd);
-        Native::GpuCheckpoints::Record(static_cast<VkCommandBuffer>(s.cmd), 1, frame,
-            vs_info.pgm_hash, fs ? fs->pgm_hash : 0, regs.num_indices);
+        if (Native::GpuCheckpoints::Requested()) {
+            const auto vs_hash = vs_info.pgm_hash, fs_hash = fs ? fs->pgm_hash : 0;
+            const auto count = regs.num_indices;
+            const auto captured_frame = frame;
+            s.cmd.Invoke([=](vk::CommandBuffer cmd) {
+                Native::GpuCheckpoints::Record(static_cast<VkCommandBuffer>(cmd), 1, captured_frame,
+                                               vs_hash, fs_hash, count);
+            });
+        }
+        const auto record_draw = [&] {
+        retired_pipeline_owners.Hold(pipeline_owner);
+        if (depth_snapshot) {
+            // Preparation may splice after the copy. Retain the image again in
+            // the actual draw stream immediately before recording its read.
+            Native::ReserveAdditional(s.writeback_plan_leases, 1);
+            s.writeback_plan_leases.push_back(depth_snapshot);
+        }
         if (quad_triangles) {
             if (index_count != 0) {
                 cmdbuf.drawIndexed(index_count, instances, 0, s32(vertex_offset),
@@ -6928,9 +9009,118 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         } else {
             cmdbuf.draw(regs.num_indices, instances, vertex_offset, instance_offset);
         }
+        };
+        bool lds_used = false;
+        bool lds_deferred = false;
+        std::optional<DynamicState> lds_draw_dynamic;
+        if (pipeline->LdsEmulation() || !s.lds_readers.empty()) lds_draw_dynamic = s.dynamic;
+        if (lds_safe_draw) {
+            const u32 cp = std::max<u32>(regs.ls_hs_config.hs_input_control_points, 1u);
+            const u64 vertex_bytes = pipeline->LdsVertexBytes();
+            // Per-draw owned storage survives with the stream until its graphics tick retires.
+            // Cap the allocation; on failure the shader sees its ordinary all-ones mask.
+            if (const auto layout = TessLdsScratchLayout(regs.num_indices, instances, cp, vertex_bytes,
+                                                         pipeline->LdsGroupPatches(), pipeline->LdsEmulation())) {
+                auto scratch = device->CreateBuffer({.size = layout->size,
+                    .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageDeviceAddress | Native::Rhi::BufferUsageTransferDst,
+                    .memory = Native::Rhi::MemoryKind::DeviceLocal, .name = "hull LDS scratch"});
+                if (scratch && scratch->GpuAddress() && (scratch->GpuAddress() & 3u) == 0 &&
+                    u32(scratch->GpuAddress() >> 32) != ~0u) {
+                    const u64 address = scratch->GpuAddress();
+                    const auto* scratch_buffer = scratch.get();
+                    s.keep.push_back(std::move(scratch));
+                    bool deferred = false;
+                    if (lds_batch_candidate) {
+                        try {
+                            s.lds_readers.emplace_back();
+                            auto& reader = s.lds_readers.back();
+                            reader.pipeline = pipeline;
+                            reader.pipeline_owner = pipeline_owner;
+                            reader.dynamic = s.dynamic;
+                            reader.vertices = *vi;
+                            if (!reader.pipeline_owner || !CaptureLdsReader(reader, b)) {
+                                s.lds_readers.pop_back();
+                            } else {
+                            reader.address = address;
+                            reader.scratch = scratch_buffer;
+                            reader.tail_offset = layout->written;
+                            reader.tail_size = layout->size - layout->written;
+                            reader.indexed = quad_triangles || is_indexed;
+                            reader.count = quad_triangles ? index_count : regs.num_indices;
+                            reader.instances = instances;
+                            reader.vertex_offset = u32(vertex_offset);
+                            reader.first_instance = instance_offset;
+                            s.lds_bytes += layout->size;
+                            deferred = true;
+                            }
+                        } catch (const std::bad_alloc&) {
+                            if (!s.lds_readers.empty() && !s.lds_readers.back().address)
+                                s.lds_readers.pop_back();
+                        }
+                    }
+                    const auto push_scratch = [&](u64 value) {
+                        const std::array<u32, 2> words{u32(value), u32(value >> 32)};
+                        s.cmd.pushConstants(pipeline->GetLayout(), AllGraphicsStageBits,
+                            u32(offsetof(Shader::PushData, quad_sample_mask)), 8u, words.data());
+                    };
+                    if (!deferred && !s.lds_readers.empty()) {
+                        FlushLdsReaders(0);
+                        s.dynamic = *lds_draw_dynamic;
+                        s.dynamic.Invalidate();
+                        s.dynamic.Commit(r.instance, CmdBuf{s.cmd});
+                        RecordVertexIndex(*vi);
+                        s.pipelines.Graphics(pipeline->Handle(), [&] {
+                            s.cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+                        });
+                        PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
+                    }
+                    push_scratch(address | 1);
+                    record_draw();
+                    if (deferred) {
+                        // The reader is emitted in order after the run's shared barrier.
+                        lds_deferred = true;
+                        lds_used = true;
+                    } else {
+                    RenderState resumed = s.render;
+                    for (u32 i = 0; i < resumed.num_color_attachments; ++i)
+                        resumed.color_attachments[i].is_clear = false;
+                    resumed.depth_stencil_attachment.depth_clear = false;
+                    resumed.depth_stencil_attachment.stencil_clear = false;
+                    const RenderState current = s.render;
+                    EndRendering();
+                    if (layout->written < layout->size)
+                        s.list->FillBuffer(scratch_buffer, layout->written, layout->size - layout->written, 0);
+                    GlobalBarrier();
+                    BeginRendering(resumed);
+                    s.render = current;
+                    push_scratch(address);
+                    lds_used = true;
+                    }
+                }
+            }
+        }
+        if (!lds_deferred) {
+            if (!s.lds_readers.empty()) {
+                FlushLdsReaders(0);
+                s.dynamic = *lds_draw_dynamic;
+                s.dynamic.Invalidate();
+                s.dynamic.Commit(r.instance, CmdBuf{s.cmd});
+                RecordVertexIndex(*vi);
+                s.pipelines.Graphics(pipeline->Handle(), [&] {
+                    s.cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+                });
+                PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
+            }
+            record_draw();
+        }
+        if (lds_used) {
+            s.cmd.pushConstants(pipeline->GetLayout(), AllGraphicsStageBits,
+                u32(offsetof(Shader::PushData, quad_sample_mask)), 8u, b.push.quad_sample_mask.data());
+        }
         SceneTrace::GpuEnd(s.cmd);
         }
     }
+    retired_pipeline_owners.Hold(pipeline_owner);
     {
         PhaseClock part{stats.record_ns[7]};
         NoteWrites(&targets, b);
@@ -7780,8 +9970,24 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
                  (sharp_size >= 1_GB && base != 0 && !r.memory->IsValidMapping(base)));
             const bool unmapped =
                 !impossible && base != 0 && sharp_size != 0 && !r.IsMappedStart(base);
-            if (base != 0 && sharp_size != 0 && !impossible && !unmapped) {
-                const u64 size = r.memory->ClampRangeSize(base, sharp_size);
+            const bool bindable = base != 0 && sharp_size != 0 && !impossible && !unmapped;
+            u64 size = bindable ? r.memory->ClampRangeSize(base, sharp_size) : 0;
+            const u64 original_size = size;
+            static const bool readable_cut = [] {
+                const char* env = std::getenv("RYGT_NATIVE_READABLE_CUT");
+                return !(env && env[0] == '0');
+            }();
+            auto* readable_direct = r.buffer_cache.GetDirectMemory();
+            if (bindable) size = Native::ReadableBindingSize(base, size, desc.is_written,
+                readable_cut, readable_direct != nullptr,
+                [&](u64 a, u64 n) { std::shared_lock lock{buffer_map_mutex}; return RegionOver(a, n) != nullptr; },
+                [&](u64 a, u64 n) { return readable_direct->EnsureImported(a, n); },
+                [&](u64 a, u64 n) { return Native::ReadablePrefix(reinterpret_cast<const void*>(a), n); });
+            // A region can appear after a worker's overlap check. Recheck any
+            // truncated/empty range on the serialized recorder rather than
+            // publishing an untracked truncated descriptor.
+            if (size != original_size) return false;
+            if (bindable && size != 0) {
                 bool region_over;
                 {
                     std::shared_lock map_lock{buffer_map_mutex};
@@ -8347,6 +10553,7 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     for (const auto* sampled : p.bindings.sampled) {
         auto& entry = *const_cast<Native::ImageEntry*>(sampled);
         entry.last_use.store(frame, std::memory_order_relaxed);
+        if (entry.from_cpu) registry->LayersRewritten(entry, frame);
         ApplyRewrite(entry); // NAT-120, NAT-133
         if (entry.from_cpu) {
             RefreshSources(entry); // NAT-104
@@ -8375,7 +10582,34 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
 void NativeRenderer::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern,
                               bool exact) {
     const u64 clock = ++write_clock; // NAT-148: when the memory was rewritten
-    registry->GpuWrote(address, size, pattern, exact, clock);
+    // A private region can contain GPU-only bytes that a CPU partial write must merge.
+    // Remember only a complete directly imported range with no overlapping region.
+    bool guest_authoritative = false;
+    auto* direct = r.buffer_cache.GetDirectMemory();
+    static const bool remember_fills = [] {
+        const char* env = std::getenv("RYGT_NATIVE_FILL_NEW_TARGETS");
+        return !(env && env[0] == '0');
+    }();
+    if (remember_fills && pattern && direct && size && size <= 16_MB &&
+        size <= ~u64{0} - address) {
+        std::shared_lock lock{buffer_map_mutex};
+        guest_authoritative = !RegionOver(address, size) && direct->EnsureImported(address, size);
+    }
+    {
+        std::scoped_lock watch_lock{fill_watch_mutex};
+        if (guest_authoritative) {
+            // Retire any watches displaced by this bounded journal on the next cleanup.
+            const auto old_ranges = registry->RecentFillRanges();
+            for (const auto& [begin, end] : old_ranges) {
+                retired_watch_ranges.emplace_back(VideoCore::PageManager::GetPageAddr(begin),
+                    VideoCore::PageManager::GetNextPageAddr(end - 1));
+            }
+            WatchPages(address, size);
+            fill_watched_ranges.emplace_back(VideoCore::PageManager::GetPageAddr(address),
+                VideoCore::PageManager::GetNextPageAddr(address + size - 1));
+        }
+        registry->GpuWrote(address, size, pattern, exact, clock, frame, guest_authoritative);
+    }
     // A fill of a stencil plane: depth images whose stencil is there clear it at next use.
     const auto it = stencil_owners.find(address);
     if (it == stencil_owners.end() || !pattern) {
@@ -8475,7 +10709,8 @@ const Native::Rhi::Buffer* NativeRenderer::PatternBuffer(u32 lo, u32 hi, u64 byt
     return slot.buffer.get();
 }
 
-bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 rows) {
+bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 rows,
+                               u32 first_layers) {
     // NAT-132/134: a picture filled with the pattern (two dwords, repeated), as memory holds it
     // after a fill: copied in from a buffer holding it (any format: every texel is the pattern's
     // bytes). `rows` != 0: only those rows of the first mip and layer (NAT-124).
@@ -8495,7 +10730,12 @@ bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 ro
     const u32 depth = desc.dim == Native::Rhi::ImageDim::D3 ? std::max(desc.depth, 1u) : 1u;
     const u32 mips = rows ? 1u : std::max(desc.mips, 1u);
     const u32 height0 = rows ? std::min(rows, desc.height) : desc.height;
-    const u64 bytes = u64(desc.width) * height0 * texel * (rows ? 1u : layers * depth);
+    const u32 row_layers = std::clamp(first_layers, 1u, layers);
+    const u64 bytes = u64(desc.width) * height0 * texel * (rows ? row_layers : layers * depth);
+    if (info.props.is_bgr_packed_float) {
+        lo = VideoCore::PackedFloatToVulkan(lo);
+        hi = VideoCore::PackedFloatToVulkan(hi);
+    }
     const Native::Rhi::Buffer* pattern = PatternBuffer(lo, hi, bytes);
     if (!pattern || pattern->Size() < bytes) {
         return false;
@@ -8516,14 +10756,15 @@ bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 ro
                                                                 : vk::ImageAspectFlagBits::eColor,
                               .mipLevel = m,
                               .baseArrayLayer = 0,
-                              .layerCount = rows ? 1u : layers},
+                              .layerCount = rows ? row_layers : layers},
             .imageOffset = {0, 0, 0},
             .imageExtent = {w, h, d},
         });
     }
     s.cmd.copyBufferToImage(buffer, vk::Image{Handle<VkImage_T>(entry.image->NativeHandle())},
-                            vk::ImageLayout::eGeneral, static_cast<u32>(copies.size()),
-                            copies.data());
+                            vk::ImageLayout::eGeneral,
+                            vk::ArrayProxy<const vk::BufferImageCopy>(
+                                static_cast<u32>(copies.size()), copies.data()));
     Written(&entry, entry.rewrite_clock); // NAT-148
     s.buffers_written = true; // the next work waits for the fill
     ++s.commands;
@@ -8535,6 +10776,15 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
     using Rewrite = Native::ImageEntry::Rewrite;
     if (entry.rewrite == Rewrite::None && !entry.stencil_clear_pending) {
         return;
+    }
+    auto claim = registry->ClaimRememberedFill(entry);
+    const auto retire_claim = [&] {
+        // Attach after recording: PatternBuffer/GlobalBarrier can splice while
+        // preparing the clear, so an earlier stream is not its completion tick.
+        if (claim.receipt) Begin().remembered_fill_receipts.push_back(std::move(claim.receipt));
+    };
+    if (!claim.valid) {
+        entry.rewrite = Rewrite::Upload;
     }
     const auto& info = entry.info;
 #if !defined(NDEBUG)
@@ -8578,7 +10828,23 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
         const u64 row_bytes = u64(std::max(info.pitch, info.size.width)) * texel;
         const u32 rows = u32(std::min<u64>((entry.rewrite_bytes + row_bytes - 1) / row_bytes,
                                            info.size.height));
-        if (rows != 0 && FillImage(entry, lo, hi, rows)) {
+        const auto* image = entry.image.get();
+        const u32 image_texel = info.props.is_depth
+            ? ((info.pixel_format == vk::Format::eD16Unorm ||
+                info.pixel_format == vk::Format::eD16UnormS8Uint) ? 2u : 4u)
+            : info.num_bits / 8;
+        const u64 layer_stride = info.resources.layers ? info.guest_size / info.resources.layers : 0;
+        const auto whole_layers = image && image->Desc().width == info.size.width &&
+                                  image->Desc().height == info.size.height &&
+                                  image->Desc().height != 0 && image->Desc().depth == 1
+          ? Native::WholeLayerClearCount(
+            info.guest_size, entry.rewrite_bytes, info.resources.layers, image->Desc().layers,
+            info.resources.levels, image->Desc().mips, info.mips_layout[0].offset,
+            info.mips_layout[0].size, image->Desc().dim == Native::Rhi::ImageDim::D2,
+            info.props.is_volume, Native::WholeLayerPatternSafe(lo, hi, image_texel, layer_stride)) : 0;
+        const bool filled_layers = whole_layers && FillImage(entry, lo, hi, image->Desc().height,
+                                                              whole_layers);
+        if (filled_layers || (rows != 0 && FillImage(entry, lo, hi, rows))) {
             NATIVE_DIAGNOSTIC(++stats.rewrite_partial);
         }
     } else if (rewrite == Rewrite::Clear && !depth_value && !color_zero) {
@@ -8596,6 +10862,7 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
         NATIVE_DIAGNOSTIC(++stats.rewrite_uploads);
     }
     if (!depth_value && !color_zero && !stencil) {
+        retire_claim();
         return;
     }
     Stream& s = Begin();
@@ -8629,6 +10896,7 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
     s.buffers_written = true; // the next work waits for the clear
     ++s.commands;
     NATIVE_DIAGNOSTIC(++stats.rewrite_clears);
+    retire_claim();
 }
 
 void NativeRenderer::ReadFillShader(const Shader::Info& cs, DrawBindings& b) {
@@ -8729,6 +10997,12 @@ void NativeRenderer::DispatchDirect() {
         NATIVE_DIAGNOSTIC(++stats.no_pipeline);
         return;
     }
+#ifndef NDEBUG
+    if (GeometryTrace::current)
+        GeometryTrace::Record("dispatch_pipeline", GeometryTrace::current,
+            pipeline->GetStage(Shader::SwStage::Compute).pgm_hash,
+            reinterpret_cast<std::uintptr_t>(pipeline), 0);
+#endif
     const auto& regs = r.liverpool->DrawRegs();
     MetaClearDispatch(pipeline->GetStage(Shader::SwStage::Compute));
     if (r.FrameDumpActive()) {
@@ -8738,17 +11012,49 @@ void NativeRenderer::DispatchDirect() {
     UiHires::Get().scale = 0.f;
     SyncUiReads(pipeline->GetStages());
     Stream& s = Begin();
+    const u64 work_before = s.resource_recording_serial;
     DrawBindings& b = bindings;
     b.Clear();
     b.push = UserData(regs);
-    BindStages(pipeline->GetStages(), regs, true, b);
+    BindStagesStable(pipeline->GetStages(), regs, true, b);
+    WritebacksBefore(b);
     if (b.failed) {
         NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
     }
     ReadFillShader(pipeline->GetStage(Shader::SwStage::Compute), b); // NAT-120
+    const bool image_work = device->PendingImageInit() || registry->HasPendingUploads();
     PrepareImages();
-    GlobalBarrier();
+    for (unsigned attempt = 0; b.region_writeback && !RegionPlanValid(*b.region_writeback) && attempt < 4; ++attempt) {
+        b.Clear();
+        b.push = UserData(regs);
+        BindStagesStable(pipeline->GetStages(), regs, true, b);
+        if (b.failed) return;
+        WritebacksBefore(b);
+        if (b.failed) return;
+        ReadFillShader(pipeline->GetStage(Shader::SwStage::Compute), b);
+        PrepareImages();
+    }
+    if (b.region_writeback) ValidateRegionPlan(*b.region_writeback);
+    const u64 program = pipeline->GetStage(Shader::SwStage::Compute).pgm_hash;
+    const bool recorded = image_work || s.resource_recording_serial != work_before;
+    const std::optional<u64> texel = b.stored.size() == 1
+        ? SameTexelKey(pipeline->GetStage(Shader::SwStage::Compute), b.image_entries)
+        : std::nullopt;
+    if (RunNeedsBarrier(s, b, program, recorded, texel)) {
+        GlobalBarrier();
+    } else {
+        EndRendering();
+    }
+    s.run_texels.Note(texel ? b.stored[0]->info.guest_address : 0, texel, !b.stored.empty());
+    if (IsSameTexelProgram(program)) {
+        for (const auto* entry : b.sampled) {
+            if (entry && !(texel && entry->info.guest_address == b.stored[0]->info.guest_address &&
+                           entry->info.guest_size == b.stored[0]->info.guest_size)) {
+                s.run_texels.NoteRead(entry->info.guest_address, entry->info.guest_size);
+            }
+        }
+    }
     // Intrusive opt-in diagnostic. Submit the bound input copy and wait before
     // recording this dispatch; shader and loop bounds are never modified.
 #if !defined(NDEBUG)
@@ -8837,7 +11143,9 @@ void NativeRenderer::DispatchDirect() {
             Begin();
             b.Clear();
             b.push=UserData(regs);
-            BindStages(pipeline->GetStages(),regs,true,b);
+            BindStagesStable(pipeline->GetStages(),regs,true,b);
+            if (b.failed) { NATIVE_DIAGNOSTIC(++stats.skipped); return; }
+            WritebacksBefore(b);
             if (b.failed) { NATIVE_DIAGNOSTIC(++stats.skipped); return; }
             PrepareImages();
             GlobalBarrier();
@@ -8876,12 +11184,17 @@ void NativeRenderer::DispatchDirect() {
 #if !defined(NDEBUG)
     scene_trace.Programs(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash);
 #endif
+    if (b.region_writeback) {
+        ValidateRegionPlan(*b.region_writeback);
+        ApplyRegionWritebackFallback(*b.region_writeback);
+        RecordRegionSnapshots(b.region_writeback);
+    }
     if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-compute id={} cs={:#x} groups={}x{}x{} threads={}x{}x{} host_subgroup={}",SceneTrace::Id(),pipeline->GetStage(Shader::SwStage::Compute).pgm_hash,cs_program.dim_x,cs_program.dim_y,cs_program.dim_z,cs_program.num_thread_x.full,cs_program.num_thread_y.full,cs_program.num_thread_z.full,r.instance.SubgroupSize()));
     SceneTrace::GpuBegin(s.cmd);
     const CmdBuf cmdbuf{s.cmd};
     bool transferred = false;
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
-    if (b.fill_arguments_snapshot && b.fill_pattern && b.fill_size != 0 &&
+    if (!b.region_writeback && b.fill_arguments_snapshot && b.fill_pattern && b.fill_size != 0 &&
         cs.pgm_hash == 0x8aa6e00c && cs.flattened_ud_buf.size() > 2 &&
         cs_program.dim_y == 1 && cs_program.dim_z == 1 &&
         cs_program.start_x == 0 && cs_program.start_y == 0 && cs_program.start_z == 0 &&
@@ -9011,8 +11324,14 @@ void NativeRenderer::DispatchDirect() {
         }
     #endif
     PushBindings(*pipeline, vk::PipelineBindPoint::eCompute, b);
-        Native::GpuCheckpoints::Record(static_cast<VkCommandBuffer>(s.cmd), 2, frame,
-            cs.pgm_hash, cs_program.dim_x, u64(cs_program.dim_y) << 32 | cs_program.dim_z);
+        if (Native::GpuCheckpoints::Requested()) {
+            const auto hash = cs.pgm_hash, x = u64(cs_program.dim_x);
+            const auto yz = u64(cs_program.dim_y) << 32 | cs_program.dim_z;
+            const auto captured_frame = frame;
+            s.cmd.Invoke([=](vk::CommandBuffer cmd) {
+                Native::GpuCheckpoints::Record(static_cast<VkCommandBuffer>(cmd), 2, captured_frame, hash, x, yz);
+            });
+        }
         cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     }
     SceneTrace::GpuEnd(s.cmd);
@@ -9024,8 +11343,11 @@ void NativeRenderer::DispatchDirect() {
     }
 #endif
     s.buffers_written = true; // what the dispatch wrote is seen after the next barrier
+    s.buffers_written.foreign = false;
     NATIVE_DIAGNOSTIC(++stats.dispatches);
     ++s.commands;
+    s.run_program = program;
+    s.run_commands = s.commands;
     ChunkFlushCheck();
     Report();
 }
@@ -9053,7 +11375,7 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     UiHires::Get().scale = 0.f;
     SyncUiReads(pipeline->GetStages());
     Stream& s = Begin();
-    const auto args = GuestBuffer(address + offset, std::max<u32>(size, 12), false);
+    auto args = GuestBuffer(address + offset, std::max<u32>(size, 12), false);
     if (!args) {
         NATIVE_DIAGNOSTIC(++stats.skipped);
         return;
@@ -9061,9 +11383,37 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     DrawBindings& b = bindings;
     b.Clear();
     b.push = UserData(regs);
-    BindStages(pipeline->GetStages(), regs, true, b);
+    const u64 indirect_region_before = regions_taken_in;
+    BindStagesStable(pipeline->GetStages(), regs, true, b);
+    if (b.failed) {
+        NATIVE_DIAGNOSTIC(++stats.skipped);
+        return;
+    }
+    if (regions_taken_in != indirect_region_before) {
+        args = GuestBuffer(address + offset, std::max<u32>(size, 12), false);
+        if (!args) {
+            NATIVE_DIAGNOSTIC(++stats.skipped);
+            return;
+        }
+    }
+    WritebacksBefore(b);
+    if (b.failed) return;
     PrepareImages();
+    for (unsigned attempt = 0; b.region_writeback && !RegionPlanValid(*b.region_writeback) && attempt < 4; ++attempt) {
+        b.Clear();
+        b.push = UserData(regs);
+        BindStagesStable(pipeline->GetStages(), regs, true, b);
+        if (b.failed) return;
+        WritebacksBefore(b);
+        if (b.failed) return;
+        PrepareImages();
+    }
+    if (b.region_writeback) ValidateRegionPlan(*b.region_writeback);
     GlobalBarrier();
+    if (b.region_writeback) {
+        ApplyRegionWritebackFallback(*b.region_writeback);
+        RecordRegionSnapshots(b.region_writeback);
+    }
     const CmdBuf cmdbuf{s.cmd};
     // FIX-188: Intel Arc (#65) binds the pipeline every time (tile work runs between).
     s.pipelines.Compute(pipeline->Handle(), r.instance.IsIntel(), [&] {
@@ -9119,6 +11469,7 @@ void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
     // resolved picture at its first read: GT Sport's minimaps, resolved into the scratch pool).
     ApplyRewrite(*src);
     ApplyRewrite(*dst);
+    registry->ForgetFillHistory(dst->info.guest_address, dst->info.guest_size, dst);
     if (r.FrameDumpActive()) {
         r.FrameDumpEvent(fmt::format("resolve {:#x} {}x{} x{} -> {:#x} {}x{} x{}",
                                      src->info.guest_address, src->info.size.width,
@@ -9153,6 +11504,85 @@ void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
     const vk::Image src_image{Handle<VkImage_T>(src->image->NativeHandle())};
     const vk::Image dst_image{Handle<VkImage_T>(dst->image->NativeHandle())};
     if (src->image->Desc().samples > 1 && dst->image->Desc().samples == 1) {
+        const auto src_format = src->image->Desc().format;
+        if (src_format != dst->image->Desc().format) {
+            // Resolve through attachment views in the source format. Vulkan's
+            // direct resolve requires identical image formats.
+            static const bool resolve_view = [] {
+                const char* env = std::getenv("RYGT_NATIVE_RESOLVE_VIEW");
+                return !(env && env[0] == '0');
+            }();
+            const vk::Format format = static_cast<vk::Format>(src_format);
+            const vk::Format dst_format = static_cast<vk::Format>(dst->image->Desc().format);
+            const bool view_compatible = [&] {
+                try { return VideoCore::IsVulkanFormatCompatible(dst_format, format); }
+                catch (const std::out_of_range&) { return false; }
+            }();
+            const bool compatible = resolve_view && layers == 1 &&
+                src->info.num_bits == dst->info.num_bits &&
+                view_compatible &&
+                r.instance.GetSupportedFormat(format, vk::FormatFeatureFlags2{src->backend_features}) == format &&
+                r.instance.GetSupportedFormat(format, vk::FormatFeatureFlags2{dst->backend_features}) == format;
+            const auto attachment_view = [&](const Native::ImageEntry& entry, u32 layer) {
+                VideoCore::ImageViewInfo view{};
+                view.format = format;
+                view.range.base.layer = u16(layer);
+                return View(entry, view, ViewUse::Attachment);
+            };
+            const auto src_view = compatible ? attachment_view(*src, region.srcSubresource.baseArrayLayer) : vk::ImageView{};
+            const auto dst_view = compatible ? attachment_view(*dst, region.dstSubresource.baseArrayLayer) : vk::ImageView{};
+            if (src_view && dst_view) {
+                const std::string_view numeric = vk::componentNumericFormat(format, 0);
+                const vk::RenderingAttachmentInfo attachment{
+                .imageView = src_view,
+                .imageLayout = vk::ImageLayout::eGeneral,
+                .resolveMode = numeric == "UINT" || numeric == "SINT"
+                                   ? vk::ResolveModeFlagBits::eSampleZero
+                                   : vk::ResolveModeFlagBits::eAverage,
+                .resolveImageView = dst_view,
+                .resolveImageLayout = vk::ImageLayout::eGeneral,
+                .loadOp = vk::AttachmentLoadOp::eLoad,
+                .storeOp = vk::AttachmentStoreOp::eStore,
+                };
+                s.cmd.beginRendering(vk::RenderingInfo{
+                    .renderArea{.extent = {region.extent.width, region.extent.height}},
+                    .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &attachment});
+                s.cmd.endRendering();
+                Written(dst);
+                s.buffers_written = true;
+                ++s.commands;
+                return;
+            }
+            // A same-format single-sample intermediate can be copied bitwise
+            // to a size-compatible destination without requiring mutable views.
+            if (src->info.num_bits != dst->info.num_bits ||
+                vk::blockSize(format) != vk::blockSize(dst_format) ||
+                src->info.props.is_block || dst->info.props.is_block)
+                UNREACHABLE_MSG("Resolve requires size-compatible uncompressed color formats");
+            auto scratch = device->CreateImage({.format = src_format,
+                .width = region.extent.width, .height = region.extent.height,
+                .layers = layers, .samples = 1,
+                .usage = Native::Rhi::ImageUsageTransferSrc | Native::Rhi::ImageUsageTransferDst,
+                .name = "resolve format intermediate"});
+            if (!scratch) UNREACHABLE_MSG("Unable to allocate resolve format intermediate");
+            device->RecordPendingImageInit(*s.list);
+            auto middle = region;
+            middle.dstSubresource.baseArrayLayer = 0;
+            const vk::Image temporary{Handle<VkImage_T>(scratch->NativeHandle())};
+            s.cmd.resolveImage(src_image, vk::ImageLayout::eGeneral, temporary,
+                               vk::ImageLayout::eGeneral, middle);
+            s.list->Barrier(Native::Rhi::ScopeTransfer, Native::Rhi::ScopeTransfer);
+            vk::ImageCopy copy{.srcSubresource = middle.dstSubresource,
+                               .dstSubresource = region.dstSubresource, .extent = region.extent};
+            s.cmd.copyImage(temporary, vk::ImageLayout::eGeneral, dst_image,
+                            vk::ImageLayout::eGeneral, copy);
+            // RHI image destruction is deferred by the scheduler timeline.
+            scratch.reset();
+            Written(dst);
+            s.buffers_written = true;
+            ++s.commands;
+            return;
+        }
         CmdBuf{s.cmd}.resolveImage(src_image, vk::ImageLayout::eGeneral, dst_image,
                                    vk::ImageLayout::eGeneral, region);
     } else {
@@ -9187,26 +11617,45 @@ void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is
         return;
     }
     const bool meta = known_meta.contains(address);
-    if (meta) {
-        cleared_meta.insert(address); // a CMASK/HTILE cleared by the CP
-        NATIVE_DIAGNOSTIC(++stats.meta_clears);
-    }
     if (r.FrameDumpActive()) {
         r.FrameDumpEvent(fmt::format("fill {:#x}+{:#x} = {:#x}{}", address, num_bytes, value,
                                      meta ? " (metadata clear)" : "")); // NAT-117
     }
     NATIVE_DIAGNOSTIC(++stats.fills);
-    if (const auto found = GuestBuffer(address, num_bytes, true)) {
+    WritebacksBefore(address, num_bytes);
+    const auto found = GuestBuffer(address, num_bytes, true);
+    WritebackPlan candidate;
+    const std::pair<VAddr, u64> written{address, num_bytes};
+    if (!PrepareRegionWriteback(candidate, std::span{&written, 1}, false)) {
+        ASSERT_MSG(false, "native region writeback preflight failed before fill");
+        return;
+    }
+    std::shared_ptr<WritebackPlan> writeback;
+    if (!candidate.parts.empty() || !candidate.forget_pages.empty() || candidate.skipped_listed)
+        writeback = std::make_shared<WritebackPlan>(std::move(candidate));
+    if (found) {
         GlobalBarrier();
+        if (writeback) {
+            try { Native::ReserveAdditional(s.writeback_plan_leases, 2); }
+            catch (...) { UNREACHABLE_MSG("native fill writeback retention allocation failed"); }
+        }
+        if (writeback) ApplyRegionWritebackFallback(*writeback);
+        RetainRegionPlan(writeback);
         CmdBuf{s.cmd}.fillBuffer(found->first, found->second, num_bytes, value);
         s.buffers_written = true;
         ++s.commands;
     } else {
+        if (RegionOver(address, num_bytes)) return;
         // Not GPU-visible as one range: written now (before the GPU runs what precedes it).
         if (r.memory->IsValidMapping(address, num_bytes)) {
             std::fill_n(reinterpret_cast<u32*>(address), num_bytes / 4, value);
         }
     }
+    if (meta) {
+        cleared_meta.insert(address); // a CMASK/HTILE cleared by the CP
+        NATIVE_DIAGNOSTIC(++stats.meta_clears);
+    }
+    RecordRegionWriteback(writeback);
     const std::array<u32, 2> pattern{value, value};
     GpuWrote(address, num_bytes, &pattern, true); // NAT-119/120
 }
@@ -9229,13 +11678,32 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
                                      dst_gds ? " (GDS)" : "", src, src_gds ? " (GDS)" : "",
                                      num_bytes)); // NAT-117
     }
+    if (!src_gds) WritebacksBefore(src, num_bytes);
+    if (!dst_gds) WritebacksBefore(dst, num_bytes);
     const vk::Buffer gds_buffer{Handle<VkBuffer_T>(gds->NativeHandle())};
-    const auto source = src_gds ? std::optional{std::pair{gds_buffer, u64(src)}}
+    auto source = src_gds ? std::optional{std::pair{gds_buffer, u64(src)}}
                                 : GuestBuffer(src, num_bytes, false);
+    const u64 before_destination = regions_taken_in;
     const auto dest = dst_gds ? std::optional{std::pair{gds_buffer, u64(dst)}}
                               : GuestBuffer(dst, num_bytes, true);
+    if (!src_gds && regions_taken_in != before_destination) source = GuestBuffer(src, num_bytes, false);
+    WritebackPlan candidate;
+    const std::pair<VAddr, u64> written{dst, num_bytes};
+    if (!dst_gds && !PrepareRegionWriteback(candidate, std::span{&written, 1}, false)) {
+        ASSERT_MSG(false, "native region writeback preflight failed before copy");
+        return;
+    }
+    std::shared_ptr<WritebackPlan> writeback;
+    if (!candidate.parts.empty() || !candidate.forget_pages.empty() || candidate.skipped_listed)
+        writeback = std::make_shared<WritebackPlan>(std::move(candidate));
     if (source && dest) {
         GlobalBarrier();
+        if (writeback) {
+            try { Native::ReserveAdditional(s.writeback_plan_leases, 2); }
+            catch (...) { UNREACHABLE_MSG("native copy writeback retention allocation failed"); }
+        }
+        if (writeback) ApplyRegionWritebackFallback(*writeback);
+        RetainRegionPlan(writeback);
         CmdBuf{s.cmd}.copyBuffer(source->first, dest->first,
                                  vk::BufferCopy{.srcOffset = source->second,
                                                 .dstOffset = dest->second,
@@ -9243,6 +11711,7 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
         s.buffers_written = true;
         ++s.commands;
     } else if (!dst_gds && !src_gds) {
+        if ((!source && RegionOver(src, num_bytes)) || (!dest && RegionOver(dst, num_bytes))) return;
         if (r.memory->IsValidMapping(dst, num_bytes) &&
             Native::Readable(reinterpret_cast<const void*>(src), num_bytes)) {
             std::memcpy(reinterpret_cast<void*>(dst), reinterpret_cast<const void*>(src),
@@ -9256,6 +11725,7 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
         }
     }
     if (!dst_gds) {
+        RecordRegionWriteback(writeback);
         GpuWrote(dst, num_bytes, nullptr, true); // NAT-119
     }
 }
@@ -9274,8 +11744,10 @@ bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
         return false;
     }
     Stream& s = Begin();
+    WritebacksBefore(address, data.size());
     GlobalBarrier();
     CmdBuf{s.cmd}.updateBuffer(found->first->Handle(), found->second, data.size(), data.data());
+    registry->ForgetFills(address, data.size());
     // NAT-146: a region over the range holds what the GPU reads there: it gets the bytes too.
     for (auto& [base, region] : regions) {
         const VAddr begin = std::max<VAddr>(address, region.begin);
@@ -9304,6 +11776,14 @@ bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
     ++s.commands;
     NATIVE_DIAGNOSTIC(++stats.inline_writes);
     return true;
+}
+
+void NativeRenderer::CancelLinearDownloads(VAddr address, u64 size) {
+    // Removing the queue entry permits a surviving target to be admitted again.
+    Native::CancelOverlappingLinearPlans(pending_linear_downloads, writebacks, [&](const auto* entry) {
+        return Native::LinearDownloadOverlaps(entry->info.guest_address, entry->info.guest_size,
+                                              address, size);
+    });
 }
 
 void NativeRenderer::OnUnmap(VAddr address, u64 size) {
@@ -9346,6 +11826,11 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
     // NAT-146: regions over unmapped memory go (the device frees their buffers once the GPU is
     // done with them).
     std::scoped_lock lock{mutex};
+    CancelLinearDownloads(address, size);
+    if (FaultAheadEnabled() && size != 0) {
+        page_watches.ClearExclusions(VideoCore::PageManager::GetPageAddr(address),
+                                    VideoCore::PageManager::GetNextPageAddr(address + size - 1));
+    }
     {
         std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
         for (auto it = regions.begin(); it != regions.end();) {
@@ -9364,9 +11849,80 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
         std::erase_if(page_snapshots, [&](const auto& snapshot) {
             return snapshot.first >= address && snapshot.first < address + size;
         });
+        std::erase_if(cpu_recent_pages, [&](const auto& entry) {
+            return entry.first < address + size && entry.first + 4096 > address;
+        });
+        std::erase_if(ahead_pages, [&](VAddr page) {
+            return page < address + size && page + 4096 > address;
+        });
+        std::erase_if(remapped_pages, [&](VAddr page) {
+            return page < address + size && page + 4096 > address;
+        });
+        std::erase_if(fault_chunks, [&](const auto& entry) {
+            return entry.first < address + size && entry.first + 64_KB > address;
+        });
+        std::erase_if(downloaded_ranges, [&](const auto& entry) {
+            return entry.first < address + size && entry.first + 4096 > address;
+        });
     }
     ++buffer_generation;        // OPT-003
+    ++buffer_hard_generation;   // PERF-GT7-047: invalidates even disjoint memos
     ++unmap_generation;         // OPT-002
+}
+
+void NativeRenderer::OnNewMapping(VAddr address, u64 size) {
+    if (!size) return;
+    std::scoped_lock lock{mutex};
+    CancelLinearDownloads(address, size);
+    std::optional<std::vector<Native::MappingRefreshRange>> plan;
+    std::unordered_set<VAddr> prepared_pages;
+    try {
+        plan = Native::PlanMappingRefresh(regions, address, size);
+        if (!plan) {
+            UNREACHABLE_MSG("new guest mapping is not safely page aligned");
+            std::terminate();
+        }
+        for (const auto& range : *plan) {
+            auto& region = regions.at(range.region);
+            const auto count = (range.end - range.first) / 4096;
+            Native::ReserveAdditional(region.dirty_pages, count);
+            for (VAddr page = range.first; page < range.end; page += 4096)
+                prepared_pages.insert(page);
+        }
+        {
+            std::scoped_lock dirty_lock{region_dirty_mutex};
+            remapped_pages.reserve(remapped_pages.size() + prepared_pages.size());
+        }
+        Native::ReserveAdditional(retired_watch_ranges, mirrors.size());
+    } catch (...) {
+        UNREACHABLE_MSG("new guest mapping refresh preflight failed");
+        std::terminate();
+    }
+    // Notification follows a successful guest mapping. Old aliases imported in the
+    // unmap/map gap stay leased until the GPU completes their actual submission.
+    if (auto* direct = r.buffer_cache.GetDirectMemory()) direct->OnUnmap(address, size);
+    {
+        std::scoped_lock dirty_lock{region_dirty_mutex};
+        for (const auto& range : *plan) {
+            auto& region = regions.at(range.region);
+            for (VAddr page = range.first; page < range.end; page += 4096) {
+                region.dirty_pages.push_back(page);
+                region.cpu_pages->erase(page);
+                region.gpu_pages->erase(page);
+                page_snapshots.erase(page);
+                cpu_recent_pages.erase(page);
+                ahead_pages.erase(page);
+                downloaded_ranges.erase(page);
+            }
+            region.dirty_sorted = false;
+        }
+        remapped_pages.merge(prepared_pages);
+    }
+    DropMirrors(address, size, MirrorUnmapDrop);
+    ++buffer_generation;
+    ++buffer_hard_generation;
+    ++unmap_generation;
+    registry->InvalidateNewMapping(address, size);
 }
 
 void NativeRenderer::WatchBind(const Native::ImageEntry& entry, const AmdGpu::Image& tsharp,
@@ -9695,6 +12251,57 @@ void NativeRenderer::EvictImages() {
         return true;
     };
     trace.Next(2);
+    // PERF-GT7-005: textures the game loaded stay past their idle time, the most recently used
+    // first, up to a budget (RYGT_NATIVE_KEEP_TEXTURES_MB, 2048; 0 as before). Their pages are
+    // watched, so a CPU write or an unmap still uploads them again at their next use. GT7's
+    // license tests left the track's textures unused for over 4 s while a retry reloaded, and
+    // at ~4 s into the next attempt 50-120 MB of them were made and uploaded again.
+    static const u64 texture_budget = [] {
+        const char* env = std::getenv("RYGT_NATIVE_KEEP_TEXTURES_MB");
+        return (env && *env ? std::strtoull(env, nullptr, 10) : u64{2048}) << 20;
+    }();
+    // PERF-GT7-011: only textures the game loaded and left alone: uploaded at most twice, never
+    // rewritten by GPU work nor made of targets, and at most 4 at one address. Keeping every idle
+    // texture kept those GT7 makes in its scratch pool (0x100a0b0000, a new layout every few
+    // frames, rewritten by compute passes): 2,600 pictures at that one address after 19 minutes,
+    // walked by every lookup, CPU write and GPU write there (ImageRegistry::Find took 5% of the
+    // recorder; 2.5 million textures made stale by CPU writes every 10 s).
+    const auto loaded_texture = [](Native::ImageEntry& entry) {
+        if (entry.total_uploads.load(std::memory_order_relaxed) > 2 ||
+            entry.force_upload.load(std::memory_order_relaxed) ||
+            entry.gpu_backing_written.load(std::memory_order_acquire) ||
+            entry.foreign_clock.load(std::memory_order_relaxed) != 0) {
+            return false;
+        }
+        std::scoped_lock lock{entry.sources_mutex};
+        return entry.sources.empty();
+    };
+    std::unordered_set<const Native::ImageEntry*> kept_textures;
+    if (texture_budget != 0) {
+        std::vector<Native::ImageEntry*> idle;
+        registry->ForEachOverlapping(0, ~VAddr{0}, [&](Native::ImageEntry& entry) {
+            if (entry.from_cpu && entry.image &&
+                entry.last_use.load(std::memory_order_relaxed) < frame - KeepFrames) {
+                idle.push_back(&entry);
+            }
+        });
+        std::ranges::sort(idle, std::greater{}, [](const Native::ImageEntry* entry) {
+            return entry->last_use.load(std::memory_order_relaxed);
+        });
+        std::unordered_map<VAddr, u32> kept_at;
+        u64 bytes = 0;
+        for (Native::ImageEntry* entry : idle) {
+            if (!loaded_texture(*entry) || kept_at[entry->info.guest_address] >= 4) {
+                continue;
+            }
+            bytes += std::max<u64>(entry->info.guest_size, 1);
+            if (bytes > texture_budget) {
+                break;
+            }
+            ++kept_at[entry->info.guest_address];
+            kept_textures.insert(entry);
+        }
+    }
     registry->Evict(frame - KeepFrames, [&](Native::ImageEntry& entry) {
         retired_watch_ranges.emplace_back(
             VideoCore::PageManager::GetPageAddr(entry.info.guest_address),
@@ -9725,13 +12332,17 @@ void NativeRenderer::EvictImages() {
         held_versions.erase(&entry);
         std::erase(stream.written, &entry);
         std::erase(writebacks, &entry);
+        pending_linear_downloads.erase(&entry);
+        std::erase(frame_writebacks, &entry);
         std::erase(dump_entries, &entry);
         for (auto it = stencil_owners.begin(); it != stencil_owners.end();) {
             auto& owners = it->second;
             owners.erase(std::remove(owners.begin(), owners.end(), &entry), owners.end());
             it = owners.empty() ? stencil_owners.erase(it) : std::next(it);
         }
-    }, keep, 16);
+    }, [&](Native::ImageEntry& entry) {
+        return kept_textures.contains(&entry) || keep(entry);
+    }, 16);
     if (newly_kept != 0) {
         static std::atomic<u32> logged{};
         if (const u32 n = logged++; n < 20 || n % 100 == 0) {
@@ -9762,6 +12373,7 @@ void NativeRenderer::UnwatchPages(VAddr begin, VAddr end) {
 }
 
 void NativeRenderer::ReleaseUnusedWatches() {
+    std::scoped_lock watch_lock{fill_watch_mutex};
     Native::SlowCallTrace<2> trace{true, "retired-page-watches", {"live-ranges", "unwatch"}};
     if (retired_watch_ranges.empty()) {
         return;
@@ -9793,6 +12405,9 @@ void NativeRenderer::ReleaseUnusedWatches() {
             retain(entry.info.guest_address,
                    entry.info.guest_address + std::max<u64>(entry.info.guest_size, 1));
         });
+        for (const auto& [base, limit] : registry->RecentFillRanges()) {
+            retain(base, limit);
+        }
         for (const auto& [base, region] : regions) {
             retain(region.begin, region.end);
         }
@@ -9826,6 +12441,47 @@ void NativeRenderer::OnCpuStack(VAddr address, u64 size) {
     has_pending_region_writes.store(true, std::memory_order_release);
     OnCpuWrite(address, size, 0);
 }
+void NativeRenderer::FaultAhead(VAddr begin, VAddr end) {
+    if (!FaultAheadEnabled() || !NativeRegionWritebackEnabled() || !writeback_pipeline) return;
+    const VAddr chunk = begin & ~VAddr{0xffff};
+    if (end > chunk + 64_KB) return;
+    const u64 now = shared_frame.load(std::memory_order_relaxed);
+    {
+        std::scoped_lock lock{region_dirty_mutex};
+        if (fault_chunks.size() >= 65536) fault_chunks.clear();
+        auto [it, first] = fault_chunks.try_emplace(chunk, now);
+        const bool recent = !first && now >= it->second && now - it->second <= 8;
+        it->second = now;
+        if (!recent) return;
+    }
+    std::shared_lock map_lock{buffer_map_mutex};
+    const Region* region = RegionOver(begin, 4096);
+    if (!region) return;
+    const VAddr from = std::max(chunk, region->begin), to = std::min(chunk + 64_KB, region->end);
+    for (VAddr page = from; page + 4096 <= to; page += 4096) {
+        if (page >= begin && page < end) continue;
+        page_watches.CaptureAndUntrack(page, [&] {
+                std::scoped_lock lock{region_dirty_mutex};
+                const auto it = cpu_recent_pages.find(page);
+                if (it == cpu_recent_pages.end() || now < it->second || now - it->second > 600)
+                    return false;
+                if (!page_snapshots.contains(page)) {
+                    auto copy = std::make_unique<std::array<u8, 4096>>();
+                    if (!Native::CopyPageWithoutFault(copy->data(), reinterpret_cast<void*>(page), 4096))
+                        return false;
+                    page_snapshots.emplace(page, std::move(copy));
+                }
+                ahead_pages.insert(page);
+                return true;
+            }, [&](VAddr address, u64 bytes) {
+                r.page_manager.UpdatePageWatchers(address, bytes, VideoCore::PageOp::Untrack);
+                std::scoped_lock lock{region_dirty_mutex};
+                pending_region_writes.emplace_back(address, address + bytes);
+                has_pending_region_writes.store(true, std::memory_order_release);
+        });
+    }
+}
+
 void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
     // The written pages stop being watched (so they open up and the write goes on), and the
     // textures over them are uploaded again when next used (which watches them again).
@@ -9863,8 +12519,9 @@ void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
             }
         }
     }
-    UnwatchPages(begin, end);
     {
+        std::scoped_lock watch_lock{fill_watch_mutex};
+        UnwatchPages(begin, end);
         Native::UploadCause::ScopedCpuFault cause{address,size,exact};
         registry->CpuWrite(begin, end - begin, exact != 0 ? (address - begin) + exact : 0);
     }
@@ -9876,6 +12533,7 @@ void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
         pending_region_writes.emplace_back(begin, end);
     }
     has_pending_region_writes.store(true, std::memory_order_release);
+    FaultAhead(begin, end);
 }
 
 u32 NativeRenderer::ReadGds(u32 gds_offset) {
@@ -9929,16 +12587,35 @@ void NativeRenderer::Splice() {
         }
     }
     if (!wrapped) {
-        const vk::CommandBuffer secondary = s.cmd;
-        r.scheduler.CommandBuffer().executeCommands(secondary);
+        r.scheduler.CommandBuffer().executeCommands(s.cmd);
     }
     const u64 tick = r.scheduler.CurrentTick();
+    if (!s.remembered_fill_receipts.empty()) {
+        // Keep the stream owners until queueing succeeds: allocation failure in
+        // the scheduler must not retire a receipt for work already enqueued.
+        Native::EnqueueRetainedReceipts(s.remembered_fill_receipts, [&](auto receipts) {
+            r.scheduler.DeferPriorityOperationAt(std::max(tick, boundary_signal),
+                [receipts = std::move(receipts)] {
+                    for (const auto& receipt : receipts) receipt->Complete();
+                });
+        });
+    }
     if (!wrapped) {
         device->MarkExecuted(s.list, {timeline.get(), tick});
     }
+    const u64 retire_tick = std::max(tick, boundary_signal);
+    retired_pipeline_owners.Retire(retire_tick);
+    retired_pipeline_owners.Collect(r.scheduler.GetWorkSemaphore()->KnownGpuTick(),
+        [&](auto owners) { r.pipeline_cache.ReleaseCompletedPipelineOwners(std::move(owners)); });
+    retired_writeback_plans.Retire(s.writeback_plan_leases, retire_tick);
+    retired_writeback_plans.Collect(r.scheduler.GetWorkSemaphore()->KnownGpuTick());
+    if (auto* direct = r.buffer_cache.GetDirectMemory()) {
+        direct->RetireLeasesAfterSplice(s.imported_view_leases, retire_tick);
+        direct->ReleaseHeldAfterSplice(retire_tick);
+    }
     {
         std::scoped_lock chunk_lock{chunk_mutex};
-        RetireUploadChunks(s.chunks, retiring_chunks, s.chunk_used, tick, ChunkSize);
+        RetireUploadChunks(s.chunks, retiring_chunks, s.chunk_used, tick, ChunkSize());
         for (const auto pool : s.pools) {
             retiring_pools.emplace_back(tick, pool);
         }
@@ -9961,11 +12638,16 @@ void NativeRenderer::Splice() {
         }
     }
     s.pools.clear();
+    for (auto& snapshot : s.pooled_snapshots) {
+        if (!snapshot_pool.Retire(snapshot, std::max(tick, boundary_signal)))
+            s.keep.push_back(std::move(snapshot));
+    }
+    s.pooled_snapshots.clear();
     s.keep.clear(); // freed by the device once the GPU ran this list (NAT-107)
     device->Collect(); // objects the GPU finished with (staging buffers of uploads)
     s.wrapped_list.reset();
     s.list = nullptr;
-    s.cmd = vk::CommandBuffer{};
+    s.cmd = CmdBuf{};
     s.rendering = false;
 #if !defined(NDEBUG)
     if(auto* sidecar=FindParallelRuntime(this);sidecar && sidecar->transfer_mode_controller && !sidecar->closing) {
@@ -10115,7 +12797,26 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         }
         ++in_place.frames;
     }
+    for (auto* entry : frame_writebacks) {
+        if (std::ranges::find(writebacks, entry) == writebacks.end()) {
+            writebacks.push_back(entry);
+        }
+    }
+    frame_writebacks.clear();
     ++frame;
+    TrimIdleChunks();
+    {
+        std::scoped_lock watch_lock{fill_watch_mutex};
+        const auto expired = registry->RecentFillRanges();
+        for (const auto& [begin, end] : expired) {
+            retired_watch_ranges.emplace_back(VideoCore::PageManager::GetPageAddr(begin),
+                VideoCore::PageManager::GetNextPageAddr(end - 1));
+        }
+        retired_watch_ranges.insert(retired_watch_ranges.end(), fill_watched_ranges.begin(),
+                                    fill_watched_ranges.end());
+        fill_watched_ranges.clear();
+        registry->ExpireRecentFills(frame);
+    }
     shared_frame.store(frame, std::memory_order_relaxed); // OPT-010
     // The game's render target there (its layout from the CB registers may differ in details
     // from the video out description), else an image of the display layout.
@@ -10140,6 +12841,9 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     if (!entry || !entry->image) {
         return std::nullopt;
     }
+    // An uncropped display returns the original entry without the crop path's
+    // admission step. Refresh a dirty CPU-backed display before presentation too.
+    ApplyRewrite(*entry);
     const auto* source = CropDisplay(*entry, {info.size.width, info.size.height});
     if (!source) {
         return std::nullopt;
@@ -10152,7 +12856,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         return std::nullopt;
     }
     // A display buffer nothing drew into yet starts in the general layout too.
-    if (device->PendingImageInit()) {
+    if (device->PendingImageInit() || registry->HasPendingUploads()) {
         Begin();
         PrepareImages();
     }
@@ -10284,6 +12988,7 @@ void NativeRenderer::VerifyMirrors() {
     }
     if (changed != 0) {
         ++buffer_generation; // OPT-003: memos see the dirty pages
+        ++buffer_hard_generation; // PERF-GT7-047
     }
 #endif
 }

@@ -1162,6 +1162,13 @@ void Translator::EmitFetch(const GcnInst& inst) {
     info.fetch_shader_sgpr_base = code_sgpr_base;
     ASSERT(ParseFetchShader(info, fetch_data));
     info.translated_fetch_shader = std::make_shared<const FetchShaderData>(fetch_data);
+    if (info.pin_fetch_sharps) {
+        for (const auto& attrib : fetch_data.attributes) {
+            info.pinned_fetch_sharps.push_back(
+                {attrib.sgpr_base, attrib.dword_offset,
+                 info.ReadUdReg<AmdGpu::Buffer>(attrib.sgpr_base, attrib.dword_offset)});
+        }
+    }
 
 #ifndef NDEBUG
     if (EmulatorSettings.IsDumpShaders()) {
@@ -1183,7 +1190,7 @@ void Translator::EmitFetch(const GcnInst& inst) {
         IR::VectorReg dst_reg{attrib.dest_vgpr};
 
         // Read the V# of the attribute to figure out component number and type.
-        const auto buffer = attrib.GetSharp(info);
+        const auto buffer = attrib.GetSharpForCode(info);
         const auto values =
             ir.CompositeConstruct(ir.GetAttribute(attr, 0), ir.GetAttribute(attr, 1),
                                   ir.GetAttribute(attr, 2), ir.GetAttribute(attr, 3));

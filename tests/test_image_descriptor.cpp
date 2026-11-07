@@ -39,6 +39,7 @@ AmdGpu::Image MakeImage(AmdGpu::ImageType type = AmdGpu::ImageType::Color2D) {
     image.width = 1023;
     image.height = 511;
     image.pitch = 1023;
+    image.tiling_index = u64(AmdGpu::TileMode::Thin1DThin);
     image.last_level = 10;
     return image;
 }
@@ -65,6 +66,7 @@ TEST(ImageDescriptorGeometry, AcceptsValidArrayAndCubeGeometryAtDeviceLimits) {
     EXPECT_EQ(CheckImageDescriptorGeometry(image, MakeLimits()),
               ImageDescriptorGeometryError::None);
     image.type = u64(AmdGpu::ImageType::Cube);
+    image.height = image.width;
     image.depth = 255;
     image.pow2pad = true;
     ASSERT_EQ(image.NumLayers(), 2048u);
@@ -120,12 +122,22 @@ TEST(ImageDescriptorGeometry, RequiresLegalFullMipChainAndViewOrdering) {
 
 TEST(ImageDescriptorGeometry, AcceptsSupportedGuestSamplesAndRejectsInvalidExponents) {
     auto image = MakeImage(AmdGpu::ImageType::Color2DMsaa);
+    image.tiling_index = u64(AmdGpu::TileMode::Thin1DThin);
     image.last_level = 4;
     EXPECT_EQ(CheckImageDescriptorGeometry(image, MakeLimits()),
               ImageDescriptorGeometryError::None);
     image.last_level = 5;
     EXPECT_EQ(CheckImageDescriptorGeometry(image, MakeLimits()),
               ImageDescriptorGeometryError::SampleCount);
+}
+
+TEST(ImageDescriptorGeometry, RejectsSixteenSampleMacroTiles) {
+    auto image = MakeImage(AmdGpu::ImageType::Color2DMsaa);
+    image.tiling_index = u64(AmdGpu::TileMode::Thin2DThin);
+    image.last_level = 3;
+    EXPECT_EQ(CheckImageDescriptorGeometry(image, MakeLimits()), ImageDescriptorGeometryError::None);
+    image.last_level = 4;
+    EXPECT_EQ(CheckImageDescriptorGeometry(image, MakeLimits()), ImageDescriptorGeometryError::SampleCount);
 }
 
 TEST(ImageDescriptorGeometry, RejectsNonTextureDescriptorTypes) {
@@ -137,7 +149,7 @@ TEST(ImageDescriptorGeometry, RejectsNonTextureDescriptorTypes) {
     }
 }
 
-TEST(ImageDescriptorGeometry, RejectsGuestSizeAboveFourGiB) {
+TEST(ImageDescriptorGeometry, RejectsNonSquareStaleCubeDescriptor) {
     // GT Sport stale-table descriptor that preceded a device loss.
     auto image = MakeImage(AmdGpu::ImageType::Cube);
     image.width = 0;
@@ -149,7 +161,7 @@ TEST(ImageDescriptorGeometry, RejectsGuestSizeAboveFourGiB) {
     image.data_format = u64(AmdGpu::DataFormat::Format2_10_10_10);
     ASSERT_EQ(image.NumLayers(), 8u);
     EXPECT_EQ(CheckImageDescriptorGeometry(image, MakeLimits()),
-              ImageDescriptorGeometryError::GuestSizeLimit);
+              ImageDescriptorGeometryError::CubeNotSquare);
 }
 
 TEST(ImageDescriptorGeometry, AcceptsLargeRealisticTextures) {

@@ -62,6 +62,7 @@ ImageInfo::ImageInfo(const Libraries::VideoOut::BufferAttributeGroup& group,
 ImageInfo::ImageInfo(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint) noexcept {
     props = ImageProperties{
         .is_tiled = buffer.IsTiled(),
+        .is_bgr_packed_float = buffer.info.format == u32(AmdGpu::DataFormat::Format11_11_10),
     };
     tile_mode = buffer.GetTileMode();
     array_mode = AmdGpu::GetArrayMode(tile_mode);
@@ -142,6 +143,7 @@ ImageInfo::ImageInfo(const AmdGpu::Image& sharp, const Shader::ImageResource& de
         .is_pow2 = static_cast<u32>(image.pow2pad),
         .is_block = AmdGpu::IsBlockCoded(data_fmt),
         .is_depth = is_depth,
+        .is_bgr_packed_float = image.data_format == u64(AmdGpu::DataFormat::Format11_11_10),
     };
     size.width = image.width + 1;
     size.height = image.height + 1;
@@ -160,7 +162,8 @@ ImageInfo::ImageInfo(const AmdGpu::Image& sharp, const Shader::ImageResource& de
 }
 
 bool ImageInfo::IsCompatible(const ImageInfo& info) const {
-    return (IsVulkanFormatCompatible(pixel_format, info.pixel_format) ||
+    return PackedOrdersCompatible(info) &&
+           (IsVulkanFormatCompatible(pixel_format, info.pixel_format) ||
             IsVulkanFormatCompatible(info.pixel_format, pixel_format)) &&
            num_samples == info.num_samples && num_bits == info.num_bits;
 }

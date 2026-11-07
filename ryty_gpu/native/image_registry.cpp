@@ -17,6 +17,7 @@
 #include "video_core/amdgpu/tiling.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/texture_cache/tiling_specialization.h"
+#include "video_core/texture_cache/packed_float.h"
 #include <array>
 #include <cstdlib>
 #include <xxhash.h>
@@ -43,6 +44,8 @@ struct TilingParams {
     u32 micro_tiled_mips;
     u32 num_mips;
     std::array<VideoCore::MipInfo, VideoCore::MAX_MIPS> mips;
+    std::array<u32, VideoCore::MAX_MIPS> valid_width;
+    std::array<u32, VideoCore::MAX_MIPS> valid_height;
 };
 
 Rhi::Format ToRhi(vk::Format format) {
@@ -193,7 +196,7 @@ bool SameLayout(const VideoCore::ImageInfo& a, const VideoCore::ImageInfo& b) {
         a.array_mode != b.array_mode || a.bank_swizzle != b.bank_swizzle ||
         a.alt_tile != b.alt_tile || a.resources != b.resources ||
         a.num_samples != b.num_samples || a.props.is_depth != b.props.is_depth ||
-        a.props.is_block != b.props.is_block || a.type != b.type) {
+        a.props.is_block != b.props.is_block || !a.PackedOrdersCompatible(b) || a.type != b.type) {
         return false;
     }
     // Equal dimensions do not imply equal byte offsets or padded mip footprints.
@@ -303,7 +306,8 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                     (c.size != info.size || c.resources != info.resources || SameLayout(c, info)) &&
                     c.num_bits == info.num_bits &&
                     c.num_samples == 1 && !c.props.is_depth && c.type == info.type &&
-                    c.pixel_format == info.pixel_format && c.resources.levels == 1 &&
+                    c.pixel_format == info.pixel_format &&
+                    c.PackedOrdersCompatible(info) && c.resources.levels == 1 &&
                     c.resources.layers == 1 && c.size.width >= info.size.width &&
                     c.size.height >= info.size.height &&
                     (!largest || u64(c.size.width) * c.size.height >
@@ -319,6 +323,9 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
 #ifndef NDEBUG
                     ++stats.reused_larger;
 #endif
+                    // The old smaller target will no longer receive the draws.
+                    // Make later texture lookups resolve to the larger picture.
+                    if (exact) MarkReused(*exact);
                 }
                 largest->last_use.store(frame, std::memory_order_relaxed);
                 return largest;
@@ -381,6 +388,7 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
                     (c.size != info.size || c.resources != info.resources || SameLayout(c, info)) &&
                     c.num_bits == info.num_bits &&
                     c.num_samples == info.num_samples && c.props.is_depth == info.props.is_depth &&
+                    c.PackedOrdersCompatible(info) &&
                     c.props.has_stencil == info.props.has_stencil && c.type == info.type &&
                     c.resources.levels >= info.resources.levels &&
                     c.resources.layers >= info.resources.layers &&
@@ -436,6 +444,9 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
     }
     entry->last_use.store(frame, std::memory_order_relaxed);
     ImageEntry* result;
+    bool remembered = false;
+    // A CPU invalidation must see either the journal entry or the fully indexed target.
+    std::unique_lock fill_lock{recent_fills_mutex};
     {
         std::unique_lock lock{shard.mutex};
         // Another thread may have made it meanwhile.
@@ -452,12 +463,29 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
             }
         }
         result = entry.get();
+        static const bool remember_fills = [] {
+            const char* env = std::getenv("RYGT_NATIVE_FILL_NEW_TARGETS");
+            return !(env && env[0] == '0');
+        }();
+        if (render_target && info.num_samples == 1 && remember_fills) {
+            if (auto fill = recent_fills.Find(info.guest_address, info.guest_size, frame)) {
+                result->rewrite = ImageEntry::Rewrite::Clear;
+                result->rewrite_pattern = fill->pattern;
+                result->rewrite_bytes = info.guest_size;
+                result->rewrite_clock = fill->clock;
+                result->remembered_fill_pending = true;
+                result->remembered_fill_receipt =
+                    std::make_shared<RememberedFillReceipt>(remembered_fill_count);
+                remembered = true;
+            }
+        }
         shard.images.emplace(info.guest_address, std::move(entry));
+        IndexEntry(*result);
         const std::pair<VAddr, VAddr> range{info.guest_address,
                                             info.guest_address + std::max<u64>(info.guest_size, 1)};
         NoteChanges({&range, 1}); // OPT-002, OPT-010
     }
-    IndexEntry(*result);
+    fill_lock.unlock();
 #ifndef NDEBUG
     if (WatchedTexture(info.guest_address, info.guest_address + 1)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: made {} {:#x} {}x{} mips {} ({:#x} bytes); "
@@ -475,7 +503,7 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         // that draws part of it leaves the rest as it was). GT Sport draws its 16x16 brightness
         // grid into a 64x16 target the CPU reads back for the exposure: the undrawn part went
         // back to memory as uninitialized video memory, and the picture came out too dark.
-        if (info.num_samples == 1) {
+        if (info.num_samples == 1 && !remembered) {
             result->needs_upload.store(true, std::memory_order_relaxed);
             result->force_upload.store(true, std::memory_order_relaxed);
             std::scoped_lock lock{upload_mutex};
@@ -554,18 +582,27 @@ ImageEntry* ImageRegistry::FindExisting(VAddr address,
 
 SourcePlace PlaceOf(const VideoCore::ImageInfo& target, const VideoCore::ImageInfo& texture) {
     if (target.props.is_depth || texture.props.is_depth || target.props.is_block ||
-        texture.props.is_block || target.num_bits != texture.num_bits ||
+        texture.props.is_block || !target.PackedOrdersCompatible(texture) ||
+        target.num_bits != texture.num_bits ||
         target.num_samples != texture.num_samples) {
         return {};
     }
     // A crop: the texture is the corner of the target in the same layout (as IsSubrectOf, any
     // colour format of the texel size).
-    if (target.guest_address == texture.guest_address && target.resources.levels == 1 &&
+    static const bool crop_of_mips = [] {
+        const char* env = std::getenv("RYGT_NATIVE_CROP_OF_MIPS");
+        return !(env && env[0] == '0');
+    }();
+    if (target.guest_address == texture.guest_address &&
+        (target.resources.levels == 1 || crop_of_mips) &&
         target.resources.layers == 1 && texture.resources.levels == 1 &&
         texture.resources.layers == 1 && target.pitch == texture.pitch &&
-        target.tile_mode == texture.tile_mode && target.bank_swizzle == texture.bank_swizzle &&
+        target.tile_mode == texture.tile_mode && target.array_mode == texture.array_mode &&
+        ((target.micro_tiled_mips ^ texture.micro_tiled_mips) & 1u) == 0 &&
+        target.bank_swizzle == texture.bank_swizzle &&
         target.alt_tile == texture.alt_tile &&
         target.mips_layout[0].pitch == texture.mips_layout[0].pitch &&
+        target.mips_layout[0].offset == texture.mips_layout[0].offset &&
         texture.size.width <= target.size.width && texture.size.height <= target.size.height &&
         (texture.size.width < target.size.width || texture.size.height < target.size.height) &&
         target.size.depth == 1 && texture.size.depth == 1 &&
@@ -821,6 +858,8 @@ u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_
             UnindexEntry(*entry);
         }
     }
+    // Pending receipts without a submitted stream retire with their entry. Submitted
+    // receipts remain owned by the scheduler until the graphics tick completes.
     {
         std::scoped_lock lock{upload_mutex};
         std::erase_if(pending_uploads, [&](ImageEntry* entry) { return gone.contains(entry); });
@@ -895,30 +934,93 @@ void ImageRegistry::MarkStale(ImageEntry& entry, Stale why) {
         }
     }
 #endif
-    // All large CPU-texture invalidations wait for actual image use. In particular,
+    // CPU-texture invalidations of every size wait for actual image use. In particular,
     // OnUnmap runs before guest memory is released: eagerly queuing here re-imports
     // and uploads a discarded texture while the unmapping thread waits for us.
     // Preserve dirty/force flags so a later use after remapping still refreshes it.
+    // Small discarded font images can share pages with a subsequently created
+    // fiber stack. An unrelated flush must not refresh them and re-arm a write
+    // watch there. Actual bindings (including memo hits) admit their dirty image.
     // Explicit RequestUpload separately admits its required rewrite immediately.
-    const bool defer = entry.from_cpu && entry.info.guest_size >= (4ull << 20);
+    const bool defer = entry.from_cpu;
     if (!already_dirty && !defer) {
         std::scoped_lock upload_lock{upload_mutex};
         pending_uploads.push_back(&entry);
     }
 }
 
+void ImageRegistry::ForgetFillHistory(VAddr address, u64 size, const ImageEntry* authoritative) {
+    std::scoped_lock lock{recent_fills_mutex};
+    recent_fills.Forget(address, size);
+    if (!authoritative || remembered_fill_count->load(std::memory_order_relaxed) == 0 ||
+        size == 0 || size > ~u64{0} - address) return;
+    // A different target cannot apply an older remembered clear after this
+    // image write. Retire it from future lookups; its in-flight image stays alive.
+    ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
+        if (&entry != authoritative && !entry.from_cpu && entry.remembered_fill_receipt &&
+            entry.remembered_fill_receipt->live.load(std::memory_order_acquire)) {
+            MarkReused(entry);
+        }
+    });
+}
+
+void ImageRegistry::ForgetFills(VAddr address, u64 size) {
+    std::scoped_lock lock{recent_fills_mutex};
+    recent_fills.Forget(address, size);
+    if (remembered_fill_count->load(std::memory_order_relaxed) == 0 || size == 0 ||
+        size > ~u64{0} - address) return;
+    ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
+        if (entry.remembered_fill_receipt &&
+            entry.remembered_fill_receipt->live.load(std::memory_order_acquire)) {
+            entry.remembered_fill_invalid = true;
+            MarkStale(entry, Stale::GpuWrite);
+        }
+    });
+}
+
+std::vector<std::pair<VAddr, VAddr>> ImageRegistry::RecentFillRanges() {
+    std::scoped_lock lock{recent_fills_mutex};
+    return recent_fills.Ranges();
+}
+
+void ImageRegistry::ExpireRecentFills(u64 frame) {
+    std::scoped_lock lock{recent_fills_mutex};
+    recent_fills.Expire(frame);
+}
+
+ImageRegistry::FillClaim ImageRegistry::ClaimRememberedFill(ImageEntry& entry) {
+    std::scoped_lock lock{recent_fills_mutex};
+    if (!entry.remembered_fill_pending) return {};
+    entry.remembered_fill_pending = false;
+    return {!entry.remembered_fill_invalid, entry.remembered_fill_receipt};
+}
+
 void ImageRegistry::Invalidate(VAddr address, u64 size, Stale why) {
+    std::scoped_lock fill_lock{recent_fills_mutex};
+    recent_fills.Forget(address, size);
     ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
         if (entry.from_cpu) {
             MarkStale(entry, why);
         } else {
             entry.guest_modified.store(true, std::memory_order_seq_cst);
+            if (entry.remembered_fill_receipt &&
+                entry.remembered_fill_receipt->live.load(std::memory_order_acquire)) {
+                entry.remembered_fill_invalid = true;
+                MarkStale(entry, why);
+            }
             // Unmapping ends the allocation's lifetime, even before it was kept.
             // Retire it from lookup without destroying resources still in flight.
             if (why == Stale::Unmap || entry.kept.load(std::memory_order_seq_cst)) {
                 MarkReused(entry); // FIX-157
             }
         }
+    });
+}
+
+void ImageRegistry::InvalidateNewMapping(VAddr address, u64 size) {
+    ForgetFills(address, size);
+    ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
+        if (entry.from_cpu) MarkStale(entry, Stale::Unmap);
     });
 }
 
@@ -965,8 +1067,48 @@ bool ImageRegistry::MemoryUnchanged(const ImageEntry& entry) {
     return hash == entry.content_hash;
 }
 
+static bool LayerSamplesEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_LAYER_SAMPLES");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
+
+static bool LayerWholeHashEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_LAYER_HASH");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
+
+bool ImageRegistry::LayersRewritten(ImageEntry& entry, u64 frame) {
+    const bool samples = LayerSamplesEnabled();
+    const bool whole = LayerWholeHashEnabled();
+    const u64 size = entry.info.guest_size;
+    const u32 layers = entry.info.resources.layers;
+    if (!samples || !entry.from_cpu || layers < 16 || size <= (4ull << 20) ||
+        size % layers != 0 || entry.gpu_backing_written.load(std::memory_order_acquire) ||
+        !memory_clamp || memory_clamp(entry.info.guest_address, size) != size) return false;
+    const u64 layer_size = size / layers;
+    const bool changed = entry.layer_hash.Changed(layers, layer_size, frame,
+        [&](u32 layer, u64 offset, u64 bytes) {
+            return Core::HashGuestBytes(entry.info.guest_address + layer * layer_size + offset, bytes);
+        }, samples, whole);
+    if (changed) MarkStale(entry, Stale::CpuWrite);
+    return changed;
+}
+
 void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern,
-                             bool exact, u64 clock) {
+                             bool exact, u64 clock, u64 frame, bool guest_authoritative) {
+    {
+        std::scoped_lock lock{recent_fills_mutex};
+        recent_fills.Forget(address, size);
+        if (pattern && guest_authoritative) {
+            recent_fills.Record(address, size, *pattern, frame, clock);
+        }
+    }
 #ifndef NDEBUG
     if (WatchedTexture(address, address + std::max<u64>(size, 1)) && WatchSample()) {
         static const bool dump_on_fill = std::getenv("RYGT_FRAME_DUMP_ON_FILL") != nullptr;
@@ -997,6 +1139,13 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
                 entry.rewrite_pattern = *pattern;
                 entry.rewrite_bytes = entry.info.guest_size;
                 entry.rewrite_clock = clock;
+                // A later CPU write of the old bytes must upload them, rather
+                // than matching the hash from before this GPU fill.
+                static const bool forget_hash = [] {
+                    const char* env = std::getenv("RYGT_NATIVE_FILL_FORGETS_HASH");
+                    return !(env && env[0] == '0');
+                }();
+                if (forget_hash) entry.content_hash = 0;
                 return;
             }
             bool made_of_targets;
@@ -1102,6 +1251,8 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
 }
 
 void ImageRegistry::CpuWrite(VAddr address, u64 size, u64 exact) {
+    std::scoped_lock fill_lock{recent_fills_mutex};
+    recent_fills.Forget(address, size);
 #ifndef NDEBUG
     if (WatchedTexture(address, address + size)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: CPU write {:#x}+{:#x} (exact {:#x})", address,
@@ -1113,6 +1264,12 @@ void ImageRegistry::CpuWrite(VAddr address, u64 size, u64 exact) {
     ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
         if (!entry.from_cpu) {
             entry.guest_modified.store(true, std::memory_order_seq_cst);
+            if (entry.remembered_fill_receipt &&
+                entry.remembered_fill_receipt->live.load(std::memory_order_acquire)) {
+                entry.remembered_fill_invalid = true;
+                entry.force_upload.store(true, std::memory_order_relaxed);
+                MarkStale(entry, Stale::CpuWrite);
+            }
             if (entry.kept.load(std::memory_order_seq_cst)) {
                 MarkReused(entry); // FIX-157
             }
@@ -1178,6 +1335,8 @@ std::unique_ptr<Rhi::Buffer> ImageRegistry::TilingParamsBuffer(const VideoCore::
     for (u32 mip = 0; mip < params.num_mips; ++mip) {
         auto& mip_info = params.mips[mip];
         mip_info = info.mips_layout[mip];
+        params.valid_width[mip] = std::max(info.size.width >> mip, 1u);
+        params.valid_height[mip] = std::max(info.size.height >> mip, 1u);
         if (info.props.is_block) {
             mip_info.pitch = std::max<u16>((mip_info.pitch + 3) / 4, 1U);
             mip_info.height = std::max<u16>((mip_info.height + 3) / 4, 1U);
@@ -1188,7 +1347,9 @@ std::unique_ptr<Rhi::Buffer> ImageRegistry::TilingParamsBuffer(const VideoCore::
 }
 
 const Rhi::Pipeline* ImageRegistry::TilingPipeline(const VideoCore::ImageInfo& info, bool tiler) {
-  const u64 key = VideoCore::TilingPipelineKey(info, tiler);
+  const u64 key = VideoCore::NativePackedTilingKey(VideoCore::TilingPipelineKey(info, tiler),
+                                                    info.props.is_bgr_packed_float,
+                                                    info.props.is_tiled);
   std::scoped_lock lock{untile_mutex};
   if (const auto it = untile_pipelines.find(key);
       it != untile_pipelines.end()) {
@@ -1196,11 +1357,14 @@ const Rhi::Pipeline* ImageRegistry::TilingPipeline(const VideoCore::ImageInfo& i
   }
     const bool macro = AmdGpu::IsMacroTiled(info.array_mode);
     const auto values = VideoCore::TilingSpecialization(info, tiler);
-    std::array<Rhi::SpecConstant, 12> constants{};
+    std::array<Rhi::SpecConstant, 15> constants{};
     for (u32 i = 0; i < constants.size(); ++i) {
         constants[i].id = i;
-        constants[i].value = values[i];
+        constants[i].value = i < values.size() ? values[i] : 0;
     }
+    constants[12].value = info.props.is_bgr_packed_float;
+    constants[13].value = !info.props.is_tiled;
+    constants[14].value = info.props.is_bgr_packed_float;
     const auto code = UntileCode(info.num_bits, macro);
     if (code.empty() || !untile_layout) {
         return nullptr;
@@ -1208,7 +1372,7 @@ const Rhi::Pipeline* ImageRegistry::TilingPipeline(const VideoCore::ImageInfo& i
     auto pipeline = device.CreateComputePipeline({
         .layout = untile_layout.get(),
         .shader = {Rhi::ShaderStage::Compute, code, "main",
-                   std::span<const Rhi::SpecConstant>{constants.data(), macro ? 12u : 4u}},
+                   std::span<const Rhi::SpecConstant>{constants}},
     });
     const Rhi::Pipeline* result = pipeline.get();
     untile_pipelines.emplace(key, std::move(pipeline));
@@ -1371,7 +1535,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
         }
         const Rhi::Buffer* linear = bytes;
         u64 linear_offset = bytes_offset;
-        if (info.props.is_tiled) {
+        if (info.props.is_tiled || info.props.is_bgr_packed_float) {
             trace.Next(7);
             const Rhi::Pipeline* untile = TilingPipeline(info, false);
             // Immutable per-image parameters are shared by uploads and downloads.
@@ -1429,7 +1593,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
             }};
             list.PushBindings(bindings);
             trace.Next(11);
-            list.Dispatch(static_cast<u32>((size / (info.num_bits / 8)) / 64), 1, 1);
+            list.Dispatch(static_cast<u32>(VideoCore::NativeTilingGroups(size, info.num_bits / 8)), 1, 1);
             list.Barrier(Rhi::ScopeCompute, Rhi::ScopeTransfer);
             linear = out;
             linear_offset = 0;
@@ -1442,6 +1606,21 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
         }
         trace.Next(13);
         list.CopyBufferToImage(linear, entry->image.get(), copies);
+        if (LayerSamplesEnabled() && entry->from_cpu && info.resources.layers >= 16 && size > HashedSize &&
+            size % info.resources.layers == 0 &&
+            !entry->gpu_backing_written.load(std::memory_order_acquire) &&
+            memory_clamp && memory_clamp(info.guest_address, size) == size &&
+            (source || gpu_source.kind == 2 || gpu_source.kind == 3)) {
+            const u64 layer_size = size / info.resources.layers;
+            entry->layer_hash.Capture(info.resources.layers, layer_size,
+                [&](u32 layer, u64 offset, u64 bytes) {
+                    const u64 at = layer * layer_size + offset;
+                    return source ? XXH3_64bits(source->Mapped() + at, bytes) :
+                                    Core::HashGuestBytes(info.guest_address + at, bytes);
+                }, LayerWholeHashEnabled());
+        } else {
+            entry->layer_hash.ClearUpload();
+        }
 #ifndef NDEBUG
         const u8 kind = source ? 4 : gpu_source.kind; // FIX-153 (diagnosis)
 #endif
@@ -1492,22 +1671,98 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
     return uploaded;
 }
 
+bool ImageRegistry::BeginDownloads(DownloadBatch& batch, u64 bytes, u64 alignment) {
+    batch.alignment = std::max<u64>(alignment, 256);
+    batch.used = 0;
+    batch.scratch = device.CreateBuffer({.size = bytes,
+                                         .usage = Rhi::BufferUsageStorage |
+                                                  Rhi::BufferUsageTransferSrc |
+                                                  Rhi::BufferUsageTransferDst,
+                                         .memory = Rhi::MemoryKind::DeviceLocal,
+                                         .name = "native write-back scratch"});
+    return batch.scratch != nullptr;
+}
+
+void ImageRegistry::FinishDownloads(Rhi::CommandList& list, DownloadBatch& batch) {
+    if (batch.tilings.empty()) {
+        if (batch.copied) {
+            list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+            batch.copied = false;
+        }
+        return;
+    }
+    list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeCompute);
+    const Rhi::Pipeline* bound = nullptr;
+    for (const auto& tiling : batch.tilings) {
+        if (tiling.pipeline != bound) {
+            list.BindPipeline(tiling.pipeline);
+            bound = tiling.pipeline;
+        }
+        const std::array<Rhi::Binding, 3> bindings{{
+            {.slot = 0, .type = Rhi::BindingType::StorageBuffer, .buffer = batch.scratch.get(),
+             .offset = tiling.tiled_offset, .size = tiling.size},
+            {.slot = 1, .type = Rhi::BindingType::StorageBuffer, .buffer = batch.scratch.get(),
+             .offset = tiling.linear_offset, .size = tiling.size},
+            {.slot = 2, .type = Rhi::BindingType::UniformBuffer, .buffer = tiling.params.get(),
+             .size = sizeof(TilingParams)},
+        }};
+        list.PushBindings(bindings);
+        list.Dispatch(tiling.groups, 1, 1);
+    }
+    list.Barrier(Rhi::ScopeCompute, Rhi::ScopeTransfer);
+    for (const auto& tiling : batch.tilings) {
+        list.CopyBuffer(batch.scratch.get(), tiling.tiled_offset, tiling.out, tiling.out_offset,
+                        tiling.size);
+    }
+    list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer | Rhi::ScopeHost);
+    batch.tilings.clear(); // the device frees the temporary buffers after the GPU used them
+    batch.copied = false;
+}
+
 bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, const Rhi::Buffer& out,
-                                   u64 out_offset) {
+                                   u64 out_offset, DownloadBatch* batch) {
     const VideoCore::ImageInfo& info = entry.info;
     const u64 size = info.guest_size;
     if (size == 0 || out.Size() < out_offset + size) {
         return false;
     }
-    if (!info.props.is_tiled) {
+    if (!info.props.is_tiled && !info.props.is_bgr_packed_float) {
         auto copies = MipCopies(info);
         for (auto& copy : copies) {
             copy.buffer_offset += out_offset;
         }
         list.CopyImageToBuffer(entry.image.get(), &out, copies);
+        if (batch) batch->copied = true;
         return true;
     }
     const Rhi::Pipeline* tile = TilingPipeline(info, true);
+    auto batch_params = batch && tile ? TilingParamsBuffer(info) : nullptr;
+    if (batch && tile && batch_params) {
+        // The tiling leaves padding unwritten: the copy back keeps what guest memory holds there.
+        const u64 step = Common::AlignUp(size, batch->alignment);
+        if (batch->used > batch->scratch->Size() ||
+            step > (batch->scratch->Size() - batch->used) / 2) {
+            return false;
+        }
+        const u64 linear_offset = batch->used;
+        const u64 tiled_offset = linear_offset + step;
+        batch->used = tiled_offset + step;
+        auto copies = MipCopies(info);
+        for (auto& copy : copies) {
+            copy.buffer_offset += linear_offset;
+        }
+        list.CopyImageToBuffer(entry.image.get(), batch->scratch.get(), copies);
+        list.CopyBuffer(&out, out_offset, batch->scratch.get(), tiled_offset, size);
+        batch->tilings.push_back({.pipeline = tile,
+                                  .params = std::move(batch_params),
+                                  .out = &out,
+                                  .out_offset = out_offset,
+                                  .size = size,
+                                  .linear_offset = linear_offset,
+                                  .tiled_offset = tiled_offset,
+                                  .groups = static_cast<u32>(VideoCore::NativeTilingGroups(size, info.num_bits / 8))});
+        return true;
+    }
     // PERF-314: GT Sport writes the same small pictures back thousands of times a second; making
     // three buffers for each write-back was most of the recorder's time in write-backs. The
     // picture's buffers are reused: its size and tiling never change, and every write-back is
@@ -1524,8 +1779,9 @@ bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, co
     }
     if (!entry.download_tiled || entry.download_tiled->Size() < size) {
         entry.download_tiled = device.CreateBuffer({.size = size,
-                                                    .usage = Rhi::BufferUsageStorage |
-                                                             Rhi::BufferUsageTransferSrc,
+                                                     .usage = Rhi::BufferUsageStorage |
+                                                              Rhi::BufferUsageTransferSrc |
+                                                              Rhi::BufferUsageTransferDst,
                                                     .memory = Rhi::MemoryKind::DeviceLocal});
     }
     Rhi::Buffer* params_buffer = entry.download_params.get();
@@ -1535,6 +1791,7 @@ bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, co
         return false;
     }
     list.CopyImageToBuffer(entry.image.get(), linear, MipCopies(info));
+    if (info.props.is_bgr_packed_float) list.CopyBuffer(&out, out_offset, tiled, 0, size);
     list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeCompute);
     list.BindPipeline(tile);
     const std::array<Rhi::Binding, 3> bindings{{
@@ -1545,7 +1802,7 @@ bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, co
          .size = sizeof(TilingParams)},
     }};
     list.PushBindings(bindings);
-    list.Dispatch(static_cast<u32>((size / (info.num_bits / 8)) / 64), 1, 1);
+    list.Dispatch(static_cast<u32>(VideoCore::NativeTilingGroups(size, info.num_bits / 8)), 1, 1);
     list.Barrier(Rhi::ScopeCompute, Rhi::ScopeTransfer);
     list.CopyBuffer(tiled, 0, &out, out_offset, size);
     // Also orders this write-back's reads of the scratch buffers before the next one's writes.

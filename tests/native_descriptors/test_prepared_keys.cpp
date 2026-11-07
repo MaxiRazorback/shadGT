@@ -59,6 +59,24 @@ int main() {
         }
     }
     if(std::count(buckets.begin(),buckets.end(),true)<200)throw std::runtime_error("poor descriptor hash bucket coverage");
+    {
+        vk::DescriptorImageInfo image{vk::Sampler{}, vk::ImageView((VkImageView)(uintptr_t)21), vk::ImageLayout::eGeneral};
+        vk::WriteDescriptorSet write{}; write.dstBinding=0; write.descriptorCount=1;
+        write.descriptorType=vk::DescriptorType::eSampledImage; write.pImageInfo=&image;
+        const auto layout=vk::DescriptorSetLayout((VkDescriptorSetLayout)(uintptr_t)1);
+        Vulkan::PreparedDescriptorKey before, snapshot, feedback;
+        before.Build(layout,{&write,1});
+        image.imageView=vk::ImageView((VkImageView)(uintptr_t)22);
+        snapshot.Build(layout,{&write,1});
+        image.imageLayout=vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
+        feedback.Build(layout,{&write,1});
+        if(before.words==snapshot.words || snapshot.words==feedback.words)
+            throw std::runtime_error("feedback descriptor view/layout reused old key");
+        Vulkan::DescriptorSetMemo<unsigned,1> memo;
+        memo.Store(before.hash,before.words,7);
+        if(memo.Find(snapshot.hash,snapshot.words) || memo.Find(feedback.hash,feedback.words))
+            throw std::runtime_error("feedback descriptor reused old set");
+    }
     Vulkan::DescriptorSetMemo<unsigned,1> collision;
     const std::array<U,3> one{1,2,3},other{1,2,4};
     collision.Store(7,one,9);
