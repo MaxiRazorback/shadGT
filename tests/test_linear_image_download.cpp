@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <gtest/gtest.h>
 #include <array>
+#include <unordered_map>
 #include "ryty_gpu/native/linear_image_download.h"
 
 TEST(LinearImageDownload, SplitsPartsAndPreservesPaddingAcrossMipsAndLayers) {
@@ -61,6 +62,20 @@ TEST(LinearImageDownload, OnlyOverlappingMappingChangesCancel) {
     EXPECT_FALSE(Native::LinearDownloadOverlaps(0x1000, 0x100, 0x1100, 0x20));
     EXPECT_FALSE(Native::LinearDownloadOverlaps(0x1000, 0x100, 0x8000, 0x20));
     EXPECT_FALSE(Native::LinearDownloadOverlaps(0x1000, 0, 0x1000, 0x20));
+}
+
+TEST(LinearImageDownload, CanceledQueueEntryCanBeAdmittedAgain) {
+    int first = 1, other = 2;
+    std::unordered_map<const int*, int> plans{{&first, 1}, {&other, 2}};
+    std::vector<int*> queue{&first, &other};
+    Native::CancelOverlappingLinearPlans(plans, queue, [&](const int* key) { return key == &first; });
+    ASSERT_EQ(queue.size(), 1u);
+    EXPECT_EQ(queue.front(), &other);
+    EXPECT_EQ(plans.count(&first), 0u);
+    plans.emplace(&first, 3);
+    queue.push_back(&first);
+    EXPECT_EQ(queue.size(), 2u);
+    EXPECT_EQ(plans.at(&first), 3);
 }
 
 TEST(LinearImageDownload, RequiresExactImageShape) {

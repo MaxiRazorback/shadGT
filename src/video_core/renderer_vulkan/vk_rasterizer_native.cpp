@@ -11713,9 +11713,10 @@ bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
 }
 
 void NativeRenderer::CancelLinearDownloads(VAddr address, u64 size) {
-    std::erase_if(pending_linear_downloads, [&](const auto& item) {
-        const auto& info = item.first->info;
-        return Native::LinearDownloadOverlaps(info.guest_address, info.guest_size, address, size);
+    // Removing the queue entry permits a surviving target to be admitted again.
+    Native::CancelOverlappingLinearPlans(pending_linear_downloads, writebacks, [&](const auto* entry) {
+        return Native::LinearDownloadOverlaps(entry->info.guest_address, entry->info.guest_size,
+                                              address, size);
     });
 }
 

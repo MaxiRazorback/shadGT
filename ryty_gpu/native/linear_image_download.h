@@ -14,6 +14,14 @@ void TransferLinearDownloadLeases(std::vector<std::shared_ptr<void>>& stream,
                                   std::vector<Part>& parts) {
     for (auto& part : parts) stream.push_back(std::move(part.lease));
 }
+template <class Plans, class Queue, class Overlaps>
+void CancelOverlappingLinearPlans(Plans& plans, Queue& queue, Overlaps&& overlaps) {
+    std::erase_if(plans, [&](const auto& item) {
+        if (!overlaps(item.first)) return false;
+        std::erase(queue, item.first);
+        return true;
+    });
+}
 constexpr bool LinearDownloadOverlaps(std::uint64_t a, std::uint64_t a_size,
                                       std::uint64_t b, std::uint64_t b_size) {
     if (!a_size || !b_size) return false;
