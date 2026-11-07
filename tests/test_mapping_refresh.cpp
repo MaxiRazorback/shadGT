@@ -8,6 +8,8 @@
 #include "common/mapping_writeback_gate.h"
 #include <future>
 #include <chrono>
+#include <array>
+#include <random>
 
 TEST(MappingRefresh, PartialRemapKeepsTheOtherGpuPages) {
     struct Region { std::uint64_t begin, end; };
@@ -140,4 +142,51 @@ TEST(MappingRefresh, SerializedTransitionsPublishBeforeNextPreNotification) {
     second.get();
     EXPECT_FALSE(gate.Complete(gap, [] {}));
     EXPECT_TRUE(gate.Complete(gate.Capture(4096, 4), [] {}));
+}
+
+TEST(MappingRefresh, AdjacentOverlapsAndRemappedHolesRemainIndependent) {
+    Common::MappingWritebackGate gate;
+    gate.FreezeProtocol(true);
+    gate.BeginUnmap(20, 10);
+    gate.BeginUnmap(10, 10);
+    gate.BeginUnmap(25, 15);
+    gate.BeginUnmap(60, 10);
+    gate.PublishMap(18, 15);
+    const auto can_write = [&](std::uint64_t start, std::uint64_t size) {
+        return gate.Complete(gate.Capture(start, size), [] {});
+    };
+    EXPECT_FALSE(can_write(10, 8));
+    EXPECT_TRUE(can_write(18, 15));
+    EXPECT_FALSE(can_write(32, 2));
+    EXPECT_TRUE(can_write(40, 20));
+    EXPECT_FALSE(can_write(60, 1));
+    EXPECT_TRUE(can_write(70, 1));
+}
+
+TEST(MappingRefresh, RandomizedRangesMatchByteReference) {
+    Common::MappingWritebackGate gate;
+    gate.FreezeProtocol(true);
+    std::array<bool, 256> unavailable{};
+    std::mt19937 random{0x326};
+    for (unsigned iteration = 0; iteration < 5000; ++iteration) {
+        const unsigned begin = random() % unavailable.size();
+        const unsigned size = 1 + random() % (unavailable.size() - begin);
+        switch (random() % 3) {
+        case 0:
+            gate.BeginUnmap(begin, size);
+            std::fill(unavailable.begin() + begin, unavailable.begin() + begin + size, true);
+            break;
+        case 1:
+            gate.PublishMap(begin, size);
+            std::fill(unavailable.begin() + begin, unavailable.begin() + begin + size, false);
+            break;
+        default: {
+            const bool expected = std::none_of(unavailable.begin() + begin,
+                                               unavailable.begin() + begin + size,
+                                               [](bool value) { return value; });
+            EXPECT_EQ(gate.Complete(gate.Capture(begin, size), [] {}), expected)
+                << "iteration " << iteration << " range " << begin << "+" << size;
+        }
+        }
+    }
 }

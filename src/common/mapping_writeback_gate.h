@@ -30,8 +30,9 @@ public:
         std::unique_lock lock{mutex};
         if (!size || address > UINT64_MAX - size) return {};
         auto token = std::make_shared<State>(State{address, address + size, true});
-        for (const auto& range : unavailable)
-            if (address < range.second && range.first < address + size) token->valid = false;
+        const auto range = std::lower_bound(unavailable.begin(), unavailable.end(), address,
+            [](const auto& item, std::uint64_t value) { return item.second <= value; });
+        if (range != unavailable.end() && range->first < address + size) token->valid = false;
         if (tokens.size() >= next_cleanup) {
             std::erase_if(tokens, [](const auto& weak) { return weak.expired(); });
             next_cleanup = std::max<std::size_t>(1024, tokens.size() * 2);
@@ -42,7 +43,29 @@ public:
     void BeginUnmap(std::uint64_t address, std::uint64_t size) {
         if (!size || address > UINT64_MAX - size) return;
         std::unique_lock lock{mutex};
-        unavailable.emplace_back(address, address + size);
+        // Reserve before mutating: a failed allocation must not lose an existing
+        // unavailable range. Adjacent intervals are merged as well as overlaps.
+        if (unavailable.size() == unavailable.capacity()) {
+            const auto max = unavailable.max_size();
+            const auto capacity = unavailable.capacity();
+            const auto grown = capacity > max / 2 ? max : std::max<std::size_t>(8, capacity * 2);
+            unavailable.reserve(std::max(unavailable.size() + 1, grown));
+        }
+        auto first = std::lower_bound(unavailable.begin(), unavailable.end(), address,
+            [](const auto& item, std::uint64_t value) { return item.second < value; });
+        auto last = first;
+        auto begin = address;
+        auto end = address + size;
+        while (last != unavailable.end() && last->first <= end) {
+            begin = std::min(begin, last->first);
+            end = std::max(end, last->second);
+            ++last;
+        }
+        if (first == last) unavailable.insert(first, {begin, end});
+        else {
+            *first = {begin, end};
+            unavailable.erase(first + 1, last);
+        }
         for (auto& weak : tokens) if (auto token = weak.lock())
             if (token->begin < address + size && address < token->end) token->valid = false;
     }
