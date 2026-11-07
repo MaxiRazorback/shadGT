@@ -311,6 +311,8 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR,
         vk::PhysicalDeviceShaderQuadControlFeaturesKHR,
         vk::PhysicalDeviceShaderObjectFeaturesEXT,
+        vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT,
+        vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT,
         vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT>();
     features = feature_chain.get().features;
     struct Maintenance11Features {
@@ -427,7 +429,10 @@ bool Instance::CreateDevice() {
         LOG_WARNING(Render_Vulkan, "PERF-210: AMD Anti-Lag {}",
                     anti_lag ? "on" : "not supported by this driver");
     }
-    attachment_feedback_loop = add_extension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
+    attachment_feedback_loop =
+        feature_chain.get<vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT>().attachmentFeedbackLoopLayout &&
+        feature_chain.get<vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT>().attachmentFeedbackLoopDynamicState &&
+        add_extension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
     if (attachment_feedback_loop) {
         attachment_feedback_loop =
             add_extension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);

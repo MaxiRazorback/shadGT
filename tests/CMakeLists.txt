@@ -100,8 +100,8 @@ gtest_discover_tests(shadps4_same_texel_test)
 
 gtest_discover_tests(shadps4_stencil_test)
 
-add_executable(shadps4_depth_attachment_test test_depth_attachment.cpp)
-target_include_directories(shadps4_depth_attachment_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_executable(shadps4_depth_attachment_test test_depth_attachment.cpp test_depth_feedback.cpp)
+target_include_directories(shadps4_depth_attachment_test PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(shadps4_depth_attachment_test PRIVATE GTest::gtest_main fmt::fmt Vulkan::Headers)
 gtest_discover_tests(shadps4_depth_attachment_test)
 
@@ -130,6 +130,13 @@ if (WIN32 AND CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_executable(shadgt_tess_lds_gpu tools/tess_lds_gpu.cpp)
     target_compile_features(shadgt_tess_lds_gpu PRIVATE cxx_std_23)
     target_link_libraries(shadgt_tess_lds_gpu PRIVATE Vulkan::Headers)
+    add_executable(shadgt_depth_snapshot_gpu tools/depth_snapshot_gpu.cpp)
+    target_compile_features(shadgt_depth_snapshot_gpu PRIVATE cxx_std_23)
+    target_include_directories(shadgt_depth_snapshot_gpu PRIVATE ${CMAKE_SOURCE_DIR})
+    target_link_libraries(shadgt_depth_snapshot_gpu PRIVATE Vulkan::Headers)
+    add_executable(shadgt_depth_feedback_gpu tools/depth_feedback_gpu.cpp)
+    target_compile_features(shadgt_depth_feedback_gpu PRIVATE cxx_std_23)
+    target_link_libraries(shadgt_depth_feedback_gpu PRIVATE Vulkan::Headers)
 endif()
 
 add_executable(shadps4_device_service_test test_device_service.cpp

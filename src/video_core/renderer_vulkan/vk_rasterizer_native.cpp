@@ -19,6 +19,8 @@
 #include "ryty_gpu/native/parallel_rotate_segment.h"
 #include "ryty_gpu/native/natural_scope_boundary.h"
 #include "ryty_gpu/native/attachment_alias.h"
+#include "ryty_gpu/native/attachment_feedback.h"
+#include "ryty_gpu/native/depth_snapshot_copies.h"
 #include "ryty_gpu/native/prepared_index_bounds.h"
 #include "ryty_gpu/native/prepared_direct_absent.h"
 #include "ryty_gpu/native/per_draw_stage_proof.h"
@@ -1449,13 +1451,14 @@ NativeRenderer::~NativeRenderer() {
 
     }
     if (stream.list) Splice();
+    // Snapshot owners also need GPU retirement when direct imports are unavailable.
+    r.scheduler.Finish();
+    stream.writeback_plan_leases.clear();
+    retired_writeback_plans.ClearAfterGpuIdle();
     if (auto* direct = r.buffer_cache.GetDirectMemory()) {
         // Teardown must also cover an earlier enqueue failure and any pending scheduler
         // callback that has not yet run, before either device or imported backing dies.
-        r.scheduler.Finish();
         stream.imported_view_leases.clear();
-        stream.writeback_plan_leases.clear();
-        retired_writeback_plans.ClearAfterGpuIdle();
         direct->ReleaseHeldAfterGpuIdle();
     }
     const vk::Device vk_device = r.instance.GetDevice();
@@ -2198,19 +2201,21 @@ void NativeRenderer::BeginRendering(const RenderState& state) {
         };
     }
     const auto& db = state.depth_stencil_attachment;
+    const bool read_only_depth = db.image_layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
+                                 db.image_layout == vk::ImageLayout::eDepthReadOnlyOptimal;
     const vk::RenderingAttachmentInfo depth{
         .imageView = db.image_view,
-        .imageLayout = vk::ImageLayout::eGeneral,
+        .imageLayout = db.image_layout,
         .loadOp = db.depth_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
-        .storeOp = vk::AttachmentStoreOp::eStore,
+        .storeOp = read_only_depth ? vk::AttachmentStoreOp::eNone : vk::AttachmentStoreOp::eStore,
         .clearValue = vk::ClearValue{.depthStencil = vk::ClearDepthStencilValue{
                                          .depth = std::bit_cast<float>(db.clear_value[0])}},
     };
     const vk::RenderingAttachmentInfo stencil{
         .imageView = db.image_view,
-        .imageLayout = vk::ImageLayout::eGeneral,
+        .imageLayout = db.image_layout,
         .loadOp = db.stencil_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
-        .storeOp = vk::AttachmentStoreOp::eStore,
+        .storeOp = read_only_depth ? vk::AttachmentStoreOp::eNone : vk::AttachmentStoreOp::eStore,
         .clearValue = vk::ClearValue{.depthStencil =
                                          vk::ClearDepthStencilValue{.stencil = db.clear_value[1]}},
     };
@@ -7148,16 +7153,106 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         if (b.failed) return;
         PrepareImages();
     }
+    const bool sampled_depth = targets.depth &&
+        std::ranges::find(b.sampled, targets.depth) != b.sampled.end();
+    const auto& db_feedback = targets.state.depth_stencil_attachment;
+    const bool depth_writes = db_feedback.depth_clear || db_feedback.stencil_clear ||
+        (regs.depth_control.depth_enable && regs.depth_control.depth_write_enable) ||
+        (db_feedback.has_stencil && regs.depth_control.stencil_enable);
+    const auto depth_feedback = Native::DecideDepthFeedback(
+        sampled_depth, depth_writes, r.instance.IsAttachmentFeedbackLoopLayoutSupported());
+    struct DepthSnapshot {
+        std::unique_ptr<Native::Rhi::Image> image;
+        std::vector<vk::UniqueImageView> views;
+    };
+    std::shared_ptr<DepthSnapshot> depth_snapshot;
+    std::vector<std::pair<vk::ImageView, vk::ImageView>> snapshot_views;
+    if (depth_feedback.unsupported) {
+        // Without feedback-loop support, sample an immutable copy of the attachment
+        // as it stood before this draw. The original remains the writable target.
+        depth_snapshot = std::make_shared<DepthSnapshot>();
+        auto desc = targets.depth->image->Desc();
+        desc.usage = Native::Rhi::ImageUsageSampled | Native::Rhi::ImageUsageTransferDst |
+                     (desc.usage & Native::Rhi::ImageUsageCube);
+        desc.name = "Depth attachment feedback snapshot";
+        depth_snapshot->image = device->CreateImage(desc);
+        if (!depth_snapshot->image) std::terminate();
+        const vk::Image snapshot_image{Handle<VkImage_T>(depth_snapshot->image->NativeHandle())};
+        std::scoped_lock view_lock{views_mutex};
+        const auto found = views.find(targets.depth);
+        if (found == views.end()) std::terminate();
+        for (const auto& record : found->second) {
+            if (record.use != ViewUse::Sampled && record.use != ViewUse::CubeSampled) continue;
+            if (std::ranges::none_of(b.images, [&](const auto& image) { return image.imageView == *record.view; })) continue;
+            auto info = record.info;
+            const u32 mips = std::max(desc.mips, 1u);
+            const u32 layers = std::max(desc.layers, 1u);
+            info.range.base.level = std::min<u32>(info.range.base.level, mips - 1);
+            info.range.extent.levels = std::clamp<u32>(info.range.extent.levels, 1, mips - info.range.base.level);
+            info.range.base.layer = std::min<u32>(info.range.base.layer, layers - 1);
+            info.range.extent.layers = std::clamp<u32>(info.range.extent.layers, 1, layers - info.range.base.layer);
+            auto type = VideoCore::ConvertImageViewType(info.type);
+            if (record.use == ViewUse::CubeSampled) {
+                info.range.extent.layers = Native::CubeViewLayers(r.instance.IsImageCubeArraySupported(),
+                    false, desc.width, desc.height, desc.layers, desc.samples, info.range.extent.layers);
+                if (!info.range.extent.layers) std::terminate();
+                type = vk::ImageViewType::eCubeArray;
+            } else if (type == vk::ImageViewType::e2D && info.range.extent.layers > 1) {
+                type = vk::ImageViewType::e2DArray;
+            }
+            const auto aspect = targets.depth->info.props.has_stencil &&
+                !LiverpoolToVK::IsFormatDepthCompatible(info.format) && LiverpoolToVK::IsFormatStencilCompatible(info.format)
+                ? vk::ImageAspectFlagBits::eStencil : vk::ImageAspectFlagBits::eDepth;
+            vk::ImageViewMinLodCreateInfoEXT min_lod{};
+            if (info.min_lod && r.instance.IsImageViewMinLodSupported())
+                min_lod.minLod = std::min(float(info.min_lod) / 256.f,
+                    float(info.range.base.level + info.range.extent.levels - 1));
+            const vk::ImageViewCreateInfo ci{
+                .pNext = info.min_lod && r.instance.IsImageViewMinLodSupported() ? &min_lod : nullptr,
+                .image = snapshot_image, .viewType = type,
+                .format = static_cast<vk::Format>(desc.format),
+                .components = info.mapping == AmdGpu::IdentityMapping ? vk::ComponentMapping{}
+                    : LiverpoolToVK::ComponentMapping(info.mapping),
+                .subresourceRange{aspect, info.range.base.level, info.range.extent.levels,
+                                  info.range.base.layer, info.range.extent.layers}};
+            auto [result, view] = r.instance.GetDevice().createImageViewUnique(ci);
+            if (result != vk::Result::eSuccess) std::terminate();
+            snapshot_views.emplace_back(*record.view, *view);
+            depth_snapshot->views.push_back(std::move(view));
+        }
+        if (snapshot_views.empty()) std::terminate();
+        Native::ReserveAdditional(s.writeback_plan_leases, 1);
+    }
     if (b.region_writeback) ValidateRegionPlan(*b.region_writeback);
     if (b.region_writeback) {
         ApplyRegionWritebackFallback(*b.region_writeback);
         RecordRegionSnapshots(b.region_writeback);
     }
     Begin();
-    // A color image sampled while this draw writes it is a feedback attachment. Native
+    if (depth_snapshot) {
+        // Earlier parallel nodes must be submitted before this pre-draw copy.
+        Splice();
+        Begin();
+        PrepareImages();
+        GlobalBarrier();
+        Native::ReserveAdditional(s.writeback_plan_leases, 1);
+        s.writeback_plan_leases.push_back(depth_snapshot);
+        const auto& desc = targets.depth->image->Desc();
+        const auto copies = Native::DepthSnapshotCopies(desc.width, desc.height, desc.mips,
+                                                        desc.layers, targets.depth->info.props.has_stencil);
+        s.cmd.copyImage(vk::Image{Handle<VkImage_T>(targets.depth->image->NativeHandle())},
+                        vk::ImageLayout::eGeneral,
+                        vk::Image{Handle<VkImage_T>(depth_snapshot->image->NativeHandle())},
+                        vk::ImageLayout::eGeneral, copies);
+        GlobalBarrier();
+        for (auto& image : b.images) for (const auto& [old_view, new_view] : snapshot_views)
+            if (image.imageView == old_view) image.imageView = new_view;
+        b.key_layout = nullptr; // cached descriptor keys named the original views
+    }
+    // An image sampled while this draw uses it as an attachment is a feedback attachment. Native
     // images normally stay in GENERAL, but that does not make an overlapping attachment
     // read legal. Enter the feedback layout for this draw and restore GENERAL afterward.
-    boost::container::small_vector<const Native::ImageEntry*, 8> feedback;
+    boost::container::small_vector<const Native::ImageEntry*, 9> feedback;
     if (r.instance.IsAttachmentFeedbackLoopLayoutSupported()) {
         for (u32 cb = 0; cb < targets.colors.size(); ++cb) {
             const auto* target = targets.colors[cb];
@@ -7176,21 +7271,30 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             }
         }
     }
+    if (depth_feedback.active || depth_feedback.read_only) feedback.push_back(targets.depth);
+    const bool has_feedback = Native::BlocksParallelFeedback(!feedback.empty(), bool(depth_snapshot));
+    const auto depth_read_layout = vk::ImageLayout::eDepthStencilReadOnlyOptimal;
     const auto feedback_layout = [&](vk::ImageLayout from, vk::ImageLayout to) {
-        boost::container::static_vector<vk::ImageMemoryBarrier2, 8> barriers;
+        boost::container::static_vector<vk::ImageMemoryBarrier2, 9> barriers;
         for (const auto* entry : feedback) {
+            const vk::ImageAspectFlags aspects = entry->info.props.is_depth
+                ? vk::ImageAspectFlagBits::eDepth |
+                      (entry->info.props.has_stencil ? vk::ImageAspectFlagBits::eStencil : vk::ImageAspectFlags{})
+                : vk::ImageAspectFlagBits::eColor;
             barriers.push_back(vk::ImageMemoryBarrier2{
                 .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
                 .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
                 .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
                 .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-                .oldLayout = from,
-                .newLayout = to,
+                .oldLayout = entry == targets.depth && depth_feedback.read_only && from != vk::ImageLayout::eGeneral
+                    ? depth_read_layout : from,
+                .newLayout = entry == targets.depth && depth_feedback.read_only && to != vk::ImageLayout::eGeneral
+                    ? depth_read_layout : to,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .image = vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())},
                 .subresourceRange{
-                    .aspectMask = vk::ImageAspectFlagBits::eColor,
+                    .aspectMask = aspects,
                     .baseMipLevel = 0,
                     .levelCount = VK_REMAINING_MIP_LEVELS,
                     .baseArrayLayer = 0,
@@ -7213,6 +7317,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                     vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
             }
         }
+        if (depth_feedback.active || depth_feedback.read_only) {
+            targets.state.depth_stencil_attachment.image_layout =
+                depth_feedback.read_only ? depth_read_layout : vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
+        }
         std::scoped_lock lock{views_mutex};
         for (const auto* entry : feedback) {
             const auto found = views.find(entry);
@@ -7225,11 +7333,13 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 }
                 for (auto& image : b.images) {
                     if (image.imageView == *view.view) {
-                        image.imageLayout = vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
+                        image.imageLayout = entry == targets.depth && depth_feedback.read_only
+                            ? depth_read_layout : vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
                     }
                 }
             }
         }
+        b.key_layout = nullptr; // attachment layout changes descriptor image layouts
     }
     PhaseClock record_clock{stats.phase_ns[7]};
     {
@@ -7290,11 +7400,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         probe.single_color+=targets.state.num_color_attachments==1;
         probe.no_clear+=targets.state.num_color_attachments==1 && !targets.state.color_attachments[0].is_clear;
         probe.no_depth+=!depth.has_depth && !depth.has_stencil; probe.no_descriptors+=b.writes.empty();
-        probe.no_storage+=!b.writes_buffers && b.stored.empty(); probe.no_feedback+=feedback.empty();
+        probe.no_storage+=!b.writes_buffers && b.stored.empty(); probe.no_feedback+=!has_feedback;
         const bool eligible=in_race && !r.FrameDumpActive() && !quad_list && !is_indexed &&
             targets.state.num_color_attachments==1 && !targets.state.color_attachments[0].is_clear &&
             !depth.has_depth && !depth.has_stencil && b.writes.empty() && !b.writes_buffers &&
-            b.stored.empty() && feedback.empty();
+            b.stored.empty() && !has_feedback;
         if (eligible) {++probe.eligible;++probe.current;} else probe.Flush();
     }
     // Experimental first subset: a complete, descriptor-free, vertexless color
@@ -7371,7 +7481,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         const bool prohibited_clear=any_clear;
         const bool fast_race=RytyGtsInRace(),fast_patch=EmulatorSettings.IsPatchShaders();
         const bool fast_trace=r.FrameDumpActive() || SceneTrace::Id() || Native::GpuCheckpoints::Requested();
-        const bool inline_safe=bool(parallel->active) && pipeline->LdsEmulation()==0 && fast_race && !fast_trace && !prohibited_clear && feedback.empty() &&
+        const bool inline_safe=bool(parallel->active) && pipeline->LdsEmulation()==0 && fast_race && !fast_trace && !prohibited_clear && !has_feedback &&
             !scale_composition && !native_fsr_composition;
 #if !defined(NDEBUG)
         static const bool serial_audit=[] {const char* p=std::getenv("RYGT_PARALLEL_SERIAL_AUDIT");return p && p[0]=='1' && p[1]=='\0';}();
@@ -7392,7 +7502,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             (!extended && is_indexed) || scale_composition || native_fsr_composition ||
             (!extended && targets.state.num_color_attachments!=1) || targets.state.num_color_attachments>8 || prohibited_clear ||
             (!extended && (fast_depth.has_depth || fast_depth.has_stencil || bool(vi->index_buffer))) ||
-            !feedback.empty() || !prepared || !from_prepared ||
+            has_feedback || !prepared || !from_prepared ||
             prepared->pipeline!=pipeline || !prepared->pipeline_keepalive ||
             b.writes_buffers || !b.gpu_writes.empty() || !b.stored.empty();
         // UI/stream preparation may retire mirrors after vertex commit. Do not
@@ -7407,7 +7517,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             if(ParallelGateDiagEnabled()) {
                 // Bit 25 means deeper stage/view/alias/descriptor checks were not examined.
                 u64 mask=u64{1}<<25;if(serial_scope_bypass)mask|=u64{1}<<26;const auto fail=[&](u32 bit,bool bad){if(bad)mask|=u64{1}<<bit;};
-                fail(27,no_pass_room);fail(0,!fast_race);fail(1,fast_patch);fail(2,fast_trace);fail(4,!feedback.empty());
+                fail(27,no_pass_room);fail(0,!fast_race);fail(1,fast_patch);fail(2,fast_trace);fail(4,has_feedback);
                 fail(5,!extended && targets.state.num_color_attachments!=1);fail(6,prohibited_clear);
                 fail(7,!extended && (fast_depth.has_depth || fast_depth.has_stencil));fail(8,quad_list || quad_triangles || (!extended && is_indexed));
                 fail(9,scale_composition || native_fsr_composition);fail(12,!extended && bool(vi->index_buffer));
@@ -7432,7 +7542,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         const bool vertex_preflight= !quad_list && !quad_triangles && (extended || !is_indexed) &&
             !scale_composition && !native_fsr_composition && (extended || targets.state.num_color_attachments==1) &&
             !prohibited_clear && (extended || (!db.has_depth && !db.has_stencil && !vi->index_buffer)) &&
-            feedback.empty() && prepared && from_prepared &&
+            !has_feedback && prepared && from_prepared &&
             prepared->pipeline==pipeline && prepared->pipeline_keepalive;
         const bool vertex_requested=ParallelVertexEnabled();
         const bool has_vertex_input=!vi->buffers.empty() || !vi->input_bindings.empty() || !vi->attributes.empty();
@@ -7625,7 +7735,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             !r.FrameDumpActive() && !SceneTrace::Id() && !Native::GpuCheckpoints::Requested() &&
             !quad_list && !quad_triangles && (extended || !is_indexed) && !scale_composition && !native_fsr_composition &&
             (extended || targets.state.num_color_attachments==1) && !prohibited_clear &&
-            (extended || (!db.has_depth && !db.has_stencil)) && feedback.empty() && vertex_safe && index_safe &&
+            (extended || (!db.has_depth && !db.has_stencil)) && !has_feedback && vertex_safe && index_safe &&
             prepared && from_prepared && prepared->pipeline==pipeline && prepared->pipeline_keepalive && stages_safe;
         bool descriptor_safe=cheap_eligible && !b.writes_buffers && b.gpu_writes.empty() && b.stored.empty();
         u32 descriptor_fail_reason=0;
@@ -7663,7 +7773,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 const auto note_view_cardinality=[&](std::size_t n) {if(sample_view)NATIVE_DIAGNOSTIC(++parallel->view_sample.cardinality[n==0?0:n==1?1:n==2?2:n<=4?3:n<=8?4:n<=16?5:n<=32?6:n<=64?7:n<=128?8:9]);};
                 const bool known_structure=worker_identity && worker_result->descriptor_structure;
                 const bool image_batch=known_structure && (worker_result->image_seal_mask[0] || worker_result->image_seal_mask[1]) &&
-                    worker_result->image_seal_owner==this && feedback.empty() && prepared->proof_context &&
+                    worker_result->image_seal_owner==this && !has_feedback && prepared->proof_context &&
                     prepared->proof_context==parallel->prepared_proof_context &&
                     prepared->proof_context->Valid(prepared->proof_mode_state) &&
                     sampler_cache_epoch.load(std::memory_order_acquire)==worker_result->image_seal_epoch;
@@ -8146,7 +8256,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                     if(push<b.grouped_writes.size() && !b.grouped_writes[push].empty()) {
                         SampledProofTimer phase{parallel->proof_phases[3],phase_sample};
                         const auto snapshot_matches=[&] {
-                            if(!worker_identity || !known_structure || !feedback.empty() || !worker_result->push_snapshot || worker_result->push_index!=push ||
+                            if(!worker_identity || !known_structure || has_feedback || !worker_result->push_snapshot || worker_result->push_index!=push ||
                                worker_result->push_data!=b.grouped_writes[push].data() || worker_result->push_size!=b.grouped_writes[push].size()) return false;
                             // Producer group rows and image values remain immutable after publication; feedback is excluded above.
                             return true;
@@ -8203,7 +8313,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             u64 mask=0;const auto fail=[&](u32 bit,bool bad){if(bad)mask|=u64{1}<<bit;};
             fail(0,!RytyGtsInRace());fail(1,EmulatorSettings.IsPatchShaders());
             fail(2,r.FrameDumpActive() || SceneTrace::Id() || Native::GpuCheckpoints::Requested());
-            fail(3,!native_attachment);fail(4,sampled_alias || !feedback.empty());
+            fail(3,!native_attachment);fail(4,sampled_alias || has_feedback);
             fail(5,!extended && targets.state.num_color_attachments!=1);fail(6,prohibited_clear);
             fail(7,!extended && (db.has_depth || db.has_stencil));fail(8,quad_list || quad_triangles || (!extended && is_indexed));
             fail(9,scale_composition || native_fsr_composition);fail(10,vertex_preflight && !vertex_safe && !vi->buffers.empty());
@@ -8355,7 +8465,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     const bool lds_safe_draw = pipeline->LdsEmulation() &&
         TessLdsSafeShape(regs.num_instances.NumInstances(), quad_triangles, lds_readonly_stages && lds_owned_buffers,
                          !b.stored.empty() || !b.gpu_writes.empty() || b.writes_buffers,
-                         regs.reg_array[0xa30e] == ~0u && regs.reg_array[0xa30f] == ~0u) && feedback.empty() &&
+                         regs.reg_array[0xa30e] == ~0u && regs.reg_array[0xa30f] == ~0u) && !has_feedback &&
         !r.FrameDumpActive() && !SceneTrace::Id() && !Native::GpuCheckpoints::Requested() &&
         !scale_composition && !native_fsr_composition &&
         b.push.quad_sample_mask[0] == ~0u && b.push.quad_sample_mask[1] == ~0u;
@@ -8373,8 +8483,18 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         PhaseClock part{stats.record_ns[2]};
         DynamicState* const saved = Rasterizer::t_dynamic_state;
         Rasterizer::t_dynamic_state = &s.dynamic;
-        r.ctx->attachment_feedback_loop = feedback.empty() ? vk::ImageAspectFlags{}
-                                                           : vk::ImageAspectFlagBits::eColor;
+        vk::ImageAspectFlags feedback_aspects{};
+        for (const auto* entry : feedback) {
+            if (entry == targets.depth && depth_feedback.read_only) {
+                continue;
+            } else if (entry->info.props.is_depth) {
+                feedback_aspects |= vk::ImageAspectFlagBits::eDepth;
+                if (entry->info.props.has_stencil) feedback_aspects |= vk::ImageAspectFlagBits::eStencil;
+            } else {
+                feedback_aspects |= vk::ImageAspectFlagBits::eColor;
+            }
+        }
+        r.ctx->attachment_feedback_loop = feedback_aspects;
         r.UpdateViewportScissorState();
         r.UpdateDepthStencilState();
         r.UpdatePrimitiveState(is_indexed, quad_triangles);
@@ -8594,6 +8714,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             });
         }
         const auto record_draw = [&] {
+        if (depth_snapshot) {
+            // Preparation may splice after the copy. Retain the image again in
+            // the actual draw stream immediately before recording its read.
+            Native::ReserveAdditional(s.writeback_plan_leases, 1);
+            s.writeback_plan_leases.push_back(depth_snapshot);
+        }
         if (quad_triangles) {
             if (index_count != 0) {
                 cmdbuf.drawIndexed(index_count, instances, 0, s32(vertex_offset),
@@ -12175,11 +12301,11 @@ void NativeRenderer::Splice() {
     if (!wrapped) {
         device->MarkExecuted(s.list, {timeline.get(), tick});
     }
+    const u64 retire_tick = std::max(tick, boundary_signal);
+    retired_writeback_plans.Retire(s.writeback_plan_leases, retire_tick);
+    retired_writeback_plans.Collect(r.scheduler.GetWorkSemaphore()->KnownGpuTick());
     if (auto* direct = r.buffer_cache.GetDirectMemory()) {
-        const u64 retire_tick = std::max(tick, boundary_signal);
         direct->RetireLeasesAfterSplice(s.imported_view_leases, retire_tick);
-        retired_writeback_plans.Retire(s.writeback_plan_leases, retire_tick);
-        retired_writeback_plans.Collect(r.scheduler.GetWorkSemaphore()->KnownGpuTick());
         direct->ReleaseHeldAfterSplice(retire_tick);
     }
     {
