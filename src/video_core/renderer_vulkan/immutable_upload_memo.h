@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 #include "upload_bytes_equal.h"
 
@@ -60,10 +61,27 @@ public:
         return {std::nullopt, slot, hash};
     }
 
-    void Store(const Lookup& lookup, std::uint32_t stage,
+    // Predicate is called synchronously while the current list owns this entry.
+    template<class Predicate>
+    std::optional<Binding> WithSlot(std::uint32_t stage, std::size_t slot, std::size_t size,
+                                    Predicate&& predicate) const {
+        if (stage >= Stages || slot >= Slots) return std::nullopt;
+        const auto& entry = entries[slot];
+        if (!entry.valid || entry.stage != stage || entry.bytes.size() != size) return std::nullopt;
+        if (!predicate(std::span<const std::uint8_t>{entry.bytes})) return std::nullopt;
+        return entry.binding;
+    }
+
+    template<class Predicate>
+    std::optional<Binding> WithLast(std::uint32_t stage, std::size_t size, Predicate&& predicate) const {
+        if (stage >= Stages) return std::nullopt;
+        return WithSlot(stage, last[stage], size, std::forward<Predicate>(predicate));
+    }
+
+    bool Store(const Lookup& lookup, std::uint32_t stage,
                std::span<const std::uint8_t> bytes, Binding binding, bool backing_proven = false) {
         if (lookup.slot >= Slots || stage >= Stages || bytes.empty() || bytes.size() > MaxBytes)
-            return;
+            return false;
         auto& entry = entries[lookup.slot];
         entry.valid = false;
         // Avoid geometric vector growth beyond the explicit per-entry bound.
@@ -71,13 +89,14 @@ public:
             std::vector<std::uint8_t>(bytes.begin(), bytes.end()).swap(entry.bytes);
             if (entry.bytes.capacity() > MaxBytes) {
                 std::vector<std::uint8_t>().swap(entry.bytes);
-                return;
+                return false;
             }
         } else {
             entry.bytes.assign(bytes.begin(), bytes.end());
         }
         entry.stage = stage; entry.hash = lookup.hash; entry.binding = binding; entry.backing_proven = backing_proven;
         entry.valid = true; last[stage] = lookup.slot;
+        return true;
     }
 
     void Clear() {
