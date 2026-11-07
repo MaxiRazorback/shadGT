@@ -63,7 +63,7 @@ TEST(TessLdsShader, EmitsRealWriterAndReaderModule) {
     Backend::Bindings bindings{};
     const auto code = Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings);
     ASSERT_GT(code.size(), 5u);
-    bool physical = false, write = false, branch = false;
+    bool physical = false, write = false, branch = false, scratch_at_112 = false;
     for (size_t offset = 5; offset < code.size();) {
         const u32 count = code[offset] >> 16;
         ASSERT_GT(count, 0u);
@@ -72,9 +72,14 @@ TEST(TessLdsShader, EmitsRealWriterAndReaderModule) {
         physical |= op == spv::Op::OpConvertUToPtr;
         write |= op == spv::Op::OpStore;
         branch |= op == spv::Op::OpBranchConditional;
+        if (op == spv::Op::OpMemberDecorate && count == 5 &&
+            code[offset + 2] == PushData::LdsScratchIndex &&
+            code[offset + 3] == u32(spv::Decoration::Offset) && code[offset + 4] == 112)
+            scratch_at_112 = true;
         offset += count;
     }
     EXPECT_TRUE(physical && write && branch);
+    EXPECT_TRUE(scratch_at_112);
     if (const char* dir = std::getenv("RYGT_TEST_SPV_DIR")) {
         std::ofstream file{std::filesystem::path(dir) / "tess_lds.spv", std::ios::binary};
         ASSERT_TRUE(file);

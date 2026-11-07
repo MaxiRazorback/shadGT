@@ -108,7 +108,7 @@ int main(int argc, char** argv) try {
     for (size_t i=0;i<2;++i) { VkDescriptorBufferInfo db{output[i].handle,0,16}; VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         w.dstSet=sets[i]; w.dstBinding=0; w.descriptorCount=1; w.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w.pBufferInfo=&db; vkUpdateDescriptorSets(device,1,&w,0,nullptr); }
     constexpr VkShaderStageFlags stages=VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT|VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
-    VkPushConstantRange push{stages,0,88}; VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; li.setLayoutCount=1; li.pSetLayouts=&set_layout; li.pushConstantRangeCount=1; li.pPushConstantRanges=&push;
+    VkPushConstantRange push{stages,0,120}; VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; li.setLayoutCount=1; li.pSetLayouts=&set_layout; li.pushConstantRangeCount=1; li.pPushConstantRanges=&push;
     VkPipelineLayout layout{}; CHECK(vkCreatePipelineLayout(device,&li,nullptr,&layout));
     std::array<VkShaderModule,3> modules{}; std::array<VkPipelineShaderStageCreateInfo,3> si{};
     const std::array<VkShaderStageFlagBits,3> kinds{VK_SHADER_STAGE_VERTEX_BIT,VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT};
@@ -138,8 +138,8 @@ int main(int argc, char** argv) try {
         VkCommandBufferBeginInfo cb{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; CHECK(vkBeginCommandBuffer(cmd,&cb));
         VkRenderPassBeginInfo rb{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO}; rb.renderPass=pass; rb.framebuffer=fb; rb.renderArea={{0,0},{1,1}};
         const auto begin = [&] { vkCmdBeginRenderPass(cmd,&rb,VK_SUBPASS_CONTENTS_INLINE); vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline); };
-        const auto draw = [&](size_t i, bool writer) { std::array<uint32_t,22> words{}; words[0]=std::bit_cast<uint32_t>(i==0?10.0f:20.0f); const uint64_t address=scratch[i].address | uint64_t(writer); words[20]=uint32_t(address); words[21]=uint32_t(address>>32);
-            vkCmdPushConstants(cmd,layout,stages,0,88,words.data()); vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,layout,0,1,&sets[i],0,nullptr); vkCmdDraw(cmd,3,1,0,0); };
+        const auto draw = [&](size_t i, bool writer) { std::array<uint32_t,30> words{}; words[0]=std::bit_cast<uint32_t>(i==0?10.0f:20.0f); const uint64_t address=scratch[i].address | uint64_t(writer); words[28]=uint32_t(address); words[29]=uint32_t(address>>32);
+            vkCmdPushConstants(cmd,layout,stages,0,120,words.data()); vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,layout,0,1,&sets[i],0,nullptr); vkCmdDraw(cmd,3,1,0,0); };
         const auto barrier = [&] { VkMemoryBarrier m{VK_STRUCTURE_TYPE_MEMORY_BARRIER}; m.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT; m.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
             vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&m,0,nullptr,0,nullptr); };
         if (batch) { begin(); draw(0,true); draw(1,true); vkCmdEndRenderPass(cmd); barrier(); begin(); draw(0,false); draw(1,false); vkCmdEndRenderPass(cmd); }

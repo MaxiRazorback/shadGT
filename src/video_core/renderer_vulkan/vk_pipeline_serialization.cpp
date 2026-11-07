@@ -24,29 +24,29 @@ namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 // Synthetic dual-source exports change the fragment shader interface. Version 13 adds the
 // general swizzled factor blend, which also changes the runtime color-buffer layout.
-static constexpr u32 ShaderBinaryVersion = 271u;
+static constexpr u32 ShaderBinaryVersion = 271u + Shader::Backend::PushDataLayoutRevision;
 // Only masked fragment permutations need the extra push constants. Keep ordinary cached
 // shaders compatible; older renderers must skip the new permutations on rollback.
-static constexpr u32 ShaderBinaryVersionQuadSampleMask = 272u;
-static constexpr u32 ShaderBinaryVersionMsaaRead = 273u;
-static constexpr u32 ShaderBinaryVersionMsaaReadQuadSampleMask = 274u;
+static constexpr u32 ShaderBinaryVersionQuadSampleMask = 272u + Shader::Backend::PushDataLayoutRevision;
+static constexpr u32 ShaderBinaryVersionMsaaRead = 273u + Shader::Backend::PushDataLayoutRevision;
+static constexpr u32 ShaderBinaryVersionMsaaReadQuadSampleMask = 274u + Shader::Backend::PushDataLayoutRevision;
 // Scalar-pointer compute loads support bounded prefixes and prologue table loads.
-static constexpr u32 ShaderBinaryVersionScalarPrefix = 275u;
-static constexpr u32 ShaderBinaryVersionScalarPrefixMsaaRead = 276u;
+static constexpr u32 ShaderBinaryVersionScalarPrefix = 275u + Shader::Backend::PushDataLayoutRevision;
+static constexpr u32 ShaderBinaryVersionScalarPrefixMsaaRead = 276u + Shader::Backend::PushDataLayoutRevision;
 // Vertex fetch conversion/swizzles must agree with the invalid-descriptor cache policy.
-static constexpr u32 ShaderBinaryVersionVertexFetch = 277u;
+static constexpr u32 ShaderBinaryVersionVertexFetch = 277u + Shader::Backend::PushDataLayoutRevision;
 // Shader semantic revision 0x100 invalidates binaries emitted before the MED3 quiet-NaN fix.
 // Fragment reflections use cube views; other stages keep their existing array path.
-static constexpr u32 ShaderBinaryVersionNativeCube = 279u;
+static constexpr u32 ShaderBinaryVersionNativeCube = 279u + Shader::Backend::PushDataLayoutRevision;
 // AMD single-sample KHR barycentrics change the fragment interface and interpolation.
-static constexpr u32 ShaderBinaryVersionSingleSampleBarycentric = 282u;
+static constexpr u32 ShaderBinaryVersionSingleSampleBarycentric = 282u + Shader::Backend::PushDataLayoutRevision;
 // Tessellation modules and keys must use the same translation-time layout.
-static constexpr u32 ShaderBinaryVersionTessellationLayout = 283u;
-static constexpr u32 ShaderBinaryVersionTessellationMip = 286u;
-static constexpr u32 ShaderBinaryVersionTessellationNoMip = 287u;
+static constexpr u32 ShaderBinaryVersionTessellationLayout = 283u + Shader::Backend::PushDataLayoutRevision;
+static constexpr u32 ShaderBinaryVersionTessellationMip = 286u + Shader::Backend::PushDataLayoutRevision;
+static constexpr u32 ShaderBinaryVersionTessellationNoMip = 287u + Shader::Backend::PushDataLayoutRevision;
 // FIX-223: fragment shaders whose discards end the pixel (AMD). 285: FIX-GTS-011 keeps some
 // shaders' discarded pixels as helpers again.
-static constexpr u32 ShaderBinaryVersionDiscardKill = 285u;
+static constexpr u32 ShaderBinaryVersionDiscardKill = 285u + Shader::Backend::PushDataLayoutRevision;
 
 static bool UsesScalarPrefix(const Shader::Info& info) {
     return info.hw_stage == Shader::HwStage::Compute &&
@@ -160,6 +160,9 @@ static bool IsKnownShaderBinaryVersion(u32 version) {
     // binary revision and retranslates it. Never relabel an old binary as corrected.
     version = UntagCubeVersion(version);
     version |= 0x100u;
+    // Old metadata remains discoverable for prewarm and index reservation. The
+    // exact comparison in LoadShaderMeta still rejects its incompatible SPIR-V.
+    version |= Shader::Backend::PushDataLayoutRevision;
     if (version == Serialization::ShaderBinaryVersionTessellationMip ||
         version == Serialization::ShaderBinaryVersionTessellationNoMip) return true;
     if (version == Serialization::ShaderBinaryVersionTessellationLayout) return true;

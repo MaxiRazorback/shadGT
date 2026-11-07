@@ -140,7 +140,7 @@ u64 RecipeSignature(const Instance& instance, const Shader::Profile& p) {
     const auto add = [&](u64 v) { for (u32 i=0;i<8;++i) { hash ^= (v >> (i*8)) & 255; hash *= 1099511628211ull; } };
     const auto props = instance.GetPhysicalDevice().getProperties();
     // Recipe translation ABI: bump when stored SPIR-V layout or policy changes.
-    constexpr u32 TranslationAbiVersion = 2;
+    constexpr u32 TranslationAbiVersion = 3; // FIX-317: six push-offset vectors.
     add(TranslationAbiVersion);
     add(Shader::LaneReadUnbranchEnabled());
     add(props.vendorID);

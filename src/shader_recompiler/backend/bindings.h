@@ -24,11 +24,13 @@ struct Bindings {
 /// evaluation 2, vertex 3, geometry 4); compute uses set 0. Push data's buffer offsets are one
 /// array shared by the stages: each stage has its own range of it.
 constexpr u32 MaxDescriptorSets = 5;
+// Distinguish stored SPIR-V compiled for the former four-vector push table.
+constexpr u32 PushDataLayoutRevision = 0x200u;
 constexpr u32 StageSet(u32 sw_stage) {
     return sw_stage < MaxDescriptorSets ? sw_stage : 0;
 }
-constexpr std::array<u32, 6> StageBufferOffsetBase{0, 32, 44, 16, 56, 0};
-constexpr std::array<u32, 6> StageBufferOffsetCount{16, 12, 12, 16, 8, 64};
+constexpr std::array<u32, 6> StageBufferOffsetBase{0, 32, 56, 16, 80, 0};
+constexpr std::array<u32, 6> StageBufferOffsetCount{16, 24, 24, 16, 16, 96};
 constexpr Bindings StageStart(u32 sw_stage) {
     return {0, sw_stage < StageBufferOffsetBase.size() ? StageBufferOffsetBase[sw_stage] : 0};
 }

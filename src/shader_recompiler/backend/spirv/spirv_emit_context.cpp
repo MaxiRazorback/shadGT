@@ -937,7 +937,8 @@ void EmitContext::DefineOutputs() {
 void EmitContext::DefinePushDataBlock() {
     // Create push constants block for instance steps rates
     const Id struct_type{
-        Name(TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[4], U32[4], U32[2]),
+        Name(TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[4], U32[4],
+                        U32[4], U32[4], U32[2]),
              "AuxData")};
     Decorate(struct_type, spv::Decoration::Block);
     MemberName(struct_type, PushData::XOffsetIndex, "xoffset");
@@ -948,6 +949,8 @@ void EmitContext::DefinePushDataBlock() {
     MemberName(struct_type, PushData::BufOffsetIndex + 1, "buf_offsets1");
     MemberName(struct_type, PushData::BufOffsetIndex + 2, "buf_offsets2");
     MemberName(struct_type, PushData::BufOffsetIndex + 3, "buf_offsets3"); // SHD-002
+    MemberName(struct_type, PushData::BufOffsetIndex + 4, "buf_offsets4");
+    MemberName(struct_type, PushData::BufOffsetIndex + 5, "buf_offsets5");
     MemberName(struct_type, PushData::QuadSampleMaskIndex, "quad_sample_mask");
     MemberDecorate(struct_type, PushData::XOffsetIndex, spv::Decoration::Offset, 0U);
     MemberDecorate(struct_type, PushData::YOffsetIndex, spv::Decoration::Offset, 4U);
@@ -957,7 +960,9 @@ void EmitContext::DefinePushDataBlock() {
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 1, spv::Decoration::Offset, 32U);
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 2, spv::Decoration::Offset, 48U);
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 3, spv::Decoration::Offset, 64U);
-    MemberDecorate(struct_type, PushData::QuadSampleMaskIndex, spv::Decoration::Offset, 80U);
+    MemberDecorate(struct_type, PushData::BufOffsetIndex + 4, spv::Decoration::Offset, 80U);
+    MemberDecorate(struct_type, PushData::BufOffsetIndex + 5, spv::Decoration::Offset, 96U);
+    MemberDecorate(struct_type, PushData::QuadSampleMaskIndex, spv::Decoration::Offset, 112U);
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
     Name(push_data_block, "push_data");
     interfaces.push_back(push_data_block);
@@ -1022,6 +1027,10 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_cohere
 };
 
 void EmitContext::DefineBuffers() {
+    const auto stage = static_cast<u32>(info.sw_stage);
+    if (stage >= StageBufferOffsetCount.size() || info.buffers.size() > StageBufferOffsetCount[stage]) {
+        throw Common::RecoverableFailure{"Shader exceeds its stage's push-offset range"};
+    }
     for (const auto& desc : info.buffers) {
         const auto buf_sharp = desc.GetSharp(info);
         // MTYPE class 3 marks guest buffers shared between invocations; shared
