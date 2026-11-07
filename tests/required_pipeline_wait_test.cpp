@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -104,6 +105,38 @@ TEST(RequiredPipelineWait, RequiredBuildCannotBeCancelledWhileWaiting) {
     waiters = 0;
     EXPECT_TRUE(cancel());
     EXPECT_EQ(done.wait_for(std::chrono::milliseconds{0}), std::future_status::ready);
+}
+
+TEST(RequiredPipelineWait, ListingRemainsOwnedAfterConcurrentConsumptionAndRehash) {
+    std::mutex mutex;
+    unsigned int waiters = 0;
+    std::promise<std::vector<int>> completion;
+    std::unordered_map<int, std::shared_future<std::vector<int>>> listings;
+    listings.emplace(1, completion.get_future().share());
+    std::promise<void> waiting;
+    std::vector<int> observed;
+    std::thread reader([&] {
+        std::unique_lock lock{mutex};
+        const auto owned = listings.at(1);
+        Vulkan::WaitOutsideLookup(lock, waiters, [&] {
+            waiting.set_value();
+            owned.wait();
+        });
+        observed = owned.get();
+        EXPECT_TRUE(lock.owns_lock());
+        EXPECT_EQ(waiters, 0u);
+    });
+    waiting.get_future().wait();
+    {
+        std::unique_lock lock{mutex};
+        completion.set_value({11, 22, 33});
+        const auto consumed = listings.at(1).get();
+        EXPECT_EQ(consumed.size(), 3u);
+        listings.erase(1);
+        for (int i = 2; i < 4096; ++i) listings.emplace(i, std::shared_future<std::vector<int>>{});
+    }
+    reader.join();
+    EXPECT_EQ(observed, (std::vector<int>{11, 22, 33}));
 }
 
 int main(int argc, char** argv) {

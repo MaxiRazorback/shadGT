@@ -571,6 +571,7 @@ private:
                                   const Shader::RuntimeInfo& runtime_info,
                                   const Shader::Backend::Bindings& binding);
     static thread_local std::vector<std::shared_ptr<TranslateJob>> unlocked_translations;
+    static thread_local std::vector<std::shared_future<StoredListing>> unlocked_listings;
     /// FIX-078 (lookup lock held): moves the finished translations of a program to its ready
     /// list, first waiting for its unfinished ones when `wait`.
     void HarvestTranslations(u64 hash, bool wait, Shader::HwStage hw_stage,
@@ -609,7 +610,7 @@ private:
     std::unique_ptr<TranslateWorkers> translate_workers;
 
     class StoreReaders;
-    std::unordered_map<u64, std::future<StoredListing>> pending_listings;
+    std::unordered_map<u64, std::shared_future<StoredListing>> pending_listings;
     std::unique_ptr<StoreReaders> store_readers;
 
     // Last member, so the workers stop before anything they use is destroyed.

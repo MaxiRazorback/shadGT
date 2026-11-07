@@ -2616,6 +2616,8 @@ static thread_local const std::shared_future<void>* t_required_pipeline_build = 
 static thread_local std::unique_lock<LookupLock>* t_required_lookup_lock = nullptr;
 thread_local std::vector<std::shared_ptr<PipelineCache::TranslateJob>>
     PipelineCache::unlocked_translations;
+thread_local std::vector<std::shared_future<PipelineCache::StoredListing>>
+    PipelineCache::unlocked_listings;
 static bool UnlockedShadersEnabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("RYGT_ONE_OFF_SHADERS_UNLOCKED");
@@ -2892,11 +2894,16 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineUnlocked(
     }();
     if (!enabled) return GetGraphicsPipeline(params);
     auto* previous = std::exchange(t_required_lookup_lock, &lock);
-    SCOPE_EXIT { t_required_lookup_lock = previous; unlocked_translations.clear(); };
+    SCOPE_EXIT {
+        t_required_lookup_lock = previous;
+        unlocked_translations.clear();
+        unlocked_listings.clear();
+    };
     for (u32 attempt = 0; attempt < 8; ++attempt) {
         unlocked_translations.clear();
+        unlocked_listings.clear();
         const auto* pipeline = GetGraphicsPipeline(params);
-        if (pipeline || unlocked_translations.empty()) return pipeline;
+        if (pipeline || (unlocked_translations.empty() && unlocked_listings.empty())) return pipeline;
         // Speculative and legacy modes use shared lookup state and may not cross an unlock.
         if (!CanUnlockRequired(regs_override != nullptr, force_legacy, fallback_nested,
                                defer_misses)) {
@@ -2904,6 +2911,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineUnlocked(
             return GetGraphicsPipeline(params);
         }
         auto jobs = std::move(unlocked_translations);
+        auto listings = std::move(unlocked_listings);
         t_required_lookup_lock = nullptr;
         WaitOutsideLookup(lock, unlocked_required_waits, [&] {
             Common::GuestClock::CompilePause pause;
@@ -2911,6 +2919,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipelineUnlocked(
                 std::unique_lock job_lock{job->mutex};
                 job->cv.wait(job_lock, [&] { return job->done.load(); });
             }
+            for (const auto& listing : listings) listing.wait();
         });
         t_required_lookup_lock = &lock;
     }
@@ -2970,13 +2979,15 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         }
         deferred_miss = false;
         key_valid = RefreshGraphicsKey();
-        if (!key_valid && t_required_lookup_lock && !unlocked_translations.empty()) break;
+        if (!key_valid && t_required_lookup_lock &&
+            (!unlocked_translations.empty() || !unlocked_listings.empty())) break;
         if (!key_valid && translation_skipped) {
             break; // SHD-005
         }
     }
     defer_misses = false;
-    if (!key_valid && t_required_lookup_lock && !unlocked_translations.empty()) {
+    if (!key_valid && t_required_lookup_lock &&
+        (!unlocked_translations.empty() || !unlocked_listings.empty())) {
         deferred_miss = false;
         return nullptr;
     }
@@ -5713,7 +5724,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
     if (store_readers && !program_cache.contains(params.hash)) {
         auto pending = pending_listings.find(params.hash);
         if (pending == pending_listings.end() && pending_listings.size() < 1024) {
-            try { pending = pending_listings.emplace(params.hash, store_readers->List(params.hash)).first; }
+            try { pending = pending_listings.emplace(params.hash, store_readers->List(params.hash).share()).first; }
             catch (const std::bad_alloc&) { /* Use the synchronous listing path. */ }
         }
         if (pending != pending_listings.end()) {
@@ -5724,7 +5735,19 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
                 else if (RetryBlockedReadAhead()) read_ahead_blocked = true;
                 return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
             }
-            if (!may_skip) pending->second.wait();
+            if (!may_skip) {
+                if (t_required_lookup_lock && UnlockedShadersEnabled() &&
+                    CanUnlockRequired(regs_override != nullptr, force_legacy, fallback_nested,
+                                      defer_misses) && PreservesDepthOutput() &&
+                    pending->second.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
+                    // The map entry can be erased or rehashed while unlocked. Own its
+                    // shared state, then let the outer lookup restart every stage/key.
+                    unlocked_listings.push_back(pending->second);
+                    deferred_miss = true;
+                    return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
+                }
+                pending->second.wait();
+            }
         }
     }
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
@@ -5734,7 +5757,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
             const auto pending = pending_listings.find(params.hash);
             if (pending == pending_listings.end()) ListStoredPermutations(params.hash, *it_pgm.value());
             else {
-                try { ApplyStoredListing(pending->second.get(), *it_pgm.value()); }
+                try { ApplyStoredListing(StoredListing{pending->second.get()}, *it_pgm.value()); }
                 catch (...) { ListStoredPermutations(params.hash, *it_pgm.value()); }
                 pending_listings.erase(pending);
             }
