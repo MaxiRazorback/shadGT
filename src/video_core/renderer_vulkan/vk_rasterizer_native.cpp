@@ -13,6 +13,7 @@
 #include "ryty_gpu/native/prepared_direct_slot.h"
 #include "ryty_gpu/native/readonly_hint.h"
 #include "ryty_gpu/native/high_cpu_writeback.h"
+#include "ryty_gpu/native/linear_image_download.h"
 #include "ryty_gpu/native/parallel_direct_capability.h"
 #include "ryty_gpu/native/parallel_gate_histogram.h"
 #include "core/emulator_settings.h"
@@ -144,6 +145,11 @@ vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type);
 #endif
 
 namespace Vulkan {
+
+struct NativeRenderer::PendingLinearDownload {
+    std::vector<VideoCore::DirectMemory::LeasedPart> imports;
+    std::vector<Native::LinearDownloadCopy> copies;
+};
 namespace {
 enum MirrorDiagnosticReason : u32 { MirrorCandidateNew,MirrorCandidateSameFrame,MirrorCandidateDynamic,
     MirrorCandidateQueued,MirrorPromotionRegion,MirrorPromotionDynamic,MirrorPromotionBudget,
@@ -2403,6 +2409,45 @@ void NativeRenderer::WritebacksBefore(DrawBindings& b) {
     }
 }
 
+static bool PlanDirectLinearDownload(const Native::ImageEntry& entry,
+    const std::vector<VideoCore::DirectMemory::LeasedPart>& imports,
+    std::vector<Native::LinearDownloadCopy>& copies) {
+    const auto& info = entry.info;
+    // These formats have the same byte layout as the guest's 8_8_8_8 data.
+    // Other format remaps need an independent byte-representation proof.
+    const bool byte_exact = info.pixel_format == vk::Format::eR8G8B8A8Unorm ||
+        info.pixel_format == vk::Format::eR8G8B8A8Snorm ||
+        info.pixel_format == vk::Format::eR8G8B8A8Uint ||
+        info.pixel_format == vk::Format::eR8G8B8A8Sint ||
+        info.pixel_format == vk::Format::eR8G8B8A8Srgb;
+    if (!entry.image) return false;
+    const auto& desc = entry.image->Desc();
+    if (info.props.is_tiled || info.props.is_bgr_packed_float || info.props.is_depth ||
+        info.props.is_block || info.props.is_volume || info.num_samples != 1 ||
+        !byte_exact ||
+        desc.format != Native::Rhi::FormatFromVk(u32(info.pixel_format)) ||
+        !Native::LinearImageShapeMatches(
+            {info.size.width, info.size.height, info.size.depth, info.resources.levels,
+             info.resources.layers, info.num_samples},
+            {desc.width, desc.height, desc.depth, desc.mips, desc.layers, desc.samples},
+            desc.dim == Native::Rhi::ImageDim::D2) ||
+        vk::blockSize(info.pixel_format) != info.num_bits / 8 ||
+        info.num_bits == 0 || info.num_bits % 8 || info.size.depth != 1 ||
+        !info.resources.levels || info.resources.levels > VideoCore::MAX_MIPS ||
+        !info.resources.layers) return false;
+    std::vector<Native::LinearDownloadPart> parts;
+    std::vector<Native::LinearDownloadMip> mips;
+    parts.reserve(imports.size()); mips.reserve(info.resources.levels);
+    for (const auto& p : imports) parts.push_back({p.range_offset, p.size, p.view_offset, p.view_size});
+    for (u32 m = 0; m < info.resources.levels; ++m) {
+        const auto& layout = info.mips_layout[m];
+        mips.push_back({layout.offset, layout.pitch, layout.height,
+            std::max(info.size.width >> m, 1u), std::max(info.size.height >> m, 1u),
+            info.resources.layers});
+    }
+    return Native::PlanLinearImageDownload(mips, parts, info.guest_size, info.num_bits / 8, copies);
+}
+
 void NativeRenderer::FlushWritebacks() {
     if (writebacks.empty() || !stream.list) {
         return;
@@ -2411,6 +2456,7 @@ void NativeRenderer::FlushWritebacks() {
     auto* direct = r.buffer_cache.GetDirectMemory();
     const u64 alignment = r.instance.StorageMinAlignment();
     struct DownloadCopy { vk::Buffer destination; u64 source_offset, destination_offset, size; };
+    struct LinearRegionCopy { vk::Buffer source, destination; u64 source_offset, destination_offset, size; };
     struct DownloadPlan {
         Native::ImageEntry* entry;
         std::unique_ptr<Native::Rhi::Buffer> out;
@@ -2418,6 +2464,8 @@ void NativeRenderer::FlushWritebacks() {
         u64 offset;
         std::vector<DownloadCopy> scatter;
         std::vector<DownloadCopy> copies;
+        std::vector<Native::LinearDownloadCopy> linear;
+        std::vector<LinearRegionCopy> linear_regions;
     };
     std::vector<DownloadPlan> plans;
     try {
@@ -2425,38 +2473,87 @@ void NativeRenderer::FlushWritebacks() {
         for (auto* entry : writebacks) {
             const VAddr address = entry->info.guest_address;
             const u64 size = entry->info.guest_size;
+            std::optional<std::vector<VideoCore::DirectMemory::LeasedPart>> parts;
+            std::vector<Native::LinearDownloadCopy> linear;
+            const bool chunked = size > 256_MB;
+            if (chunked) {
+                const auto pending = pending_linear_downloads.find(entry);
+                if (pending == pending_linear_downloads.end()) continue;
+                if (entry->reused.load(std::memory_order_acquire)) {
+                    pending_linear_downloads.erase(pending);
+                    continue;
+                }
+                try {
+                    parts = pending->second->imports;
+                    linear = pending->second->copies;
+                } catch (...) {
+                    pending_linear_downloads.erase(pending);
+                    continue; // Optional extension: retain the prior fallback.
+                }
+            }
             if (!size || address > UINT64_MAX - size) {
                 UNREACHABLE_MSG("native image download range overflow");
                 return;
             }
-            if (!direct || !direct->EnsureImported(address, size)) {
+            if (!chunked && (!direct || !direct->EnsureImported(address, size))) {
                 UNREACHABLE_MSG("native image download import failed");
                 return;
             }
-            auto parts = direct->PlanLeasedParts(address, size, alignment, 1);
-            const bool direct_output = parts && parts->size() == 1;
-            if (!direct_output) parts = direct->PlanLeasedParts(address, size, 4, 4);
+            if (!chunked) parts = direct->PlanLeasedParts(address, size, alignment, 1);
+            const bool direct_output = !chunked && parts && parts->size() == 1;
+            if (!chunked && !direct_output) parts = direct->PlanLeasedParts(address, size, 4, 4);
             if (!parts) {
                 UNREACHABLE_MSG("native image download import coverage or alignment failed");
                 return;
             }
-            auto out = direct_output ? device->WrapBuffer(
+            auto out = chunked ? nullptr : direct_output ? device->WrapBuffer(
                 reinterpret_cast<u64>(static_cast<VkBuffer>(parts->front().buffer)), parts->front().view_size)
                 : device->CreateBuffer({.size = size,
                     .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageTransferSrc |
                              Native::Rhi::BufferUsageTransferDst,
                     .memory = Native::Rhi::MemoryKind::DeviceLocal, .name = "native image download scatter"});
-            if (!out) {
+            if (!out && !chunked) {
                 UNREACHABLE_MSG("native image download wrapper allocation failed");
                 return;
             }
             const u64 offset = direct_output ? parts->front().view_offset : 0;
-            DownloadPlan plan{entry, std::move(out), std::move(*parts), offset, {}, {}};
-            if (!direct_output) {
+            DownloadPlan plan{entry, std::move(out), std::move(*parts), offset, {}, {},
+                              std::move(linear), {}};
+            if (!direct_output && !chunked) {
                 for (const auto& part : plan.imports)
                     plan.scatter.push_back({part.buffer, part.range_offset, part.view_offset, part.size});
             }
+            bool valid_linear_regions = true;
             for (auto& [base, region] : regions) {
+                if (chunked) {
+                    const u64 texel_bytes = entry->info.num_bits / 8;
+                    for (const auto& copy : plan.linear) for (u32 row = 0; row < copy.height; ++row) {
+                        const VAddr from = address + copy.range_offset + u64(row) * copy.pitch * texel_bytes;
+                        const VAddr to = from + u64(copy.width) * texel_bytes;
+                        const VAddr begin = std::max(from, region.begin), end = std::min(to, region.end);
+                        if (begin >= end) continue;
+                        const u64 src = copy.buffer_offset + u64(row) * copy.pitch * texel_bytes + begin - from;
+                        const u64 dst = begin - region.begin;
+                        if ((src | dst | (end - begin)) & 3u) {
+                            valid_linear_regions = false;
+                            break;
+                        }
+                        const vk::Buffer source = plan.imports[copy.part].buffer;
+                        const vk::Buffer destination{Handle<VkBuffer_T>(region.buffer->NativeHandle())};
+                        if (!plan.linear_regions.empty()) {
+                            auto& last = plan.linear_regions.back();
+                            if (last.source == source && last.destination == destination &&
+                                last.source_offset + last.size == src &&
+                                last.destination_offset + last.size == dst) {
+                                last.size += end - begin;
+                                continue;
+                            }
+                        }
+                        plan.linear_regions.push_back({source, destination, src, dst, end - begin});
+                    }
+                    if (!valid_linear_regions) break;
+                    continue;
+                }
                 const VAddr begin = std::max(address, region.begin);
                 const VAddr end = std::min(address + size, region.end);
                 if (begin >= end) continue;
@@ -2468,6 +2565,10 @@ void NativeRenderer::FlushWritebacks() {
                 }
                 plan.copies.push_back({vk::Buffer{Handle<VkBuffer_T>(region.buffer->NativeHandle())},
                                        src, dst, end - begin});
+            }
+            if (chunked) {
+                pending_linear_downloads.erase(entry);
+                if (!valid_linear_regions || entry->reused.load(std::memory_order_acquire)) continue;
             }
             plans.push_back(std::move(plan));
         }
@@ -2491,8 +2592,10 @@ void NativeRenderer::FlushWritebacks() {
     if (batched) {
         const u64 step_alignment = std::max<u64>(alignment, 256);
         u64 bytes = 0;
-        for (const auto* entry : writebacks) {
-            bytes += 2 * Common::AlignUp(u64(entry->info.guest_size), step_alignment);
+        for (const auto& plan : plans) {
+            const auto& info = plan.entry->info;
+            if (!info.props.is_tiled && !info.props.is_bgr_packed_float) continue;
+            bytes += 2 * Common::AlignUp(u64(info.guest_size), step_alignment);
         }
         use_batch = bytes != 0 && registry->BeginDownloads(batch, bytes, alignment);
     }
@@ -2505,6 +2608,72 @@ void NativeRenderer::FlushWritebacks() {
             })) {
             registry->FinishDownloads(*s.list, batch);
             batch_ranges.clear();
+        }
+        if (!plan.linear.empty()) {
+            if (entry->reused.load(std::memory_order_acquire)) continue;
+            if (use_batch) { registry->FinishDownloads(*s.list, batch); batch_ranges.clear(); }
+            // Capacity was reserved for all plans above. Transfer ownership before
+            // the first command, including when later metadata allocation fails.
+            Native::TransferLinearDownloadLeases(s.imported_view_leases, plan.imports);
+            const vk::Image image{Handle<VkImage_T>(entry->image->NativeHandle())};
+            for (const auto& copy : plan.linear) {
+                const vk::BufferImageCopy region{
+                    .bufferOffset = copy.buffer_offset,
+                    .bufferRowLength = copy.pitch,
+                    .imageSubresource = {vk::ImageAspectFlagBits::eColor, copy.mip, copy.layer, 1},
+                    .imageOffset = {s32(copy.x), s32(copy.y), 0},
+                    .imageExtent = {copy.width, copy.height, 1},
+                };
+                s.cmd.copyImageToBuffer(image, vk::ImageLayout::eGeneral,
+                                        plan.imports[copy.part].buffer, region);
+            }
+            if (!plan.linear_regions.empty()) {
+                const vk::MemoryBarrier2 copied{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+                    .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+                    .dstAccessMask = vk::AccessFlagBits2::eTransferRead};
+                s.cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &copied});
+                for (const auto& copy : plan.linear_regions)
+                    s.cmd.copyBuffer(copy.source, copy.destination,
+                        vk::BufferCopy{copy.source_offset, copy.destination_offset, copy.size});
+            }
+            s.list->Barrier(Native::Rhi::ScopeTransfer, Native::Rhi::ScopeTransfer |
+                            Native::Rhi::ScopeCompute | Native::Rhi::ScopeHost);
+            // Only pixels were copied: do not mark guest padding as downloaded.
+            const u64 texel_bytes = entry->info.num_bits / 8;
+            try {
+              {
+                std::scoped_lock lock{region_dirty_mutex};
+                for (const auto& copy : plan.linear) for (u32 row = 0; row < copy.height; ++row) {
+                    const VAddr from = address + copy.range_offset + u64(row) * copy.pitch * texel_bytes;
+                    const VAddr to = from + u64(copy.width) * texel_bytes;
+                    for (auto& [base, region] : regions) {
+                        const VAddr begin = std::max(from, region.begin), end = std::min(to, region.end);
+                        for (VAddr page = Common::AlignDown(begin, 4096); begin < end && page < end; page += 4096) {
+                            region.dirty_pages.push_back(page);
+                            Native::AddPageDownloadRange(downloaded_ranges[page], std::max(begin, page),
+                                                         std::min(end, page + 4096));
+                        }
+                        if (begin < end) region.dirty_sorted = false;
+                    }
+                }
+              }
+                for (const auto& copy : plan.linear) for (u32 row = 0; row < copy.height; ++row) {
+                    const VAddr from = address + copy.range_offset + u64(row) * copy.pitch * texel_bytes;
+                    const VAddr to = from + u64(copy.width) * texel_bytes;
+                    for (auto it = FirstMirror(from); it != mirrors.end() && it->second.begin < to; ++it) {
+                        Mirror& mirror = it->second;
+                        for (VAddr page = Common::AlignDown(std::max(from, mirror.begin), 4096);
+                             page < std::min(to, mirror.end); page += 4096) mirror.dirty_pages.push_back(page);
+                    }
+                }
+            } catch (...) {
+                // The command stream is already mutated and cannot safely be resumed.
+                std::terminate();
+            }
+            NATIVE_DIAGNOSTIC(++stats.writebacks);
+            continue;
         }
         if (!plan.scatter.empty()) {
             const vk::Buffer scratch{Handle<VkBuffer_T>(plan.out->NativeHandle())};
@@ -6725,6 +6894,28 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
                     if (Native::ClassifyHighCpuWriteback(entry->info.guest_address, size,
                             NativeInplaceFrom(), budget, usage, true) == Native::HighCpuWriteback::Admit) {
                         QueueWriteback(entry);
+                    }
+                } else if (initial == Native::HighCpuWriteback::OverLimit &&
+                           size <= ~u64{0} - entry->info.guest_address &&
+                           std::ranges::find(writebacks, entry) == writebacks.end()) {
+                    // Large plain linear images can be written directly into
+                    // leased views in bounded row rectangles, without a full-image scratch.
+                    try {
+                        auto* direct = r.buffer_cache.GetDirectMemory();
+                        if (direct && direct->EnsureImported(entry->info.guest_address, size)) {
+                            auto parts = direct->PlanLeasedParts(entry->info.guest_address, size, 4, 4);
+                            std::vector<Native::LinearDownloadCopy> copies;
+                            if (parts && !entry->reused.load(std::memory_order_acquire) &&
+                                PlanDirectLinearDownload(*entry, *parts, copies)) {
+                                auto pending = std::make_shared<PendingLinearDownload>();
+                                pending->imports = std::move(*parts);
+                                pending->copies = std::move(copies);
+                                pending_linear_downloads.insert_or_assign(entry, std::move(pending));
+                                QueueWriteback(entry);
+                            }
+                        }
+                    } catch (...) {
+                        // Keep the prior behavior when a plan cannot be prepared.
                     }
                 }
             }
@@ -11521,6 +11712,13 @@ bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
     return true;
 }
 
+void NativeRenderer::CancelLinearDownloads(VAddr address, u64 size) {
+    std::erase_if(pending_linear_downloads, [&](const auto& item) {
+        const auto& info = item.first->info;
+        return Native::LinearDownloadOverlaps(info.guest_address, info.guest_size, address, size);
+    });
+}
+
 void NativeRenderer::OnUnmap(VAddr address, u64 size) {
     if (UiHires::Enabled()) {
         auto& ui = UiHires::Get();
@@ -11561,6 +11759,7 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
     // NAT-146: regions over unmapped memory go (the device frees their buffers once the GPU is
     // done with them).
     std::scoped_lock lock{mutex};
+    CancelLinearDownloads(address, size);
     if (FaultAheadEnabled() && size != 0) {
         page_watches.ClearExclusions(VideoCore::PageManager::GetPageAddr(address),
                                     VideoCore::PageManager::GetNextPageAddr(address + size - 1));
@@ -11607,6 +11806,7 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
 void NativeRenderer::OnNewMapping(VAddr address, u64 size) {
     if (!size) return;
     std::scoped_lock lock{mutex};
+    CancelLinearDownloads(address, size);
     std::optional<std::vector<Native::MappingRefreshRange>> plan;
     std::unordered_set<VAddr> prepared_pages;
     try {
@@ -12065,6 +12265,7 @@ void NativeRenderer::EvictImages() {
         held_versions.erase(&entry);
         std::erase(stream.written, &entry);
         std::erase(writebacks, &entry);
+        pending_linear_downloads.erase(&entry);
         std::erase(frame_writebacks, &entry);
         std::erase(dump_entries, &entry);
         for (auto it = stencil_owners.begin(); it != stencil_owners.end();) {

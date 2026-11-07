@@ -5,6 +5,7 @@
 #include "ryty_gpu/native/writeback_plan.h"
 #include "ryty_gpu/native/high_cpu_writeback.h"
 #include "ryty_gpu/native/whole_layer_clear.h"
+#include "ryty_gpu/native/linear_image_download.h"
 #include "video_core/buffer_cache/imported_part_plan.h"
 #include "video_core/buffer_cache/imported_view_lease.h"
 #include "video_core/host_shaders/native_region_writeback_comp.h"
@@ -62,6 +63,79 @@ VideoCore::ImageInfo MakeInfo(AmdGpu::TileMode tile_mode, u32 width, u32 height,
 
 u32 Texel(u32 x, u32 y, u32 mip) {
     return x | (y << 10) | (mip << 20) | 0xA0000000u;
+}
+
+bool RunLinearPartsCase(Rhi::Device& device, Rhi::Fence& fence, u64& tick, std::string& log) {
+    ImageRegistry registry{device};
+    auto info = MakeInfo(AmdGpu::TileMode::DisplayLinearAligned, 17, 9, 3, 0x7800'0000'0000ULL);
+    info.resources.layers = 2; info.UpdateSize();
+    const u64 bytes = info.guest_size;
+    if (bytes < 64 || bytes % 4) return false;
+    auto* image = registry.Find(info, true, 1);
+    auto source = device.CreateBuffer({.size=bytes, .usage=Rhi::BufferUsageTransferSrc |
+        Rhi::BufferUsageTransferDst, .memory=Rhi::MemoryKind::DeviceLocal});
+    if (!image || !source) return false;
+    std::vector<u8> expected(bytes, 0x5a);
+    std::vector<Native::LinearDownloadMip> mips;
+    for (u32 m=0; m<info.resources.levels; ++m) {
+        const auto& layout = info.mips_layout[m];
+        const u32 width = std::max(info.size.width >> m, 1u), height = std::max(info.size.height >> m, 1u);
+        mips.push_back({layout.offset, layout.pitch, layout.height, width, height, info.resources.layers});
+        for (u32 layer=0; layer<info.resources.layers; ++layer)
+            for (u32 y=0; y<height; ++y) for (u32 x=0; x<width; ++x) {
+                const u32 value = 0xa0000000u | (m << 20) | (layer << 16) | (y << 8) | x;
+                const u64 offset = layout.offset + (u64(layer) * layout.height + y) * layout.pitch * 4 + x * 4;
+                if (offset + 4 > bytes) return false;
+                std::memcpy(expected.data() + offset, &value, 4);
+            }
+    }
+    const u64 middle = (bytes / 2) & ~u64{3};
+    const std::array parts{Native::LinearDownloadPart{0,16,16,48},
+        Native::LinearDownloadPart{16,middle-16,16,middle+16},
+        Native::LinearDownloadPart{middle,bytes-middle,16,bytes-middle+32}};
+    std::vector<Native::LinearDownloadCopy> copies;
+    if (!Native::PlanLinearImageDownload(mips, parts, bytes, 4, copies)) return false;
+    std::array<std::unique_ptr<Rhi::Buffer>,3> outs;
+    auto* list = device.AcquireCommandList(); list->Begin();
+    registry.RecordUploads(*list);
+    list->FillBuffer(source.get(), 0, bytes, 0x5a5a5a5a);
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+    for (u32 m=0; m<info.resources.levels; ++m) {
+        const auto& layout = info.mips_layout[m];
+        const u32 width = std::max(info.size.width >> m, 1u), height = std::max(info.size.height >> m, 1u);
+        for (u32 layer=0; layer<info.resources.layers; ++layer)
+            for (u32 y=0; y<height; ++y) for (u32 x=0; x<width; ++x) {
+                const u64 offset = layout.offset + (u64(layer) * layout.height + y) * layout.pitch * 4 + x * 4;
+                u32 value{}; std::memcpy(&value, expected.data() + offset, 4);
+                list->FillBuffer(source.get(), offset, 4, value);
+            }
+    }
+    for (u32 i=0;i<outs.size();++i) {
+        outs[i] = device.CreateBuffer({.size=parts[i].capacity, .usage=Rhi::BufferUsageTransferDst |
+            Rhi::BufferUsageTransferSrc, .memory=Rhi::MemoryKind::Readback});
+        if (!outs[i] || !outs[i]->Mapped()) return false;
+        list->FillBuffer(outs[i].get(), 0, parts[i].capacity, 0x5a5a5a5a);
+    }
+    list->Barrier(Rhi::ScopeTransfer | Rhi::ScopeCompute, Rhi::ScopeTransfer);
+    list->CopyBufferToImage(source.get(), image->image.get(), MipCopies(info));
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+    for (const auto& c : copies) {
+        const Rhi::BufferImageCopy copy{.buffer_offset=c.buffer_offset, .buffer_row_texels=c.pitch,
+            .mip=c.mip, .base_layer=c.layer, .layers=1, .offset={s32(c.x),s32(c.y),0},
+            .extent={c.width,c.height,1}, .aspect=Rhi::AspectColor};
+        list->CopyImageToBuffer(image->image.get(), outs[c.part].get(), {&copy,1});
+    }
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeHost); list->End();
+    Rhi::CommandList* lists[]{list}; device.GraphicsQueue().Submit(lists, {}, {&fence, ++tick});
+    if (!fence.Wait(tick, 5'000'000'000ULL)) return false;
+    for (u32 i=0;i<outs.size();++i) {
+        outs[i]->Invalidate();
+        if (std::memcmp(outs[i]->Mapped() + parts[i].offset, expected.data() + parts[i].range,
+                        parts[i].size) != 0) return false;
+        for (u64 j=0;j<parts[i].offset;++j) if (outs[i]->Mapped()[j] != 0x5a) return false;
+    }
+    log += "linear multipart mip/layer pixel copies and padding: passed\n";
+    return true;
 }
 
 bool RunLargeCpuWritebackCase(Rhi::Device& device, Rhi::Fence& fence, u64& tick,
@@ -1343,6 +1417,7 @@ bool RunImageSelfTest(std::string& log) {
     ok = RunWholeLayerClearCase(*device, *fence, tick, log) && ok;
     ok = RunAsyncMirrorCase(*device,*fence,tick,log) && ok;
     ok = RunLargeCpuWritebackCase(*device, *fence, tick, log) && ok;
+    ok = RunLinearPartsCase(*device, *fence, tick, log) && ok;
     ok = RunEvictionBudgetCase(*device, log) && ok;
     ok = RunUnmapTargetLifetimeCase(*device, log) && ok;
     ok = RunUploadChunkCacheCase(*device,*fence,tick,log) && ok;

@@ -659,6 +659,10 @@ private:
     /// FIX-157: bytes of pictures kept past their idle time.
     u64 kept_bytes = 0;
     std::vector<Native::ImageEntry*> writebacks;
+    struct PendingLinearDownload;
+    std::unordered_map<const Native::ImageEntry*, std::shared_ptr<PendingLinearDownload>> pending_linear_downloads;
+    // Caller holds the renderer mutex; a mapping change cancels only overlapping plans.
+    void CancelLinearDownloads(VAddr address, u64 size);
     std::vector<Native::ImageEntry*> frame_writebacks;
     void QueueWriteback(const Native::ImageEntry* entry);
     void WritebacksBefore(VAddr address, u64 size);
