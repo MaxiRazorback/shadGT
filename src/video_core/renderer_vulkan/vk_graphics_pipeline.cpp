@@ -263,22 +263,13 @@ static std::atomic<s64> last_pipeline_miss_ms{};
 
 // Preserve the existing ordinary/UI policy: optional optimized replacement is opt-in.
 // Tessellation never retains optimizer IR or enters LTO (previous multi-GB failures).
-// AMD-PERF-001: on AMD GPUs the optimized link is on by default. Without it every draw used the
-// fast-linked pipeline, which the driver's compiler builds without cross-stage optimization.
-// The optimized pipeline is built in the background once the game has been quiet for 3 s (and
-// only with 1 GB of RAM free); draws switch to it when it is ready. Tessellated pipelines stay
-// fast-linked. RYGT_PIPELINE_LTO=1 on, =0 off, on any GPU.
-bool& AmdPipelineLtoDefault() {
-    static bool on = false;
-    return on;
-}
+// AMD-PERF-001 was reverted: RyGTS AMD-322 found that on an RX 7600 link-time data and the
+// optimized link made menu pipelines take 0.4-0.7 s and filled pipeline memory (4.4 GB), and
+// here it made loading much slower and ran out of memory. RYGT_PIPELINE_LTO=1 still trials it.
 static bool LinkTimeOptimization() {
     static const bool lto = [] {
         const char* env = std::getenv("RYGT_PIPELINE_LTO");
-        if (env && *env) {
-            return env[0] == '1';
-        }
-        return AmdPipelineLtoDefault();
+        return env && env[0] == '1';
     }();
     return lto;
 }
@@ -935,13 +926,7 @@ GraphicsPipeline::GraphicsPipeline(
     // does not populate the stage-library cache used when new runtime permutations appear.
     const auto compile_policy = SharedPipelinePolicy::Select(
         SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(),preloading),
-        // AMD-PERF-001: on AMD, LTO for ordinary pipelines leaves tessellation on its shared
-        // libraries: those never retain LTO data, and the library keys include the create
-        // flags, so retained and plain libraries are never mixed. (Elsewhere LTO still sends
-        // tessellation to whole pipelines, as before.)
-        tessellated && (Common::PerfFeatureEnabled(80) ||
-                        !Mr14SharedTessellationEnabled(LinkTimeOptimization() &&
-                                                       !AmdPipelineLtoDefault())),
+        tessellated && (Common::PerfFeatureEnabled(80) || !Mr14SharedTessellationEnabled(LinkTimeOptimization())),
         tessellated, LinkTimeOptimization(), is_rect_list || is_quad_list);
     if (compile_policy.libraries) {
         // PERF-017: a pipeline first needed during play is built from four separately compiled

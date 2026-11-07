@@ -30,7 +30,6 @@
 #include <vk_mem_alloc.h>
 
 namespace Vulkan {
-bool& AmdPipelineLtoDefault(); // AMD-PERF-001, vk_graphics_pipeline.cpp
 
 static StoreGpuFamily g_store_gpu_family{StoreGpuFamily::Other}; // AMD-312
 
@@ -562,7 +561,6 @@ bool Instance::CreateDevice() {
              amd_vertex_order);
     amd_shader_explicit_vertex_parameter =
         add_extension(VK_AMD_SHADER_EXPLICIT_VERTEX_PARAMETER_EXTENSION_NAME);
-    AmdPipelineLtoDefault() = properties.vendorID == 0x1002; // AMD-PERF-001
     const char* direct_barycentric_env = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC");
     // AMD-314: AMD's older shader compiler (RX 6000 and older) smeared textures with KHR
     // barycentrics (AMD-305), and AMD-307 already finds its vertex order, so there the
