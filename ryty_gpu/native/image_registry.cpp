@@ -441,6 +441,9 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
     }
     entry->last_use.store(frame, std::memory_order_relaxed);
     ImageEntry* result;
+    bool remembered = false;
+    // A CPU invalidation must see either the journal entry or the fully indexed target.
+    std::unique_lock fill_lock{recent_fills_mutex};
     {
         std::unique_lock lock{shard.mutex};
         // Another thread may have made it meanwhile.
@@ -457,12 +460,29 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
             }
         }
         result = entry.get();
+        static const bool remember_fills = [] {
+            const char* env = std::getenv("RYGT_NATIVE_FILL_NEW_TARGETS");
+            return !(env && env[0] == '0');
+        }();
+        if (render_target && info.num_samples == 1 && remember_fills) {
+            if (auto fill = recent_fills.Find(info.guest_address, info.guest_size, frame)) {
+                result->rewrite = ImageEntry::Rewrite::Clear;
+                result->rewrite_pattern = fill->pattern;
+                result->rewrite_bytes = info.guest_size;
+                result->rewrite_clock = fill->clock;
+                result->remembered_fill_pending = true;
+                result->remembered_fill_receipt =
+                    std::make_shared<RememberedFillReceipt>(remembered_fill_count);
+                remembered = true;
+            }
+        }
         shard.images.emplace(info.guest_address, std::move(entry));
+        IndexEntry(*result);
         const std::pair<VAddr, VAddr> range{info.guest_address,
                                             info.guest_address + std::max<u64>(info.guest_size, 1)};
         NoteChanges({&range, 1}); // OPT-002, OPT-010
     }
-    IndexEntry(*result);
+    fill_lock.unlock();
 #ifndef NDEBUG
     if (WatchedTexture(info.guest_address, info.guest_address + 1)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: made {} {:#x} {}x{} mips {} ({:#x} bytes); "
@@ -480,7 +500,7 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         // that draws part of it leaves the rest as it was). GT Sport draws its 16x16 brightness
         // grid into a 64x16 target the CPU reads back for the exposure: the undrawn part went
         // back to memory as uninitialized video memory, and the picture came out too dark.
-        if (info.num_samples == 1) {
+        if (info.num_samples == 1 && !remembered) {
             result->needs_upload.store(true, std::memory_order_relaxed);
             result->force_upload.store(true, std::memory_order_relaxed);
             std::scoped_lock lock{upload_mutex};
@@ -835,6 +855,8 @@ u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_
             UnindexEntry(*entry);
         }
     }
+    // Pending receipts without a submitted stream retire with their entry. Submitted
+    // receipts remain owned by the scheduler until the graphics tick completes.
     {
         std::scoped_lock lock{upload_mutex};
         std::erase_if(pending_uploads, [&](ImageEntry* entry) { return gone.contains(entry); });
@@ -921,12 +943,65 @@ void ImageRegistry::MarkStale(ImageEntry& entry, Stale why) {
     }
 }
 
+void ImageRegistry::ForgetFillHistory(VAddr address, u64 size, const ImageEntry* authoritative) {
+    std::scoped_lock lock{recent_fills_mutex};
+    recent_fills.Forget(address, size);
+    if (!authoritative || remembered_fill_count->load(std::memory_order_relaxed) == 0 ||
+        size == 0 || size > ~u64{0} - address) return;
+    // A different target cannot apply an older remembered clear after this
+    // image write. Retire it from future lookups; its in-flight image stays alive.
+    ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
+        if (&entry != authoritative && !entry.from_cpu && entry.remembered_fill_receipt &&
+            entry.remembered_fill_receipt->live.load(std::memory_order_acquire)) {
+            MarkReused(entry);
+        }
+    });
+}
+
+void ImageRegistry::ForgetFills(VAddr address, u64 size) {
+    std::scoped_lock lock{recent_fills_mutex};
+    recent_fills.Forget(address, size);
+    if (remembered_fill_count->load(std::memory_order_relaxed) == 0 || size == 0 ||
+        size > ~u64{0} - address) return;
+    ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
+        if (entry.remembered_fill_receipt &&
+            entry.remembered_fill_receipt->live.load(std::memory_order_acquire)) {
+            entry.remembered_fill_invalid = true;
+            MarkStale(entry, Stale::GpuWrite);
+        }
+    });
+}
+
+std::vector<std::pair<VAddr, VAddr>> ImageRegistry::RecentFillRanges() {
+    std::scoped_lock lock{recent_fills_mutex};
+    return recent_fills.Ranges();
+}
+
+void ImageRegistry::ExpireRecentFills(u64 frame) {
+    std::scoped_lock lock{recent_fills_mutex};
+    recent_fills.Expire(frame);
+}
+
+ImageRegistry::FillClaim ImageRegistry::ClaimRememberedFill(ImageEntry& entry) {
+    std::scoped_lock lock{recent_fills_mutex};
+    if (!entry.remembered_fill_pending) return {};
+    entry.remembered_fill_pending = false;
+    return {!entry.remembered_fill_invalid, entry.remembered_fill_receipt};
+}
+
 void ImageRegistry::Invalidate(VAddr address, u64 size, Stale why) {
+    std::scoped_lock fill_lock{recent_fills_mutex};
+    recent_fills.Forget(address, size);
     ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
         if (entry.from_cpu) {
             MarkStale(entry, why);
         } else {
             entry.guest_modified.store(true, std::memory_order_seq_cst);
+            if (entry.remembered_fill_receipt &&
+                entry.remembered_fill_receipt->live.load(std::memory_order_acquire)) {
+                entry.remembered_fill_invalid = true;
+                MarkStale(entry, why);
+            }
             // Unmapping ends the allocation's lifetime, even before it was kept.
             // Retire it from lookup without destroying resources still in flight.
             if (why == Stale::Unmap || entry.kept.load(std::memory_order_seq_cst)) {
@@ -1013,7 +1088,14 @@ bool ImageRegistry::LayersRewritten(ImageEntry& entry, u64 frame) {
 }
 
 void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern,
-                             bool exact, u64 clock) {
+                             bool exact, u64 clock, u64 frame, bool guest_authoritative) {
+    {
+        std::scoped_lock lock{recent_fills_mutex};
+        recent_fills.Forget(address, size);
+        if (pattern && guest_authoritative) {
+            recent_fills.Record(address, size, *pattern, frame, clock);
+        }
+    }
 #ifndef NDEBUG
     if (WatchedTexture(address, address + std::max<u64>(size, 1)) && WatchSample()) {
         static const bool dump_on_fill = std::getenv("RYGT_FRAME_DUMP_ON_FILL") != nullptr;
@@ -1156,6 +1238,8 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
 }
 
 void ImageRegistry::CpuWrite(VAddr address, u64 size, u64 exact) {
+    std::scoped_lock fill_lock{recent_fills_mutex};
+    recent_fills.Forget(address, size);
 #ifndef NDEBUG
     if (WatchedTexture(address, address + size)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: CPU write {:#x}+{:#x} (exact {:#x})", address,
@@ -1167,6 +1251,12 @@ void ImageRegistry::CpuWrite(VAddr address, u64 size, u64 exact) {
     ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
         if (!entry.from_cpu) {
             entry.guest_modified.store(true, std::memory_order_seq_cst);
+            if (entry.remembered_fill_receipt &&
+                entry.remembered_fill_receipt->live.load(std::memory_order_acquire)) {
+                entry.remembered_fill_invalid = true;
+                entry.force_upload.store(true, std::memory_order_relaxed);
+                MarkStale(entry, Stale::CpuWrite);
+            }
             if (entry.kept.load(std::memory_order_seq_cst)) {
                 MarkReused(entry); // FIX-157
             }

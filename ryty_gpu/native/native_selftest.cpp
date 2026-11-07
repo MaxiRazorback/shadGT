@@ -19,7 +19,9 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <latch>
 #include <string>
+#include <thread>
 #include <vector>
 #include <unordered_set>
 #include <fmt/format.h>
@@ -408,6 +410,100 @@ bool RunRegistryReuseAndFillCase(ImageRegistry& registry, std::string& log) {
     log += fmt::format("registry larger-target retirement/mip-crop/fill-hash/packed-layout: {} / {} / {} / {}\n",
                        retired ? "pass" : "FAIL", crop ? "pass" : "FAIL", invalidated ? "pass" : "FAIL",
                        packed ? "pass" : "FAIL");
+    return ok;
+}
+
+bool RunRememberedFillRaceCase(Rhi::Device& device, ImageRegistry& registry,
+                               Rhi::Fence& fence, u64& tick, std::string& log) {
+    const std::array<u32, 2> pattern{0x11223344, 0x55667788};
+    auto info = MakeInfo(AmdGpu::TileMode::DisplayLinearAligned, 32, 32, 1,
+                         0x7600'0000'0004ULL);
+    const auto begin = info.guest_address - 4;
+    registry.GpuWrote(begin, info.guest_size + 4, &pattern, true, 101, 11, true);
+    auto* target = registry.Find(info, true, 11);
+    if (!target) return false;
+    auto claim = registry.ClaimRememberedFill(*target);
+    const bool rotated = target->rewrite_pattern == std::array<u32, 2>{pattern[1], pattern[0]} &&
+                         claim.valid && claim.receipt;
+    std::latch claimed{1}, written{1};
+    std::thread cpu([&] {
+        claimed.wait();
+        registry.CpuWrite(info.guest_address, 4, 4);
+        written.count_down();
+    });
+    claimed.count_down();
+    written.wait();
+    const bool after_claim = claim.receipt && claim.receipt->live.load() &&
+                             target->needs_upload.load() && target->force_upload.load();
+    if (claim.receipt) claim.receipt->Complete(); // stand in for the graphics tick
+    cpu.join();
+
+    auto later = info;
+    later.guest_address += 0x100000;
+    registry.GpuWrote(later.guest_address, later.guest_size, &pattern, true, 102, 11, true);
+    registry.CpuWrite(later.guest_address, 4, 4);
+    auto* after_write = registry.Find(later, true, 11);
+    const bool before_creation = after_write &&
+        after_write->rewrite == ImageEntry::Rewrite::None && after_write->needs_upload.load();
+    bool publication_race = true;
+    for (u32 i = 0; i != 16; ++i) {
+        auto racing = info;
+        racing.guest_address += 0x200000 + u64(i) * 0x10000;
+        registry.GpuWrote(racing.guest_address, racing.guest_size, &pattern, true, 103 + i, 11, true);
+        std::latch start{1};
+        ImageEntry* made = nullptr;
+        std::thread creator([&] { start.wait(); made = registry.Find(racing, true, 11); });
+        std::thread fault([&] { start.wait(); registry.CpuWrite(racing.guest_address, 4, 4); });
+        start.count_down();
+        creator.join();
+        fault.join();
+        if (!made) { publication_race = false; continue; }
+        auto racing_claim = registry.ClaimRememberedFill(*made);
+        publication_race &= racing_claim.receipt ? !racing_claim.valid : made->needs_upload.load();
+        if (racing_claim.receipt) racing_claim.receipt->Complete();
+    }
+    // Real GPU chronology: a remembered clear is followed by a legitimate
+    // image write. Discarding fill history must not queue an old guest upload.
+    std::vector<u8> guest(64 * 64 * 4, 0x11);
+    auto gpu_info = MakeInfo(AmdGpu::TileMode::DisplayLinearAligned, 64, 64, 1,
+                             reinterpret_cast<VAddr>(guest.data()));
+    ImageRegistry chronology{device};
+    chronology.GpuWrote(gpu_info.guest_address, gpu_info.guest_size, &pattern, true, 1, 21, true);
+    auto* gpu_target = chronology.Find(gpu_info, true, 21);
+    if (!gpu_target) return false;
+    auto alias_info = gpu_info;
+    alias_info.pixel_format = vk::Format::eB8G8R8A8Unorm;
+    auto* gpu_alias = chronology.Find(alias_info, true, 21, true, true);
+    if (!gpu_alias || gpu_alias == gpu_target) return false;
+    auto gpu_claim = chronology.ClaimRememberedFill(*gpu_target);
+    auto readback = device.CreateBuffer({.size = gpu_info.guest_size,
+        .usage = Rhi::BufferUsageTransferDst, .memory = Rhi::MemoryKind::Readback});
+    if (!gpu_claim.valid || !gpu_claim.receipt || !readback || !readback->Mapped()) return false;
+    auto* list = device.AcquireCommandList();
+    list->Begin();
+    list->ClearColorImage(gpu_target->image.get(), {1.f, 0.f, 0.f, 1.f});
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+    list->ClearColorImage(gpu_target->image.get(), {0.f, 1.f, 0.f, 1.f});
+    chronology.ForgetFillHistory(gpu_info.guest_address, gpu_info.guest_size, gpu_target);
+    const bool no_old_upload = !gpu_target->needs_upload.load() &&
+                               chronology.RecordUploads(*list) == 0;
+    const bool old_alias_retired = gpu_alias->reused.load();
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+    list->CopyImageToBuffer(gpu_target->image.get(), readback.get(), MipCopies(gpu_info));
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeHost);
+    list->End();
+    Rhi::CommandList* lists[]{list};
+    device.GraphicsQueue().Submit(lists, {}, {&fence, ++tick});
+    const bool completed = fence.Wait(tick, 5'000'000'000ULL);
+    if (completed) readback->Invalidate();
+    const auto* pixel = readback->Mapped();
+    const bool gpu_write = completed && pixel[0] == 0 && pixel[1] == 255 &&
+                           pixel[2] == 0 && pixel[3] == 255;
+    gpu_claim.receipt->Complete();
+    const bool ok = rotated && after_claim && before_creation && publication_race &&
+                    no_old_upload && old_alias_retired && gpu_write;
+    log += fmt::format("remembered fill rotation, CPU races, and GPU draw authority: {}\n",
+                       ok ? "passed" : "FAILED");
     return ok;
 }
 
@@ -1087,6 +1183,7 @@ bool RunImageSelfTest(std::string& log) {
         ImageRegistry registry{*device};
         ok = RunResolveFormatCase(registry, log) && ok;
         ok = RunRegistryReuseAndFillCase(registry, log) && ok;
+        ok = RunRememberedFillRaceCase(*device, registry, *fence, tick, log) && ok;
         for (const auto mode : {AmdGpu::TileMode::Thin1DThin, AmdGpu::TileMode::Thin2DThin,
                                 AmdGpu::TileMode::Display2DThin}) {
             ok = RunCase(*device, registry, *fence, tick, mode, log) && ok;

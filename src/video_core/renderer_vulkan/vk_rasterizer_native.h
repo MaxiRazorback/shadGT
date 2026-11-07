@@ -67,6 +67,7 @@ class DirectMemory;
 namespace Native {
 class ImageEntry;
 class ImageRegistry;
+struct RememberedFillReceipt;
 struct MadeImage;
 namespace Rhi {
 class Buffer;
@@ -282,6 +283,7 @@ private:
         std::vector<std::shared_ptr<void>> imported_view_leases;
         std::vector<std::shared_ptr<void>> writeback_plan_leases;
         std::vector<std::unique_ptr<Native::Rhi::Buffer>> pooled_snapshots;
+        std::vector<std::shared_ptr<Native::RememberedFillReceipt>> remembered_fill_receipts;
         std::vector<LdsReader> lds_readers;
         u64 lds_bytes = 0;
         u32 commands = 0;
@@ -959,6 +961,9 @@ private:
     /// NAT-105: the pages native textures watch (each watched once in the page manager, which
     /// counts at most 255 watchers a page; many textures share pages).
     PageWatchTracker page_watches;
+    // Serializes fill-journal publication with page-unwatch and CPU fault invalidation.
+    std::mutex fill_watch_mutex;
+    std::vector<std::pair<VAddr, VAddr>> fill_watched_ranges;
 
     /// CMASK / HTILE addresses the game cleared: the next pass into their target clears it.
     std::unordered_set<VAddr> cleared_meta;

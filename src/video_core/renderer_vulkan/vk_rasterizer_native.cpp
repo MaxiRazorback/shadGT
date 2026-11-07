@@ -6610,6 +6610,7 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
         }
         if (entry && std::ranges::find(s.written, entry) == s.written.end()) {
             s.written.push_back(entry);
+            registry->ForgetFillHistory(entry->info.guest_address, entry->info.guest_size, entry);
         }
     };
     // NAT-112: small pictures go back to guest memory. FIX-GTS-001: untiled ones up to 256 KB,
@@ -10120,7 +10121,34 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
 void NativeRenderer::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern,
                               bool exact) {
     const u64 clock = ++write_clock; // NAT-148: when the memory was rewritten
-    registry->GpuWrote(address, size, pattern, exact, clock);
+    // A private region can contain GPU-only bytes that a CPU partial write must merge.
+    // Remember only a complete directly imported range with no overlapping region.
+    bool guest_authoritative = false;
+    auto* direct = r.buffer_cache.GetDirectMemory();
+    static const bool remember_fills = [] {
+        const char* env = std::getenv("RYGT_NATIVE_FILL_NEW_TARGETS");
+        return !(env && env[0] == '0');
+    }();
+    if (remember_fills && pattern && direct && size && size <= 16_MB &&
+        size <= ~u64{0} - address) {
+        std::shared_lock lock{buffer_map_mutex};
+        guest_authoritative = !RegionOver(address, size) && direct->EnsureImported(address, size);
+    }
+    {
+        std::scoped_lock watch_lock{fill_watch_mutex};
+        if (guest_authoritative) {
+            // Retire any watches displaced by this bounded journal on the next cleanup.
+            const auto old_ranges = registry->RecentFillRanges();
+            for (const auto& [begin, end] : old_ranges) {
+                retired_watch_ranges.emplace_back(VideoCore::PageManager::GetPageAddr(begin),
+                    VideoCore::PageManager::GetNextPageAddr(end - 1));
+            }
+            WatchPages(address, size);
+            fill_watched_ranges.emplace_back(VideoCore::PageManager::GetPageAddr(address),
+                VideoCore::PageManager::GetNextPageAddr(address + size - 1));
+        }
+        registry->GpuWrote(address, size, pattern, exact, clock, frame, guest_authoritative);
+    }
     // A fill of a stencil plane: depth images whose stencil is there clear it at next use.
     const auto it = stencil_owners.find(address);
     if (it == stencil_owners.end() || !pattern) {
@@ -10282,6 +10310,15 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
     if (entry.rewrite == Rewrite::None && !entry.stencil_clear_pending) {
         return;
     }
+    auto claim = registry->ClaimRememberedFill(entry);
+    const auto retire_claim = [&] {
+        // Attach after recording: PatternBuffer/GlobalBarrier can splice while
+        // preparing the clear, so an earlier stream is not its completion tick.
+        if (claim.receipt) Begin().remembered_fill_receipts.push_back(std::move(claim.receipt));
+    };
+    if (!claim.valid) {
+        entry.rewrite = Rewrite::Upload;
+    }
     const auto& info = entry.info;
 #if !defined(NDEBUG)
     if (Native::WatchedTexture(info.guest_address, info.guest_address + 1) &&
@@ -10342,6 +10379,7 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
         NATIVE_DIAGNOSTIC(++stats.rewrite_uploads);
     }
     if (!depth_value && !color_zero && !stencil) {
+        retire_claim();
         return;
     }
     Stream& s = Begin();
@@ -10375,6 +10413,7 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
     s.buffers_written = true; // the next work waits for the clear
     ++s.commands;
     NATIVE_DIAGNOSTIC(++stats.rewrite_clears);
+    retire_claim();
 }
 
 void NativeRenderer::ReadFillShader(const Shader::Info& cs, DrawBindings& b) {
@@ -10941,6 +10980,7 @@ void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
     // resolved picture at its first read: GT Sport's minimaps, resolved into the scratch pool).
     ApplyRewrite(*src);
     ApplyRewrite(*dst);
+    registry->ForgetFillHistory(dst->info.guest_address, dst->info.guest_size, dst);
     if (r.FrameDumpActive()) {
         r.FrameDumpEvent(fmt::format("resolve {:#x} {}x{} x{} -> {:#x} {}x{} x{}",
                                      src->info.guest_address, src->info.size.width,
@@ -11218,6 +11258,7 @@ bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
     WritebacksBefore(address, data.size());
     GlobalBarrier();
     CmdBuf{s.cmd}.updateBuffer(found->first->Handle(), found->second, data.size(), data.data());
+    registry->ForgetFills(address, data.size());
     // NAT-146: a region over the range holds what the GPU reads there: it gets the bytes too.
     for (auto& [base, region] : regions) {
         const VAddr begin = std::max<VAddr>(address, region.begin);
@@ -11775,6 +11816,7 @@ void NativeRenderer::UnwatchPages(VAddr begin, VAddr end) {
 }
 
 void NativeRenderer::ReleaseUnusedWatches() {
+    std::scoped_lock watch_lock{fill_watch_mutex};
     Native::SlowCallTrace<2> trace{true, "retired-page-watches", {"live-ranges", "unwatch"}};
     if (retired_watch_ranges.empty()) {
         return;
@@ -11806,6 +11848,9 @@ void NativeRenderer::ReleaseUnusedWatches() {
             retain(entry.info.guest_address,
                    entry.info.guest_address + std::max<u64>(entry.info.guest_size, 1));
         });
+        for (const auto& [base, limit] : registry->RecentFillRanges()) {
+            retain(base, limit);
+        }
         for (const auto& [base, region] : regions) {
             retain(region.begin, region.end);
         }
@@ -11917,8 +11962,9 @@ void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
             }
         }
     }
-    UnwatchPages(begin, end);
     {
+        std::scoped_lock watch_lock{fill_watch_mutex};
+        UnwatchPages(begin, end);
         Native::UploadCause::ScopedCpuFault cause{address,size,exact};
         registry->CpuWrite(begin, end - begin, exact != 0 ? (address - begin) + exact : 0);
     }
@@ -11987,6 +12033,16 @@ void NativeRenderer::Splice() {
         r.scheduler.CommandBuffer().executeCommands(s.cmd);
     }
     const u64 tick = r.scheduler.CurrentTick();
+    if (!s.remembered_fill_receipts.empty()) {
+        // Keep the stream owners until queueing succeeds: allocation failure in
+        // the scheduler must not retire a receipt for work already enqueued.
+        Native::EnqueueRetainedReceipts(s.remembered_fill_receipts, [&](auto receipts) {
+            r.scheduler.DeferPriorityOperationAt(std::max(tick, boundary_signal),
+                [receipts = std::move(receipts)] {
+                    for (const auto& receipt : receipts) receipt->Complete();
+                });
+        });
+    }
     if (!wrapped) {
         device->MarkExecuted(s.list, {timeline.get(), tick});
     }
@@ -12188,6 +12244,18 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     }
     frame_writebacks.clear();
     ++frame;
+    {
+        std::scoped_lock watch_lock{fill_watch_mutex};
+        const auto expired = registry->RecentFillRanges();
+        for (const auto& [begin, end] : expired) {
+            retired_watch_ranges.emplace_back(VideoCore::PageManager::GetPageAddr(begin),
+                VideoCore::PageManager::GetNextPageAddr(end - 1));
+        }
+        retired_watch_ranges.insert(retired_watch_ranges.end(), fill_watched_ranges.begin(),
+                                    fill_watched_ranges.end());
+        fill_watched_ranges.clear();
+        registry->ExpireRecentFills(frame);
+    }
     shared_frame.store(frame, std::memory_order_relaxed); // OPT-010
     // The game's render target there (its layout from the CB registers may differ in details
     // from the video out description), else an image of the display layout.

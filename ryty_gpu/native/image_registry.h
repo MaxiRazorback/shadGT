@@ -22,10 +22,24 @@
 #include <vector>
 
 #include "common/types.h"
+#include "ryty_gpu/native/recent_fills.h"
 #include "ryty_gpu/native/rhi/rhi.h"
 #include "video_core/texture_cache/image_info.h"
 
 namespace Native {
+
+struct RememberedFillReceipt {
+    explicit RememberedFillReceipt(std::shared_ptr<std::atomic<u64>> count_) : count(std::move(count_)) {
+        count->fetch_add(1, std::memory_order_relaxed);
+    }
+    ~RememberedFillReceipt() { Complete(); }
+    void Complete() {
+        if (live.exchange(false, std::memory_order_acq_rel))
+            count->fetch_sub(1, std::memory_order_relaxed);
+    }
+    std::atomic<bool> live{true};
+    std::shared_ptr<std::atomic<u64>> count;
+};
 
 /// How a view looks at an image (a T#'s format, dimensions, swizzle and subresources).
 struct ImageViewKey {
@@ -138,6 +152,10 @@ public:
     /// version once the rewrite is applied (later, at its next use), so targets drawn between
     /// the fill and that use still count as newer for the textures made of them.
     u64 rewrite_clock = 0;
+    // Protected by ImageRegistry::recent_fills_mutex, including CPU fault callbacks.
+    bool remembered_fill_pending = false;
+    bool remembered_fill_invalid = false;
+    std::shared_ptr<RememberedFillReceipt> remembered_fill_receipt;
     bool stencil_clear_pending = false;
     u8 stencil_clear_value = 0;
 
@@ -276,7 +294,15 @@ public:
     /// size is only what the shader may write (GT Sport binds its whole scratch pool), so such a
     /// write uploads a target again only when the buffer is about the target's size.
     void GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern, bool exact,
-                  u64 clock);
+                  u64 clock, u64 frame = 0, bool guest_authoritative = false);
+    void ForgetFills(VAddr address, u64 size);
+    // Image writes preserve that image's GPU-authoritative contents. They end
+    // historical fill lookup without scheduling an upload from guest memory.
+    void ForgetFillHistory(VAddr address, u64 size, const ImageEntry* authoritative = nullptr);
+    std::vector<std::pair<VAddr, VAddr>> RecentFillRanges();
+    void ExpireRecentFills(u64 frame);
+    struct FillClaim { bool valid = true; std::shared_ptr<RememberedFillReceipt> receipt; };
+    FillClaim ClaimRememberedFill(ImageEntry& entry);
     /// NAT-120: uploads the image from guest memory before its next use.
     // Admission happens on actual image use, not on each intermediate streaming write.
     // Duplicate requests are harmless: RecordUploads atomically consumes needs_upload.
@@ -374,6 +400,9 @@ private:
     // shard cannot starve cold entries in the other shards.
     u32 eviction_shard_cursor = 0;
     std::mutex upload_mutex;
+    std::mutex recent_fills_mutex;
+    RecentFills recent_fills;
+    std::shared_ptr<std::atomic<u64>> remembered_fill_count = std::make_shared<std::atomic<u64>>(0);
     std::vector<ImageEntry*> pending_uploads;
     std::atomic<u64> generation{0}; ///< OPT-002
     /// OPT-010: the ranges of the pictures made or dropped, by the generation they made.
