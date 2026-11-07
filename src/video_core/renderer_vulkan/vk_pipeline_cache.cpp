@@ -78,6 +78,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/shader_usage_serde.h"
 #include "video_core/renderer_vulkan/required_pipeline_wait.h"
+#include "video_core/renderer_vulkan/one_off_regs.h"
 #include "video_core/renderer_vulkan/retry_input_policy.h"
 #include "video_core/renderer_vulkan/read_ahead_retry_inputs.h"
 #include "video_core/renderer_vulkan/exit_save_registry.h"
@@ -4541,6 +4542,16 @@ bool PipelineCache::PreservesDepthOutput() const {
     return true;
 }
 
+static bool LearnedOneOffWait(const AmdGpu::Regs& regs) {
+    if (auto observer = CurrentOneOffObserver()) {
+        const auto outputs = GetOneOffOutputs(regs);
+        for (size_t i = 0; i < outputs.count; ++i) {
+            if (observer->MustWait(outputs.keys[i])) return true;
+        }
+    }
+    return false;
+}
+
 bool PipelineCache::NeverSkipped(const std::array<const Shader::Info*, MaxShaderStages>& infos) {
     if (const auto* fragment = infos[u32(Shader::SwStage::Fragment)];
         fragment && IsGt7OneShotShader(fragment->pgm_hash)) return true;
@@ -4549,6 +4560,7 @@ bool PipelineCache::NeverSkipped(const std::array<const Shader::Info*, MaxShader
     if (PreservesDepthOutput()) {
         return true;
     }
+    if (LearnedOneOffWait(Regs())) return true;
     // Keep going: rendering must not wait for a cosmetic pipeline.
     if (CompileMode() == 2) return false;
     // FIX-064: tessellated draws wait for their pipeline. On GT Sport's race summary they are
@@ -5146,6 +5158,7 @@ bool PipelineCache::SkipTranslationWait(SwStage sw_stage, const Shader::ShaderPa
     static const bool enabled = Common::PerfFeatureEnabled(171);
     if (!enabled || PreservesDepthOutput() || IsGt7OneShotShader(params.hash) ||
         regs_override != nullptr || sw_stage == SwStage::Compute ||
+        LearnedOneOffWait(Regs()) ||
         !AsyncTranslation() || !AsyncPipelines() || MenusWait()) {
         return false;
     }

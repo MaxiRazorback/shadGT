@@ -348,6 +348,12 @@ target_compile_features(shadps4_whole_layer_clear_test PRIVATE cxx_std_23)
 target_link_libraries(shadps4_whole_layer_clear_test PRIVATE GTest::gtest)
 gtest_discover_tests(shadps4_whole_layer_clear_test)
 
+add_executable(shadps4_one_off_observer_test one_off_observer_test.cpp)
+target_include_directories(shadps4_one_off_observer_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_one_off_observer_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_one_off_observer_test PRIVATE GTest::gtest)
+gtest_discover_tests(shadps4_one_off_observer_test)
+
 add_executable(shadps4_guarded_shader_snapshot_test guarded_shader_snapshot_test.cpp)
 target_include_directories(shadps4_guarded_shader_snapshot_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(shadps4_guarded_shader_snapshot_test PRIVATE cxx_std_23)

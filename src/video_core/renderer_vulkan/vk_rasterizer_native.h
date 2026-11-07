@@ -81,6 +81,7 @@ class PipelineLayout;
 } // namespace Native
 
 namespace Vulkan {
+class OneOffObserver;
 
 template <class Buffer> class AsyncMirrorBuffer;
 
@@ -884,6 +885,7 @@ private:
 
     Rasterizer& r;
     std::unique_ptr<Native::Rhi::Device> device;
+    std::shared_ptr<OneOffObserver> one_off_observer;
     std::unique_ptr<AsyncMirrorBuffer<Native::Rhi::Buffer>> mirror_preparation;
     std::unique_ptr<Native::Rhi::Fence> timeline;
     std::unique_ptr<Native::ImageRegistry> registry;

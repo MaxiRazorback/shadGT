@@ -93,6 +93,8 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "common/elf_info.h"
+#include "video_core/renderer_vulkan/one_off_regs.h"
 #include "common/perf_monitor.h"
 #include "common/ryty_config.h"
 // (ryty_config.h brings in windows.h, whose `near` and `far` macros would rename variables here.)
@@ -1408,9 +1410,31 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
     LOG_INFO(Render_Vulkan, "NAT-100: native mode: draws, dispatches and copies are recorded with "
                             "native images and guest memory read in place");
     if (auto* direct = r.buffer_cache.GetDirectMemory()) direct->HoldNativeReleases();
+    static const bool learn = [] {
+        const char* value = std::getenv("RYGT_ONE_OFF_LEARN");
+        return !value || value[0] != '0';
+    }();
+    if (learn) {
+        try {
+            std::string serial{Common::ElfInfo::Instance().GameSerial()};
+            for (auto& c : serial) {
+                if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                      (c >= '0' && c <= '9') || c == '-' || c == '_')) c = '_';
+            }
+            if (serial.empty()) serial = "unknown";
+            const auto path = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+                              fmt::format("{}.one_off_harmful_v1.txt", serial);
+            one_off_observer = std::make_shared<OneOffObserver>(path);
+            g_one_off_observer.store(one_off_observer, std::memory_order_release);
+        } catch (...) {
+            LOG_WARNING(Render_Vulkan, "One-off observation unavailable; existing wait policy remains active");
+        }
+    }
 }
 
 NativeRenderer::~NativeRenderer() {
+    auto expected_observer = one_off_observer;
+    g_one_off_observer.compare_exchange_strong(expected_observer, {}, std::memory_order_acq_rel);
     if(PreparedSampledProofRequested())prepared_proof_contexts.Close(this);
     auto ahead_shutdown=BeginAheadShutdown(this);
     if(ahead_shutdown)while(ahead_shutdown->active.load(std::memory_order_acquire) || !ahead_shutdown->pools.Quiescent())std::this_thread::yield();
@@ -5425,6 +5449,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                     b.images.push_back({VK_NULL_HANDLE, memo->views[i], vk::ImageLayout::eGeneral});
                 }
                 (storage ? b.stored : b.sampled).push_back(entry);
+                if (!storage && one_off_observer) one_off_observer->Sampled(entry->info.guest_address);
                 note_entry(entry);
                 add_write();
                 NATIVE_DIAGNOSTIC(++stats.texture_memo_hits);
@@ -5637,6 +5662,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                          entry->info.guest_address + std::max<u64>(entry->info.guest_size, 1));
         }
         (storage ? b.stored : b.sampled).push_back(entry);
+        if (!storage && one_off_observer) one_off_observer->Sampled(entry->info.guest_address);
         note_entry(entry);
         add_write();
     }
@@ -6996,6 +7022,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             !quad_list);
     }();
     if (!pipeline) {
+        if (one_off_observer) {
+            const auto outputs = GetOneOffOutputs(regs);
+            for (size_t i = 0; i < outputs.count; ++i) one_off_observer->Skipped(outputs.keys[i]);
+        }
         NATIVE_DIAGNOSTIC(++stats.no_pipeline);
         return;
     }
@@ -8630,6 +8660,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 return;
             }
         } else PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
+        if (one_off_observer && one_off_observer->HasWatches()) {
+            const auto outputs = GetOneOffOutputs(regs);
+            for (size_t i = 0; i < outputs.count; ++i) one_off_observer->Redrawn(outputs.keys[i]);
+        }
     }
     {
         PhaseClock part{stats.record_ns[6]};
