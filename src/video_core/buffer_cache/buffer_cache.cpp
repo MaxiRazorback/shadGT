@@ -245,16 +245,14 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       // store of the old value). With exact store sizes it produced corrupted (blue, exploded)
       // vertices around the track in a race, so CPU write faults drain the GPU again.
       split_write_faults{false},
-      // PERF-015 is disabled: without the drain, GPU results near those records (GT Sport's
-      // sparks) no longer reached guest memory before the game's CPU used them, and sparks
-      // came with exploded vertices. The drain's wait for all earlier GPU work is what the game
-      // relies on there.
+      // PERF-015: enabled by default after the GTS runtime comparison. Keep an
+      // explicit OFF control for the former full-drain write-fault behavior.
       split_gds_write_faults{[] {
           const char* env = std::getenv("RYGT_SPLIT_GDS_WRITE_FAULTS");
-          return env && env[0] == '1' && env[1] == '\0';
+          return !(env && env[0] == '0' && env[1] == '\0');
       }()} {
     if (split_gds_write_faults) {
-        LOG_INFO(Render_Vulkan, "PERF-015: GDS write-fault splitting enabled by explicit trial switch");
+        LOG_INFO(Render_Vulkan, "PERF-015: GDS write-fault splitting enabled (RYGT_SPLIT_GDS_WRITE_FAULTS=0 disables)");
     }
     if (DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported()) { // D1
         direct_memory = std::make_unique<DirectMemory>(instance, scheduler);

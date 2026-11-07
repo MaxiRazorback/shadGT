@@ -47,11 +47,11 @@ Will's switches/defaults are retained: `RYGT_D1_VIEW_MB=256`,
 optimization enabled. Program-specific dispatch shortcuts require the exact
 upstream program identity and proofs; other dispatches keep their barriers.
 
-For the explicitly requested GDS experiment,
-`RYGT_SPLIT_GDS_WRITE_FAULTS=1` enables the existing PERF-015 path at startup.
-Unset or `0` keeps it disabled. This trial does not change the separate PERF-014
-drain/readback safeguards. Previous vertex/sparks corruption remains a required
-runtime comparison, not a resolved defect.
+`RYGT_SPLIT_GDS_WRITE_FAULTS` now defaults ON following the requested GTS
+runtime check. Explicit `0` restores the full-drain control. The user reported
+correct grass placement with the enabled run; no matched OFF recovery comparison
+has established the individual cause. Separate PERF-014 drain/readback safeguards
+and the general write-fault splitting default are unchanged.
 
 ## Validation so far
 
