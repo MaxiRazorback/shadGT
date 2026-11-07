@@ -1,4 +1,5 @@
 #include "video_core/renderer_vulkan/shared_pipeline_policy.h"
+#include "video_core/renderer_vulkan/oneshot_shader.h"
 #include "video_core/renderer_vulkan/ordered_parallel_read.h"
 #include "video_core/renderer_vulkan/bounded_read_cache.h"
 #include "video_core/renderer_vulkan/driver_cache_snapshot.h"
@@ -4530,6 +4531,8 @@ bool PipelineCache::PreservesDepthOutput() const {
 }
 
 bool PipelineCache::NeverSkipped(const std::array<const Shader::Info*, MaxShaderStages>& infos) {
+    if (const auto* fragment = infos[u32(Shader::SwStage::Fragment)];
+        fragment && IsGt7OneShotShader(fragment->pgm_hash)) return true;
     // A loading-time shadow bake may run only once. Preserve depth-only output
     // without forcing ordinary menu color draws to wait for compilation.
     if (PreservesDepthOutput()) {
@@ -5130,7 +5133,8 @@ bool PipelineCache::SkipTranslationWait(SwStage sw_stage, const Shader::ShaderPa
     // dozen new shaders came at once). Not compute, and not a shader that writes memory (later
     // work reads what it writes). -DisablePerf 171 waits as before.
     static const bool enabled = Common::PerfFeatureEnabled(171);
-    if (!enabled || PreservesDepthOutput() || regs_override != nullptr || sw_stage == SwStage::Compute ||
+    if (!enabled || PreservesDepthOutput() || IsGt7OneShotShader(params.hash) ||
+        regs_override != nullptr || sw_stage == SwStage::Compute ||
         !AsyncTranslation() || !AsyncPipelines() || MenusWait()) {
         return false;
     }

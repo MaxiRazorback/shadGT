@@ -12,6 +12,7 @@
 #include "ryty_gpu/native/rhi/completed_owner_release.h"
 #include "ryty_gpu/native/prepared_direct_slot.h"
 #include "ryty_gpu/native/readonly_hint.h"
+#include "ryty_gpu/native/high_cpu_writeback.h"
 #include "ryty_gpu/native/parallel_direct_capability.h"
 #include "ryty_gpu/native/parallel_gate_histogram.h"
 #include "core/emulator_settings.h"
@@ -4103,6 +4104,14 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBuffer(VAddr addr
     return result;
 }
 
+static VAddr NativeInplaceFrom() {
+    static const VAddr from = [] {
+        const char* env = std::getenv("RYGT_NATIVE_INPLACE_FROM");
+        return env ? static_cast<VAddr>(std::strtoull(env, nullptr, 16)) : VAddr{0xf000000000};
+    }();
+    return from;
+}
+
 std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAddr address, u64 size,
                                                                             bool write,
                                                                             bool mirror) {
@@ -4139,10 +4148,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     // to read back (in a region the CPU never saw them: no rain drops on the windshield); written
     // ranges there stay in guest memory. RYGT_NATIVE_INPLACE_FROM=<hex address> moves the limit
     // (ffffffffffffffff: every written range gets a region, as before).
-    static const VAddr inplace_from = [] {
-        const char* env = std::getenv("RYGT_NATIVE_INPLACE_FROM");
-        return env ? static_cast<VAddr>(std::strtoull(env, nullptr, 16)) : VAddr{0xf000000000};
-    }();
+    const VAddr inplace_from = NativeInplaceFrom();
     // FIX-172 (diagnosis, RYGT_NATIVE_INPLACE_RANGES=<hex address>+<hex size>,...): written
     // ranges meeting one of these stay in guest memory too.
     const auto& inplace_ranges = NativeInplaceRanges();
@@ -6640,6 +6646,10 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
         }
         return entry.info.guest_address >= 0xf000000000ULL ? 16_MB : 256_KB;
     };
+    static const bool extra_cpu_writebacks = [] {
+        const char* env = std::getenv("RYGT_NATIVE_WRITEBACK_CPU");
+        return !(env && env[0] == '0');
+    }();
     for (const auto* entry : b.sampled) {
         if (entry && std::ranges::find(s.read, entry) == s.read.end()) {
             s.read.push_back(entry); // NAT-140
@@ -6657,9 +6667,34 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
         attached(targets->depth);
         for (const auto* entry : targets->colors) {
             note(entry);
-            if (entry && entry->info.guest_size <= writeback_size(*entry) &&
-                entry->info.num_samples == 1) {
-                QueueWriteback(entry);
+            if (entry && entry->info.num_samples == 1) {
+                const u64 size = entry->info.guest_size;
+                const auto initial = Native::ClassifyHighCpuWriteback(entry->info.guest_address,
+                    size, NativeInplaceFrom(), 0, 0, extra_cpu_writebacks, writeback_size(*entry));
+                if (initial == Native::HighCpuWriteback::Existing) {
+                    QueueWriteback(entry); // Preserve all pre-existing GTS cases.
+                } else if (initial == Native::HighCpuWriteback::Admit &&
+                           std::ranges::find(writebacks, entry) == writebacks.end()) {
+                    auto* direct = r.buffer_cache.GetDirectMemory();
+                    if (!direct || !direct->EnsureImported(entry->info.guest_address, size) ||
+                        !direct->PlanLeasedParts(entry->info.guest_address, size, 4, 4)) continue;
+                    const u64 budget = r.instance.GetTotalMemoryBudget();
+                    u64 usage = budget ? r.instance.GetDeviceMemoryUsage() : 0;
+                    // Pending downloads have not allocated their scatter/batch
+                    // scratch yet; reserve their worst-case GPU footprint too.
+                    if (budget) for (const auto* pending : writebacks) {
+                        const u64 bytes = pending->info.guest_size;
+                        if (bytes > (budget - std::min(usage, budget)) / 3) {
+                            usage = budget;
+                            break;
+                        }
+                        usage += bytes * 3;
+                    }
+                    if (Native::ClassifyHighCpuWriteback(entry->info.guest_address, size,
+                            NativeInplaceFrom(), budget, usage, true) == Native::HighCpuWriteback::Admit) {
+                        QueueWriteback(entry);
+                    }
+                }
             }
         }
         note(targets->depth);

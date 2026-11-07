@@ -3,6 +3,7 @@
 #include "ryty_gpu/native/region_init_gaps.h"
 #include "ryty_gpu/native/retired_snapshot_pool.h"
 #include "ryty_gpu/native/writeback_plan.h"
+#include "ryty_gpu/native/high_cpu_writeback.h"
 #include "video_core/buffer_cache/imported_part_plan.h"
 #include "video_core/buffer_cache/imported_view_lease.h"
 #include "video_core/host_shaders/native_region_writeback_comp.h"
@@ -60,6 +61,40 @@ VideoCore::ImageInfo MakeInfo(AmdGpu::TileMode tile_mode, u32 width, u32 height,
 
 u32 Texel(u32 x, u32 y, u32 mip) {
     return x | (y << 10) | (mip << 20) | 0xA0000000u;
+}
+
+bool RunLargeCpuWritebackCase(Rhi::Device& device, Rhi::Fence& fence, u64& tick,
+                              std::string& log) {
+    auto info = MakeInfo(AmdGpu::TileMode::DisplayLinearAligned, 2048, 2049, 1,
+                         0xf000100000ull);
+    const auto decision = ClassifyHighCpuWriteback(info.guest_address, info.guest_size,
+        0xf000000000ull, 1ull << 30, 0, true, 16ull << 20);
+    if (decision != HighCpuWriteback::Admit) return false;
+    ImageRegistry registry{device};
+    auto* target = registry.Find(info, true, 1);
+    auto out = device.CreateBuffer({.size=info.guest_size,
+        .usage=Rhi::BufferUsageTransferSrc | Rhi::BufferUsageTransferDst,
+        .memory=Rhi::MemoryKind::Readback});
+    if (!target || !out || !out->Mapped()) return false;
+    auto* list = device.AcquireCommandList(); list->Begin();
+    registry.RecordUploads(*list);
+    list->Barrier(Rhi::ScopeTransfer | Rhi::ScopeCompute, Rhi::ScopeTransfer);
+    list->ClearColorImage(target->image.get(), {0.f, 1.f, 0.f, 1.f});
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+    if (!registry.RecordDownload(*list, *target, *out, 0)) return false;
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeHost); list->End();
+    Rhi::CommandList* lists[]{list}; device.GraphicsQueue().Submit(lists, {}, {&fence, ++tick});
+    if (!fence.Wait(tick, 5'000'000'000ULL)) return false;
+    out->Invalidate();
+    const u32 pitch = info.mips_layout[0].pitch;
+    bool ok = true;
+    for (const u32 y : {0u, 1024u, 2048u}) {
+        const u8* p = out->Mapped() + (u64(y) * pitch + 2047) * 4;
+        ok &= p[0] == 0 && p[1] == 255 && p[2] == 0 && p[3] == 255;
+    }
+    log += fmt::format("large high-address image writeback before fence ({} bytes): {}\n",
+                       info.guest_size, ok ? "passed" : "FAILED");
+    return ok;
 }
 
 bool RunPackedFloatCase(Rhi::Device& device, Rhi::Fence& fence, u64& tick,
@@ -1247,6 +1282,7 @@ bool RunImageSelfTest(std::string& log) {
     u64 tick = 0;
     bool ok = true;
     ok = RunAsyncMirrorCase(*device,*fence,tick,log) && ok;
+    ok = RunLargeCpuWritebackCase(*device, *fence, tick, log) && ok;
     ok = RunEvictionBudgetCase(*device, log) && ok;
     ok = RunUnmapTargetLifetimeCase(*device, log) && ok;
     ok = RunUploadChunkCacheCase(*device,*fence,tick,log) && ok;
