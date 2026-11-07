@@ -23,6 +23,7 @@
 #include "common/perf_monitor.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
+#include "common/native_thread_priority.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/process.h"
@@ -1417,6 +1418,9 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     SCOPE_EXIT { Common::UpdateCoreOwner(0, false); };
+#ifdef RYTY_GPU
+    Common::NativeThreadPriority native_priority;
+#endif
     Common::SetCurrentThreadName("shadGT:GpuCommandProcessor");
     Common::PreferPerformanceCores(); // PERF-088
     Common::GuestClock::MarkGpuCommandThread(); // FIX-044
@@ -1427,6 +1431,9 @@ void Liverpool::Process(std::stop_token stoken) {
 #endif
 
     while (!stoken.stop_requested()) {
+#ifdef RYTY_GPU
+        native_priority.Update(Vulkan::NativeModeRequested() && Common::NativeCpuPriorityRequested());
+#endif
         if (draw_pipe) {
             draw_pipe->ReleaseExclusive(); // PERF-050: idle; urgent work may run on the recorder
         }

@@ -13,6 +13,7 @@
 #include "common/perf_monitor.h"
 #include "common/scope_exit.h"
 #include "common/thread.h"
+#include "common/native_thread_priority.h"
 #include "video_core/buffer_cache/direct_memory.h"
 #include "video_core/amdgpu/draw_pipe.h"
 
@@ -466,6 +467,9 @@ DrawPipe::Stats DrawPipe::TakeStats() {
 
 void DrawPipe::Run(std::stop_token stop) {
     SCOPE_EXIT { Common::UpdateCoreOwner(1, false); };
+#ifdef RYTY_GPU
+    Common::NativeThreadPriority native_priority;
+#endif
     if (thread_init) {
         thread_init();
     }
@@ -477,6 +481,9 @@ void DrawPipe::Run(std::stop_token stop) {
 
     std::deque<Work> batch;
     while (true) {
+#ifdef RYTY_GPU
+        native_priority.Update(Vulkan::NativeModeRequested() && Common::NativeCpuPriorityRequested());
+#endif
         RunUrgent();
         {
             std::unique_lock lk{mutex};

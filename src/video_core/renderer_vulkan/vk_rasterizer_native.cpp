@@ -62,6 +62,7 @@
 #include "video_core/renderer_vulkan/stable_region_bindings.h"
 #include "video_core/renderer_vulkan/scene_region_scale.h"
 #include "video_core/renderer_vulkan/upload_chunk_tail.h"
+#include "video_core/renderer_vulkan/native_chunk_policy.h"
 #include "video_core/renderer_vulkan/upload_chunk_cache.h"
 #include "video_core/renderer_vulkan/native_ring_policy.h"
 #include "common/thread.h"
@@ -873,7 +874,10 @@ struct RecordPartitionEndGuard {
 };
 #endif
 
-constexpr u64 ChunkSize = 8_MB;
+u64 ChunkSize() {
+    static const u64 size = NativeChunkBytes(std::getenv("RYGT_NATIVE_CHUNK_MB"));
+    return size;
+}
 constexpr u32 SpliceAfter = 512; ///< commands per list before it is run and submitted
 
 } // namespace
@@ -2656,7 +2660,7 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
     const auto create = [&] {
         Chunk result;
         result.buffer = device->CreateBuffer({
-        .size = UploadChunkCapacity(size, ChunkSize),
+        .size = UploadChunkCapacity(size, ChunkSize()),
         .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageUniform |
                  Native::Rhi::BufferUsageIndex | Native::Rhi::BufferUsageVertex |
                  Native::Rhi::BufferUsageIndirect | Native::Rhi::BufferUsageTransferSrc,
@@ -2884,7 +2888,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
             // before the complete sparse fallback for this gap.
             s.list->Barrier(Native::Rhi::ScopeTransfer,Native::Rhi::ScopeTransfer);
             for (u64 offset=0;offset<gap_size;) {
-                const u64 bytes=std::min<u64>(4_MB,gap_size-offset);
+                const u64 bytes=NativeRegionUploadStep(gap_size-offset, ChunkSize());
                 const auto [upload,upload_offset,data]=Allocate(bytes,4);
                 r.memory->CopySparseMemory(gap.begin+offset,data,bytes);
                 s.cmd.copyBuffer(upload,dst,vk::BufferCopy{
@@ -12055,7 +12059,7 @@ void NativeRenderer::Splice() {
     }
     {
         std::scoped_lock chunk_lock{chunk_mutex};
-        RetireUploadChunks(s.chunks, retiring_chunks, s.chunk_used, tick, ChunkSize);
+        RetireUploadChunks(s.chunks, retiring_chunks, s.chunk_used, tick, ChunkSize());
         for (const auto pool : s.pools) {
             retiring_pools.emplace_back(tick, pool);
         }
