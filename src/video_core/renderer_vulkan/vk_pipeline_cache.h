@@ -61,6 +61,9 @@ class DataBase;
 }
 
 namespace Vulkan {
+#ifndef NDEBUG
+class ReadAheadKeyTrace;
+#endif
 bool SaveDriverCacheAtExit();
 
 /// FIX-227: the hull shader LDS emulation mode for the current draw (0: off).
@@ -165,6 +168,10 @@ public:
     LookupLock& LookupMutex() {
         return lookup_mutex;
     }
+#ifndef NDEBUG
+    // Diagnostic only: drops rather than waiting for the cache lookup lock.
+    void TraceRecorderSelected(const GraphicsPipeline& pipeline, const DrawIndirectParams& params) noexcept;
+#endif
     /// The infos the last GetGraphicsPipeline selected, with that draw's user data.
     const std::array<const Shader::Info*, MaxShaderStages>& SelectedInfos() const {
         return scratch_.infos;
@@ -467,6 +474,13 @@ private:
     bool CaptureBlockedAheadInputs(const AmdGpu::Regs& regs, BlockedAheadState& state);
     bool DirectOnlyRetryProgram(u64 hash) const;
     bool read_ahead_blocked{}; // lookup mutex held
+#ifndef NDEBUG
+    ReadAheadKeyTrace* KeyTrace() noexcept;
+    void ReportKeyTrace() noexcept;
+    std::unique_ptr<ReadAheadKeyTrace> read_ahead_key_trace;
+    bool read_ahead_key_trace_initialized{};
+    std::atomic<u64> read_ahead_key_trace_dropped{};
+#endif
     struct QueuedStateStats {
         u32 evaluated{};
         u32 started{};
@@ -477,6 +491,7 @@ private:
 #ifndef NDEBUG
         u32 retry_retained{};
         u32 retry_unproven{};
+        u32 new_shader_deferred{};
 #endif
     } queued_state_stats;
     std::mutex on_screen_mutex;

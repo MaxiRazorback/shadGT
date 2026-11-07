@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <new>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -64,6 +65,7 @@
 #include "shader_recompiler/info.h"
 #ifndef NDEBUG
 #include "shader_recompiler/srt_arena_trace.h"
+#include "video_core/renderer_vulkan/read_ahead_key_trace.h"
 #endif
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/recompiler.h"
@@ -100,6 +102,91 @@ extern thread_local std::span<const u32> g_diag_compiling_code;
 extern thread_local u64 g_diag_compiling_hash;
 } // namespace Shader::Optimization
 namespace Vulkan {
+#ifndef NDEBUG
+// Used under the pipeline lookup lock. The allocation and all tracing are opt-in.
+static bool KeyTraceEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("RYGT_READ_AHEAD_KEY_TRACE");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+template<class Stages>
+static std::array<u64, MaxShaderStages> KeyTracePrograms(const Stages& stages) {
+    std::array<u64, MaxShaderStages> programs{};
+    for (size_t i = 0; i < programs.size() && i < stages.size(); ++i)
+        if (stages[i]) programs[i] = stages[i]->pgm_hash;
+    return programs;
+}
+ReadAheadKeyTrace* PipelineCache::KeyTrace() noexcept {
+    if (!read_ahead_key_trace_initialized) {
+        read_ahead_key_trace_initialized = true;
+        if (KeyTraceEnabled())
+            read_ahead_key_trace.reset(new (std::nothrow) ReadAheadKeyTrace);
+    }
+    return read_ahead_key_trace.get();
+}
+void PipelineCache::TraceRecorderSelected(const GraphicsPipeline& pipeline,
+                                          const DrawIndirectParams& params) noexcept {
+    if (!KeyTraceEnabled()) return;
+    try {
+    std::unique_lock lock{lookup_mutex, std::try_to_lock};
+    if (!lock.owns_lock()) { ++read_ahead_key_trace_dropped; return; }
+    if (auto* trace = KeyTrace())
+        trace->RecorderSelected(pipeline.GetGraphicsKey(), KeyTracePrograms(pipeline.GetStages()),
+                                params.is_indirect, params.tessellate_quads,
+                                AmdGpu::ReadAheadPair::recorder ? AmdGpu::ReadAheadPair::current : 0);
+    else ++read_ahead_key_trace_dropped;
+    } catch (...) { ++read_ahead_key_trace_dropped; }
+}
+void PipelineCache::ReportKeyTrace() noexcept {
+    try {
+        auto* trace = KeyTrace();
+        if (!trace) return;
+        const auto s = trace->Take();
+        const auto dropped = read_ahead_key_trace_dropped.exchange(0);
+        if (!s.ahead && !s.actual_observations && !s.recorder_selected && !dropped &&
+            !s.dequeued_decoded && !s.dequeued_scan) return;
+        std::string fields, stages;
+        for (size_t i = 0; i < s.fields.size(); ++i)
+            fields += fmt::format(" {}={}", ReadAheadKeyTrace::FieldNames[i], s.fields[i]);
+        for (size_t i = 0; i < s.stage_mismatch.size(); ++i)
+            stages += fmt::format(" {}={}", i, s.stage_mismatch[i]);
+        LOG_WARNING(Render_Vulkan, "AHEAD-KEY-TRACE bounded interval: ahead={} actual_hook_observations={} retained_ahead_first_demand={} evicted_undemanded={} evicted_demanded={}; first_diff:{}; no_same_stages_vs_latest:{}",
+                    s.ahead, s.actual_observations, s.exact_later, s.evicted_undemanded, s.evicted_demanded, fields, stages);
+        LOG_WARNING(Render_Vulkan, "AHEAD-KEY-TRACE recorder_selected={} retained_first_selected={} evicted_unselected={} evicted_selected={} dropped_lock={} same_program_same_stage={} same_program_different_stage={} no_retained_program_match={} ahead_evaluation_params_direct/indirect/tess={}/{}/{} params_selected_direct/indirect/tess={}/{}/{}",
+                    s.recorder_selected, s.selected_first, s.evicted_unselected, s.evicted_selected, dropped, s.same_program_same_stages,
+                    s.same_program_different_stages, s.no_program_match, s.ahead_params[0], s.ahead_params[1],
+                    s.ahead_params[2], s.selected_params[0], s.selected_params[1], s.selected_params[2]);
+        LOG_WARNING(Render_Vulkan, "AHEAD-PAIR-TRACE dequeued_decoded={} dequeued_scan={} decoded_indirect={} at_or_before_recorder_started_highwater={} paired_prediction_first={} paired_selection_first={} pair_evicted_unmatched={} pair_evicted_prediction_only={} pair_evicted_selection_only={} key_equal={} key_different={} program_equal={} program_different={} stage_mismatch={}/{}/{}/{}/{}",
+                    s.dequeued_decoded, s.dequeued_scan, s.decoded_indirect, s.at_or_before_recorder_started_highwater,
+                    s.paired_prediction_first, s.paired_selection_first, s.pair_evicted_unmatched,
+                    s.pair_evicted_prediction_only, s.pair_evicted_selection_only,
+                    s.pair_key_equal, s.pair_key_different, s.pair_program_equal, s.pair_program_different,
+                    s.pair_stage_mismatch[0], s.pair_stage_mismatch[1], s.pair_stage_mismatch[2],
+                    s.pair_stage_mismatch[3], s.pair_stage_mismatch[4]);
+        for (size_t i = 0; i < s.pair_example_count; ++i) {
+            const auto& p = s.pair_examples[i];
+            LOG_WARNING(Render_Vulkan, "AHEAD-PAIR-TRACE example token={} prediction_first={} predicted_key={:#x} selected_key={:#x} predicted_stages={:#x}/{:#x}/{:#x}/{:#x}/{:#x} selected_stages={:#x}/{:#x}/{:#x}/{:#x}/{:#x} predicted_programs={:#x}/{:#x}/{:#x}/{:#x}/{:#x} selected_programs={:#x}/{:#x}/{:#x}/{:#x}/{:#x}",
+                p.token, p.prediction_first, std::hash<GraphicsPipelineKey>{}(p.predicted), std::hash<GraphicsPipelineKey>{}(p.selected),
+                p.predicted.stage_hashes[0], p.predicted.stage_hashes[1], p.predicted.stage_hashes[2], p.predicted.stage_hashes[3], p.predicted.stage_hashes[4],
+                p.selected.stage_hashes[0], p.selected.stage_hashes[1], p.selected.stage_hashes[2], p.selected.stage_hashes[3], p.selected.stage_hashes[4],
+                p.predicted_programs[0], p.predicted_programs[1], p.predicted_programs[2], p.predicted_programs[3], p.predicted_programs[4],
+                p.selected_programs[0], p.selected_programs[1], p.selected_programs[2], p.selected_programs[3], p.selected_programs[4]);
+        }
+        for (size_t i = 0; i < s.example_count; ++i) {
+            const auto& e = s.examples[i];
+            LOG_WARNING(Render_Vulkan, "AHEAD-KEY-TRACE example same_programs={} first_diff={} ahead_key={:#x} selected_key={:#x} ahead_stages={:#x}/{:#x}/{:#x}/{:#x}/{:#x} selected_stages={:#x}/{:#x}/{:#x}/{:#x}/{:#x} ahead_programs={:#x}/{:#x}/{:#x}/{:#x}/{:#x} selected_programs={:#x}/{:#x}/{:#x}/{:#x}/{:#x}",
+                        e.same_programs, ReadAheadKeyTrace::FieldNames[e.field], std::hash<GraphicsPipelineKey>{}(e.ahead),
+                        std::hash<GraphicsPipelineKey>{}(e.actual), e.ahead.stage_hashes[0],
+                        e.ahead.stage_hashes[1], e.ahead.stage_hashes[2], e.ahead.stage_hashes[3], e.ahead.stage_hashes[4],
+                        e.actual.stage_hashes[0], e.actual.stage_hashes[1], e.actual.stage_hashes[2], e.actual.stage_hashes[3], e.actual.stage_hashes[4],
+                        e.ahead_programs[0], e.ahead_programs[1], e.ahead_programs[2], e.ahead_programs[3], e.ahead_programs[4],
+                        e.actual_programs[0], e.actual_programs[1], e.actual_programs[2], e.actual_programs[3], e.actual_programs[4]);
+        }
+    } catch (...) { /* Diagnostics cannot affect rendering. */ }
+}
+#endif
 u32 TessLdsEmulation(const AmdGpu::Regs& regs) {
     static const u32 mode = [] {
         const char* env = std::getenv("RYGT_TESS_LDS_EMULATION");
@@ -2591,6 +2678,11 @@ void PipelineCache::ReadAhead(const DrawIndirectParams params, bool restore) {
             return false;
         }
         pending_builds.emplace(S().graphics_key, StartPipelineBuild(false));
+#ifndef NDEBUG
+        if (auto* trace = KeyTrace()) trace->Ahead(S().graphics_key, KeyTracePrograms(S().infos),
+                                                   S().draw_indirect_params.is_indirect,
+                                                   S().draw_indirect_params.tessellate_quads);
+#endif
         ++started;
         return true;
     });
@@ -2648,6 +2740,18 @@ static bool RetryBlockedReadAhead() {
         return !value || value[0] != '0';
     }();
     return enabled;
+}
+
+static bool ReadAheadNewShadersEnabled() {
+#ifndef RYTY_GPU
+    return true;
+#else
+    static const bool enabled = [] {
+        const char* value = std::getenv("RYGT_READ_AHEAD_NEW_SHADERS");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+#endif
 }
 
 bool PipelineCache::DirectOnlyRetryProgram(u64 hash) const {
@@ -2763,12 +2867,19 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
                 t_required_pipeline_build->wait_for(std::chrono::microseconds{0}) !=
                     std::future_status::ready);
     };
+#ifndef NDEBUG
+    AmdGpu::ReadAheadPair::Metadata pair_metadata{};
+#endif
     const auto evaluate = [&] {
         ++evaluated;
         S().draw_indirect_params = {};
         read_ahead_blocked = false;
         const bool valid = TrySpeculativeKey(regs_override, queued_state_regs.get(),
                                              [&] { return RefreshGraphicsKey(); });
+#ifndef NDEBUG
+        if (valid) if (auto* trace = KeyTrace())
+            trace->Prediction(pair_metadata.token, S().graphics_key, KeyTracePrograms(S().infos));
+#endif
         if (!valid || !HasSupportedColorTargets() || graphics_pipelines.contains(S().graphics_key)) {
             return !read_ahead_blocked;
         }
@@ -2780,12 +2891,20 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
                 pending.value() = StartPipelineBuild(false);
 #ifndef NDEBUG
                 ++prewarm_stats.promoted;
+                if (auto* trace = KeyTrace()) trace->Ahead(S().graphics_key, KeyTracePrograms(S().infos),
+                                                           S().draw_indirect_params.is_indirect,
+                                                           S().draw_indirect_params.tessellate_quads);
 #endif
                 ++started;
             }
             return true;
         }
         pending_builds.emplace(S().graphics_key, StartPipelineBuild(false));
+#ifndef NDEBUG
+        if (auto* trace = KeyTrace()) trace->Ahead(S().graphics_key, KeyTracePrograms(S().infos),
+                                                   S().draw_indirect_params.is_indirect,
+                                                   S().draw_indirect_params.tessellate_quads);
+#endif
         ++started;
         return true;
     };
@@ -2798,6 +2917,9 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
             if (!RestoreRetryRegisters(queued_state_regs->reg_array, blocked.ranges)) continue;
             const auto* previous_inputs = std::exchange(retry_ahead_inputs, &blocked);
             SCOPE_EXIT { retry_ahead_inputs = previous_inputs; };
+#ifndef NDEBUG
+            pair_metadata = {}; // Retried state has no directly paired draw token.
+#endif
             if (!evaluate()) {
                 blocked_ahead_states.Retry(std::move(blocked), now);
             }
@@ -2805,7 +2927,15 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
     } else if (!RetryBlockedReadAhead()) {
         blocked_ahead_states.clear();
     }
-    while (in_budget() && states->Take(queued_state_regs->reg_array)) {
+    while (in_budget() && states->Take(queued_state_regs->reg_array
+#ifndef NDEBUG
+                                      , &pair_metadata
+#endif
+                                      )) {
+#ifndef NDEBUG
+        if (auto* trace = KeyTrace()) trace->Dequeued(pair_metadata,
+            AmdGpu::ReadAheadPair::recorder_started.load(std::memory_order_acquire));
+#endif
         if (!evaluate() && RetryBlockedReadAhead()) {
             // FIX-GT7-005: hull constants are mutable and cannot safely be retried later.
             using Stages = AmdGpu::ShaderStageEnable::VgtStages;
@@ -2845,13 +2975,16 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
     stats.started += started;
     stats.ms += std::chrono::duration<double, std::milli>(now - start).count();
     if (now - stats.since >= std::chrono::seconds{2}) {
+        const auto reached = states->TakeDropStats();
         LOG_WARNING(Render_Vulkan,
                     "PERF-034 pipeline read-ahead in {:.1f} s: {} draw states from the command "
                     "thread evaluated, {} builds started, {:.1f} ms; {} draws waited for a build "
-                    "({:.1f} ms); {} pending; owned retries retained {}, unproven {}",
+                    "({:.1f} ms); {} pending; owned retries retained {}, unproven {}; new shader requests deferred {}; queued reached dropped {}, decoded returned {}, scan returned {}",
                     std::chrono::duration<double>(now - stats.since).count(), stats.evaluated,
                     stats.started, stats.ms, stats.waits, stats.wait_ms, pending_builds.size(),
-                    stats.retry_retained, stats.retry_unproven);
+                    stats.retry_retained, stats.retry_unproven, stats.new_shader_deferred,
+                    reached.dropped, reached.returned_decoded, reached.returned_scan);
+        ReportKeyTrace();
         stats = {};
         stats.since = now;
     }
@@ -3024,6 +3157,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     if (!key_valid) {
         return nullptr;
     }
+#ifndef NDEBUG
+    // A normal key may be replaced by a legacy fallback before PipelineForCurrentKey.
+    if (!regs_override) if (auto* trace = KeyTrace()) trace->Actual(S().graphics_key);
+#endif
     if (regs_override == nullptr) {
         const auto now = std::chrono::steady_clock::now();
         if (now - stale_ahead_checked >= std::chrono::seconds{2}) {
@@ -3116,6 +3253,9 @@ Shader::Info& PipelineCache::MatchInfo(const Shader::Info& cached) {
 }
 
 const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectParams params) {
+#ifndef NDEBUG
+    if (!regs_override) if (auto* trace = KeyTrace()) trace->Actual(S().graphics_key);
+#endif
     if (S().graphics_key.num_color_attachments > AmdGpu::NUM_COLOR_BUFFERS) {
         LOG_WARNING(Render_Vulkan, "Skipping draw with {} color attachments (MRT mask={:#x})",
                     S().graphics_key.num_color_attachments, S().graphics_key.mrt_mask);
@@ -5975,6 +6115,8 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
                 if (matched && fast_mode) RecordSpecInputs(permutation, info, runtime_info, binding);
             }
             if (matched &&
+                !(regs_override && !ReadAheadNewShadersEnabled() &&
+                  !info.attribute_flags_known && IsTessEmulatedDraw()) &&
                 !(AsyncTranslation() && !info.attribute_flags_known && IsTessEmulatedDraw())) {
                 if (!info.attribute_flags_known && IsTessEmulatedDraw()) {
                     RecoverAttributeFlags(info, permutation.spec, params, runtime_info,
@@ -6019,7 +6161,8 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
         }
         // Old cache metadata needs a fresh translation to recover attribute flags.
         // Let the existing worker miss path do it instead of recompiling here.
-        if (AsyncTranslation() && !info.attribute_flags_known && IsTessEmulatedDraw()) {
+        if ((AsyncTranslation() || (regs_override && !ReadAheadNewShadersEnabled())) &&
+            !info.attribute_flags_known && IsTessEmulatedDraw()) {
             continue;
         }
         bool matches;
@@ -6079,6 +6222,14 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
         return std::make_tuple(&info, permutation.module, HashCombine(params.hash, perm_idx));
     }
     match_timer.reset();
+    // A queued state owns registers, but not the guest resources they point to. Reuse
+    // known permutations for read-ahead; let the actual draw translate a new one.
+    if (regs_override && !ReadAheadNewShadersEnabled()) {
+#ifndef NDEBUG
+        ++queued_state_stats.new_shader_deferred;
+#endif
+        return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
+    }
     if (AsyncTranslation()) {
         // FIX-078: a translation the workers made for these inputs.
         const bool read_ahead = regs_override != nullptr;
