@@ -4,6 +4,7 @@
 #include "ryty_gpu/native/retired_snapshot_pool.h"
 #include "ryty_gpu/native/writeback_plan.h"
 #include "ryty_gpu/native/high_cpu_writeback.h"
+#include "ryty_gpu/native/whole_layer_clear.h"
 #include "video_core/buffer_cache/imported_part_plan.h"
 #include "video_core/buffer_cache/imported_view_lease.h"
 #include "video_core/host_shaders/native_region_writeback_comp.h"
@@ -1271,6 +1272,64 @@ bool RunLayerHashUploadCase(Rhi::Device& device, Rhi::Fence& fence, u64& tick, s
     return ok;
 }
 
+bool RunWholeLayerClearCase(Rhi::Device& device, Rhi::Fence& fence, u64& tick, std::string& log) {
+    constexpr u32 width = 8, height = 4, layers = 4;
+    constexpr u64 layer_bytes = width * height * 4;
+    constexpr u64 bytes = layers * layer_bytes;
+    const u32 count = WholeLayerClearCount(bytes, 2 * layer_bytes, layers, layers,
+        1, 1, 0, bytes, true, false,
+        WholeLayerPatternSafe(0xaabbccdd, 0xaabbccdd, 4, layer_bytes));
+    const bool proof = count == 2 &&
+        WholeLayerClearCount(bytes, 2 * layer_bytes + 1, layers, layers, 1, 1, 0, bytes, true, false) == 0 &&
+        WholeLayerClearCount(bytes, 2 * layer_bytes, layers, layers, 2, 1, 0, bytes, true, false) == 0 &&
+        WholeLayerClearCount(bytes, 2 * layer_bytes, layers, layers, 1, 1, 0, bytes, true, true) == 0;
+    if (!proof) return false;
+    auto image = device.CreateImage({.format = Rhi::FormatFromVk(u32(vk::Format::eR8G8B8A8Unorm)),
+        .width = width, .height = height, .layers = layers,
+        .usage = Rhi::ImageUsageTransferSrc | Rhi::ImageUsageTransferDst});
+    auto source = device.CreateBuffer({.size = bytes,
+        .usage = Rhi::BufferUsageTransferSrc | Rhi::BufferUsageTransferDst,
+        .memory = Rhi::MemoryKind::DeviceLocal});
+    auto read = device.CreateBuffer({.size = bytes, .usage = Rhi::BufferUsageTransferDst,
+        .memory = Rhi::MemoryKind::Readback});
+    if (!image || !source || !read || !read->Mapped()) return false;
+    auto* list = device.AcquireCommandList();
+    if (!list) return false;
+    list->Begin();
+    list->FillBuffer(source.get(), 0, bytes, 0x11223344);
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+    Rhi::BufferImageCopy region{.layers = layers, .extent = {width, height, 1}};
+    list->CopyBufferToImage(source.get(), image.get(), {&region, 1});
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+    list->FillBuffer(source.get(), 0, count * layer_bytes, 0xaabbccdd);
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+    region.layers = count;
+    list->CopyBufferToImage(source.get(), image.get(), {&region, 1});
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
+    region.layers = layers;
+    list->CopyImageToBuffer(image.get(), read.get(), {&region, 1});
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeHost);
+    list->End();
+    Rhi::CommandList* lists[]{list};
+    device.GraphicsQueue().Submit(lists, {}, {&fence, ++tick});
+    if (!fence.Wait(tick, 5'000'000'000ULL)) {
+        std::ignore = fence.Wait(tick, ~u64{0});
+        return false;
+    }
+    read->Invalidate();
+    bool ok = true;
+    for (u32 layer = 0; layer < layers; ++layer) {
+        const u32 expected = layer < count ? 0xaabbccdd : 0x11223344;
+        for (u64 offset = layer * layer_bytes; offset < (layer + 1) * layer_bytes; offset += 4) {
+            u32 value{};
+            std::memcpy(&value, read->Mapped() + offset, sizeof(value));
+            ok &= value == expected;
+        }
+    }
+    log += fmt::format("whole-layer partial clear, untouched layers: {}\n", ok ? "passed" : "FAILED");
+    return ok;
+}
+
 bool RunImageSelfTest(std::string& log) {
     std::string error;
     auto device = Rhi::CreateStandaloneVulkanDevice(&error);
@@ -1281,6 +1340,7 @@ bool RunImageSelfTest(std::string& log) {
     auto fence = device->CreateFence(0);
     u64 tick = 0;
     bool ok = true;
+    ok = RunWholeLayerClearCase(*device, *fence, tick, log) && ok;
     ok = RunAsyncMirrorCase(*device,*fence,tick,log) && ok;
     ok = RunLargeCpuWritebackCase(*device, *fence, tick, log) && ok;
     ok = RunEvictionBudgetCase(*device, log) && ok;

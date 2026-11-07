@@ -64,6 +64,7 @@
 #include "video_core/renderer_vulkan/stable_region_bindings.h"
 #include "video_core/renderer_vulkan/scene_region_scale.h"
 #include "video_core/renderer_vulkan/upload_chunk_tail.h"
+#include "ryty_gpu/native/whole_layer_clear.h"
 #include "video_core/renderer_vulkan/native_chunk_policy.h"
 #include "video_core/renderer_vulkan/upload_chunk_cache.h"
 #include "video_core/renderer_vulkan/native_ring_policy.h"
@@ -10297,7 +10298,8 @@ const Native::Rhi::Buffer* NativeRenderer::PatternBuffer(u32 lo, u32 hi, u64 byt
     return slot.buffer.get();
 }
 
-bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 rows) {
+bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 rows,
+                               u32 first_layers) {
     // NAT-132/134: a picture filled with the pattern (two dwords, repeated), as memory holds it
     // after a fill: copied in from a buffer holding it (any format: every texel is the pattern's
     // bytes). `rows` != 0: only those rows of the first mip and layer (NAT-124).
@@ -10317,7 +10319,8 @@ bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 ro
     const u32 depth = desc.dim == Native::Rhi::ImageDim::D3 ? std::max(desc.depth, 1u) : 1u;
     const u32 mips = rows ? 1u : std::max(desc.mips, 1u);
     const u32 height0 = rows ? std::min(rows, desc.height) : desc.height;
-    const u64 bytes = u64(desc.width) * height0 * texel * (rows ? 1u : layers * depth);
+    const u32 row_layers = std::clamp(first_layers, 1u, layers);
+    const u64 bytes = u64(desc.width) * height0 * texel * (rows ? row_layers : layers * depth);
     if (info.props.is_bgr_packed_float) {
         lo = VideoCore::PackedFloatToVulkan(lo);
         hi = VideoCore::PackedFloatToVulkan(hi);
@@ -10342,7 +10345,7 @@ bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 ro
                                                                 : vk::ImageAspectFlagBits::eColor,
                               .mipLevel = m,
                               .baseArrayLayer = 0,
-                              .layerCount = rows ? 1u : layers},
+                              .layerCount = rows ? row_layers : layers},
             .imageOffset = {0, 0, 0},
             .imageExtent = {w, h, d},
         });
@@ -10414,7 +10417,23 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
         const u64 row_bytes = u64(std::max(info.pitch, info.size.width)) * texel;
         const u32 rows = u32(std::min<u64>((entry.rewrite_bytes + row_bytes - 1) / row_bytes,
                                            info.size.height));
-        if (rows != 0 && FillImage(entry, lo, hi, rows)) {
+        const auto* image = entry.image.get();
+        const u32 image_texel = info.props.is_depth
+            ? ((info.pixel_format == vk::Format::eD16Unorm ||
+                info.pixel_format == vk::Format::eD16UnormS8Uint) ? 2u : 4u)
+            : info.num_bits / 8;
+        const u64 layer_stride = info.resources.layers ? info.guest_size / info.resources.layers : 0;
+        const auto whole_layers = image && image->Desc().width == info.size.width &&
+                                  image->Desc().height == info.size.height &&
+                                  image->Desc().height != 0 && image->Desc().depth == 1
+          ? Native::WholeLayerClearCount(
+            info.guest_size, entry.rewrite_bytes, info.resources.layers, image->Desc().layers,
+            info.resources.levels, image->Desc().mips, info.mips_layout[0].offset,
+            info.mips_layout[0].size, image->Desc().dim == Native::Rhi::ImageDim::D2,
+            info.props.is_volume, Native::WholeLayerPatternSafe(lo, hi, image_texel, layer_stride)) : 0;
+        const bool filled_layers = whole_layers && FillImage(entry, lo, hi, image->Desc().height,
+                                                              whole_layers);
+        if (filled_layers || (rows != 0 && FillImage(entry, lo, hi, rows))) {
             NATIVE_DIAGNOSTIC(++stats.rewrite_partial);
         }
     } else if (rewrite == Rewrite::Clear && !depth_value && !color_zero) {
