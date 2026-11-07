@@ -29,6 +29,8 @@
 #include "video_core/buffer_cache/direct_memory.h"
 #include "video_core/buffer_cache/page_hash_table.h"
 #include "video_core/buffer_cache/range_set.h"
+#include "video_core/buffer_cache/mapping_readback_guard.h"
+#include "common/mapping_writeback_gate.h"
 #include "video_core/buffer_cache/uploaded_pages.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -77,6 +79,9 @@ public:
     u64 SparseResidentBytes();
     u64 SparseFreedBytes();
     void NoteArenaMapping(VAddr address, u64 size);
+    /// A successful new mapping supersedes old GPU copies without reading them back.
+    void InvalidateNewMapping(VAddr address, u64 size);
+    void MarkMappingUnavailable(VAddr address, u64 size);
 
     /// Returns a pointer to GDS device local buffer.
     [[nodiscard]] const Buffer* GetGdsBuffer() const noexcept {
@@ -205,6 +210,9 @@ public:
     struct AsyncReadback {
         VAddr address;
         u32 size;
+#ifdef RYTY_GPU
+        Common::MappingWritebackGate::Token mapping_token;
+#endif
         Vulkan::StagingBufferRef download;
         bool valid = true;
         /// PERF-011: guest bytes when recorded; a mismatch at completion means the CPU wrote the
@@ -292,6 +300,10 @@ private:
         u64 seq{}; // GPU writes logged after this one are newer than the download
         Vulkan::StagingBufferRef download{};
         boost::container::small_vector<vk::BufferCopy, 4> copies;
+#ifdef RYTY_GPU
+        std::vector<Common::MappingWritebackGate::Token> mapping_tokens;
+        Common::MappingWritebackGate::Token mapping_window_token;
+#endif
         boost::container::small_vector<std::pair<VAddr, VAddr>, 4> ranges;
         /// Bytes an earlier fault released before this one reached guest memory: the CPU may
         /// have written them since, so they are not written again (fault_downloads_mutex).
@@ -319,6 +331,7 @@ private:
     std::atomic<u64> async_fault_wait_us{};
 
     void InvalidateAsyncReadbacks(VAddr address, u64 size);
+    void InvalidateAsyncReadbacksLocked(VAddr address, u64 size);
     /// PERF-011: handles a CPU write fault on a page with GPU-written bytes that the write does
     /// not touch, without waiting for the GPU. Returns false when the exact path is needed.
     bool TrySplitWriteFault(const Buffer* arena, VAddr address, u64 size, VAddr window_start,
@@ -343,6 +356,7 @@ private:
     u64 big_quad_draws_logged{};
 
     std::mutex async_readbacks_mutex;
+    MappingReadbackGuard mapping_readback_guard; // protected by async_readbacks_mutex
     std::vector<std::shared_ptr<AsyncReadback>> pending_async_readbacks;
     std::vector<std::shared_ptr<AsyncReadback>> inflight_async_readbacks;
     std::vector<Vulkan::StagingBufferRef> finished_async_downloads;

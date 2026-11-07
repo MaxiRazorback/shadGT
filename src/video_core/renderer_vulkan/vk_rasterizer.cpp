@@ -15,6 +15,7 @@
 #include <boost/container/small_vector.hpp>
 #include <fmt/ranges.h>
 #include "common/debug.h"
+#include "common/mapping_writeback_gate.h"
 #include "common/path_util.h"
 #include "common/perf_monitor.h"
 #include "ryty_gpu/native/slow_call_trace.h"
@@ -3131,8 +3132,14 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
 #ifndef NDEBUG
     const auto deferred_at = std::chrono::steady_clock::now();
 #endif
+#ifdef RYTY_GPU
+    auto mapping_token = Common::GuestMappingWritebackGate().Capture(address, value.empty() ? 8 : value.size());
+#endif
     scheduler.DeferPriorityOperation(
         [this, address,
+#ifdef RYTY_GPU
+         mapping_token = std::move(mapping_token),
+#endif
 #ifndef NDEBUG
          deferred_at,
 #endif
@@ -3140,6 +3147,9 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
          async_readbacks = std::move(async_readbacks), signal = std::move(signal)]() mutable {
             texture_cache.CompleteReadbacks(readbacks);
             buffer_cache.CompleteAsyncReadbacks(async_readbacks);
+#ifdef RYTY_GPU
+            Common::ScopedMappingWritebackToken mapping_scope{mapping_token};
+#endif
             signal();
 #ifndef NDEBUG
             RecordDeferredFenceLatency(deferred_at);
@@ -6259,6 +6269,15 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
 }
 
 void Rasterizer::MapMemory(VAddr addr, u64 size) {
+    if (size && Common::GuestMappingWritebackGate().ProtocolAvailable()) {
+        tsharp_epoch.fetch_add(1, std::memory_order_release);
+#ifdef RYTY_GPU
+        if (native) native->OnNewMapping(addr, size);
+        else
+#endif
+        if (auto* direct = buffer_cache.GetDirectMemory()) direct->OnUnmap(addr, size);
+        buffer_cache.InvalidateNewMapping(addr, size);
+    }
     buffer_cache.NoteArenaMapping(addr, size);
     {
         std::scoped_lock lock{mapped_ranges_mutex};
@@ -6289,6 +6308,7 @@ bool Rasterizer::IsMappedStart(VAddr address) {
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
+    if (Common::GuestMappingWritebackGate().ProtocolAvailable()) buffer_cache.MarkMappingUnavailable(addr, size);
     Native::SlowCallTrace<5> trace{true, "guest-unmap",
         {"native-invalidate", "import-invalidate", "buffer-invalidate", "gpu-command-sync", "mapped-ranges"}};
     trace.Next(0, addr, size);

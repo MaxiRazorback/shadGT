@@ -30,6 +30,7 @@
 #include "ryty_gpu/native/descriptor_update_batch.h"
 #include "ryty_gpu/native/upload_phase_trace.h"
 #include "ryty_gpu/native/region_init_gaps.h"
+#include "ryty_gpu/native/mapping_refresh.h"
 #include "ryty_gpu/native/writeback_plan.h"
 #include "ryty_gpu/native/page_download_ranges.h"
 #include "ryty_gpu/native/safe_page_snapshot.h"
@@ -3773,11 +3774,13 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         vk::Buffer upload{};
         u64 upload_offset{};
         u8* mapped{};
+        bool remapped{};
     };
     std::vector<RefreshPagePlan> refresh(pages.size());
     {
         std::scoped_lock lock{region_dirty_mutex};
         for (size_t i = 0; i < pages.size(); ++i) {
+            refresh[i].remapped = remapped_pages.contains(pages[i]);
             if (auto it = downloaded_ranges.find(pages[i]); it != downloaded_ranges.end())
                 refresh[i].downloads = it->second;
         }
@@ -3822,6 +3825,7 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
     try {
         Native::ReserveAdditional(s.imported_view_leases, lease_count);
         for (size_t i = 0; i < pages.size(); ++i) {
+            if (refresh[i].remapped) continue;
             bool valid = false;
             std::tie(refresh[i].upload, refresh[i].upload_offset, refresh[i].mapped) =
                 Allocate(std::min<u64>(4096, region.end - pages[i]), 4, &valid);
@@ -3835,6 +3839,7 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         return;
     }
     for (size_t i = 0; i < pages.size(); ++i) {
+        if (refresh[i].remapped) continue;
         const u64 bytes = std::min<u64>(4096, region.end - pages[i]);
         if (!Core::RytyMemory::GuardedCopy(refresh[i].mapped,
                 reinterpret_cast<const void*>(pages[i]), bytes)) {
@@ -3853,7 +3858,8 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         std::scoped_lock lock{region_dirty_mutex};
         for (size_t i = 0; i < pages.size(); ++i) {
             auto it = downloaded_ranges.find(pages[i]);
-            if ((it == downloaded_ranges.end() && !refresh[i].downloads.empty()) ||
+            if (remapped_pages.contains(pages[i]) != refresh[i].remapped ||
+                (it == downloaded_ranges.end() && !refresh[i].downloads.empty()) ||
                 (it != downloaded_ranges.end() && it->second != refresh[i].downloads)) {
                 UNREACHABLE_MSG("native image download changed during refresh preflight");
                 return;
@@ -3865,6 +3871,7 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
                 page_snapshots.erase(it);
             }
             opened_ahead[i] = ahead_pages.erase(pages[i]) != 0;
+            if (refresh[i].remapped) remapped_pages.erase(pages[i]);
             if (auto it = downloaded_ranges.find(pages[i]); it != downloaded_ranges.end()) {
                 downloads[i] = std::move(it->second);
                 downloaded_ranges.erase(it);
@@ -3880,6 +3887,7 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         first = last;
     }
     for (size_t i = 0; i < pages.size(); ++i) {
+        if (refresh[i].remapped) continue;
         const u64 bytes = std::min<u64>(4096, region.end - pages[i]);
         if (!Core::RytyMemory::GuardedCopy(refresh[i].mapped,
                 reinterpret_cast<const void*>(pages[i]), bytes)) {
@@ -3932,7 +3940,7 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         }();
         const u64 page_bytes = std::min<u64>(4096, region.end - page);
         const auto& before = snapshots[i];
-        if (!opened_ahead[i] && (downloads[i].empty() || before))
+        if (!refresh[i].remapped && !opened_ahead[i] && (downloads[i].empty() || before))
             (*region.cpu_pages)[page] = frame;
         const auto copy_downloads = [&] {
             if (downloads[i].empty()) return;
@@ -3945,6 +3953,7 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
             for (size_t n = 0; n < downloads[i].size(); ++n)
                 copy_imported(downloads[i][n].first, refresh[i].download_parts[n]);
         };
+        if (refresh[i].remapped) { copy_imported(page, refresh[i].whole); copy_downloads(); continue; }
         if (opened_ahead[i] && !was_recent && !before) { copy_downloads(); continue; }
         const u8* now = refresh[i].mapped;
         if (force_whole || !before || (NativeRegionWritebackEnabled() && !opened_ahead[i] &&
@@ -11366,6 +11375,9 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
         std::erase_if(ahead_pages, [&](VAddr page) {
             return page < address + size && page + 4096 > address;
         });
+        std::erase_if(remapped_pages, [&](VAddr page) {
+            return page < address + size && page + 4096 > address;
+        });
         std::erase_if(fault_chunks, [&](const auto& entry) {
             return entry.first < address + size && entry.first + 64_KB > address;
         });
@@ -11376,6 +11388,60 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
     ++buffer_generation;        // OPT-003
     ++buffer_hard_generation;   // PERF-GT7-047: invalidates even disjoint memos
     ++unmap_generation;         // OPT-002
+}
+
+void NativeRenderer::OnNewMapping(VAddr address, u64 size) {
+    if (!size) return;
+    std::scoped_lock lock{mutex};
+    std::optional<std::vector<Native::MappingRefreshRange>> plan;
+    std::unordered_set<VAddr> prepared_pages;
+    try {
+        plan = Native::PlanMappingRefresh(regions, address, size);
+        if (!plan) {
+            UNREACHABLE_MSG("new guest mapping is not safely page aligned");
+            std::terminate();
+        }
+        for (const auto& range : *plan) {
+            auto& region = regions.at(range.region);
+            const auto count = (range.end - range.first) / 4096;
+            Native::ReserveAdditional(region.dirty_pages, count);
+            for (VAddr page = range.first; page < range.end; page += 4096)
+                prepared_pages.insert(page);
+        }
+        {
+            std::scoped_lock dirty_lock{region_dirty_mutex};
+            remapped_pages.reserve(remapped_pages.size() + prepared_pages.size());
+        }
+        Native::ReserveAdditional(retired_watch_ranges, mirrors.size());
+    } catch (...) {
+        UNREACHABLE_MSG("new guest mapping refresh preflight failed");
+        std::terminate();
+    }
+    // Notification follows a successful guest mapping. Old aliases imported in the
+    // unmap/map gap stay leased until the GPU completes their actual submission.
+    if (auto* direct = r.buffer_cache.GetDirectMemory()) direct->OnUnmap(address, size);
+    {
+        std::scoped_lock dirty_lock{region_dirty_mutex};
+        for (const auto& range : *plan) {
+            auto& region = regions.at(range.region);
+            for (VAddr page = range.first; page < range.end; page += 4096) {
+                region.dirty_pages.push_back(page);
+                region.cpu_pages->erase(page);
+                region.gpu_pages->erase(page);
+                page_snapshots.erase(page);
+                cpu_recent_pages.erase(page);
+                ahead_pages.erase(page);
+                downloaded_ranges.erase(page);
+            }
+            region.dirty_sorted = false;
+        }
+        remapped_pages.merge(prepared_pages);
+    }
+    DropMirrors(address, size, MirrorUnmapDrop);
+    ++buffer_generation;
+    ++buffer_hard_generation;
+    ++unmap_generation;
+    registry->InvalidateNewMapping(address, size);
 }
 
 void NativeRenderer::WatchBind(const Native::ImageEntry& entry, const AmdGpu::Image& tsharp,

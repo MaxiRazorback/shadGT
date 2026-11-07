@@ -113,6 +113,8 @@ public:
     bool InlineWrite(VAddr address, std::span<const u8> data);
     /// Guest memory is unmapped: textures over it are uploaded again when next used.
     void OnUnmap(VAddr address, u64 size);
+    /// A successful mapping replaced the old guest pages at this address.
+    void OnNewMapping(VAddr address, u64 size);
     /// NAT-105: the CPU wrote watched memory (a page fault on any thread): the textures there
     /// are uploaded again before their next use, and their pages are no longer watched.
     void OnCpuWrite(VAddr address, u64 size, u64 exact);
@@ -354,6 +356,7 @@ private:
     std::unordered_map<VAddr, std::unique_ptr<std::array<u8, 4096>>> page_snapshots;
     std::unordered_map<VAddr, u64> cpu_recent_pages; ///< under region_dirty_mutex
     std::unordered_set<VAddr> ahead_pages; ///< under region_dirty_mutex
+    std::unordered_set<VAddr> remapped_pages; ///< complete newly mapped pages awaiting refresh
     std::unordered_map<VAddr, u64> fault_chunks; ///< under region_dirty_mutex
     std::unordered_map<VAddr, std::vector<std::pair<VAddr, VAddr>>> downloaded_ranges;
     void FaultAhead(VAddr begin, VAddr end);

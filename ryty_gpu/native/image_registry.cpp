@@ -1014,6 +1014,13 @@ void ImageRegistry::Invalidate(VAddr address, u64 size, Stale why) {
     });
 }
 
+void ImageRegistry::InvalidateNewMapping(VAddr address, u64 size) {
+    ForgetFills(address, size);
+    ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
+        if (entry.from_cpu) MarkStale(entry, Stale::Unmap);
+    });
+}
+
 void ImageRegistry::MarkReused(ImageEntry& entry) {
     if (entry.reused.exchange(true, std::memory_order_relaxed)) {
         return;

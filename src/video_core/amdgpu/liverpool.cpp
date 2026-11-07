@@ -19,6 +19,7 @@
 #include "common/scope_exit.h"
 #include "common/debug.h"
 #include "common/guest_clock.h"
+#include "common/mapping_writeback_gate.h"
 #include "common/nvtx.h"
 #include "common/perf_monitor.h"
 #include "common/polyfill_thread.h"
@@ -117,9 +118,15 @@ static void WriteDeferredFence(void* address, const void* data, u32 num_bytes) {
     }
 #endif
     auto* memory = Core::Memory::Instance();
-    if (memory->IsValidMapping(reinterpret_cast<VAddr>(address), num_bytes)) {
-        memory->TryWriteBacking(address, data, num_bytes);
-    }
+    const auto writeback = [&] {
+        if (memory->IsValidMapping(reinterpret_cast<VAddr>(address), num_bytes))
+            memory->TryWriteBacking(address, data, num_bytes);
+    };
+#ifdef RYTY_GPU
+    Common::CompleteScopedMappingWriteback(writeback);
+#else
+    writeback();
+#endif
 }
 
 // PERF-095 (opt-in, SHADGT_LAZY_ASC_EPOCH=1): a compute-queue submission or wait only bumps the

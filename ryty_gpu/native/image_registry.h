@@ -283,6 +283,7 @@ public:
     /// CPU writes to guest memory (file loads, the game writing texture data): textures over the
     /// range are uploaded again before their next use.
     void Invalidate(VAddr address, u64 size, Stale why = Stale::CpuWrite);
+    void InvalidateNewMapping(VAddr address, u64 size);
 
     /// NAT-119/120: GPU work (a shader's storage buffer, a CP fill or copy) wrote [address,
     /// address + size), with `pattern` (two dwords, repeated) when it is a fill. As the old
