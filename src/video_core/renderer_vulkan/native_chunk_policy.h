@@ -17,6 +17,6 @@ inline std::uint64_t NativeChunkBytes(const char* value) {
                ? count * mb : mb;
 }
 inline std::uint64_t NativeRegionUploadStep(std::uint64_t remaining, std::uint64_t chunk) {
-    return std::min({std::uint64_t{4} * 1024 * 1024, chunk, remaining});
+    return (std::min)({std::uint64_t{4} * 1024 * 1024, chunk, remaining});
 }
 } // namespace Vulkan
