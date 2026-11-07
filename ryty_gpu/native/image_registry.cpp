@@ -777,6 +777,17 @@ void ImageRegistry::ForEachOverlapping(VAddr begin, VAddr end,
     }
 }
 
+void ImageRegistry::ForEachImage(const std::function<void(ImageEntry&)>& fn) {
+    for (Shard& shard : shards) {
+        std::shared_lock lock{shard.mutex};
+        for (const auto& [base, entry] : shard.images) {
+            // Match ForEachOverlapping(0, ~VAddr{0}), including overflow edges.
+            const u64 span = std::clamp<u64>(entry->info.guest_size, 1, MaxIndexedSize);
+            if (base < ~VAddr{0} && base + span > base) fn(*entry);
+        }
+    }
+}
+
 std::vector<std::pair<VAddr, u32>> ImageRegistry::Crowded(u32 count) {
     std::unordered_map<VAddr, u32> per_address;
     for (Shard& shard : shards) {
@@ -1090,7 +1101,8 @@ bool ImageRegistry::LayersRewritten(ImageEntry& entry, u64 frame) {
     const u32 layers = entry.info.resources.layers;
     if (!samples || !entry.from_cpu || layers < 16 || size <= (4ull << 20) ||
         size % layers != 0 || entry.gpu_backing_written.load(std::memory_order_acquire) ||
-        !memory_clamp || memory_clamp(entry.info.guest_address, size) != size) return false;
+        entry.layer_hash.Checked(frame) || !memory_clamp ||
+        memory_clamp(entry.info.guest_address, size) != size) return false;
     const u64 layer_size = size / layers;
     const bool changed = entry.layer_hash.Changed(layers, layer_size, frame,
         [&](u32 layer, u64 offset, u64 bytes) {

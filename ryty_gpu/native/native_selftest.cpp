@@ -1326,7 +1326,9 @@ bool RunLayerHashUploadCase(Rhi::Device& device, Rhi::Fence& fence, u64& tick, s
     info.UpdateSize();
     if (info.guest_size != guest.size()) return false;
     ImageRegistry registry{device};
-    registry.SetMemoryClamp([](VAddr, u64 size) { return size; });
+    u32 clamps = 0;
+    bool fail_clamp = false;
+    registry.SetMemoryClamp([&](VAddr, u64 size) { ++clamps; return fail_clamp ? 0 : size; });
     auto* image = registry.Find(info, false, 1);
     if (!image) return false;
     auto upload = [&] {
@@ -1336,13 +1338,58 @@ bool RunLayerHashUploadCase(Rhi::Device& device, Rhi::Fence& fence, u64& tick, s
         device.GraphicsQueue().Submit(lists, {}, {&fence, ++tick});
         return recorded && fence.Wait(tick, 5'000'000'000ULL);
     };
-    bool ok = upload() && !registry.LayersRewritten(*image, 1);
+    bool ok = upload();
+    clamps = 0;
+    fail_clamp = true;
+    ok = !registry.LayersRewritten(*image, 1) && clamps == 1 && ok;
+    fail_clamp = false;
+    ok = !registry.LayersRewritten(*image, 1) && clamps == 2 && ok;
+    for (u32 i = 0; i < 18; ++i) ok = !registry.LayersRewritten(*image, 1) && ok;
+    ok = clamps == 2 && ok;
     guest[12 * layer_bytes + 1000] = 1; // outside every 64-byte sample
     ok = ok && registry.LayersRewritten(*image, 2) && image->needs_upload.load();
     registry.QueueUploadForUse(*image);
     ok = upload() && ok;
     ok = !registry.LayersRewritten(*image, 3) && ok;
-    log += fmt::format("large layered upload detects unsampled rewrite: {}\n", ok ? "passed" : "FAILED");
+    // Capture and ClearUpload intentionally do not reset the existing frame gate.
+    LayerHashState state;
+    auto hash = [](u32, u64, u64) { return u64{0}; };
+    ok = state.Checked(UINT64_MAX) && !state.Changed(16, 256, UINT64_MAX, hash, true, true) && ok;
+    state.Capture(16, 256, hash);
+    ok = !state.Changed(16, 256, 7, hash, true, true) && state.Checked(7) && ok;
+    state.Capture(16, 256, hash);
+    state.ClearUpload();
+    ok = state.Checked(7) && !state.Changed(16, 256, 7, hash, true, true) && ok;
+    log += fmt::format("layer clamp retry/duplicate bindings, unsampled rewrite and capture gate: {}\n", ok ? "passed" : "FAILED");
+    return ok;
+}
+
+bool RunUniqueImageTraversalCase(Rhi::Device& device, std::string& log) {
+    ImageRegistry registry{device};
+    constexpr VAddr base = 0x730000000000ull;
+    for (u32 i = 0; i < 8; ++i) {
+        auto info = MakeInfo(AmdGpu::TileMode::DisplayLinearAligned, 512, 256, 1,
+                             base + u64{i} * 0x200000);
+        if (!registry.Find(info, false, i < 4 ? 1 : 100)) return false;
+    }
+    auto alias = MakeInfo(AmdGpu::TileMode::DisplayLinearAligned, 256, 256, 1, base);
+    if (!registry.Find(alias, false, 1)) return false;
+    auto recent = MakeInfo(AmdGpu::TileMode::DisplayLinearAligned, 512, 256, 1,
+                           base + 0x200000);
+    if (!registry.Find(recent, false, 100)) return false;
+    const auto compare = [&] {
+        std::unordered_set<ImageEntry*> unique, overlapping;
+        bool no_duplicates = true;
+        registry.ForEachImage([&](ImageEntry& entry) { no_duplicates &= unique.insert(&entry).second; });
+        registry.ForEachOverlapping(0, ~VAddr{0}, [&](ImageEntry& entry) {
+            no_duplicates &= overlapping.insert(&entry).second;
+        });
+        return no_duplicates && unique == overlapping && unique.size() == registry.Count();
+    };
+    bool ok = compare();
+    ok = registry.Evict(50, [](ImageEntry&) {}) == 4 && compare() && ok;
+    ok = registry.Evict(200, [](ImageEntry&) {}) == 5 && compare() && ok;
+    log += fmt::format("unique full-range traversal across granules and retirement: {}\n", ok ? "passed" : "FAILED");
     return ok;
 }
 
@@ -1516,6 +1563,7 @@ bool RunImageSelfTest(std::string& log) {
     ok = RunPackedFloatCase(*device, *fence, tick, AmdGpu::TileMode::Thin2DThin, log) && ok;
     ok = RunPackedFloatCase(*device, *fence, tick, AmdGpu::TileMode::Thin2DThin, log, 64, 64, false, 4) && ok;
     ok = RunLayerHashUploadCase(*device,*fence,tick,log) && ok;
+    ok = RunUniqueImageTraversalCase(*device,log) && ok;
     {
         ImageRegistry registry{*device};
         ok = RunResolveFormatCase(registry, log) && ok;

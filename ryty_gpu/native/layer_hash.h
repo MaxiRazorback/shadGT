@@ -30,6 +30,7 @@ public:
         sampled = std::move(next_samples);
         cursor = 0;
     }
+    bool Checked(std::uint64_t frame) const { return last_frame == frame; }
     template<class Hash>
     bool Changed(std::uint32_t layers, std::uint64_t layer_size, std::uint64_t frame, Hash hash,
                  bool samples, bool whole) {
