@@ -47,6 +47,7 @@
 #include "common/perf_monitor.h"
 #include "common/recoverable.h"
 #ifdef RYTY_GPU
+#include "ryty_gpu/native/menu_compile_policy.h"
 #include "ryty_gpu/ryty_hdr_ui.h"
 #include "ryty_gpu/ryty_ghost.h"
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
@@ -142,6 +143,8 @@ bool CompilationInProgress() {
 
 #ifdef RYTY_GPU
 bool RytyGtsInRace(); // FIX-110, ryty_game_patch.cpp
+bool RytyGtsMenuCaptureCanContinue();
+bool RytyGtsMenuCaptureAvailable();
 #endif
 
 // PERF-310: in a race, shader translations and pipeline builds run below the game's priority.
@@ -2470,13 +2473,18 @@ std::chrono::microseconds PipelineCache::QuickWait() {
 }
 
 bool PipelineCache::MenusWait() {
-    // Menu rendering includes one-shot car thumbnails and their intermediate
-    // reflection/lighting passes. A skipped compile cannot be repaired by a
-    // later frame after the CPU has encoded that image. Keep the recorder at
-    // the dependent draw while compiler workers finish; do not suspend them.
-    // This correctness rule precedes every cosmetic compile-mode override.
+    // Captures retain every producer, including intermediate lighting passes,
+    // until their actual save job completes. Ordinary Keep Going menu frames
+    // may skip cosmetic work; an unavailable/ambiguous capture hook fails closed.
 #ifdef RYTY_GPU
-    return !RytyGtsInRace();
+    static const bool logged = [] {
+        LOG_INFO(Render_Vulkan, "Compile policy: mode={} (0=pause, 1=slow motion, 2=keep going), capture guard idle={}",
+                 CompileMode(), RytyGtsMenuCaptureCanContinue());
+        return true;
+    }();
+    (void)logged;
+    return Native::MenuCompileMustWait(CompileMode(), RytyGtsInRace(),
+                                       RytyGtsMenuCaptureAvailable(), RytyGtsMenuCaptureCanContinue());
 #else
     return false;
 #endif
@@ -3438,7 +3446,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             if (!AsyncPipelines()) why += " no-async";
             if (S().key_uses_legacy) why += " legacy";
             if (WritesMemory(S().infos)) why += " writes-memory";
-            if (NeverSkipped(S().infos)) why += " tessellation";
+            if (NeverSkipped(S().infos)) why += " required-output";
             if (MenusWait()) why += " menus";
             LOG_WARNING(Render_Vulkan,
                         "Pipeline {:#x} {}: built {:.1f} ms after it was queued, draw waited "

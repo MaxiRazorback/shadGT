@@ -1,5 +1,24 @@
 # Will Scarlett source port candidate
 
+## FIX-331: Keep Going menu capture scope
+
+- Keep Going no longer makes every ordinary menu draw a required compilation.
+  The verified GTS icon-capture Begin starts a required interval before image
+  and mask work is scheduled. It stays required through the actual asynchronous
+  save worker and capture End. Missing hooks, interrupted saves, unknown owners
+  and mismatched generations retain the conservative wait policy.
+- A retained engine shared owner protects the capture across the save wrapper,
+  including an early End. Only a matched completed capture releases that pin.
+  Unsupported/interrupted cases retain a bounded pin and wait policy until exit.
+  Known one-shot, shader memory-write and depth-bake protections remain in place.
+- The skipped-output observer is now explicitly opt-in with
+  `RYGT_ONE_OFF_LEARN=1`: sampling a temporary skipped intermediate does not prove
+  that it is a persistent one-shot image, and address reuse must not silently
+  convert normal Keep Going draws into blocking work.
+- `RYGT_CAPTURE_SCOPED_MENUS=0` restores the previous blanket menu wait for a
+  control run. This is an isolated candidate; cold thumbnail output, cancellation,
+  animated menu performance and race/UI transitions require runtime validation.
+
 Target base: `ryty-gpu` at `20b1965a00de9f1b5fdca9b3f861c7a7f6faadee`.
 Upstream snapshot: `rygt-team/shadgt7` main at
 `3b27dbfee4cd63eaf173826c5447c8cd715a183b`.

@@ -1418,7 +1418,10 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
     if (auto* direct = r.buffer_cache.GetDirectMemory()) direct->HoldNativeReleases();
     static const bool learn = [] {
         const char* value = std::getenv("RYGT_ONE_OFF_LEARN");
-        return !value || value[0] != '0';
+        // A sampled skipped output may be an ordinary multi-pass frame, not a
+        // persistent bake. Learning is investigative and must not silently turn
+        // subsequent Keep Going misses into required waits at reused addresses.
+        return value && std::strcmp(value, "1") == 0;
     }();
     if (learn) {
         try {
