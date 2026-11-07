@@ -87,6 +87,9 @@ public:
         /// PERF-068: a quad list's pipeline when the recorder tessellates its quads (the
         /// triangle one is `pipeline`); the recorder decides which it draws with.
         bool is_quad_list{};
+        bool indirect{};
+        u16 vertex_sgpr_offset{};
+        u32 instance_sgpr_offset{};
         const GraphicsPipeline* quad_tess_pipeline{};
         std::array<SelectedStage, Shader::MaxStageTypes> quad_tess_stages{};
     };
@@ -95,7 +98,7 @@ public:
     bool SelectsPipelinesAhead() const;
     /// PERF-047: on the command thread, for a direct draw it is decoding. Nothing for draws the
     /// recorder filters out or whose pipeline depends on the recorder's state (quad lists).
-    std::optional<SelectedPipeline> SelectPipelineAhead();
+    std::optional<SelectedPipeline> SelectPipelineAhead(const DrawIndirectParams* indirect = nullptr);
     /// PERF-055: the same for a direct dispatch it is decoding (-DisablePerf 66: none).
     std::optional<SelectedPipeline> SelectComputePipelineAhead();
     /// NAT-030: on a game job thread whose registers Liverpool::SetThreadDrawState installed,

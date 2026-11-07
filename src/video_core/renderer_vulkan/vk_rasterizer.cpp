@@ -36,6 +36,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/draw_selection_identity.h"
 #include "video_core/renderer_vulkan/native_fence_batch.h"
 #ifdef RYTY_GPU
 #include "ryty_gpu/native/image_registry.h"
@@ -253,12 +254,13 @@ void Rasterizer::CopySelectedStages(std::array<SelectedStage, Shader::MaxStageTy
     }
 }
 
-std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead() {
+std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead(
+    const DrawIndirectParams* indirect) {
     // The command thread's registers are those of the draw it is decoding.
     const auto& regs = liverpool->DrawRegs();
     bool depth_copy;
     bool stencil_copy;
-    const bool quad_list = regs.primitive_type == AmdGpu::PrimitiveType::QuadList;
+    const bool quad_list = !indirect && regs.primitive_type == AmdGpu::PrimitiveType::QuadList;
     // PERF-068: a quad list's pipeline depends on whether its indices are GPU-written, which
     // only the recorder's buffer cache knows: both are selected, the recorder takes its one.
     // -DisablePerf 75 leaves quad lists to the recorder.
@@ -272,9 +274,12 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead() {
     selected.is_compute = false;
     selected.compute = nullptr;
     selected.is_quad_list = quad_list;
+    selected.indirect = indirect != nullptr;
+    selected.vertex_sgpr_offset = indirect ? indirect->vertex_sgpr_offset : 0;
+    selected.instance_sgpr_offset = indirect ? indirect->instance_sgpr_offset : 0;
     selected.quad_tess_pipeline = nullptr;
     std::unique_lock lk{pipeline_cache.LookupMutex()};
-    selected.pipeline = pipeline_cache.GetGraphicsPipelineUnlocked({
+    selected.pipeline = pipeline_cache.GetGraphicsPipelineUnlocked(indirect ? *indirect : DrawIndirectParams{
         .vertex_sgpr_offset = 0,
         .instance_sgpr_offset = 0,
         .tessellate_quads = false,
@@ -387,6 +392,7 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectComputePipelineAhe
     Common::PhaseTimer timer{Common::Phase::SelectAhead};
     SelectedPipeline selected = selected_recycler.Take(); // PERF-056
     selected.pipeline = nullptr;
+    selected.indirect = false;
     selected.is_compute = true;
     std::scoped_lock lk{pipeline_cache.LookupMutex()};
     selected.compute = pipeline_cache.GetComputePipeline();
@@ -1170,7 +1176,10 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
 #endif
     // PERF-068: a quad list's selection holds both of its pipelines.
     const bool quad_selection = selected_pipeline && selected_pipeline->is_quad_list;
-    if ((selected_allowed || quad_selection) && selected_pipeline) {
+    if (selected_pipeline && CanUseDrawSelection(
+            selected_pipeline->indirect, quad_selection, selected_pipeline->vertex_sgpr_offset,
+            selected_pipeline->instance_sgpr_offset, params.is_indirect,
+            params.vertex_sgpr_offset, params.instance_sgpr_offset, selected_allowed)) {
         const bool tess = quad_selection && params.tessellate_quads;
         const auto* pipeline =
             tess ? selected_pipeline->quad_tess_pipeline : selected_pipeline->pipeline;
@@ -2455,6 +2464,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         .instance_sgpr_offset = instance_sgpr_offset,
         // PERF-028: the vertex count is in GPU memory, so quads cannot be expanded here.
         .tessellate_quads = true,
+        .is_indirect = true,
     };
     const GraphicsPipeline* pipeline = AcquireGraphicsPipeline(params, false);
     if (!pipeline || !pipeline->Handle()) {

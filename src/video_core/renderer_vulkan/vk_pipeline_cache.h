@@ -79,6 +79,7 @@ struct DrawIndirectParams {
     /// PERF-028: draw a quad list through the tessellation helpers instead of as triangles
     /// (indirect draws, or indices the command thread cannot read).
     bool tessellate_quads{};
+    bool is_indirect{};
 };
 
 /// PERF-098: progress of building the stored pipelines (the precompile shown over the splash).
