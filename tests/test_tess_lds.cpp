@@ -12,6 +12,50 @@ TEST(TessLdsScratch, BoundedAndOverflowSafe) {
     EXPECT_FALSE(TessLdsScratchSize(1, 1, 1, ~0ull));
 }
 
+TEST(TessLdsScratch, PadsFinalGroupAndForwardReaderWithoutOverflow) {
+    using Vulkan::TessLdsScratchLayout;
+    auto group = TessLdsScratchLayout(3, 1, 1, 80, 2, 1);
+    ASSERT_TRUE(group);
+    EXPECT_EQ(group->written, 240);
+    EXPECT_EQ(group->size, 320);
+    auto forward = TessLdsScratchLayout(3, 1, 1, 80, 2, 2);
+    ASSERT_TRUE(forward);
+    EXPECT_EQ(forward->written, 240);
+    EXPECT_EQ(forward->size, 320);
+    auto aligned = TessLdsScratchLayout(4, 1, 1, 80, 2, 1);
+    ASSERT_TRUE(aligned);
+    EXPECT_EQ(aligned->written, aligned->size);
+    EXPECT_FALSE(TessLdsScratchLayout(~0ull, 1, 1, 80, 2, 2));
+    EXPECT_FALSE(TessLdsScratchLayout(3, 2, 1, 80, 2, 1));
+    EXPECT_FALSE(TessLdsScratchLayout(3, 1, 1, 528, 2, 1));
+}
+
+TEST(TessLdsScratch, AllocationContainsEveryPatchReaderAndWriter) {
+    using Vulkan::TessLdsScratchLayout;
+    for (const auto cp : {1ull, 3ull, 32ull}) {
+        for (const auto patches : {1ull, 3ull, 17ull}) {
+            for (const auto raw_group : {0ull, 1ull, 2ull, 16ull, 255ull}) {
+                for (const auto mode : {1u, 2u}) {
+                    const auto group = std::max(raw_group, 1ull);
+                    const auto layout = TessLdsScratchLayout(patches * cp + cp - 1,
+                        1, cp, 80, raw_group, mode);
+                    ASSERT_TRUE(layout);
+                    EXPECT_EQ(layout->written, patches * cp * 80);
+                    EXPECT_LE(layout->written, layout->size);
+                    for (std::uint64_t prim = 0; prim < patches; ++prim) {
+                        const auto base = mode == 1 ? (prim / group) * group * cp : prim * cp;
+                        const auto last_reader = base + group * cp - 1;
+                        EXPECT_LT(last_reader * 80 + 79, layout->size);
+                        EXPECT_LT(((prim + 1) * cp - 1) * 80 + 79, layout->written);
+                    }
+                }
+            }
+        }
+    }
+    EXPECT_FALSE(TessLdsScratchLayout(3, 1, ~0ull, 80, 2, 1));
+    EXPECT_FALSE(TessLdsScratchLayout(3, 1, 1, 80, ~0ull, 2));
+}
+
 TEST(TessLdsScratch, RejectsUnsafeDraws) {
     using Vulkan::TessLdsSafeShape;
     EXPECT_TRUE(TessLdsSafeShape(1, false, true, false));

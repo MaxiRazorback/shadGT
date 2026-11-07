@@ -44,6 +44,10 @@ static constexpr u32 ShaderBinaryVersionSingleSampleBarycentric = 282u + Shader:
 static constexpr u32 ShaderBinaryVersionTessellationLayout = 283u + Shader::Backend::PushDataLayoutRevision;
 static constexpr u32 ShaderBinaryVersionTessellationMip = 286u + Shader::Backend::PushDataLayoutRevision;
 static constexpr u32 ShaderBinaryVersionTessellationNoMip = 287u + Shader::Backend::PushDataLayoutRevision;
+// FIX-335: LDS readers branch before input loads and use bounded, padded scratch.
+// Only emulated TCS modules change; unrelated stored shaders remain compatible.
+static constexpr u32 ShaderBinaryVersionTessellationLdsBoundsMip = 288u + Shader::Backend::PushDataLayoutRevision;
+static constexpr u32 ShaderBinaryVersionTessellationLdsBoundsNoMip = 289u + Shader::Backend::PushDataLayoutRevision;
 // FIX-223: fragment shaders whose discards end the pixel (AMD). 285: FIX-GTS-011 keeps some
 // shaders' discarded pixels as helpers again.
 static constexpr u32 ShaderBinaryVersionDiscardKill = 285u + Shader::Backend::PushDataLayoutRevision;
@@ -116,6 +120,10 @@ static u32 ShaderBinaryVersionFor(const Shader::StageSpecialization& spec,
             const char* env = std::getenv("RYGT_UNNORMALIZED_MIP");
             return !(env && env[0] == '0');
         }();
+        if (spec.runtime_info.sw.tcs.lds_emulation) {
+            return mip ? Serialization::ShaderBinaryVersionTessellationLdsBoundsMip
+                       : Serialization::ShaderBinaryVersionTessellationLdsBoundsNoMip;
+        }
         return mip ? Serialization::ShaderBinaryVersionTessellationMip
                    : Serialization::ShaderBinaryVersionTessellationNoMip;
     }
@@ -163,7 +171,9 @@ static bool IsKnownShaderBinaryVersion(u32 version) {
     // Old metadata remains discoverable for prewarm and index reservation. The
     // exact comparison in LoadShaderMeta still rejects its incompatible SPIR-V.
     version |= Shader::Backend::PushDataLayoutRevision;
-    if (version == Serialization::ShaderBinaryVersionTessellationMip ||
+    if (version == Serialization::ShaderBinaryVersionTessellationLdsBoundsMip ||
+        version == Serialization::ShaderBinaryVersionTessellationLdsBoundsNoMip ||
+        version == Serialization::ShaderBinaryVersionTessellationMip ||
         version == Serialization::ShaderBinaryVersionTessellationNoMip) return true;
     if (version == Serialization::ShaderBinaryVersionTessellationLayout) return true;
     if (version == Serialization::ShaderBinaryVersionDiscardKill) {

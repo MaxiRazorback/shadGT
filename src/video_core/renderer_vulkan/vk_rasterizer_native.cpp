@@ -2069,6 +2069,9 @@ void NativeRenderer::FlushLdsReaders(u32) {
     resumed.depth_stencil_attachment.depth_clear = false;
     resumed.depth_stencil_attachment.stencil_clear = false;
     if (s.rendering) { s.cmd.endRendering(); s.rendering = false; }
+    for (const auto& reader : readers) {
+        if (reader.tail_size) s.list->FillBuffer(reader.scratch, reader.tail_offset, reader.tail_size, 0);
+    }
     const vk::MemoryBarrier2 barrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
@@ -8709,9 +8712,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     admission_partition.Finish();
     // Deferred readers own their pipeline and copy descriptor metadata; GPU objects
     // remain alive under the stream's existing graphics retirement policy.
-    const auto lds_proposed_size = pipeline->LdsEmulation() ? TessLdsScratchSize(regs.num_indices,
+    const auto lds_proposed_size = pipeline->LdsEmulation() ? TessLdsScratchLayout(regs.num_indices,
         regs.num_instances.NumInstances(), regs.ls_hs_config.hs_input_control_points,
-        pipeline->LdsVertexBytes()) : std::optional<u64>{};
+        pipeline->LdsVertexBytes(), pipeline->LdsGroupPatches(), pipeline->LdsEmulation()) : std::optional<TessLdsLayout>{};
     const bool lds_readonly_stages = !pipeline->LdsEmulation() || std::ranges::all_of(pipeline->GetStages(), [](const Shader::Info* stage) {
         return !stage || (stage->resource_usage_known && !stage->uses_dma && !stage->uses_direct &&
             !stage->has_storage_images && !stage->uses_shader_clock &&
@@ -8741,7 +8744,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     const bool lds_batch_candidate = lds_proposed_size && LdsBatchOn() && lds_safe_draw &&
                                      !pipeline->UsesShaderObjects();
     if (!s.lds_readers.empty() && (!lds_batch_candidate || s.lds_readers.size() >= 1024 ||
-        s.lds_bytes + *lds_proposed_size > (32ull << 20))) FlushLdsReaders(0);
+        s.lds_bytes + lds_proposed_size->size > (32ull << 20))) FlushLdsReaders(0);
     {
         PhaseClock part{stats.record_ns[1]};
         if(!parallel_draw) BeginRendering(targets.state);
@@ -9013,16 +9016,18 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         if (pipeline->LdsEmulation() || !s.lds_readers.empty()) lds_draw_dynamic = s.dynamic;
         if (lds_safe_draw) {
             const u32 cp = std::max<u32>(regs.ls_hs_config.hs_input_control_points, 1u);
-            const u64 vertex_bytes = std::max<u32>(pipeline->LdsVertexBytes(), 64u);
+            const u64 vertex_bytes = pipeline->LdsVertexBytes();
             // Per-draw owned storage survives with the stream until its graphics tick retires.
             // Cap the allocation; on failure the shader sees its ordinary all-ones mask.
-            if (const auto size = TessLdsScratchSize(regs.num_indices, instances, cp, vertex_bytes)) {
-                auto scratch = device->CreateBuffer({.size = *size,
-                    .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageDeviceAddress,
+            if (const auto layout = TessLdsScratchLayout(regs.num_indices, instances, cp, vertex_bytes,
+                                                         pipeline->LdsGroupPatches(), pipeline->LdsEmulation())) {
+                auto scratch = device->CreateBuffer({.size = layout->size,
+                    .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageDeviceAddress | Native::Rhi::BufferUsageTransferDst,
                     .memory = Native::Rhi::MemoryKind::DeviceLocal, .name = "hull LDS scratch"});
                 if (scratch && scratch->GpuAddress() && (scratch->GpuAddress() & 3u) == 0 &&
                     u32(scratch->GpuAddress() >> 32) != ~0u) {
                     const u64 address = scratch->GpuAddress();
+                    const auto* scratch_buffer = scratch.get();
                     s.keep.push_back(std::move(scratch));
                     bool deferred = false;
                     if (lds_batch_candidate) {
@@ -9037,12 +9042,15 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                 s.lds_readers.pop_back();
                             } else {
                             reader.address = address;
+                            reader.scratch = scratch_buffer;
+                            reader.tail_offset = layout->written;
+                            reader.tail_size = layout->size - layout->written;
                             reader.indexed = quad_triangles || is_indexed;
                             reader.count = quad_triangles ? index_count : regs.num_indices;
                             reader.instances = instances;
                             reader.vertex_offset = u32(vertex_offset);
                             reader.first_instance = instance_offset;
-                            s.lds_bytes += *size;
+                            s.lds_bytes += layout->size;
                             deferred = true;
                             }
                         } catch (const std::bad_alloc&) {
@@ -9080,6 +9088,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                     resumed.depth_stencil_attachment.stencil_clear = false;
                     const RenderState current = s.render;
                     EndRendering();
+                    if (layout->written < layout->size)
+                        s.list->FillBuffer(scratch_buffer, layout->written, layout->size - layout->written, 0);
                     GlobalBarrier();
                     BeginRendering(resumed);
                     s.render = current;

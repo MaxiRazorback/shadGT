@@ -240,3 +240,30 @@ GPU suites and Release diagnostic gating. Two-race menu/Brand Central checks,
 native remap execution and the explicitly requested split-GDS ON trial require
 gameplay validation. Component tests establish neither a runtime speedup nor
 the 16.6 ms target. No port binary has been installed or merged.
+
+## FIX-335: Wide tessellation LDS scratch
+
+Subsequent local testing installed the port and exposed a repeated HS translation
+failure for an LS stride of 72 bytes. The writer, reader and interface already
+round that to five vec4s (80 bytes); the prologue's old 64-byte assertion was stale.
+The correction retains LDS emulation and validates the generic interface bounds.
+Own-patch input loads now occur only in their valid branch. Out-of-group vertex,
+attribute and component reads return zero without evaluating an invalid pointer.
+
+Native scratch allocation reserves the complete reachable tail for each mode,
+including a partial final patch group, within the existing 32 MiB cap. Unwritten
+tails are cleared before the existing writer-to-reader barrier. Deferred readers
+clear their tails together, preserving batching and avoiding a new per-draw pass.
+Only emulated TCS cache revisions change; unrelated shader binaries remain usable.
+
+Five CPU layout tests, two actual SPIR-V emission tests and eight NVIDIA fixture
+cases pass locally. The GPU cases exercise 64/72-byte strides, both modes,
+partial-group padding, invalid indices, disabled scratch and own-patch input;
+serial and batched runs check all output components, writer bytes, zeroed tails
+and canaries. The full Debug/Release renderer assembly and linked component tests
+are recorded with their final artifacts, not implied by these standalone checks.
+
+The preceding cold-cache cockpit run lost the Vulkan device and Windows recorded
+an NVIDIA driver reset. Its relationship to the translation failure or these
+bounds defects is unproven pending a matched cockpit rerun. GDS stays ON. Working
+runtime libraries, the UI/capture guards and Keep Going policy are unchanged.

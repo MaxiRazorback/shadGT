@@ -605,6 +605,8 @@ private:
         DrawBindings bindings;
         std::vector<std::pair<u32, u32>> infos;
         u64 address = 0;       ///< its scratch
+        const Native::Rhi::Buffer* scratch = nullptr; // owned by stream.keep
+        u64 tail_offset = 0, tail_size = 0;
         bool indexed = false;
         u32 count = 0, instances = 0, vertex_offset = 0, first_instance = 0;
     };

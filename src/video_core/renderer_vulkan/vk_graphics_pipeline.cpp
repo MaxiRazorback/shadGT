@@ -387,6 +387,7 @@ GraphicsPipeline::GraphicsPipeline(
     if (infos[u32(Shader::SwStage::TessellationControl)]) {
         const auto& tcs = runtime_infos[u32(Shader::SwStage::TessellationControl)].sw.tcs;
         lds_emulation = tcs.lds_emulation;
+        lds_group_patches = tcs.num_patches;
         lds_vertex_bytes = ((tcs.ls_stride + 15) / 16) * 16;
     }
     if (fetch_shader_) {

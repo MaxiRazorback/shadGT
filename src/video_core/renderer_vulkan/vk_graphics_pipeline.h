@@ -157,6 +157,7 @@ public:
     u32 LdsVertexBytes() const {
         return lds_vertex_bytes;
     }
+    u32 LdsGroupPatches() const { return lds_group_patches; }
 
     /// Gets the attributes and bindings for vertex inputs.
     template <typename Attribute, typename Binding>
@@ -217,6 +218,7 @@ private:
 
     GraphicsPipelineKey key;
     u32 lds_emulation{};
+    u32 lds_group_patches{};
     u32 lds_vertex_bytes{};
     Shader::Gcn::FetchShaderData fetch_shader{};
     ParallelStageSummary parallel_stage_summary;

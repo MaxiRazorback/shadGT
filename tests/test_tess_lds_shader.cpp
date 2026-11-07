@@ -24,7 +24,8 @@ TEST(TessLdsShader, RawMaskChangesRuntimeSpecialization) {
     EXPECT_EQ(partial.sw.tcs.lds_emulation, 0);
 }
 
-TEST(TessLdsShader, EmitsRealWriterAndReaderModule) {
+static void EmitFixture(unsigned stride, unsigned mode, bool invalid, bool invalid_attr, bool invalid_comp,
+                        const char* name, bool own = false) {
     using namespace Shader;
     Info info{};
     info.hw_stage = HwStage::Hull;
@@ -43,8 +44,11 @@ TEST(TessLdsShader, EmitsRealWriterAndReaderModule) {
     program.post_order_blocks = IR::PostOrder(block);
     IR::IREmitter ir{*block};
     ir.Prologue();
-    const auto value = ir.GetTessGenericAttribute(ir.Imm32(1u), ir.Imm32(0u), ir.Imm32(0u));
-    ir.SetTcsGenericAttribute(value, ir.Imm32(0u), ir.Imm32(0u));
+    for (u32 comp = 0; comp < 4; ++comp) {
+        const auto value = ir.GetTessGenericAttribute(ir.Imm32(own ? 0u : invalid ? 2u : 1u),
+            ir.Imm32(invalid_attr ? 5u : (stride == 64 ? 3u : 4u)), ir.Imm32(invalid_comp ? 4u : comp));
+        ir.SetTcsGenericAttribute(value, ir.Imm32(0u), ir.Imm32(comp));
+    }
     ir.SetPatch(IR::Patch::TessellationLodLeft, ir.Imm32(1.0f));
     ir.SetPatch(IR::Patch::TessellationLodTop, ir.Imm32(1.0f));
     ir.SetPatch(IR::Patch::TessellationLodRight, ir.Imm32(1.0f));
@@ -54,11 +58,11 @@ TEST(TessLdsShader, EmitsRealWriterAndReaderModule) {
     profile.supported_spirv = 0x00010600;
     RuntimeInfo runtime{};
     runtime.Initialize(HwStage::Hull, SwStage::TessellationControl);
-    runtime.sw.tcs.lds_emulation = 2;
-    runtime.sw.tcs.num_patches = 4;
+    runtime.sw.tcs.lds_emulation = mode;
+    runtime.sw.tcs.num_patches = 2;
     runtime.sw.tcs.num_input_control_points = 1;
     runtime.sw.tcs.num_threads = 1;
-    runtime.sw.tcs.ls_stride = 16;
+    runtime.sw.tcs.ls_stride = stride;
     runtime.sw.tcs.hs_output_cp_stride = 16;
     Backend::Bindings bindings{};
     const auto code = Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings);
@@ -81,9 +85,19 @@ TEST(TessLdsShader, EmitsRealWriterAndReaderModule) {
     EXPECT_TRUE(physical && write && branch);
     EXPECT_TRUE(scratch_at_112);
     if (const char* dir = std::getenv("RYGT_TEST_SPV_DIR")) {
-        std::ofstream file{std::filesystem::path(dir) / "tess_lds.spv", std::ios::binary};
+        std::ofstream file{std::filesystem::path(dir) / name, std::ios::binary};
         ASSERT_TRUE(file);
         file.write(reinterpret_cast<const char*>(code.data()), std::streamsize(code.size() * sizeof(u32)));
         ASSERT_TRUE(file);
     }
+}
+
+TEST(TessLdsShader, EmitsRealWriterAndReaderModule) {
+    EmitFixture(64, 1, false, false, false, "tess_lds_64_mode1.spv");
+    EmitFixture(72, 1, false, false, false, "tess_lds_72_mode1.spv");
+    EmitFixture(72, 2, false, false, false, "tess_lds_72_mode2.spv");
+    EmitFixture(72, 1, true, false, false, "tess_lds_invalid.spv");
+    EmitFixture(72, 1, false, true, false, "tess_lds_invalid_attr.spv");
+    EmitFixture(72, 1, false, false, true, "tess_lds_invalid_comp.spv");
+    EmitFixture(72, 2, false, false, false, "tess_lds_own.spv", true);
 }
