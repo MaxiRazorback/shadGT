@@ -6311,6 +6311,9 @@ std::optional<std::vector<u32>> PipelineCache::GetShaderPatch(u64 hash, Shader::
 
 
 namespace Vulkan {
+void PipelineCache::ReleaseCompletedPipelineOwners(std::vector<std::shared_ptr<const void>> owners) {
+    PipelineRetirementWorker().Enqueue([owners = std::move(owners)] {});
+}
 std::shared_ptr<const void> PipelineCache::KeepAlive(const GraphicsPipeline* pipeline) const {
     if (!pipeline) return {};
     const auto it = graphics_pipelines.find(pipeline->GetGraphicsKey());

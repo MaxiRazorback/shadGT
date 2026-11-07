@@ -143,6 +143,7 @@ public:
     void TrimUnusedPipelines();
     std::shared_ptr<const void> KeepAlive(const GraphicsPipeline* pipeline) const;
     std::shared_ptr<const void> KeepAlive(const ComputePipeline* pipeline) const;
+    void ReleaseCompletedPipelineOwners(std::vector<std::shared_ptr<const void>> owners);
 
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
     // Caller holds lock; required pipeline waits may release and reacquire it.

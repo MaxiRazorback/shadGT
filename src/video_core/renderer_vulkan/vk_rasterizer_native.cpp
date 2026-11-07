@@ -62,6 +62,7 @@
 // own threads with this code (ryty_gpu/native/DESIGN.md, N4).
 
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
+#include "video_core/renderer_vulkan/pipeline_owner.h"
 #include "video_core/renderer_vulkan/upload_memory_recovery.h"
 #include "video_core/host_shaders/native_region_writeback_comp.h"
 #include "video_core/renderer_vulkan/stable_region_bindings.h"
@@ -1486,6 +1487,7 @@ NativeRenderer::~NativeRenderer() {
     if (stream.list) Splice();
     // Snapshot owners also need GPU retirement when direct imports are unavailable.
     r.scheduler.Finish();
+    retired_pipeline_owners.ClearAfterGpuIdle();
     stream.writeback_plan_leases.clear();
     retired_writeback_plans.ClearAfterGpuIdle();
     if (auto* direct = r.buffer_cache.GetDirectMemory()) {
@@ -7217,10 +7219,13 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     // OPT-012: when the command thread didn't select (it saw the prepared draw), the job
     // thread's selection is installed and trusted.
     bool trusted = false;
+    std::shared_ptr<const void> pipeline_owner;
     const GraphicsPipeline* pipeline = [&]() -> const GraphicsPipeline* {
         PhaseClock clock{stats.phase_ns[0]};
-        if (prepared && !quad_list && r.selected_pipeline == nullptr && prepared->pipeline) {
+        if (prepared && !quad_list && r.selected_pipeline == nullptr && prepared->pipeline &&
+            PipelineOwnerMatches(prepared->pipeline, prepared->pipeline_keepalive)) {
             if (const GraphicsPipeline* installed = InstallPrepared(*prepared)) {
+                pipeline_owner = prepared->pipeline_keepalive;
                 trusted = true;
                 return installed;
             }
@@ -7231,7 +7236,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 .instance_sgpr_offset = 0,
                 .tessellate_quads = quad_list && !quad_triangles,
             },
-            !quad_list);
+            !quad_list, &pipeline_owner);
     }();
     if (!pipeline) {
         if (one_off_observer) {
@@ -7241,6 +7246,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         NATIVE_DIAGNOSTIC(++stats.no_pipeline);
         return;
     }
+    ASSERT_MSG(PipelineOwnerMatches(pipeline, pipeline_owner), "Graphics pipeline owner mismatch");
 #if !defined(NDEBUG)
     // DIAG-152 (RYGT_NATIVE_SKIP_PS=<hex,...>): draws with these pixel shaders are skipped.
     static const std::vector<u64> skip_ps = [] {
@@ -8784,10 +8790,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     }
     const u32 index_count = vi->index_count;
     const CmdBuf cmdbuf{s.cmd};
+    retired_pipeline_owners.Hold(pipeline_owner);
     {
         PhaseClock part{stats.record_ns[4]};
         if (!parallel_draw && pipeline->UsesShaderObjects()) {
-            auto owner = r.pipeline_cache.KeepAlive(pipeline);
+            auto owner = pipeline_owner;
             ASSERT_MSG(owner, "Shader object pipeline must outlive deferred recording");
             static const bool delta = [] {
                 const char* env = std::getenv("RYGT_SO_DELTA");
@@ -8960,6 +8967,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             });
         }
         const auto record_draw = [&] {
+        retired_pipeline_owners.Hold(pipeline_owner);
         if (depth_snapshot) {
             // Preparation may splice after the copy. Retain the image again in
             // the actual draw stream immediately before recording its read.
@@ -9001,8 +9009,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                             s.lds_readers.emplace_back();
                             auto& reader = s.lds_readers.back();
                             reader.pipeline = pipeline;
-                            reader.pipeline_owner = prepared && from_prepared && prepared->pipeline == pipeline
-                                ? prepared->pipeline_keepalive : r.GetPipelineCache().KeepAlive(pipeline);
+                            reader.pipeline_owner = pipeline_owner;
                             reader.dynamic = s.dynamic;
                             reader.vertices = *vi;
                             if (!reader.pipeline_owner || !CaptureLdsReader(reader, b)) {
@@ -9082,6 +9089,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         SceneTrace::GpuEnd(s.cmd);
         }
     }
+    retired_pipeline_owners.Hold(pipeline_owner);
     {
         PhaseClock part{stats.record_ns[7]};
         NoteWrites(&targets, b);
@@ -12559,6 +12567,9 @@ void NativeRenderer::Splice() {
         device->MarkExecuted(s.list, {timeline.get(), tick});
     }
     const u64 retire_tick = std::max(tick, boundary_signal);
+    retired_pipeline_owners.Retire(retire_tick);
+    retired_pipeline_owners.Collect(r.scheduler.GetWorkSemaphore()->KnownGpuTick(),
+        [&](auto owners) { r.pipeline_cache.ReleaseCompletedPipelineOwners(std::move(owners)); });
     retired_writeback_plans.Retire(s.writeback_plan_leases, retire_tick);
     retired_writeback_plans.Collect(r.scheduler.GetWorkSemaphore()->KnownGpuTick());
     if (auto* direct = r.buffer_cache.GetDirectMemory()) {

@@ -37,6 +37,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/pipeline_owner.h"
 #include "video_core/renderer_vulkan/draw_selection_identity.h"
 #include "video_core/renderer_vulkan/native_fence_batch.h"
 #ifdef RYTY_GPU
@@ -1125,7 +1126,9 @@ bool Rasterizer::InstallDrawStages(const Pipeline* pipeline,
 }
 
 const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectParams& params,
-                                                            bool selected_allowed) {
+                                                            bool selected_allowed,
+                                                            std::shared_ptr<const void>* owner) {
+    if (owner) owner->reset();
     if (!SelectsPipelinesAhead()) {
         // A cached pipeline may still point at a per-race shadow. Reinstall a
         // recorder-owned stage from the current lookup after leaving race mode.
@@ -1135,9 +1138,10 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
             std::unique_lock lk{pipeline_cache.LookupMutex()};
             pipeline = pipeline_cache.GetGraphicsPipelineUnlocked(params, lk);
             if (!pipeline) return nullptr;
+            if (owner) *owner = pipeline_cache.KeepAlive(pipeline);
             CopySelectedStages(stages);
         }
-        if (!InstallDrawStages(pipeline, stages, false)) return nullptr;
+        if (!InstallDrawStages(pipeline, stages, false)) { if (owner) owner->reset(); return nullptr; }
         return pipeline;
     }
 #ifndef NDEBUG
@@ -1184,13 +1188,14 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
         const bool tess = quad_selection && params.tessellate_quads;
         const auto* pipeline =
             tess ? selected_pipeline->quad_tess_pipeline : selected_pipeline->pipeline;
+        const auto& selected_owner = selected_pipeline->keepalive[tess ? 2 : 0];
         if (!pipeline) {
 #ifndef NDEBUG
             ++stats.ahead;
 #endif
             return nullptr;
         }
-        if (InstallDrawStages(pipeline,
+        if (PipelineOwnerMatches(pipeline, selected_owner) && InstallDrawStages(pipeline,
                               tess ? selected_pipeline->quad_tess_stages : selected_pipeline->stages,
                               true)) {
 #ifndef NDEBUG
@@ -1201,6 +1206,7 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
             static const bool verify = !Common::LeanRun();
             // PERF-063: not for captured work; the game may have rewritten the memory.
             if (!verify || read_capture || ++select_verify_count % 64 != 0) {
+                if (owner) *owner = selected_owner;
                 return pipeline;
             }
 #ifndef NDEBUG
@@ -1212,10 +1218,12 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
                 // FIX-077: skipped while the command thread holds the lock, as for compute.
                 std::unique_lock lk{pipeline_cache.LookupMutex(), std::try_to_lock};
                 if (!lk.owns_lock()) {
+                    if (owner) *owner = selected_owner;
                     return pipeline;
                 }
                 own_pipeline = pipeline_cache.GetGraphicsPipeline(params);
                 if (own_pipeline) {
+                    if (owner) *owner = pipeline_cache.KeepAlive(own_pipeline);
                     CopySelectedStages(own);
                 }
             }
@@ -1258,9 +1266,13 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
         if (!pipeline) {
             return nullptr;
         }
+        if (owner) *owner = pipeline_cache.KeepAlive(pipeline);
         CopySelectedStages(stages);
     }
-    InstallDrawStages(pipeline, stages, false);
+    if (!InstallDrawStages(pipeline, stages, false)) {
+        if (owner) owner->reset();
+        return nullptr;
+    }
     return pipeline;
 }
 

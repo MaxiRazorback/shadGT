@@ -11,6 +11,7 @@
 // NAT-100: native mode (RYGT_NATIVE=1, ryGT builds); see vk_rasterizer_native.cpp.
 
 #pragma once
+#include "video_core/renderer_vulkan/pipeline_owner.h"
 
 #include <array>
 #include <atomic>
@@ -945,6 +946,7 @@ private:
     size_t free_chunks_low = 0; // minimum completed/free count since the last trim
     Native::RetiredSnapshotPool<Native::Rhi::Buffer> snapshot_pool;
     Native::RetiredWritebackPlans retired_writeback_plans;
+    PipelineOwnerRetirement retired_pipeline_owners;
     std::deque<Chunk> retiring_chunks;
     std::vector<vk::DescriptorPool> free_pools;
     std::deque<std::pair<u64, vk::DescriptorPool>> retiring_pools;

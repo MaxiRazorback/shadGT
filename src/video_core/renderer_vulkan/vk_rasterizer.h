@@ -521,7 +521,8 @@ private:
     /// The pipeline of a graphics draw: the one selected ahead when it still fits the memory the
     /// recorder sees, else looked up here. With PERF-047 the draw's infos are the copies.
     const GraphicsPipeline* AcquireGraphicsPipeline(const DrawIndirectParams& params,
-                                                    bool selected_allowed);
+                                                    bool selected_allowed,
+                                                    std::shared_ptr<const void>* owner = nullptr);
     /// Points the pipeline's stages at copies holding the given user data; with `validate`,
     /// false if a stage's flattened user data now differs from what selection used.
     /// PERF-065: the selection's flattened user data is moved into the stage (swapped).

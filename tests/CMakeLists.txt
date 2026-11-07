@@ -339,6 +339,12 @@ target_compile_features(shadps4_required_pipeline_wait_test PRIVATE cxx_std_23)
 target_link_libraries(shadps4_required_pipeline_wait_test PRIVATE GTest::gtest)
 gtest_discover_tests(shadps4_required_pipeline_wait_test)
 
+add_executable(shadps4_pipeline_owner_test pipeline_owner_test.cpp)
+target_include_directories(shadps4_pipeline_owner_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_pipeline_owner_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_pipeline_owner_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_pipeline_owner_test)
+
 add_executable(shadps4_draw_selection_identity_test draw_selection_identity_test.cpp)
 target_include_directories(shadps4_draw_selection_identity_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(shadps4_draw_selection_identity_test PRIVATE cxx_std_23)
