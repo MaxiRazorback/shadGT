@@ -2980,6 +2980,24 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             return nullptr;
         }
     }
+    // PERF-GT7-017: avoid creating and erasing a placeholder for each draw while
+    // its optional asynchronous pipeline is still building. Required draws and
+    // completed builds continue through the normal lookup and installation path.
+    if (CompileMode() == 2 && !graphics_pipelines.contains(S().graphics_key)) {
+        const auto pending = pending_builds.find(S().graphics_key);
+        if (pending != pending_builds.end() && pending->second->async &&
+            pending->second->done.wait_for(std::chrono::microseconds{0}) !=
+                std::future_status::ready &&
+            !LegacyWaits() && !WritesMemory(S().infos) && !NeverSkipped(S().infos) &&
+            !MenusWait()) {
+#ifndef NDEBUG
+            ++async_stats.skipped_draws;
+#endif
+            NoteSkippedDraw();
+            NoteAsyncSkip(pending->second, true);
+            return nullptr;
+        }
+    }
     const auto [it, is_new] = graphics_pipelines.try_emplace(S().graphics_key);
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(S().graphics_key);
