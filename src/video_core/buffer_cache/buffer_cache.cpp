@@ -245,14 +245,18 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       // store of the old value). With exact store sizes it produced corrupted (blue, exploded)
       // vertices around the track in a race, so CPU write faults drain the GPU again.
       split_write_faults{false},
-      // PERF-015: enabled by default after the GTS runtime comparison. Keep an
-      // explicit OFF control for the former full-drain write-fault behavior.
+      // PERF-015 was disabled: without the drain, GPU results near those records (GT Sport's
+      // sparks) no longer reached guest memory before the game's CPU used them, and sparks
+      // came with exploded vertices. GDS-WINDOW-001: the split now requires the drain's whole
+      // 512 KB download window to hold only the pending GDS copies, so those nearby results
+      // still take the drain; on by default. RYGT_SPLIT_GDS_WRITE_FAULTS=0 drains every time.
       split_gds_write_faults{[] {
           const char* env = std::getenv("RYGT_SPLIT_GDS_WRITE_FAULTS");
-          return !(env && env[0] == '0' && env[1] == '\0');
+          return !(env && env[0] == '0');
       }()} {
     if (split_gds_write_faults) {
-        LOG_INFO(Render_Vulkan, "PERF-015: GDS write-fault splitting enabled (RYGT_SPLIT_GDS_WRITE_FAULTS=0 disables)");
+        LOG_INFO(Render_Vulkan, "PERF-015: GDS write-fault splitting on (GDS-WINDOW-001: only "
+                                "when the drain window holds nothing but GDS copies)");
     }
     if (DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported()) { // D1
         direct_memory = std::make_unique<DirectMemory>(instance, scheduler);
@@ -917,7 +921,8 @@ void BufferCache::ApplyCompletedReadbacks() {
     }
 }
 
-bool BufferCache::TrySplitGdsWriteFault(VAddr address, u64 exact_write_size) {
+bool BufferCache::TrySplitGdsWriteFault(VAddr address, u64 exact_write_size, VAddr window_start,
+                                        VAddr window_end) {
     // PERF-015: GT Sport keeps 16-byte records whose second half a GDS copy writes (PERF-009)
     // and whose first half the CPU writes, about once per frame, forcing a full drain. When every
     // GPU-written byte of the page is a pending GDS copy and the store (exact size, PERF-011b)
@@ -927,28 +932,38 @@ bool BufferCache::TrySplitGdsWriteFault(VAddr address, u64 exact_write_size) {
         gpu_modified_ranges.Intersects(address, exact_write_size)) {
         return false;
     }
+    // GDS-WINDOW-001: the drain this replaces downloads every GPU-written byte of a 512 KB window
+    // around the store (DownloadMemory over window_start..window_end), not just the store's page.
+    // GT Sport relied on that: spark results the GPU wrote on nearby pages reached guest memory
+    // only through that window, and checking the page alone left them stale (exploded spark
+    // vertices). So the whole window must hold nothing but pending GDS copies; anything else
+    // there (another GPU write, a GPU image, a non-GDS readback) keeps the drain.
     const VAddr page = Common::AlignDown(address, 4_KB);
-    if (HasGpuImageAlias(page, 4_KB)) {
+    const VAddr region = std::min(window_start, page);
+    const u64 region_size = std::max<VAddr>(window_end, page + 4_KB) - region;
+    if (HasGpuImageAlias(region, region_size)) {
         return false;
     }
     std::scoped_lock lk{async_readbacks_mutex};
     std::vector<std::shared_ptr<AsyncReadback>> page_readbacks;
+    bool own_page = false;
     for (const auto* list : {&pending_async_readbacks, &inflight_async_readbacks}) {
         for (const auto& readback : *list) {
-            if (readback->valid && readback->address < page + 4_KB &&
-                page < readback->address + readback->size) {
+            if (readback->valid && readback->address < region + region_size &&
+                region < readback->address + readback->size) {
                 if (!readback->is_gds) {
                     return false;
                 }
+                own_page |= readback->address < page + 4_KB && page < readback->address + readback->size;
                 page_readbacks.push_back(readback);
             }
         }
     }
-    if (page_readbacks.empty()) {
+    if (!own_page) {
         return false;
     }
     bool covered = true;
-    gpu_modified_ranges.ForEachInRange(page, 4_KB, [&](VAddr start, VAddr end) {
+    gpu_modified_ranges.ForEachInRange(region, region_size, [&](VAddr start, VAddr end) {
         for (VAddr byte = start; byte < end;) {
             const auto it = std::ranges::find_if(page_readbacks, [&](const auto& readback) {
                 return readback->address <= byte && byte < readback->address + readback->size;
@@ -960,9 +975,24 @@ bool BufferCache::TrySplitGdsWriteFault(VAddr address, u64 exact_write_size) {
             byte = (*it)->address + (*it)->size;
         }
     });
+    // GDS-WINDOW-001: how often a store was split, and how often other GPU data in the window
+    // kept the drain.
+    static std::atomic<u64> split_count{}, kept_drain{};
+    const auto report = [&] {
+        const u64 total = split_count.load() + kept_drain.load();
+        if (total % 1000 == 0) {
+            LOG_INFO(Render_Vulkan, "GDS-WINDOW-001: {} GDS stores split without a drain, {} kept "
+                                    "the drain (other GPU data in the window)",
+                     split_count.load(), kept_drain.load());
+        }
+    };
     if (!covered) {
+        ++kept_drain;
+        report();
         return false;
     }
+    ++split_count;
+    report();
     for (const auto& readback : page_readbacks) {
         if (readback->snapshot.empty()) {
             readback->snapshot.resize(readback->size);
@@ -1087,7 +1117,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
         ApplyCompletedReadbacks();
         NoteCpuReadFault(device_addr, size, exact_write_size);
-        if (is_write && (TrySplitGdsWriteFault(device_addr, exact_write_size) ||
+        if (is_write && (TrySplitGdsWriteFault(device_addr, exact_write_size, window_start, window_end) ||
                          TrySplitWriteFault(arena, device_addr, size, window_start, window_end,
                                             exact_write_size))) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
@@ -1559,7 +1589,7 @@ std::shared_ptr<BufferCache::FaultDownload> BufferCache::BeginFaultFlush(VAddr d
         std::min<VAddr>(std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
     ApplyCompletedReadbacks();
     NoteCpuReadFault(device_addr, size, exact_write_size);
-    if (is_write && (TrySplitGdsWriteFault(device_addr, exact_write_size) ||
+    if (is_write && (TrySplitGdsWriteFault(device_addr, exact_write_size, window_start, window_end) ||
                      TrySplitWriteFault(arena, device_addr, size, window_start, window_end,
                                         exact_write_size))) {
         memory_tracker->MarkRegionAsCpuModified(device_addr, size);
