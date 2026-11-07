@@ -17,6 +17,7 @@
 #include "video_core/amdgpu/tiling.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/texture_cache/tiling_specialization.h"
+#include "video_core/texture_cache/packed_float.h"
 #include <array>
 #include <cstdlib>
 #include <xxhash.h>
@@ -43,6 +44,8 @@ struct TilingParams {
     u32 micro_tiled_mips;
     u32 num_mips;
     std::array<VideoCore::MipInfo, VideoCore::MAX_MIPS> mips;
+    std::array<u32, VideoCore::MAX_MIPS> valid_width;
+    std::array<u32, VideoCore::MAX_MIPS> valid_height;
 };
 
 Rhi::Format ToRhi(vk::Format format) {
@@ -1322,6 +1325,8 @@ std::unique_ptr<Rhi::Buffer> ImageRegistry::TilingParamsBuffer(const VideoCore::
     for (u32 mip = 0; mip < params.num_mips; ++mip) {
         auto& mip_info = params.mips[mip];
         mip_info = info.mips_layout[mip];
+        params.valid_width[mip] = std::max(info.size.width >> mip, 1u);
+        params.valid_height[mip] = std::max(info.size.height >> mip, 1u);
         if (info.props.is_block) {
             mip_info.pitch = std::max<u16>((mip_info.pitch + 3) / 4, 1U);
             mip_info.height = std::max<u16>((mip_info.height + 3) / 4, 1U);
@@ -1332,7 +1337,9 @@ std::unique_ptr<Rhi::Buffer> ImageRegistry::TilingParamsBuffer(const VideoCore::
 }
 
 const Rhi::Pipeline* ImageRegistry::TilingPipeline(const VideoCore::ImageInfo& info, bool tiler) {
-  const u64 key = VideoCore::TilingPipelineKey(info, tiler);
+  const u64 key = VideoCore::NativePackedTilingKey(VideoCore::TilingPipelineKey(info, tiler),
+                                                    info.props.is_bgr_packed_float,
+                                                    info.props.is_tiled);
   std::scoped_lock lock{untile_mutex};
   if (const auto it = untile_pipelines.find(key);
       it != untile_pipelines.end()) {
@@ -1340,11 +1347,14 @@ const Rhi::Pipeline* ImageRegistry::TilingPipeline(const VideoCore::ImageInfo& i
   }
     const bool macro = AmdGpu::IsMacroTiled(info.array_mode);
     const auto values = VideoCore::TilingSpecialization(info, tiler);
-    std::array<Rhi::SpecConstant, 12> constants{};
+    std::array<Rhi::SpecConstant, 15> constants{};
     for (u32 i = 0; i < constants.size(); ++i) {
         constants[i].id = i;
-        constants[i].value = values[i];
+        constants[i].value = i < values.size() ? values[i] : 0;
     }
+    constants[12].value = info.props.is_bgr_packed_float;
+    constants[13].value = !info.props.is_tiled;
+    constants[14].value = info.props.is_bgr_packed_float;
     const auto code = UntileCode(info.num_bits, macro);
     if (code.empty() || !untile_layout) {
         return nullptr;
@@ -1352,7 +1362,7 @@ const Rhi::Pipeline* ImageRegistry::TilingPipeline(const VideoCore::ImageInfo& i
     auto pipeline = device.CreateComputePipeline({
         .layout = untile_layout.get(),
         .shader = {Rhi::ShaderStage::Compute, code, "main",
-                   std::span<const Rhi::SpecConstant>{constants.data(), macro ? 12u : 4u}},
+                   std::span<const Rhi::SpecConstant>{constants}},
     });
     const Rhi::Pipeline* result = pipeline.get();
     untile_pipelines.emplace(key, std::move(pipeline));
@@ -1515,7 +1525,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
         }
         const Rhi::Buffer* linear = bytes;
         u64 linear_offset = bytes_offset;
-        if (info.props.is_tiled) {
+        if (info.props.is_tiled || info.props.is_bgr_packed_float) {
             trace.Next(7);
             const Rhi::Pipeline* untile = TilingPipeline(info, false);
             // Immutable per-image parameters are shared by uploads and downloads.
@@ -1573,7 +1583,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
             }};
             list.PushBindings(bindings);
             trace.Next(11);
-            list.Dispatch(static_cast<u32>((size / (info.num_bits / 8)) / 64), 1, 1);
+            list.Dispatch(static_cast<u32>(VideoCore::NativeTilingGroups(size, info.num_bits / 8)), 1, 1);
             list.Barrier(Rhi::ScopeCompute, Rhi::ScopeTransfer);
             linear = out;
             linear_offset = 0;
@@ -1706,7 +1716,7 @@ bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, co
     if (size == 0 || out.Size() < out_offset + size) {
         return false;
     }
-    if (!info.props.is_tiled) {
+    if (!info.props.is_tiled && !info.props.is_bgr_packed_float) {
         auto copies = MipCopies(info);
         for (auto& copy : copies) {
             copy.buffer_offset += out_offset;
@@ -1740,7 +1750,7 @@ bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, co
                                   .size = size,
                                   .linear_offset = linear_offset,
                                   .tiled_offset = tiled_offset,
-                                  .groups = static_cast<u32>((size / (info.num_bits / 8)) / 64)});
+                                  .groups = static_cast<u32>(VideoCore::NativeTilingGroups(size, info.num_bits / 8))});
         return true;
     }
     // PERF-314: GT Sport writes the same small pictures back thousands of times a second; making
@@ -1759,8 +1769,9 @@ bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, co
     }
     if (!entry.download_tiled || entry.download_tiled->Size() < size) {
         entry.download_tiled = device.CreateBuffer({.size = size,
-                                                    .usage = Rhi::BufferUsageStorage |
-                                                             Rhi::BufferUsageTransferSrc,
+                                                     .usage = Rhi::BufferUsageStorage |
+                                                              Rhi::BufferUsageTransferSrc |
+                                                              Rhi::BufferUsageTransferDst,
                                                     .memory = Rhi::MemoryKind::DeviceLocal});
     }
     Rhi::Buffer* params_buffer = entry.download_params.get();
@@ -1770,6 +1781,7 @@ bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, co
         return false;
     }
     list.CopyImageToBuffer(entry.image.get(), linear, MipCopies(info));
+    if (info.props.is_bgr_packed_float) list.CopyBuffer(&out, out_offset, tiled, 0, size);
     list.Barrier(Rhi::ScopeTransfer, Rhi::ScopeCompute);
     list.BindPipeline(tile);
     const std::array<Rhi::Binding, 3> bindings{{
@@ -1780,7 +1792,7 @@ bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, co
          .size = sizeof(TilingParams)},
     }};
     list.PushBindings(bindings);
-    list.Dispatch(static_cast<u32>((size / (info.num_bits / 8)) / 64), 1, 1);
+    list.Dispatch(static_cast<u32>(VideoCore::NativeTilingGroups(size, info.num_bits / 8)), 1, 1);
     list.Barrier(Rhi::ScopeCompute, Rhi::ScopeTransfer);
     list.CopyBuffer(tiled, 0, &out, out_offset, size);
     // Also orders this write-back's reads of the scratch buffers before the next one's writes.

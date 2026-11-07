@@ -80,6 +80,7 @@
 #include <magic_enum/magic_enum.hpp>
 #include <vulkan/vulkan_format_traits.hpp>
 #include "video_core/texture_cache/host_compatibility.h"
+#include "video_core/texture_cache/packed_float.h"
 #include <xxhash.h>
 
 #include "ryty_gpu/ryty_upscaler_status.h"
@@ -10273,6 +10274,10 @@ bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 ro
     const u32 mips = rows ? 1u : std::max(desc.mips, 1u);
     const u32 height0 = rows ? std::min(rows, desc.height) : desc.height;
     const u64 bytes = u64(desc.width) * height0 * texel * (rows ? 1u : layers * depth);
+    if (info.props.is_bgr_packed_float) {
+        lo = VideoCore::PackedFloatToVulkan(lo);
+        hi = VideoCore::PackedFloatToVulkan(hi);
+    }
     const Native::Rhi::Buffer* pattern = PatternBuffer(lo, hi, bytes);
     if (!pattern || pattern->Size() < bytes) {
         return false;

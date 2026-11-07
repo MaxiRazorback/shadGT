@@ -27,6 +27,12 @@ target_include_directories(shadps4_recent_fills_test PRIVATE ${CMAKE_SOURCE_DIR}
 target_compile_features(shadps4_recent_fills_test PRIVATE cxx_std_23)
 target_link_libraries(shadps4_recent_fills_test PRIVATE GTest::gtest_main)
 gtest_discover_tests(shadps4_recent_fills_test)
+
+add_executable(shadps4_packed_float_test test_packed_float.cpp)
+target_include_directories(shadps4_packed_float_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_packed_float_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_packed_float_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_packed_float_test)
 add_executable(shadps4_readable_binding_test test_readable_binding.cpp)
 target_include_directories(shadps4_readable_binding_test PRIVATE ${CMAKE_SOURCE_DIR})
 target_compile_features(shadps4_readable_binding_test PRIVATE cxx_std_23)

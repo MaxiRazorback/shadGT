@@ -31,6 +31,7 @@
 #include "ryty_gpu/native/rhi/rhi_vulkan.h"
 #include "video_core/amdgpu/tiling.h"
 #include "video_core/renderer_vulkan/upload_chunk_cache.h"
+#include "video_core/texture_cache/packed_float.h"
 #include <deque>
 
 namespace {
@@ -59,6 +60,81 @@ VideoCore::ImageInfo MakeInfo(AmdGpu::TileMode tile_mode, u32 width, u32 height,
 
 u32 Texel(u32 x, u32 y, u32 mip) {
     return x | (y << 10) | (mip << 20) | 0xA0000000u;
+}
+
+bool RunPackedFloatCase(Rhi::Device& device, Rhi::Fence& fence, u64& tick,
+                        AmdGpu::TileMode mode, std::string& log,
+                        u32 width = 32, u32 height = 32, bool batched = false, u32 levels = 1) {
+    ImageRegistry registry{device};
+    auto info = MakeInfo(mode, width, height, levels, 0x7700'0000'0000ULL + (u64(mode) << 24));
+    info.pixel_format = vk::Format::eB10G11R11UfloatPack32;
+    info.props.is_bgr_packed_float = true;
+    const u64 bytes = info.guest_size;
+    auto* target = registry.Find(info, true, 1);
+    auto source = device.CreateBuffer({.size=bytes, .usage=Rhi::BufferUsageTransferSrc,
+                                        .memory=Rhi::MemoryKind::Upload});
+    auto guest = device.CreateBuffer({.size=bytes, .usage=Rhi::BufferUsageStorage |
+        Rhi::BufferUsageTransferSrc | Rhi::BufferUsageTransferDst, .memory=Rhi::MemoryKind::Readback});
+    if (!target || !source || !guest || !source->Mapped() || !guest->Mapped()) return false;
+    std::memset(source->Mapped(), 0, bytes);
+    const u32 canonical = (0x2abu << 22) | (0x123u << 11) | 0x456u;
+    for (u32 m=0; m<levels; ++m) {
+        const u32 value = canonical ^ (m * 0x04010010u);
+        for (u32 y=0; y<std::max(height >> m, 1u); ++y)
+            for (u32 x=0; x<std::max(width >> m, 1u); ++x)
+                std::memcpy(source->Mapped() + info.mips_layout[m].offset +
+                                (u64(y) * info.mips_layout[m].pitch + x) * 4, &value, 4);
+    }
+    auto* list = device.AcquireCommandList(); list->Begin();
+    registry.RecordUploads(*list);
+    list->FillBuffer(guest.get(), 0, bytes, 0x5a5a5a5a);
+    list->Barrier(Rhi::ScopeTransfer | Rhi::ScopeCompute, Rhi::ScopeTransfer);
+    list->CopyBufferToImage(source.get(), target->image.get(), MipCopies(info));
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer | Rhi::ScopeCompute);
+    DownloadBatch batch;
+    if (batched && !registry.BeginDownloads(batch, 2 * Common::AlignUp(bytes, u64{256}), 256)) return false;
+    if (!registry.RecordDownload(*list, *target, *guest, 0, batched ? &batch : nullptr)) return false;
+    if (batched) registry.FinishDownloads(*list, batch);
+    list->Barrier(Rhi::ScopeTransfer | Rhi::ScopeCompute, Rhi::ScopeHost); list->End();
+    Rhi::CommandList* lists[]{list}; device.GraphicsQueue().Submit(lists, {}, {&fence, ++tick});
+    if (!fence.Wait(tick, 5'000'000'000ULL)) return false;
+    guest->Invalidate();
+    u32 first{}; std::memcpy(&first, guest->Mapped(), 4);
+    if (first != VideoCore::PackedFloatFromVulkan(canonical)) return false;
+    if (mode == AmdGpu::TileMode::DisplayLinearAligned && levels == 1) {
+        for (u64 offset = 0; offset + 4 <= bytes; offset += 4) {
+            const u64 pixel = offset / 4;
+            if (pixel / info.mips_layout[0].pitch < height &&
+                pixel % info.mips_layout[0].pitch < width) continue;
+            u32 padding{}; std::memcpy(&padding, guest->Mapped() + offset, 4);
+            if (padding != 0x5a5a5a5a) return false;
+        }
+    }
+    std::vector<u8> backing(bytes + 4096);
+    auto* aligned = reinterpret_cast<u8*>((reinterpret_cast<uintptr_t>(backing.data()) + 4095) & ~uintptr_t{4095});
+    std::memcpy(aligned, guest->Mapped(), bytes);
+    auto texture_info = info; texture_info.guest_address = reinterpret_cast<VAddr>(aligned);
+    auto* texture = registry.Find(texture_info, false, 2);
+    auto read = device.CreateBuffer({.size=bytes, .usage=Rhi::BufferUsageTransferDst,
+                                    .memory=Rhi::MemoryKind::Readback});
+    if (!texture || !read || !read->Mapped()) return false;
+    list = device.AcquireCommandList(); list->Begin();
+    if (registry.RecordUploads(*list) != 1) return false;
+    list->Barrier(Rhi::ScopeTransfer | Rhi::ScopeCompute, Rhi::ScopeTransfer);
+    list->CopyImageToBuffer(texture->image.get(), read.get(), MipCopies(texture_info));
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeHost); list->End();
+    lists[0] = list; device.GraphicsQueue().Submit(lists, {}, {&fence, ++tick});
+    if (!fence.Wait(tick, 5'000'000'000ULL)) return false;
+    read->Invalidate();
+    for (u32 m=0; m<levels; ++m) for (u32 y=0; y<std::max(height >> m, 1u); ++y)
+        for (u32 x=0; x<std::max(width >> m, 1u); ++x) {
+            u32 value{}; std::memcpy(&value, read->Mapped() + info.mips_layout[m].offset +
+                (u64(y) * info.mips_layout[m].pitch + x) * 4, 4);
+            if (value != (canonical ^ (m * 0x04010010u))) return false;
+        }
+    log += fmt::format("packed-float {} {}x{} mips {} {} upload/download and padding: passed\n",
+                       AmdGpu::NameOf(mode), width, height, levels, batched ? "batched" : "single");
+    return true;
 }
 
 bool RunCase(Rhi::Device& device, ImageRegistry& registry, Rhi::Fence& fence, u64& tick,
@@ -1178,6 +1254,13 @@ bool RunImageSelfTest(std::string& log) {
     ok = RunRegionMergeOrderCase(*device,*fence,tick,log) && ok;
     ok = RunRegionWritebackReplay(*device,*fence,tick,log) && ok;
     ok = RunCpuRefreshOwnershipCase(*device,*fence,tick,log) && ok;
+    ok = RunPackedFloatCase(*device, *fence, tick, AmdGpu::TileMode::DisplayLinearAligned, log) && ok;
+    ok = RunPackedFloatCase(*device, *fence, tick, AmdGpu::TileMode::DisplayLinearAligned, log, 1, 1) && ok;
+    ok = RunPackedFloatCase(*device, *fence, tick, AmdGpu::TileMode::DisplayLinearAligned, log, 17, 3, true) && ok;
+    ok = RunPackedFloatCase(*device, *fence, tick, AmdGpu::TileMode::DisplayLinearAligned, log, 17, 3) && ok;
+    ok = RunPackedFloatCase(*device, *fence, tick, AmdGpu::TileMode::Thin1DThin, log) && ok;
+    ok = RunPackedFloatCase(*device, *fence, tick, AmdGpu::TileMode::Thin2DThin, log) && ok;
+    ok = RunPackedFloatCase(*device, *fence, tick, AmdGpu::TileMode::Thin2DThin, log, 64, 64, false, 4) && ok;
     ok = RunLayerHashUploadCase(*device,*fence,tick,log) && ok;
     {
         ImageRegistry registry{*device};
