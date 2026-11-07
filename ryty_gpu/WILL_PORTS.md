@@ -1,4 +1,4 @@
-# Will Scarlett source port (in progress)
+# Will Scarlett source port candidate
 
 Target base: `ryty-gpu` at `20b1965a00de9f1b5fdca9b3f861c7a7f6faadee`.
 Upstream snapshot: `rygt-team/shadgt7` main at
@@ -125,21 +125,99 @@ These groups include source defaults where their lifetime and API contracts can
 be retained. GT7-only addresses, game patch offsets and branding require a GTS
 adaptation; they are not evidence of equivalent behavior in GT Sport.
 
-## Remaining work
+## Closing implementation groups
 
-The all-author reconciliation remains in progress. Outstanding groups include
-map-time stale-copy handling, remaining packed-float conversion and remembered
-fills, shader-store cube-mode composition, readable-range handling and GTS fence
-batching. An inventory row without a mapping is unknown, not proof that the
-behavior is absent; final source reverts and GT7-only code need explicit handling.
+- PERF-297 batches eligible native fences while preserving forced flushes, polling
+  progress, readbacks, and the non-pipelined VideoOut path.
+- FIX-296 composes cube shader-store policy with existing fragment revisions and
+  preserves foreign and sparse occupied indices. FIX-303 admits readable prefixes
+  only for qualified read-only bindings; changed worker bindings revalidate serially.
+- PERF-298 skips redundant compatibility scans only after a fresh-store proof.
+  FIX-306 detects unsampled rewrites of large layered CPU textures.
+- FIX-307 remembers watched directly imported fills through actual GPU completion,
+  rejects stale CPU receipts, preserves later authoritative draws, and retires
+  conflicting aliases. GPU-private fills keep the established path.
+- FIX-308 adds packed-float clears/fills and linear/tiled upload/download conversion,
+  bounded rounded dispatch, per-mip extents and padding preservation.
+- PERF-304 and PERF-309 release the shared lookup lock during qualified required
+  compiler or listing waits. Retained jobs/shared futures survive map replacement;
+  bounded retries rebuild the complete lookup. Transient modes retain their path.
+- PERF-310 avoids repeated placeholder work for pending optional pipelines.
+  PERF-311 retries only owned, guarded direct-user-data VS/PS inputs with exact
+  job identity; SRT walkers, fetch shaders, tessellation and geometry are excluded.
+  Retention is bounded to 512 states and 8 MiB, with expiry and required-work priority.
+- PERF-312 selects indirect pipelines on the command thread with exact draw-kind
+  and SGPR identity. Indirect data is not falsely declared captured.
+- FIX-313 supplies the paired runtime mapping protocol; FIX-299 invalidates stale
+  CPU-origin mapping copies and guards delayed readbacks against address reuse.
+  The capability freezes before use. Old runtimes keep their original behavior
+  without token allocations. The companion patch is a reviewed artifact, not an
+  automatically applied CI runtime update.
+- PERF-314 uses configurable 1 MiB upload chunks and staging steps that fit them.
+  Decoder/recorder priority is explicit opt-in; periodic comparison is Debug-only.
+  FIX-318 keeps its standalone policy header compatible with Windows macros.
+- FIX-315 preserves every existing GTS writeback and adds qualified high-address
+  color outputs with import and GPU-budget preflight. Its ordinary extension is
+  bounded to 256 MiB. FIX-322 streams larger byte-exact RGBA8 linear images across
+  retained imports without whole-image scratch. FIX-324 permits re-admission after
+  overlapping unsubmitted plans are canceled. Unrelated mappings do not cancel.
+- FIX-316 clears proven complete prefixes of equal-stride image layers; ambiguous
+  layouts or pattern phases use the established fallback.
+- FIX-317 expands the push-offset table to 96 bytes without overlapping the shared
+  mask/LDS slot at byte 112. The complete push block stays within Vulkan's 128-byte
+  minimum. Old metadata stays discoverable, while incompatible SPIR-V and compute
+  recipes are skipped without deleting their files. DEBUG-321 isolates its tests.
+- FIX-319 uses legal read-only depth layouts or supported feedback-loop layouts,
+  and a pre-draw snapshot fallback for unsupported writable feedback. Descriptor
+  keys refresh after view/layout substitution; snapshot owners survive both copy
+  and draw submission ticks, including intervening command-list splits.
+- PERF-320 learns exact potentially harmful skipped-output identities and adds
+  both translation and pipeline waits. It never relaxes existing UI/depth guards.
+  Bounded persistence runs on a joined background worker.
+- PERF-323 periodically trims completed, idle upload chunks, retaining the
+  low-water reserve and existing byte budget. Active/tail and retiring chunks
+  remain owned. The trim can be disabled explicitly.
+- PERF-326 keeps unavailable mapping ranges merged and ordered so repeated
+  readback captures do not add another linear allocation-registry scan.
 
-Component checks cover ownership/cancellation failure paths, packed lookup,
-shader-object binary alignment and output, region scatter padding, and actual GPU
-tick retirement. The emitted tessellation shader passed SPIR-V validation and a
-standalone NVIDIA two-draw writer/reader fixture with both separate and shared
-barriers. None of those fixtures establishes the full NativeRenderer lifetime or
-game output. The latest assembly still needs both full builds, linked GPU tests,
-two-race menu/Brand Central checks and the explicitly requested GDS ON trial.
+## Deliberate adaptations and validation boundaries
 
-No runtime speedup, stutter reduction or 16.6 ms target is established by these
-component tests. Nothing in this port has been installed or merged.
+All-author inventory and module ledgers distinguish ported behavior, pre-existing
+coverage, source reverts, diagnostics and game-specific code. They do not equate
+186 source commits with 186 literal cherry-picks. GT7 addresses, executable patch
+offsets, the GT7 headlight fill hash and branding are not installed in GT Sport.
+The display-awake workaround follows upstream's revert; the reverted unoptimized
+compute policy stays reverted. Destructive worktree/hash-driven store clearing
+conflicts with the user's cache-preservation instruction and is not restored.
+
+The learned one-off policy is deliberately conservative: exact observations can
+add waits, while weak kind/family matches cannot remove UI or depth safety waits.
+First encounters and prepared/aliased observations are not fully covered.
+The retry path likewise makes no claim for unowned shader or SRT inputs.
+
+Mapping protection requires the companion kernel protocol. The isolated kernel
+was checked against the current Fiber/libc package: all 664 original kernel
+exports and all 2,766 package imports remain, and its literal protocol export
+returns version 1. This is a historical-object rebuild and loader audit, not a
+fresh complete runtime build or map/remap gameplay proof. Full runtime rebuilding
+also encountered toolchain failures in unchanged libc; those libraries are not
+replaced by this port.
+
+Partial GPU-authoritative remaps retain inherited limitations. Remembered fills
+require qualified direct imports. Large tiled/packed/other-format writebacks
+outside the bounded path keep their prior behavior. Unsupported writable depth
+feedback samples pre-draw contents, not writes occurring within the same draw.
+
+Debug and Release checkpoint abbefb5b both built with matching PDBs and all 2,766
+imports, and passed paired-runtime loading. Its linked NVIDIA RHI, ImageRegistry
+and descriptor suites pass, including packed linear 1x1/17x3 padding, tiled/mip
+roundtrips, large writeback fences, layered rewrites, and changed/untouched layers.
+The actual emitted TCS also passes a separate NVIDIA writer/reader fixture with
+the new push ABI. The depth fixture passes read-only, forced snapshot and supported
+feedback draws. Later assembly validation is recorded beside the final artifacts.
+
+Final acceptance requires both full assembly builds, relevant CPU tests, linked
+GPU suites and Release diagnostic gating. Two-race menu/Brand Central checks,
+native remap execution and the explicitly requested split-GDS ON trial require
+gameplay validation. Component tests establish neither a runtime speedup nor
+the 16.6 ms target. No port binary has been installed or merged.
