@@ -331,6 +331,7 @@ private:
     /// Upload memory of the stream's list: (buffer, offset, CPU pointer).
     std::tuple<vk::Buffer, u64, u8*> Allocate(u64 size, u64 align, bool* backing_proven = nullptr);
     Chunk TakeChunk(u64 size);
+    void TrimIdleChunks();
     vk::DescriptorBufferInfo UploadFlatData(u32 stage, const u8* source, u32 size, bool* backing_proven = nullptr);
     vk::DescriptorPool TakeDescriptorPool();
 
@@ -941,6 +942,7 @@ private:
 
     std::mutex chunk_mutex;
     std::vector<Chunk> free_chunks;
+    size_t free_chunks_low = 0; // minimum completed/free count since the last trim
     Native::RetiredSnapshotPool<Native::Rhi::Buffer> snapshot_pool;
     Native::RetiredWritebackPlans retired_writeback_plans;
     std::deque<Chunk> retiring_chunks;

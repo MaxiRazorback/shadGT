@@ -2825,6 +2825,21 @@ void NativeRenderer::ChunkFlushCheck() {
     }
 }
 
+void NativeRenderer::TrimIdleChunks() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_CHUNK_TRIM");
+        return !(env && env[0] == '0');
+    }();
+    if (!enabled || frame % 150 != 0) return;
+    std::vector<Chunk> dropped;
+    {
+        std::scoped_lock lock{chunk_mutex};
+        try { TrimIdleUploadChunks(free_chunks, free_chunks_low, dropped); }
+        catch (const std::bad_alloc&) { return; } // optional trim leaves the pool intact
+    }
+    // Release completed buffers outside the pool mutex.
+}
+
 NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
     Native::SlowCallTrace<6> trace{t_timed, "take-upload-chunk",
         {"mutex", "timeline-query", "trim-free", "reclaim-retired", "take-free", "create-buffer"}};
@@ -2846,6 +2861,7 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
     trace.Next(2);
     trace.Next(3);
     CacheCompletedUploadChunks(free_chunks, retiring_chunks, known);
+    free_chunks_low = std::min(free_chunks_low, free_chunks.size());
     trace.Next(4);
     auto fit = free_chunks.end();
     for (auto it = free_chunks.begin(); it != free_chunks.end(); ++it) {
@@ -2855,6 +2871,7 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
     if (fit != free_chunks.end()) {
         Chunk chunk = std::move(*fit);
         free_chunks.erase(fit);
+        free_chunks_low = std::min(free_chunks_low, free_chunks.size());
         return chunk;
     }
     Chunk chunk;
@@ -2884,6 +2901,7 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
                 device->DestroyCompletedBuffer(std::move(buffer));
             },
             [&] { device->Collect(); return create(); });
+        free_chunks_low = std::min(free_chunks_low, free_chunks.size());
     }
     ASSERT_MSG(chunk.buffer && chunk.buffer->Mapped(), "NAT-100: no upload memory ({} bytes)",
                size);
@@ -12735,6 +12753,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     }
     frame_writebacks.clear();
     ++frame;
+    TrimIdleChunks();
     {
         std::scoped_lock watch_lock{fill_watch_mutex};
         const auto expired = registry->RecentFillRanges();
