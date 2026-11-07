@@ -250,6 +250,9 @@ public:
     }
     /// NAT-105: every image overlapping [begin, end).
     void ForEachOverlapping(VAddr begin, VAddr end, const std::function<void(ImageEntry&)>& fn);
+    /// Full-range indexed images, once each. Callback must not reenter the registry.
+    /// Retirement must be serialized with this traversal.
+    void ForEachImage(const std::function<void(ImageEntry&)>& fn);
 
     /// The image for this layout: one already at the address with the same layout (whatever
     /// its colour format, if the texel size matches), or a new one. A texture found nowhere is

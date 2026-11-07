@@ -12279,7 +12279,7 @@ void NativeRenderer::EvictImages() {
     std::unordered_set<const Native::ImageEntry*> kept_textures;
     if (texture_budget != 0) {
         std::vector<Native::ImageEntry*> idle;
-        registry->ForEachOverlapping(0, ~VAddr{0}, [&](Native::ImageEntry& entry) {
+        registry->ForEachImage([&](Native::ImageEntry& entry) {
             if (entry.from_cpu && entry.image &&
                 entry.last_use.load(std::memory_order_relaxed) < frame - KeepFrames) {
                 idle.push_back(&entry);
