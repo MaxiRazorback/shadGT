@@ -12790,6 +12790,9 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     if (!entry || !entry->image) {
         return std::nullopt;
     }
+    // An uncropped display returns the original entry without the crop path's
+    // admission step. Refresh a dirty CPU-backed display before presentation too.
+    ApplyRewrite(*entry);
     const auto* source = CropDisplay(*entry, {info.size.width, info.size.height});
     if (!source) {
         return std::nullopt;
@@ -12802,7 +12805,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         return std::nullopt;
     }
     // A display buffer nothing drew into yet starts in the general layout too.
-    if (device->PendingImageInit()) {
+    if (device->PendingImageInit() || registry->HasPendingUploads()) {
         Begin();
         PrepareImages();
     }

@@ -934,12 +934,15 @@ void ImageRegistry::MarkStale(ImageEntry& entry, Stale why) {
         }
     }
 #endif
-    // All large CPU-texture invalidations wait for actual image use. In particular,
+    // CPU-texture invalidations of every size wait for actual image use. In particular,
     // OnUnmap runs before guest memory is released: eagerly queuing here re-imports
     // and uploads a discarded texture while the unmapping thread waits for us.
     // Preserve dirty/force flags so a later use after remapping still refreshes it.
+    // Small discarded font images can share pages with a subsequently created
+    // fiber stack. An unrelated flush must not refresh them and re-arm a write
+    // watch there. Actual bindings (including memo hits) admit their dirty image.
     // Explicit RequestUpload separately admits its required rewrite immediately.
-    const bool defer = entry.from_cpu && entry.info.guest_size >= (4ull << 20);
+    const bool defer = entry.from_cpu;
     if (!already_dirty && !defer) {
         std::scoped_lock upload_lock{upload_mutex};
         pending_uploads.push_back(&entry);

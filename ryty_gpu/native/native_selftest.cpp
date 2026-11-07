@@ -1404,6 +1404,88 @@ bool RunWholeLayerClearCase(Rhi::Device& device, Rhi::Fence& fence, u64& tick, s
     return ok;
 }
 
+// A small CPU texture can share a page with later guest allocations. A stale
+// image must not re-arm its page watch until it is actually used.
+bool RunSmallCpuDeferredUploadCase(Rhi::Device& device, Rhi::Fence& fence, u64& tick,
+                                   std::string& log) {
+    std::vector<u8> backing(8192, 0);
+    auto* guest = reinterpret_cast<u8*>((reinterpret_cast<uintptr_t>(backing.data()) + 4095) &
+                                        ~uintptr_t{4095});
+    const auto info = MakeInfo(AmdGpu::TileMode::DisplayLinearAligned, 8, 8, 1,
+                               reinterpret_cast<VAddr>(guest));
+    if (info.guest_size > 4096) return false;
+    ImageRegistry registry{device};
+    registry.SetMemoryClamp([&](VAddr address, u64 size) {
+        const VAddr begin = reinterpret_cast<VAddr>(guest);
+        return address >= begin && address - begin < 4096 ?
+            std::min(size, 4096 - (address - begin)) : u64{0};
+    });
+    u32 watches = 0;
+    registry.SetUploadHook([&](ImageEntry&) { ++watches; });
+    auto* texture = registry.Find(info, false, 1);
+    if (!texture) return false;
+    std::array<std::unique_ptr<Rhi::Buffer>, 3> reads;
+    for (auto& read : reads) {
+        read = device.CreateBuffer({.size=4, .usage=Rhi::BufferUsageTransferDst,
+                                    .memory=Rhi::MemoryKind::Readback});
+        if (!read || !read->Mapped()) return false;
+    }
+    const auto set_pixel = [&](u32 pixel) { std::memcpy(guest, &pixel, sizeof(pixel)); };
+    const Rhi::BufferImageCopy pixel_copy{.extent={1,1,1}};
+    auto* list = device.AcquireCommandList(); list->Begin();
+    auto capture = [&](u32 index) {
+        list->Barrier(Rhi::ScopeTransfer | Rhi::ScopeCompute, Rhi::ScopeTransfer);
+        list->CopyImageToBuffer(texture->image.get(), reads[index].get(), {&pixel_copy, 1});
+        list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer | Rhi::ScopeCompute);
+    };
+    set_pixel(0xff112233u);
+    if (registry.RecordUploads(*list) != 1 || watches != 1) return false;
+    capture(0);
+    const auto cpu_uploads = registry.GetUploadStats().cpu.load();
+    for (u32 i = 0; i < 3; ++i) {
+        registry.CpuWrite(info.guest_address, 4, 4);
+        set_pixel(0xff445500u + i);
+        if (!texture->needs_upload.load() || registry.RecordUploads(*list) != 0 ||
+            watches != 1 || registry.GetUploadStats().cpu.load() != cpu_uploads) {
+            log += "small CPU texture uploaded or rearmed before use\n"; return false;
+        }
+    }
+    registry.Invalidate(info.guest_address, 4096, ImageRegistry::Stale::Unmap);
+    set_pixel(0xff778899u);
+    if (!texture->needs_upload.load() || registry.RecordUploads(*list) != 0 || watches != 1) {
+        log += "unmapped small CPU texture uploaded or rearmed before use\n"; return false;
+    }
+    registry.QueueUploadForUse(*texture);
+    registry.QueueUploadForUse(*texture);
+    if (registry.RecordUploads(*list) != 1 || registry.RecordUploads(*list) != 0 || watches != 2) {
+        log += "small CPU texture use did not coalesce refreshes\n"; return false;
+    }
+    capture(1);
+    registry.CpuWrite(info.guest_address, 4, 4);
+    set_pixel(0xffaabbccu);
+    registry.RequestUpload(*texture);
+    if (registry.RecordUploads(*list) != 1 || watches != 3) {
+        log += "explicit small texture upload was not immediate\n"; return false;
+    }
+    capture(2);
+    list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeHost); list->End();
+    Rhi::CommandList* lists[]{list};
+    device.GraphicsQueue().Submit(lists, {}, {&fence, ++tick});
+    if (!fence.Wait(tick, 5'000'000'000ULL)) return false;
+    const std::array<u32, 3> expected{0xff112233u, 0xff778899u, 0xffaabbccu};
+    for (u32 i = 0; i < reads.size(); ++i) {
+        reads[i]->Invalidate();
+        u32 actual{}; std::memcpy(&actual, reads[i]->Mapped(), sizeof(actual));
+        if (actual != expected[i]) {
+            log += fmt::format("small CPU texture phase {} returned {:08x}, expected {:08x}\n",
+                               i, actual, expected[i]);
+            return false;
+        }
+    }
+    log += "small CPU texture writes/unmap deferred until use; explicit upload and pixels: passed\n";
+    return true;
+}
+
 bool RunImageSelfTest(std::string& log) {
     std::string error;
     auto device = Rhi::CreateStandaloneVulkanDevice(&error);
@@ -1425,6 +1507,7 @@ bool RunImageSelfTest(std::string& log) {
     ok = RunRegionMergeOrderCase(*device,*fence,tick,log) && ok;
     ok = RunRegionWritebackReplay(*device,*fence,tick,log) && ok;
     ok = RunCpuRefreshOwnershipCase(*device,*fence,tick,log) && ok;
+    ok = RunSmallCpuDeferredUploadCase(*device,*fence,tick,log) && ok;
     ok = RunPackedFloatCase(*device, *fence, tick, AmdGpu::TileMode::DisplayLinearAligned, log) && ok;
     ok = RunPackedFloatCase(*device, *fence, tick, AmdGpu::TileMode::DisplayLinearAligned, log, 1, 1) && ok;
     ok = RunPackedFloatCase(*device, *fence, tick, AmdGpu::TileMode::DisplayLinearAligned, log, 17, 3, true) && ok;

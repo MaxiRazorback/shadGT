@@ -308,7 +308,7 @@ public:
     // Admission happens on actual image use, not on each intermediate streaming write.
     // Duplicate requests are harmless: RecordUploads atomically consumes needs_upload.
     void QueueUploadForUse(ImageEntry& entry) {
-        if (entry.from_cpu && entry.info.guest_size >= (4ull << 20) &&
+        if (entry.from_cpu &&
             entry.needs_upload.load(std::memory_order_acquire)) {
             std::scoped_lock lock{upload_mutex};
             pending_uploads.push_back(&entry);
