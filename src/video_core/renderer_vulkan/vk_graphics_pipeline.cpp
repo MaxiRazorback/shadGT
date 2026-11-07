@@ -263,10 +263,22 @@ static std::atomic<s64> last_pipeline_miss_ms{};
 
 // Preserve the existing ordinary/UI policy: optional optimized replacement is opt-in.
 // Tessellation never retains optimizer IR or enters LTO (previous multi-GB failures).
+// AMD-PERF-001: on AMD GPUs the optimized link is on by default. Without it every draw used the
+// fast-linked pipeline, which the driver's compiler builds without cross-stage optimization.
+// The optimized pipeline is built in the background once the game has been quiet for 3 s (and
+// only with 1 GB of RAM free); draws switch to it when it is ready. Tessellated pipelines stay
+// fast-linked. RYGT_PIPELINE_LTO=1 on, =0 off, on any GPU.
+bool& AmdPipelineLtoDefault() {
+    static bool on = false;
+    return on;
+}
 static bool LinkTimeOptimization() {
     static const bool lto = [] {
         const char* env = std::getenv("RYGT_PIPELINE_LTO");
-        return env && env[0] == '1';
+        if (env && *env) {
+            return env[0] == '1';
+        }
+        return AmdPipelineLtoDefault();
     }();
     return lto;
 }
@@ -923,7 +935,13 @@ GraphicsPipeline::GraphicsPipeline(
     // does not populate the stage-library cache used when new runtime permutations appear.
     const auto compile_policy = SharedPipelinePolicy::Select(
         SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(),preloading),
-        tessellated && (Common::PerfFeatureEnabled(80) || !Mr14SharedTessellationEnabled(LinkTimeOptimization())),
+        // AMD-PERF-001: on AMD, LTO for ordinary pipelines leaves tessellation on its shared
+        // libraries: those never retain LTO data, and the library keys include the create
+        // flags, so retained and plain libraries are never mixed. (Elsewhere LTO still sends
+        // tessellation to whole pipelines, as before.)
+        tessellated && (Common::PerfFeatureEnabled(80) ||
+                        !Mr14SharedTessellationEnabled(LinkTimeOptimization() &&
+                                                       !AmdPipelineLtoDefault())),
         tessellated, LinkTimeOptimization(), is_rect_list || is_quad_list);
     if (compile_policy.libraries) {
         // PERF-017: a pipeline first needed during play is built from four separately compiled
@@ -1769,12 +1787,14 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
     bool cached_fragment = false;
 #ifdef RYTY_GPU
     static const char* const descriptor_override = std::getenv("RYGT_NVIDIA_CACHED_FRAGMENT_SETS");
+    static const char* const amd_descriptor_override = std::getenv("RYGT_AMD_CACHED_FRAGMENT_SETS");
     cached_fragment = CacheFragmentDescriptors(instance.GetVendorID(), NativeModeRequested(),
-                                                descriptor_override);
+                                                descriptor_override, amd_descriptor_override);
     if (cached_fragment) {
         static std::once_flag logged;
-        std::call_once(logged, [] {
-            LOG_INFO(Render_Vulkan, "DESC-POLICY: NVIDIA fragment sets use immutable descriptor caching; vertex push descriptors retained when supported");
+        std::call_once(logged, [vendor = instance.GetVendorID()] {
+            LOG_INFO(Render_Vulkan, "DESC-POLICY: {} fragment sets use immutable descriptor caching; vertex push descriptors retained when supported",
+                     vendor == 0x1002 ? "AMD (AMD-PERF-002)" : "NVIDIA");
         });
     }
 #endif

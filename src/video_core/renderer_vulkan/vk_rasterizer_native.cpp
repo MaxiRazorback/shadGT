@@ -1265,9 +1265,16 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
         // A never-GPU-written CPU texture can use RecordUploads' guarded staging
         // copy instead. Existing imports and every authoritative GPU source keep
         // the original path, including partial region overlays.
+        // AMD-PERF-003: AMD too (it was gated to the NVIDIA card it was tested on); AMD's
+        // driver pays the same per-view import cost. RYGT_AMD_TEXTURE_STAGING=0 turns it off.
+        static const bool amd_staging = [] {
+            const char* env = std::getenv("RYGT_AMD_TEXTURE_STAGING");
+            return !(env && env[0] == '0');
+        }();
+        const u32 vendor = r.instance.GetVendorID();
         if (entry.from_cpu && size > 4_MB && size <= 64_MB &&
             !entry.gpu_backing_written.load(std::memory_order_acquire) && !overlap &&
-            r.instance.GetVendorID() == 0x10de) {
+            (vendor == 0x10de || (vendor == 0x1002 && amd_staging))) {
             trace.Next(9);
             Native::UploadPhaseTrace<5> policy_trace{true,"cpu-staging-eligibility",
                 {"sources-lock", "gpu-history", "find-import", "readable-check", "cpu-source"}};

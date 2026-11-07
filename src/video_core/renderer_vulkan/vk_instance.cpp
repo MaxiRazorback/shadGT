@@ -30,6 +30,7 @@
 #include <vk_mem_alloc.h>
 
 namespace Vulkan {
+bool& AmdPipelineLtoDefault(); // AMD-PERF-001, vk_graphics_pipeline.cpp
 
 static StoreGpuFamily g_store_gpu_family{StoreGpuFamily::Other}; // AMD-312
 
@@ -552,6 +553,7 @@ bool Instance::CreateDevice() {
              amd_vertex_order);
     amd_shader_explicit_vertex_parameter =
         add_extension(VK_AMD_SHADER_EXPLICIT_VERTEX_PARAMETER_EXTENSION_NAME);
+    AmdPipelineLtoDefault() = properties.vendorID == 0x1002; // AMD-PERF-001
     const char* direct_barycentric_env = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC");
     // AMD-314: AMD's older shader compiler (RX 6000 and older) smeared textures with KHR
     // barycentrics (AMD-305), and AMD-307 already finds its vertex order, so there the
@@ -649,6 +651,15 @@ bool Instance::CreateDevice() {
     LOG_INFO(Render_Vulkan,
              "VRAM paging enabled={}: supported device-local allocations may spill to system RAM",
              pageable_memory);
+    memory_priority = pageable_memory; // AMD-VRAM-003
+    // AMD-VRAM-002: AMD's driver may refuse device memory past the physical VRAM size by its own
+    // policy; VK_AMD_memory_overallocation_behavior set to "allowed" lets it page instead (the
+    // 8 GB RX 7600 failed allocations in races). RYGT_AMD_OVERALLOCATION=0 leaves the default.
+    const char* overallocation_setting = std::getenv("RYGT_AMD_OVERALLOCATION");
+    amd_overallocation = properties.vendorID == 0x1002 &&
+                         !(overallocation_setting && overallocation_setting[0] == '0') &&
+                         add_extension(VK_AMD_MEMORY_OVERALLOCATION_BEHAVIOR_EXTENSION_NAME);
+    LOG_INFO(Render_Vulkan, "AMD-VRAM-002: memory overallocation allowed: {}", amd_overallocation);
     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     if (shader_clock) {
         shader_clock_features = feature_chain.get<vk::PhysicalDeviceShaderClockFeaturesKHR>();
@@ -956,7 +967,13 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceShaderQuadControlFeaturesKHR{
             .shaderQuadControl = true, // AMD-306
         },
+        vk::DeviceMemoryOverallocationCreateInfoAMD{
+            .overallocationBehavior = vk::MemoryOverallocationBehaviorAMD::eAllowed, // AMD-VRAM-002
+        },
     };
+    if (!amd_overallocation) {
+        device_chain.unlink<vk::DeviceMemoryOverallocationCreateInfoAMD>();
+    }
     if (!quad_control) {
         device_chain.unlink<vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>();
         device_chain.unlink<vk::PhysicalDeviceShaderQuadControlFeaturesKHR>();
@@ -1122,8 +1139,18 @@ void Instance::CreateAllocator() {
         .vkGetDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr,
     };
 
+    // AMD-VRAM-003: VK_EXT_memory_priority was enabled, but VMA was never told, so every
+    // allocation had the same priority and AMD's driver could page a render target out as
+    // readily as an old texture. On AMD, VMA now passes each allocation's priority (render
+    // targets and depth high, see UniqueImage::Create). RYGT_AMD_MEMORY_PRIORITY=0 turns it off.
+    const char* priority_setting = std::getenv("RYGT_AMD_MEMORY_PRIORITY");
+    const bool use_priority = memory_priority && properties.vendorID == 0x1002 &&
+                              !(priority_setting && priority_setting[0] == '0');
+    LOG_INFO(Render_Vulkan, "AMD-VRAM-003: memory priorities passed to the driver: {}",
+             use_priority);
     const VmaAllocatorCreateInfo allocator_info = {
-        .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
+        .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT |
+                 (use_priority ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT : 0u),
         .physicalDevice = physical_device,
         .device = *device,
         // Small persistent images must not pin mostly empty 256 MiB scene blocks.

@@ -661,6 +661,8 @@ private:
     bool maintenance_5{};
     bool maintenance_8{};
     bool anti_lag{};
+    bool amd_overallocation{}; // AMD-VRAM-002
+    bool memory_priority{};    // AMD-VRAM-003
     mutable u64 anti_lag_frame{};
     mutable std::mutex anti_lag_mutex;
     bool attachment_feedback_loop{};
