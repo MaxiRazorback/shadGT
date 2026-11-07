@@ -5,6 +5,13 @@
 #include <array>
 #include <mutex>
 #include <utility>
+#if defined(_WIN32) && !defined(NDEBUG)
+#include <atomic>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cwchar>
+#endif
 #include "common/adaptive_mutex.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -45,6 +52,80 @@
 #endif
 
 namespace VideoCore {
+
+#if defined(_WIN32) && !defined(NDEBUG)
+namespace {
+u64 TracePage() {
+    static const u64 page = [] {
+        const char* value = std::getenv("RYGT_TRACE_PAGE");
+        if (!value || !*value || *value == '-' || *value == '+' || *value == ' ') return ~u64{0};
+        errno = 0;
+        char* end = nullptr;
+        const auto parsed = std::strtoull(value, &end, 0);
+        if (errno == ERANGE || end == value || *end != '\0') return ~u64{0};
+        return static_cast<u64>(parsed) & ~u64{4095};
+    }();
+    return page;
+}
+bool TraceOverlaps(u64 addr, u64 size) {
+    const u64 page = TracePage();
+    return page != ~u64{0} && size && addr <= page + 4095 &&
+           (addr > page || size > page - addr);
+}
+struct PageTraceFile {
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    HMODULE renderer = nullptr;
+    PageTraceFile() {
+        wchar_t path[MAX_PATH]{};
+        const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
+        if (!length || length >= MAX_PATH) return;
+        auto* name = std::wcsrchr(path, L'\\');
+        if (!name) return;
+        const auto remaining = std::size(path) - static_cast<size_t>(name + 1 - path);
+        if (std::swprintf(name + 1, remaining, L"logs\\page-owner-%lu.log",
+                          GetCurrentProcessId()) < 0) return;
+        renderer = GetModuleHandleW(L"libSceVideoOut.prx");
+        handle = CreateFileW(path, FILE_APPEND_DATA,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    }
+    ~PageTraceFile() { if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle); }
+};
+PageTraceFile& TraceFile() {
+    static PageTraceFile file;
+    return file;
+}
+void TracePageEvent(const char* source, u64 addr, u64 size, int op, int read_op,
+                    unsigned bw, unsigned br, unsigned bg, unsigned aw, unsigned ar, unsigned ag,
+                    unsigned perms, unsigned old_protect, unsigned new_protect, bool stack) {
+    if (!TraceOverlaps(addr, size)) return;
+    auto& output = TraceFile();
+    if (output.handle == INVALID_HANDLE_VALUE) return;
+    static std::atomic<unsigned> count{};
+    const unsigned index = count.fetch_add(1, std::memory_order_relaxed);
+    if (index >= 128) return;
+    void* frames[12]{};
+    const auto frame_count = stack ? RtlCaptureStackBackTrace(0, 12, frames, nullptr) : 0;
+    char text[1024];
+    int n = std::snprintf(text, sizeof(text),
+        "PAGE-OWNER %u tick=%llu base=%p tid=%lu %s range=%llx+%llx op=%d readop=%d watchers=%u/%u/%u->%u/%u/%u perms=%u protect=%lx->%lx stack=",
+        index, static_cast<unsigned long long>(GetTickCount64()), static_cast<void*>(output.renderer),
+        GetCurrentThreadId(), source, static_cast<unsigned long long>(addr),
+        static_cast<unsigned long long>(size), op, read_op, bw, br, bg, aw, ar, ag, perms,
+        static_cast<unsigned long>(old_protect), static_cast<unsigned long>(new_protect));
+    if (n < 0) return;
+    size_t used = std::min(static_cast<size_t>(n), sizeof(text) - 2);
+    for (unsigned i = 0; i < frame_count && used < sizeof(text) - 2; ++i) {
+        n = std::snprintf(text + used, sizeof(text) - used, "%s%p", i ? "," : "", frames[i]);
+        if (n < 0) break;
+        used += std::min(static_cast<size_t>(n), sizeof(text) - used - 1);
+    }
+    text[used++] = '\n';
+    DWORD written{};
+    WriteFile(output.handle, text, static_cast<DWORD>(used), &written, nullptr);
+}
+}
+#endif
 
 struct PageManager::Impl {
     struct PageState {
@@ -102,6 +183,17 @@ struct PageManager::Impl {
         }
     };
 
+#if defined(_WIN32) && !defined(NDEBUG)
+    static void TraceState(const char* source, u64 addr, u64 size, int op, int read_op,
+                           u64 page, const PageState& before, const PageState& after) {
+        if (page != (TracePage() >> PM_PAGE_BITS)) return;
+        TracePageEvent(source, addr, size, op, read_op, before.num_write_watchers,
+                       before.num_read_watchers, before.num_guards, after.num_write_watchers,
+                       after.num_read_watchers, after.num_guards,
+                       static_cast<unsigned>(after.Perms()), 0, 0, true);
+    }
+#endif
+
     static constexpr size_t ADDRESS_BITS = 40;
     static constexpr size_t NUM_ADDRESS_PAGES = 1ULL << (40 - PM_PAGE_BITS);
     static constexpr size_t NUM_ADDRESS_LOCKS = NUM_ADDRESS_PAGES / NUM_REGION_PAGES;
@@ -141,6 +233,9 @@ struct PageManager::Impl {
                 continue;
             }
             std::scoped_lock lk{locks[page]};
+#if defined(_WIN32) && !defined(NDEBUG)
+            const auto before = *state;
+#endif
             const auto old_perms = state->Perms();
             if (add) {
                 if (state->num_guards == 255) {
@@ -154,6 +249,9 @@ struct PageManager::Impl {
                 --state->num_guards;
             }
             ++guarded;
+#if defined(_WIN32) && !defined(NDEBUG)
+            TraceState("Guard", addr, size, add ? 1 : -1, 0, page, before, *state);
+#endif
             if (const auto new_perms = state->Perms(); new_perms != old_perms) {
                 Protect(page << PM_PAGE_BITS, PM_PAGE_SIZE, new_perms);
             }
@@ -173,6 +271,9 @@ struct PageManager::Impl {
                 continue;
             }
             std::scoped_lock lk{locks[page]};
+#if defined(_WIN32) && !defined(NDEBUG)
+            TraceState("ReapplyProtection", addr, size, 0, 0, page, *state, *state);
+#endif
             if (const auto perms = state->Perms(); perms != Core::MemoryPermission::ReadWrite) {
                 Protect(page << PM_PAGE_BITS, PM_PAGE_SIZE, perms);
             }
@@ -188,11 +289,20 @@ struct PageManager::Impl {
             return;
         }
         std::scoped_lock lk{locks[page]};
+#if defined(_WIN32) && !defined(NDEBUG)
+        const auto before = *state;
+#endif
         if (state->num_guards == 0) {
+#if defined(_WIN32) && !defined(NDEBUG)
+            TraceState("DropGuards", page_addr, PM_PAGE_SIZE, 0, 0, page, before, *state);
+#endif
             return;
         }
         const auto old_perms = state->Perms();
         state->num_guards = 0;
+#if defined(_WIN32) && !defined(NDEBUG)
+        TraceState("DropGuards", page_addr, PM_PAGE_SIZE, 0, 0, page, before, *state);
+#endif
         if (const auto new_perms = state->Perms(); new_perms != old_perms) {
             Protect(page << PM_PAGE_BITS, PM_PAGE_SIZE, new_perms);
         }
@@ -237,6 +347,9 @@ struct PageManager::Impl {
 
             locks[page].lock();
 
+#if defined(_WIN32) && !defined(NDEBUG)
+            const auto before = *state;
+#endif
             const auto old_perms = state->Perms();
             if (page == page_start) {
                 perms = old_perms;
@@ -244,6 +357,10 @@ struct PageManager::Impl {
 
             // Apply the change to the page state
             const auto new_perms = state->Update(write_op);
+#if defined(_WIN32) && !defined(NDEBUG)
+            TraceState("UpdatePageWatchers", addr, size, static_cast<int>(write_op), 0,
+                       page, before, *state);
+#endif
             if (new_perms != perms) [[unlikely]] {
                 // If the protection changed add pending (un)protect action
                 release_pending();
@@ -308,6 +425,9 @@ struct PageManager::Impl {
 
             locks[base_page + page].lock();
 
+#if defined(_WIN32) && !defined(NDEBUG)
+            const auto before = *state;
+#endif
             const auto old_perms = state->Perms();
             if (page == page_start) {
                 perms = old_perms;
@@ -317,6 +437,12 @@ struct PageManager::Impl {
             const bool update_write = write_op != PageOp::None && write_mask.GetPage(page);
             const bool update_read = read_op != PageOp::None && read_mask.GetPage(page);
             const auto new_perms = state->Update(write_op, update_write, read_op, update_read);
+#if defined(_WIN32) && !defined(NDEBUG)
+            TraceState("UpdatePageWatchersForRegion", (base_page + page_start) << PM_PAGE_BITS,
+                       (page_end - page_start) << PM_PAGE_BITS,
+                       update_write ? static_cast<int>(write_op) : 0,
+                       update_read ? static_cast<int>(read_op) : 0, base_page + page, before, *state);
+#endif
 
             if (new_perms != perms) [[unlikely]] {
                 // If the protection changed add pending (un)protect action
@@ -507,6 +633,10 @@ public:
 struct SignalImpl : public PageManager::Impl {
     SignalImpl(Vulkan::Rasterizer* rasterizer_) : Impl() {
         rasterizer = rasterizer_;
+#if defined(_WIN32) && !defined(NDEBUG)
+        // Open the opt-in trace before any page locks or exception callbacks can use it.
+        if (TracePage() != ~u64{0}) (void)TraceFile();
+#endif
 
         // Should be called first.
         constexpr auto priority = std::numeric_limits<u32>::min();
@@ -548,6 +678,23 @@ struct SignalImpl : public PageManager::Impl {
         }
         auto* memory = Core::Memory::Instance();
         auto& impl = memory->GetAddressSpace();
+#if defined(_WIN32) && !defined(NDEBUG)
+        const auto protect = [&](VAddr start, u64 length, Core::MemoryPermission requested) {
+            MEMORY_BASIC_INFORMATION before{}, after{};
+            const bool traced = TraceOverlaps(start, length);
+            if (traced) VirtualQuery(reinterpret_cast<void*>(TracePage()), &before, sizeof(before));
+            impl.Protect(start, length, requested);
+            if (traced) {
+                VirtualQuery(reinterpret_cast<void*>(TracePage()), &after, sizeof(after));
+                TracePageEvent("Protect", start, length, 0, 0, 0, 0, 0, 0, 0, 0,
+                               static_cast<unsigned>(requested), before.Protect, after.Protect, true);
+            }
+        };
+#else
+        const auto protect = [&](VAddr start, u64 length, Core::MemoryPermission requested) {
+            impl.Protect(start, length, requested);
+        };
+#endif
         ASSERT_MSG(perms != Core::MemoryPermission::Write,
                    "Attempted to protect region as write-only which is not a valid permission");
         // FIX-028: keep the execute permission of guest code. A GPU buffer over module code
@@ -558,7 +705,7 @@ struct SignalImpl : public PageManager::Impl {
         // -DisablePerf 37 protects without it.
         static const bool keep_exec = Common::PerfFeatureEnabled(37);
         if (!keep_exec) {
-            impl.Protect(address, size, perms);
+            protect(address, size, perms);
             return;
         }
         memory->ForEachExecRange(address, size, [&](VAddr start, u64 length, bool exec) {
@@ -571,7 +718,7 @@ struct SignalImpl : public PageManager::Impl {
                                 start, length);
                 }
             }
-            impl.Protect(start, length, exec ? perms | Core::MemoryPermission::Execute : perms);
+            protect(start, length, exec ? perms | Core::MemoryPermission::Execute : perms);
         });
     }
 
