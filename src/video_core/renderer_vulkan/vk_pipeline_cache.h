@@ -15,6 +15,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include "video_core/renderer_vulkan/guarded_shader_snapshot.h"
+#include "video_core/renderer_vulkan/read_ahead_retry_queue.h"
 #include <filesystem>
 #include <future>
 #include <mutex>
@@ -448,6 +450,22 @@ private:
     u32 last_scan_draws{};
     // PERF-034: the registers of the queued draw state being evaluated.
     std::unique_ptr<AmdGpu::Regs> queued_state_regs;
+    struct BlockedAheadState {
+        struct Stage {
+            GuardedShaderSnapshot program;
+            std::vector<u32> flat;
+        };
+        std::vector<u32> ranges;
+        std::array<std::optional<Stage>, 6> stages;
+        size_t bytes{};
+        std::chrono::steady_clock::time_point first;
+        std::chrono::steady_clock::time_point next;
+    };
+    ReadAheadRetryQueue<BlockedAheadState> blocked_ahead_states;
+    const BlockedAheadState* retry_ahead_inputs{}; // lookup mutex held
+    bool CaptureBlockedAheadInputs(const AmdGpu::Regs& regs, BlockedAheadState& state);
+    bool DirectOnlyRetryProgram(u64 hash) const;
+    bool read_ahead_blocked{}; // lookup mutex held
     struct QueuedStateStats {
         u32 evaluated{};
         u32 started{};
@@ -455,6 +473,10 @@ private:
         double wait_ms{};
         double ms{};
         std::chrono::steady_clock::time_point since{};
+#ifndef NDEBUG
+        u32 retry_retained{};
+        u32 retry_unproven{};
+#endif
     } queued_state_stats;
     std::mutex on_screen_mutex;
     std::vector<std::shared_ptr<PipelineBuild>> on_screen;
@@ -536,6 +558,7 @@ private:
         std::chrono::steady_clock::time_point retry_after{};
         std::chrono::steady_clock::time_point queued_at{};
         bool required{}; // protected by the translation queue mutex until claimed
+        bool retry_direct_only{}; // fixed before the job is published to workers
         bool cancelled{}; // published before done
         bool failure_reported{};
         std::atomic<bool> done{};

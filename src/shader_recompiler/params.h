@@ -17,9 +17,11 @@ struct ShaderParams {
     std::span<const u32, NumShaderUserData> user_data;
     std::span<const u32> code;
     u64 hash;
+    // An owned code snapshot can retain the guest address used for shader identity.
+    VAddr source_base{};
 
     VAddr Base() const noexcept {
-        return reinterpret_cast<VAddr>(code.data());
+        return source_base ? source_base : reinterpret_cast<VAddr>(code.data());
     }
 };
 

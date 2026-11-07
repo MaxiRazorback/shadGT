@@ -77,6 +77,8 @@
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/shader_usage_serde.h"
 #include "video_core/renderer_vulkan/required_pipeline_wait.h"
+#include "video_core/renderer_vulkan/retry_input_policy.h"
+#include "video_core/renderer_vulkan/read_ahead_retry_inputs.h"
 #include "video_core/renderer_vulkan/exit_save_registry.h"
 #include "video_core/renderer_vulkan/compute_warm_recipe.h"
 #include "video_core/renderer_vulkan/shader_store_readers.h"
@@ -2621,9 +2623,83 @@ static bool UnlockedShadersEnabled() {
     return enabled;
 }
 
+static bool RetryBlockedReadAhead() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("RYGT_READ_AHEAD_RETRY");
+        return !value || value[0] != '0';
+    }();
+    return enabled;
+}
+
+bool PipelineCache::DirectOnlyRetryProgram(u64 hash) const {
+    const auto program = program_cache.find(hash);
+    if (program == program_cache.end() || !program->second) return false;
+    for (const auto& module : program->second->modules) {
+        if (!module.info || !module.spec.fetch_shader_data.Empty() ||
+            !DirectOnlyRetryInputs(module.info->srt_info.walker_func != nullptr,
+                module.info->has_fetch_shader, bool(module.info->translated_fetch_shader))) return false;
+    }
+    const auto direct_jobs = [hash](const auto& map) {
+        const auto found = map.find(hash);
+        if (found == map.end()) return true;
+        return std::ranges::all_of(found->second, [](const auto& job) {
+            return job->retry_direct_only;
+        });
+    };
+    return direct_jobs(translate_jobs) && direct_jobs(ready_translations);
+}
+
+bool PipelineCache::CaptureBlockedAheadInputs(const AmdGpu::Regs& regs, BlockedAheadState& state) {
+#ifndef RYTY_GPU
+    return false; // No guarded guest reader is available here.
+#else
+    constexpr size_t MaxProgramBytes = 64 * 1024;
+    constexpr size_t MaxStateBytes = 256 * 1024;
+    if (!DirectOnlyRetryLayout(regs.stage_enable.raw == AmdGpu::ShaderStageEnable::VgtStages::Vs))
+        return false;
+    size_t active = 0;
+    state.bytes = state.ranges.capacity() * sizeof(u32);
+    for (u32 stage = 0; stage < state.stages.size(); ++stage) {
+        if (!regs.stage_enable.IsStageEnabled(stage)) continue;
+        const auto* pgm = regs.ProgramForStage(stage);
+        if (!pgm || !pgm->Address<VAddr>()) return false;
+        const VAddr base = pgm->Address<VAddr>();
+        auto program = CaptureShaderSnapshot<AmdGpu::BinaryInfo>(
+            base, [](void* dst, uintptr_t address, size_t size) {
+                return Core::RytyMemory::GuardedCopy(dst, reinterpret_cast<const void*>(address), size);
+            }, MaxProgramBytes);
+        if (!program) return false;
+        if (!DirectOnlyRetryProgram(program->hash)) return false;
+        bool direct_owned_job = false;
+        const auto jobs = translate_jobs.find(program->hash);
+        if (jobs != translate_jobs.end()) {
+            for (const auto& job : jobs->second) {
+                if (OwnedRetryJobMatches(stage, base, pgm->user_data, program->code,
+                                         u32(job->hw_stage), job->code_base, job->user_data,
+                                         job->code_copy, job->retry_direct_only)) {
+                    direct_owned_job = true;
+                    break;
+                }
+            }
+        }
+        // Only direct user data is replayed. A walker, fetch shader or missing
+        // prepared stage can follow guest pointers after the state is retained.
+        if (!direct_owned_job) return false;
+        BlockedAheadState::Stage owned;
+        owned.program = std::move(*program);
+        owned.flat.assign(pgm->user_data.begin(), pgm->user_data.end());
+        state.bytes += owned.program.code.capacity() * sizeof(u32) + owned.flat.capacity() * sizeof(u32);
+        if (state.bytes > MaxStateBytes) return false;
+        state.stages[stage] = std::move(owned);
+        ++active;
+    }
+    return active != 0;
+#endif
+}
+
 void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool restore) {
     auto* states = liverpool->PipeReadAheadStates();
-    if (!states || states->Empty()) {
+    if (!states || (states->Empty() && blocked_ahead_states.empty())) {
         return;
     }
     const auto start = std::chrono::steady_clock::now();
@@ -2662,16 +2738,20 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
             restore_error = std::current_exception();
         }
     };
-    while (std::chrono::steady_clock::now() < *budget && (!restore || evaluated < 64) &&
-           (!restore || !t_required_pipeline_build ||
-            t_required_pipeline_build->wait_for(std::chrono::microseconds{0}) != std::future_status::ready) &&
-           states->Take(queued_state_regs->reg_array)) {
+    const auto in_budget = [&] {
+        return std::chrono::steady_clock::now() < *budget && (!restore || evaluated < 64) &&
+               (!t_required_pipeline_build ||
+                t_required_pipeline_build->wait_for(std::chrono::microseconds{0}) !=
+                    std::future_status::ready);
+    };
+    const auto evaluate = [&] {
         ++evaluated;
         S().draw_indirect_params = {};
+        read_ahead_blocked = false;
         const bool valid = TrySpeculativeKey(regs_override, queued_state_regs.get(),
                                              [&] { return RefreshGraphicsKey(); });
         if (!valid || !HasSupportedColorTargets() || graphics_pipelines.contains(S().graphics_key)) {
-            continue;
+            return !read_ahead_blocked;
         }
         if (const auto pending = pending_builds.find(S().graphics_key);
             pending != pending_builds.end()) {
@@ -2684,10 +2764,54 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
 #endif
                 ++started;
             }
-            continue;
+            return true;
         }
         pending_builds.emplace(S().graphics_key, StartPipelineBuild(false));
         ++started;
+        return true;
+    };
+    if (RetryBlockedReadAhead() && !force_legacy && !fallback_nested) {
+        const auto now = std::chrono::steady_clock::now();
+        for (size_t remaining = blocked_ahead_states.size(); remaining && in_budget(); --remaining) {
+            auto item = blocked_ahead_states.TakeReady(now);
+            if (!item) break;
+            auto blocked = std::move(*item);
+            if (!RestoreRetryRegisters(queued_state_regs->reg_array, blocked.ranges)) continue;
+            const auto* previous_inputs = std::exchange(retry_ahead_inputs, &blocked);
+            SCOPE_EXIT { retry_ahead_inputs = previous_inputs; };
+            if (!evaluate()) {
+                blocked_ahead_states.Retry(std::move(blocked), now);
+            }
+        }
+    } else if (!RetryBlockedReadAhead()) {
+        blocked_ahead_states.clear();
+    }
+    while (in_budget() && states->Take(queued_state_regs->reg_array)) {
+        if (!evaluate() && RetryBlockedReadAhead()) {
+            // FIX-GT7-005: hull constants are mutable and cannot safely be retried later.
+            using Stages = AmdGpu::ShaderStageEnable::VgtStages;
+            const auto stages = queued_state_regs->stage_enable.raw;
+            if (stages == Stages::LsHs || stages == Stages::LsHsEsGs) {
+#ifndef NDEBUG
+                ++queued_state_stats.retry_unproven;
+#endif
+                continue;
+            }
+            try {
+                BlockedAheadState blocked;
+                blocked.first = std::chrono::steady_clock::now();
+                blocked.next = blocked.first + std::chrono::milliseconds{5};
+                blocked.ranges = CaptureRetryRegisters(queued_state_regs->reg_array);
+                if (blocked.ranges.empty()) continue;
+                [[maybe_unused]] const bool retained = CaptureBlockedAheadInputs(*queued_state_regs, blocked) &&
+                                      blocked_ahead_states.Keep(std::move(blocked));
+#ifndef NDEBUG
+                ++(retained ? queued_state_stats.retry_retained : queued_state_stats.retry_unproven);
+#endif
+            } catch (const std::bad_alloc&) {
+                // Read-ahead is optional; a required draw still evaluates normally.
+            }
+        }
     }
     if (started > 0 && build_workers) {
         // PERF-038: the game needs pipelines; background builds wait.
@@ -2705,9 +2829,10 @@ void PipelineCache::BuildQueuedStates(const DrawIndirectParams params, bool rest
         LOG_WARNING(Render_Vulkan,
                     "PERF-034 pipeline read-ahead in {:.1f} s: {} draw states from the command "
                     "thread evaluated, {} builds started, {:.1f} ms; {} draws waited for a build "
-                    "({:.1f} ms); {} pending",
+                    "({:.1f} ms); {} pending; owned retries retained {}, unproven {}",
                     std::chrono::duration<double>(now - stats.since).count(), stats.evaluated,
-                    stats.started, stats.ms, stats.waits, stats.wait_ms, pending_builds.size());
+                    stats.started, stats.ms, stats.waits, stats.wait_ms, pending_builds.size(),
+                    stats.retry_retained, stats.retry_unproven);
         stats = {};
         stats.since = now;
     }
@@ -3250,7 +3375,16 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
                     Common::GuestClock::CompilePause pause;
                     Common::SetCompileCoresWide(true);
                     SCOPE_EXIT { Common::SetCompileCoresWide(false); };
-                    build->done.wait();
+                    while (build->done.wait_for(std::chrono::milliseconds{5}) !=
+                           std::future_status::ready) {
+                        if (RetryBlockedReadAhead() && lock->try_lock()) {
+                            SCOPE_EXIT { lock->unlock(); };
+                            const auto* previous_required = t_required_pipeline_build;
+                            t_required_pipeline_build = &build->done;
+                            SCOPE_EXIT { t_required_pipeline_build = previous_required; };
+                            BuildQueuedStates(params, false);
+                        }
+                    }
                 });
                 return GetGraphicsPipeline(params);
             }
@@ -3675,6 +3809,11 @@ bool PipelineCache::RefreshGraphicsStages() {
         for (u32 stage = 0; stage < checked.size(); ++stage) {
             const auto* pgm = regs.ProgramForStage(stage);
             const VAddr address = pgm ? pgm->Address<VAddr>() : 0;
+            if (retry_ahead_inputs && regs.stage_enable.IsStageEnabled(stage) && address) {
+                const auto& owned = retry_ahead_inputs->stages[stage];
+                if (!owned || owned->program.guest_base != address) return false;
+                continue;
+            }
             if (!regs.stage_enable.IsStageEnabled(stage) || address == 0 ||
                 address == checked[stage]) {
                 continue;
@@ -3714,7 +3853,29 @@ bool PipelineCache::RefreshGraphicsStages() {
             return false;
         }
 
-        const auto params = AmdGpu::GetParams(*pgm);
+        const auto* owned = retry_ahead_inputs ? &retry_ahead_inputs->stages[stage_in_idx] : nullptr;
+        if (owned && (!*owned || (*owned)->program.guest_base != pgm->Address<VAddr>())) {
+            stage_failed = true;
+            return true;
+        }
+        if (owned && !DirectOnlyRetryProgram((**owned).program.hash)) {
+            stage_failed = true;
+            return true;
+        }
+        const auto params = [&]() -> Shader::ShaderParams {
+            if (owned) {
+                const auto& saved = **owned;
+                return MakeOwnedShaderParams(pgm->user_data, saved.program);
+            }
+            return AmdGpu::GetParams(*pgm);
+        }();
+        Shader::ReplayInputs replay{};
+        const auto* previous_replay = Shader::t_replay;
+        if (owned) {
+            replay.flat = &(**owned).flat;
+            Shader::t_replay = &replay;
+        }
+        SCOPE_EXIT { Shader::t_replay = previous_replay; };
         std::tie(S().infos[stage_out_idx], S().modules[stage_out_idx], key.stage_hashes[stage_out_idx]) =
             GetProgram(stage_in, stage_out, params, binding);
         if (!S().modules[stage_out_idx]) {
@@ -5095,6 +5256,9 @@ bool PipelineCache::QueueTranslation(HwStage hw_stage, SwStage sw_stage,
 #endif
         prepared->program.emplace(Shader::TranslateProgram(job->code, prepared->pools, *job->info,
                                                            prepared->compiled_runtime, profile));
+        job->retry_direct_only = DirectOnlyRetryInputs(
+            job->info->srt_info.walker_func != nullptr, job->info->has_fetch_shader,
+            bool(job->info->translated_fetch_shader)) && job->fetch_code.empty();
 #ifndef NDEBUG
         job->translate_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - preparation_start).count();
@@ -5553,6 +5717,7 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
             const bool may_skip = regs_override != nullptr || defer_misses || skip;
             if (may_skip && pending->second.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {
                 if (!regs_override) { deferred_miss = true; translation_skipped |= skip; }
+                else if (RetryBlockedReadAhead()) read_ahead_blocked = true;
                 return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
             }
             if (!may_skip) pending->second.wait();
@@ -5851,10 +6016,10 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
     if (AsyncTranslation()) {
         // FIX-078: a translation the workers made for these inputs.
         const bool read_ahead = regs_override != nullptr;
+        const bool insert = !read_ahead || RetryBlockedReadAhead();
         if (TakeReadyTranslation(hw_stage, sw_stage, params.hash, *program, params, runtime_info,
-                                 binding,
-                                 !read_ahead)) {
-            if (read_ahead) {
+                                 binding, insert)) {
+            if (!insert) {
                 return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
             }
             return GetProgram(hw_stage, sw_stage, params, binding);
@@ -5879,7 +6044,8 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
             // on. No key without it: the state is skipped for now. SHD-005: a stage's bindings
             // no longer follow from the stages before it, so a race queues every missing stage
             // of the draw at once and skips it.
-            if (!S().stage_deferred || skip_wait || unlocked) {
+            if (!S().stage_deferred || skip_wait || unlocked ||
+                (read_ahead && RetryBlockedReadAhead())) {
                 S().stage_deferred = true;
                 QueueTranslation(hw_stage, sw_stage, params, runtime_info, binding, !unlocked);
             }
@@ -5887,6 +6053,8 @@ PipelineCache::Result PipelineCache::GetProgramImpl(HwStage hw_stage, SwStage sw
             if (!read_ahead) {
                 deferred_miss = true;
                 translation_skipped |= skip_wait;
+            } else if (RetryBlockedReadAhead()) {
+                read_ahead_blocked = true;
             }
             return std::make_tuple(nullptr, vk::ShaderModule{}, u64{0});
         }
