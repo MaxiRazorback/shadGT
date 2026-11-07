@@ -1,4 +1,5 @@
 #include "video_core/renderer_vulkan/shared_pipeline_policy.h"
+#include "common/geometry_trace.h"
 #include "video_core/renderer_vulkan/oneshot_shader.h"
 #include "video_core/renderer_vulkan/ordered_parallel_read.h"
 #include "video_core/renderer_vulkan/bounded_read_cache.h"
@@ -3411,6 +3412,7 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             }
 #ifndef NDEBUG
             const auto wait_start = std::chrono::steady_clock::now();
+            if (GeometryTrace::current) GeometryTrace::Record("wait_begin", GeometryTrace::current, pipeline_hash);
 #endif
             // Queueing a cosmetic job must not freeze input/audio clocks. Hold
             // them only while this command actually needs an unfinished build.
@@ -3432,6 +3434,10 @@ const GraphicsPipeline* PipelineCache::PipelineForCurrentKey(const DrawIndirectP
             hold.reset();
 #ifndef NDEBUG
             const auto now = std::chrono::steady_clock::now();
+            if (GeometryTrace::current) {
+                GeometryTrace::Record("wait_end", GeometryTrace::current, pipeline_hash);
+                if (now - wait_start >= std::chrono::milliseconds{50}) GeometryTrace::Trigger();
+            }
             if (queued_states) {
                 ++queued_state_stats.waits;
                 queued_state_stats.wait_ms +=

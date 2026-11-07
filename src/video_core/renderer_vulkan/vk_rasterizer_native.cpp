@@ -62,6 +62,7 @@
 // own threads with this code (ryty_gpu/native/DESIGN.md, N4).
 
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
+#include "common/geometry_trace.h"
 #include "video_core/renderer_vulkan/pipeline_owner.h"
 #include "video_core/renderer_vulkan/upload_memory_recovery.h"
 #include "video_core/host_shaders/native_region_writeback_comp.h"
@@ -6160,6 +6161,13 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
         u64 size = 0;
         const VAddr base = guest.base_address;
         const u64 sharp_size = guest.GetSize();
+#ifndef NDEBUG
+        if (GeometryTrace::current) {
+            GeometryTrace::Record("vertex_guest", GeometryTrace::current,
+                pipeline.GetStage(Shader::SwStage::Vertex).pgm_hash, base, sharp_size,
+                (u64(index) << 32) | guest.GetStride());
+        }
+#endif
         // FIX-178 (diagnosis, RYGT_NATIVE_VERTEX_NEAR=0): every attribute looked up.
         static const bool near_on = [] {
             const char* env = std::getenv("RYGT_NATIVE_VERTEX_NEAR");
@@ -6190,6 +6198,15 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
         v.offsets.push_back(found ? found->second : 0);
         v.sizes.push_back(found ? size : 0);
         v.strides.push_back(guest.GetStride());
+#ifndef NDEBUG
+        if (GeometryTrace::current) {
+            GeometryTrace::Record("vertex_resolved", GeometryTrace::current,
+                index, found ? GeometryTrace::HandleIdentity(static_cast<VkBuffer>(found->first)) : 0,
+                found ? found->second : 0, buffer_generation);
+            GeometryTrace::Record("vertex_extent", GeometryTrace::current,
+                index, found ? size : 0, frame, r.scheduler.CurrentTick());
+        }
+#endif
         Mirror* bound_mirror = found && near && base >= near->begin &&
                                        base + std::max<u64>(size, 1) <= near->end
                                    ? near
@@ -7244,6 +7261,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             for (size_t i = 0; i < outputs.count; ++i) one_off_observer->Skipped(outputs.keys[i]);
         }
         NATIVE_DIAGNOSTIC(++stats.no_pipeline);
+#ifndef NDEBUG
+        if (GeometryTrace::current)
+            GeometryTrace::Record("draw_no_pipeline", GeometryTrace::current);
+#endif
         return;
     }
     ASSERT_MSG(PipelineOwnerMatches(pipeline, pipeline_owner), "Graphics pipeline owner mismatch");
@@ -10966,6 +10987,12 @@ void NativeRenderer::DispatchDirect() {
         NATIVE_DIAGNOSTIC(++stats.no_pipeline);
         return;
     }
+#ifndef NDEBUG
+    if (GeometryTrace::current)
+        GeometryTrace::Record("dispatch_pipeline", GeometryTrace::current,
+            pipeline->GetStage(Shader::SwStage::Compute).pgm_hash,
+            reinterpret_cast<std::uintptr_t>(pipeline), 0);
+#endif
     const auto& regs = r.liverpool->DrawRegs();
     MetaClearDispatch(pipeline->GetStage(Shader::SwStage::Compute));
     if (r.FrameDumpActive()) {

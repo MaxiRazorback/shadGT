@@ -1,4 +1,5 @@
 #include "common/debug_environment.h"
+#include "common/geometry_trace.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -253,6 +254,10 @@ void Rasterizer::CopySelectedStages(std::array<SelectedStage, Shader::MaxStageTy
         ASSERT(selected.num_user_data <= selected.user_data.size());
         std::ranges::copy(info->user_data, selected.user_data.begin());
         selected.flattened = info->flattened_ud_buf;
+#ifndef NDEBUG
+        if (GeometryTrace::current) GeometryTrace::Record("stage_cpu_flat", GeometryTrace::current,
+            stage, info->pgm_hash, selected.flattened.size(), GeometryTrace::Hash(selected.flattened));
+#endif
     }
 }
 
@@ -324,6 +329,10 @@ void Rasterizer::CopyComputeStage(std::array<SelectedStage, Shader::MaxStageType
     ASSERT(selected.num_user_data <= selected.user_data.size());
     std::ranges::copy(info->user_data, selected.user_data.begin());
     selected.flattened = info->flattened_ud_buf;
+#ifndef NDEBUG
+    if (GeometryTrace::current) GeometryTrace::Record("stage_cpu_flat", GeometryTrace::current,
+        u32(Shader::SwStage::Compute), info->pgm_hash, selected.flattened.size(), GeometryTrace::Hash(selected.flattened));
+#endif
 }
 
 const GraphicsPipeline* Rasterizer::LookupJobPipeline(std::shared_ptr<const void>& keepalive,
@@ -411,6 +420,7 @@ const ComputePipeline* Rasterizer::AcquireComputePipeline() {
         if (!pipeline) {
 #ifndef NDEBUG
             ++select_stats.compute_ahead;
+            if (GeometryTrace::current) GeometryTrace::Record("compute_no_pipeline", GeometryTrace::current, 1);
 #endif
             return nullptr;
         }
@@ -465,6 +475,9 @@ const ComputePipeline* Rasterizer::AcquireComputePipeline() {
         std::scoped_lock lk{pipeline_cache.LookupMutex()};
         pipeline = pipeline_cache.GetComputePipeline();
         if (!pipeline) {
+#ifndef NDEBUG
+            if (GeometryTrace::current) GeometryTrace::Record("compute_no_pipeline", GeometryTrace::current, 2);
+#endif
             return nullptr;
         }
         if (install) {
@@ -1116,9 +1129,21 @@ bool Rasterizer::InstallDrawStages(const Pipeline* pipeline,
             // The sharps are read again from the memory as the recorder sees it now.
             info.RefreshFlatBuf();
             if (validate && info.flattened_ud_buf != selected.flattened) {
+#ifndef NDEBUG
+                if (GeometryTrace::current) GeometryTrace::Record("stage_rejected", GeometryTrace::current,
+                    stage, info.pgm_hash, info.flattened_ud_buf.size(), GeometryTrace::Hash(info.flattened_ud_buf));
+#endif
                 return false;
             }
         }
+#ifndef NDEBUG
+        if (GeometryTrace::current) {
+            GeometryTrace::Record("stage_installed", GeometryTrace::current, stage, info.pgm_hash,
+                info.flattened_ud_buf.size(), GeometryTrace::Hash(info.flattened_ud_buf));
+            GeometryTrace::Record("stage_mode", GeometryTrace::current, stage, validate, trust_selection,
+                reinterpret_cast<std::uintptr_t>(pipeline));
+        }
+#endif
         draw_stages[stage] = &info;
     }
     pipeline->SetDrawStages(draw_stages);

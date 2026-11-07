@@ -1,4 +1,5 @@
 #include "common/debug_environment.h"
+#include "common/geometry_trace.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -817,8 +818,25 @@ static bool FilteredDraw(const Regs& state);
 
 void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bool direct_draw,
                            std::optional<IndirectSgprs> indirect) {
+#ifndef NDEBUG
+    GeometryTrace::PollFlush();
+    const auto trace_id = GeometryTrace::Enabled() && GeometryTrace::Get().armed.load()
+        ? GeometryTrace::Get().next.fetch_add(1) : 0;
+    GeometryTrace::Scope trace_scope{trace_id};
+    if (trace_id) GeometryTrace::Record("decode", trace_id, compute, direct_draw,
+        regs.num_indices, regs.num_instances.NumInstances());
+    if (trace_id && !compute) GeometryTrace::Record("decode_index", trace_id,
+        regs.index_base_address.Address<VAddr>(), regs.max_index_size,
+        u64(regs.index_buffer_type.index_type));
+#endif
     if (!draw_pipe) {
+#ifndef NDEBUG
+        if (trace_id) GeometryTrace::Record("direct_begin", trace_id);
+#endif
         draw();
+#ifndef NDEBUG
+        if (trace_id) GeometryTrace::Record("direct_end", trace_id);
+#endif
         return;
     }
     // PERF-056: the delta vectors go back and forth between the threads with their capacity.
@@ -953,6 +971,12 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         filtered_neutral && !staged && direct_draw && !compute && FilteredDraw(regs);
     const auto kind = staged || neutral_filtered ? DrawPipe::JobKind::Neutral
                                                  : DrawPipe::JobKind::Barrier;
+#ifndef NDEBUG
+    if (trace_id) GeometryTrace::Record("queue", trace_id, decode_epoch,
+        bool(staged || selected), prepared_draw, bool(capture));
+    if (trace_id) GeometryTrace::Record("queue_flags", trace_id,
+        u64(kind == DrawPipe::JobKind::Neutral), compute, direct_draw, bool(staged));
+#endif
     if (!staged) {
         // DIAG-069
         DrawPipe::SetPushTag(compute ? (direct_draw ? "dispatch not selected" : "indirect dispatch")
@@ -965,8 +989,21 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
     draw_pipe->Push([this, delta = std::move(delta), cs, cb_extent = last_cb_extent,
                      db_extent = last_db_extent, expected = std::move(expected),
                      selected = std::move(selected), draw = std::move(draw),
-                     decode_epoch, capture = std::move(capture), staged, indirect_selected]() mutable {
+                     decode_epoch, capture = std::move(capture), staged, indirect_selected
+#ifndef NDEBUG
+                     , trace_id
+#endif
+                     ]() mutable {
+#ifndef NDEBUG
+        GeometryTrace::Scope trace_scope{trace_id};
+        if (trace_id) GeometryTrace::Record("recorder_begin", trace_id);
+#endif
         auto& sel = staged ? staged->selected : selected;
+#ifndef NDEBUG
+        if (trace_id && sel) GeometryTrace::Record("selected", trace_id,
+            reinterpret_cast<std::uintptr_t>(sel->pipeline),
+            reinterpret_cast<std::uintptr_t>(sel->compute), indirect_selected, bool(staged));
+#endif
         auto& state = *recorder;
         RegsDelta<Regs::NumRegs>::Apply(delta, std::span<u32, Regs::NumRegs>{state.regs.reg_array});
         if (cs) {
@@ -982,6 +1019,9 @@ void Liverpool::RecordDraw(Common::UniqueFunction<void>&& draw, bool compute, bo
         rasterizer->SetReadCapture(capture.get());
         rasterizer->SetBufferPlan(staged ? &staged->plan : nullptr);
         draw();
+#ifndef NDEBUG
+        if (trace_id) GeometryTrace::Record("recorder_end", trace_id);
+#endif
         rasterizer->SetBufferPlan(nullptr);
         rasterizer->SetReadCapture(nullptr);
         rasterizer->SetDrawEpoch(0);
