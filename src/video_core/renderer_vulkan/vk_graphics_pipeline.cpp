@@ -1023,6 +1023,23 @@ GraphicsPipeline::GraphicsPipeline(
                                                       : "interface library"};
             auto [library_result, library] =
                 device.createGraphicsPipeline(pipeline_cache, part_infos[i]);
+            // AMD-OOM-001: AMD's compiler ran out of system memory (ErrorOutOfHostMemory,
+            // "LLVM ERROR: out of memory") with several builds at once, and the assertion below
+            // ended GT Sport. Wait, then retry alone (the heavy-build slot), up to six times.
+            for (int attempt = 1;
+                 attempt <= 6 && (library_result == vk::Result::eErrorOutOfHostMemory ||
+                                  library_result == vk::Result::eErrorOutOfDeviceMemory);
+                 ++attempt) {
+                LOG_WARNING(Render_Vulkan,
+                            "AMD-OOM-001: {} library of {} out of memory ({}); retry {} alone",
+                            i == 1 ? "pre-raster" : i == 2 ? "fragment" : "interface", debug_str,
+                            vk::to_string(library_result), attempt);
+                std::this_thread::sleep_for(std::chrono::milliseconds{250 * attempt});
+                HeavyBuildGate alone{!(tessellated && i == 1)};
+                auto retried = device.createGraphicsPipeline(pipeline_cache, part_infos[i]);
+                library_result = retried.result;
+                library = retried.value;
+            }
             ASSERT_MSG(library_result == vk::Result::eSuccess,
                        "Failed to create graphics pipeline library: {}",
                        vk::to_string(library_result));
