@@ -186,7 +186,7 @@ uint64_t SelectedVersion(const ffxCreateBackendVKDesc& backend) {
         // FSR-210: SDK 2.x lists driver-provided versions (FSR 4) only for a given device. The
         // three handles are laid out as its VkDeviceContext.
         // FSR-211: only when FSR 4 is asked for, on a card AMD's driver runs it on (RX 9000,
-        // and RX 7000 with the INT8 FSR 4.1 model since Adrenalin 26.6.2), and with a
+        // and RX 7000 and RX 6000 with the INT8 FSR 4.1 model), and with a
         // FidelityFX DLL from SDK 2.x or newer (Vulkan FSR 4 came with SDK 2.4). With a device
         // the DLL asks the AMD driver (amdxc64.dll) for its FSR 4 provider; through the 1.0.x
         // DLL this build shipped, that call jumped to an invalid address on an RX 7600 and GT
@@ -195,11 +195,12 @@ uint64_t SelectedVersion(const ffxCreateBackendVKDesc& backend) {
         const std::string_view gpu_name{properties.deviceName.data()};
         const bool fsr4_gpu = properties.vendorID == 0x1002 &&
                               (gpu_name.find("RX 9") != std::string_view::npos ||
-                               gpu_name.find("RX 7") != std::string_view::npos);
+                               gpu_name.find("RX 7") != std::string_view::npos ||
+                               gpu_name.find("RX 6") != std::string_view::npos);
         if (RequestedMajor() == 4 && fsr4_gpu && g_sdk2) {
             query.device = const_cast<VkDevice*>(&backend.vkDevice);
         } else if (RequestedMajor() == 4) {
-            LOG_WARNING(Render_Vulkan, "FSR-211: FSR 4 needs a Radeon RX 7000 or RX 9000 card "
+            LOG_WARNING(Render_Vulkan, "FSR-211: FSR 4 needs a Radeon RX 6000, RX 7000 or RX 9000 card "
                                        "(this is {}) and FidelityFX SDK 2.x DLLs "
                                        "(amd_fidelityfx_loader_vk.dll; this build has {}); FSR "
                                        "3.1 is used",
