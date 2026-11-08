@@ -185,7 +185,22 @@ uint64_t SelectedVersion(const ffxCreateBackendVKDesc& backend) {
         query.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
         // FSR-210: SDK 2.x lists driver-provided versions (FSR 4) only for a given device. The
         // three handles are laid out as its VkDeviceContext.
-        query.device = const_cast<VkDevice*>(&backend.vkDevice);
+        // FSR-211: only when FSR 4 is asked for on an RDNA 4 card (Radeon RX 9000), the only
+        // GPUs AMD's driver runs FSR 4 on. With a device the DLL asks the AMD driver
+        // (amdxc64.dll) for its FSR 4 provider, and on other AMD cards that call jumped to an
+        // invalid address and GT Sport crashed the first time FSR ran. Without one the DLL
+        // lists its own versions (FSR 3.1).
+        const auto properties = vk::PhysicalDevice{backend.vkPhysicalDevice}.getProperties();
+        const std::string_view gpu_name{properties.deviceName.data()};
+        const bool rdna4 = properties.vendorID == 0x1002 &&
+                           gpu_name.find("RX 9") != std::string_view::npos;
+        if (RequestedMajor() == 4 && rdna4) {
+            query.device = const_cast<VkDevice*>(&backend.vkDevice);
+        } else if (RequestedMajor() == 4) {
+            LOG_WARNING(Render_Vulkan, "FSR-211: FSR 4 needs a Radeon RX 9000 card ({} is not); "
+                                       "FSR 3.1 is used",
+                        gpu_name);
+        }
         query.outputCount = &count;
         if (g_api.query(nullptr, &query.header) != FFX_API_RETURN_OK || count == 0) {
             return uint64_t{0};
