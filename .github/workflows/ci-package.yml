@@ -1,0 +1,27 @@
+name: RyGTS packages for renderer changes
+
+on:
+  push:
+    branches: [ryty-gpu]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: renderer-packages-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    uses: RyGT-Team/RyGTS/.github/workflows/ci-package-release.yml@development
+    with:
+      renderer_sha: ${{ github.sha }}
+    secrets:
+      GITLAB_PACKAGE_TOKEN: ${{ secrets.GITLAB_PACKAGE_TOKEN }}
+  diagnostics:
+    uses: RyGT-Team/RyGTS/.github/workflows/ci-package-debug.yml@development
+    with:
+      renderer_sha: ${{ github.sha }}
+    secrets:
+      GITLAB_PACKAGE_TOKEN: ${{ secrets.GITLAB_PACKAGE_TOKEN }}
