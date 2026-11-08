@@ -12360,7 +12360,16 @@ void NativeRenderer::EvictImages() {
         return entry.sources.empty();
     };
     std::unordered_set<const Native::ImageEntry*> kept_textures;
-    if (texture_budget != 0) {
+    // VRAM-PRESSURE-001: a device allocation failed (a heavy track's 257 MB buffer on an 8 GB
+    // card, 17 failures and then an abort, while up to 805 MB of idle textures were kept).
+    // This pass keeps none of them, so the next attempt finds the room.
+    const bool pressure = Native::Rhi::g_device_memory_pressure.exchange(false,
+                                                                         std::memory_order_relaxed);
+    if (pressure) {
+        LOG_WARNING(Render_Vulkan, "VRAM-PRESSURE-001: device memory ran out; idle textures are "
+                                   "released instead of kept");
+    }
+    if (texture_budget != 0 && !pressure) {
         std::vector<Native::ImageEntry*> idle;
         registry->ForEachImage([&](Native::ImageEntry& entry) {
             if (entry.from_cpu && entry.image &&
