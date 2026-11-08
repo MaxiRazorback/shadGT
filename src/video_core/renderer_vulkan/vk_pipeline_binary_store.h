@@ -45,7 +45,23 @@ struct Stats {
     std::atomic<u64> loaded{};
     std::atomic<u64> saved{};
     std::atomic<u64> failed{};
+    // BIN-002: what each failure was.
+    std::atomic<u64> unreadable{};      // a stored file could not be read
+    std::atomic<u64> binaries_refused{}; // the driver refused the stored binaries
+    std::atomic<u64> pipeline_refused{}; // the pipeline could not be made from them
+    std::atomic<u64> nothing_captured{}; // the driver gave no binaries (no shaders, or none kept)
+    std::atomic<u64> capture_failed{};   // reading the binaries out failed
+    std::atomic<u64> write_failed{};
+    std::atomic<u64> no_key{};
 };
+
+// BIN-002: the first failures of each kind, with the driver's result.
+inline void Note(std::atomic<u64>& counter, const char* what, VkResult result) {
+    if (++counter <= 5) {
+        LOG_WARNING(Render_Vulkan, "BIN-002: {} ({})", what,
+                    vk::to_string(vk::Result{result}));
+    }
+}
 
 inline Stats& GetStats() {
     static Stats stats;
@@ -147,8 +163,12 @@ inline void Report() {
     if (total != 0 && total % 500 == 0) {
         LOG_WARNING(Render_Vulkan,
                     "BIN-001: {} pipelines from stored binaries, {} compiled and stored, {} "
-                    "failed",
-                    stats.loaded.load(), stats.saved.load(), stats.failed.load());
+                    "failed (BIN-002: unreadable {}, binaries refused {}, pipeline refused {}, "
+                    "nothing captured {}, capture failed {}, write failed {}, no key {})",
+                    stats.loaded.load(), stats.saved.load(), stats.failed.load(),
+                    stats.unreadable.load(), stats.binaries_refused.load(),
+                    stats.pipeline_refused.load(), stats.nothing_captured.load(),
+                    stats.capture_failed.load(), stats.write_failed.load(), stats.no_key.load());
     }
 }
 
@@ -173,13 +193,21 @@ inline vk::ResultValue<vk::Pipeline> CreateGraphics(const Instance& instance, vk
     VkPipelineCreateInfoKHR key_info{VK_STRUCTURE_TYPE_PIPELINE_CREATE_INFO_KHR,
                                      const_cast<VkGraphicsPipelineCreateInfo*>(&raw)};
     VkPipelineBinaryKeyKHR key{VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
-    if (d.vkGetPipelineKeyKHR(device, &key_info, &key) != VK_SUCCESS || key.keySize == 0) {
+    if (const VkResult key_result = d.vkGetPipelineKeyKHR(device, &key_info, &key);
+        key_result != VK_SUCCESS || key.keySize == 0) {
+        Note(GetStats().no_key, "no pipeline key", key_result);
         return device.createGraphicsPipeline(cache, info);
     }
     const auto path = folder / (Hex(key.key, key.keySize) + ".bin");
 
     // A stored pipeline: create it from its binaries.
-    if (std::vector<Entry> entries; Read(path, entries)) {
+    std::error_code exists_error;
+    const bool stored_file = std::filesystem::exists(path, exists_error);
+    std::vector<Entry> entries;
+    if (stored_file && !Read(path, entries)) {
+        Note(GetStats().unreadable, "stored file unreadable", VK_SUCCESS);
+    }
+    if (stored_file && !entries.empty()) {
         std::vector<VkPipelineBinaryKeyKHR> keys;
         std::vector<VkPipelineBinaryDataKHR> datas;
         for (auto& entry : entries) {
@@ -195,7 +223,11 @@ inline vk::ResultValue<vk::Pipeline> CreateGraphics(const Instance& instance, vk
         VkPipelineBinaryHandlesInfoKHR handles{VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR,
                                                nullptr, static_cast<u32>(binaries.size()),
                                                binaries.data()};
-        if (d.vkCreatePipelineBinariesKHR(device, &create, nullptr, &handles) == VK_SUCCESS) {
+        const VkResult created = d.vkCreatePipelineBinariesKHR(device, &create, nullptr, &handles);
+        if (created != VK_SUCCESS) {
+            Note(GetStats().binaries_refused, "driver refused stored binaries", created);
+        }
+        if (created == VK_SUCCESS) {
             VkPipelineBinaryInfoKHR binary_info{VK_STRUCTURE_TYPE_PIPELINE_BINARY_INFO_KHR,
                                                 raw.pNext, handles.pipelineBinaryCount,
                                                 binaries.data()};
@@ -205,6 +237,9 @@ inline vk::ResultValue<vk::Pipeline> CreateGraphics(const Instance& instance, vk
             const VkResult result = d.vkCreateGraphicsPipelines(device, cache, 1, &from_binaries,
                                                                 nullptr, &pipeline);
             Destroy(device, binaries);
+            if (result != VK_SUCCESS) {
+                Note(GetStats().pipeline_refused, "pipeline from stored binaries refused", result);
+            }
             if (result == VK_SUCCESS) {
                 ++GetStats().loaded;
                 Report();
@@ -238,8 +273,12 @@ inline vk::ResultValue<vk::Pipeline> CreateGraphics(const Instance& instance, vk
     VkPipelineBinaryHandlesInfoKHR handles{VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR};
     std::vector<VkPipelineBinaryKHR> binaries;
     bool stored = false;
-    if (d.vkCreatePipelineBinariesKHR(device, &from_pipeline, nullptr, &handles) == VK_SUCCESS &&
-        handles.pipelineBinaryCount != 0) {
+    bool captured = false;
+    const VkResult counted = d.vkCreatePipelineBinariesKHR(device, &from_pipeline, nullptr, &handles);
+    if (counted != VK_SUCCESS || handles.pipelineBinaryCount == 0) {
+        Note(GetStats().nothing_captured, "driver gave no binaries", counted);
+    }
+    if (counted == VK_SUCCESS && handles.pipelineBinaryCount != 0) {
         binaries.assign(handles.pipelineBinaryCount, VK_NULL_HANDLE);
         handles.pPipelineBinaries = binaries.data();
         if (d.vkCreatePipelineBinariesKHR(device, &from_pipeline, nullptr, &handles) ==
@@ -260,7 +299,10 @@ inline vk::ResultValue<vk::Pipeline> CreateGraphics(const Instance& instance, vk
                                VK_SUCCESS;
                 }
             }
+            captured = complete;
+            if (!complete) Note(GetStats().capture_failed, "reading binaries out failed", VK_SUCCESS);
             stored = complete && Write(path, entries);
+            if (complete && !stored) Note(GetStats().write_failed, "writing binaries failed", VK_SUCCESS);
         }
     }
     Destroy(device, binaries);
