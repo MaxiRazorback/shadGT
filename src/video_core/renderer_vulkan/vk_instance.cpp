@@ -429,6 +429,30 @@ bool Instance::CreateDevice() {
         LOG_WARNING(Render_Vulkan, "PERF-210: AMD Anti-Lag {}",
                     anti_lag ? "on" : "not supported by this driver");
     }
+    // BIN-001 (RYGT_PIPELINE_BINARIES=0 off): pipeline binaries. AMD's Windows driver keeps
+    // nothing of its compiles in a VkPipelineCache, so every launch compiled every pipeline
+    // again; the renderer stores the driver's binaries itself and reuses them.
+    if (const char* env = std::getenv("RYGT_PIPELINE_BINARIES"); !(env && env[0] == '0') &&
+                                                                 maintenance_5) {
+        const auto chain = physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
+                                                        vk::PhysicalDevicePipelineBinaryFeaturesKHR>();
+        pipeline_binary = chain.get<vk::PhysicalDevicePipelineBinaryFeaturesKHR>().pipelineBinaries &&
+                          add_extension(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+        if (pipeline_binary) {
+            const auto props = physical_device.getProperties2<
+                vk::PhysicalDeviceProperties2, vk::PhysicalDevicePipelineBinaryPropertiesKHR>();
+            const auto& p = props.get<vk::PhysicalDevicePipelineBinaryPropertiesKHR>();
+            LOG_WARNING(Render_Vulkan,
+                        "BIN-001: pipeline binaries on (internal cache {}, prefers internal "
+                        "cache {}, precompiled internal cache {}, compressed {})",
+                        bool(p.pipelineBinaryInternalCache),
+                        bool(p.pipelineBinaryPrefersInternalCache),
+                        bool(p.pipelineBinaryPrecompiledInternalCache),
+                        bool(p.pipelineBinaryCompressedData));
+        } else {
+            LOG_WARNING(Render_Vulkan, "BIN-001: pipeline binaries not supported by this driver");
+        }
+    }
     attachment_feedback_loop =
         feature_chain.get<vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT>().attachmentFeedbackLoopLayout &&
         feature_chain.get<vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT>().attachmentFeedbackLoopDynamicState &&
@@ -968,6 +992,9 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceAntiLagFeaturesAMD{
             .antiLag = true, // PERF-210
         },
+        vk::PhysicalDevicePipelineBinaryFeaturesKHR{
+            .pipelineBinaries = true, // BIN-001
+        },
         vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR{
             .shaderMaximalReconvergence = true, // AMD-306
         },
@@ -990,6 +1017,9 @@ bool Instance::CreateDevice() {
     }
     if (!anti_lag) {
         device_chain.unlink<vk::PhysicalDeviceAntiLagFeaturesAMD>();
+    }
+    if (!pipeline_binary) {
+        device_chain.unlink<vk::PhysicalDevicePipelineBinaryFeaturesKHR>();
     }
     if (!xess_mutable_descriptor) {
         device_chain.unlink<vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT>();

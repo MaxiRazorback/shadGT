@@ -39,6 +39,7 @@
 #include "video_core/renderer_vulkan/fragment_multisample_key.h"
 #include "video_core/renderer_vulkan/shared_creation_cache.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_pipeline_binary_store.h" // BIN-001
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
@@ -1021,8 +1022,8 @@ GraphicsPipeline::GraphicsPipeline(
             BuildWatch part_watch{debug_str, i == 1 ? "pre-raster library"
                                              : i == 2 ? "fragment library"
                                                       : "interface library"};
-            auto [library_result, library] =
-                device.createGraphicsPipeline(pipeline_cache, part_infos[i]);
+            auto [library_result, library] = PipelineBinaryStore::CreateGraphics(
+                instance, device, pipeline_cache, part_infos[i]); // BIN-001
             // AMD-OOM-001: AMD's compiler ran out of system memory (ErrorOutOfHostMemory,
             // "LLVM ERROR: out of memory") with several builds at once, and the assertion below
             // ended GT Sport. Wait, then retry alone (the heavy-build slot), up to six times.
@@ -1036,7 +1037,8 @@ GraphicsPipeline::GraphicsPipeline(
                             vk::to_string(library_result), attempt);
                 std::this_thread::sleep_for(std::chrono::milliseconds{250 * attempt});
                 HeavyBuildGate alone{!(tessellated && i == 1)};
-                auto retried = device.createGraphicsPipeline(pipeline_cache, part_infos[i]);
+                auto retried = PipelineBinaryStore::CreateGraphics(instance, device,
+                                                                   pipeline_cache, part_infos[i]);
                 library_result = retried.result;
                 library = retried.value;
             }
