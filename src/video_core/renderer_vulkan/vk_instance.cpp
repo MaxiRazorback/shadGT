@@ -490,7 +490,7 @@ bool Instance::CreateDevice() {
     // geometry shader) are drawn with vertex and fragment shader objects and dynamic state
     // instead of a compiled pipeline: no driver pipeline compile for them. Needs the dynamic
     // states of extended_dynamic_state3 that those pipelines otherwise fix.
-    // SO-011: on by default; RYGT_SHADER_OBJECT=0 builds pipelines as before.
+    // FIX-366-GTS: use pipelines by default; RYGT_SHADER_OBJECT=1 opts into shader objects.
     // SO-012: a start after a lost device with shader objects on uses pipelines once (the marker
     // is removed, so the start after that tries shader objects again).
     const auto lost_marker = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
@@ -505,16 +505,13 @@ bool Instance::CreateDevice() {
                                        "objects: this run builds pipelines");
         }
     }
-    // AMD-SO-001: on AMD GPUs shader objects are off unless RYGT_SHADER_OBJECT=1. With them on,
-    // GT Sport lost the GPU device in the menus on an RX 7600 (driver 2.0.416) while tessellated
-    // pipelines were being drawn, and the MR that turned them on for every GPU was not tested on
-    // AMD. Pipelines (with the AMD paths AMD-PERF-001..003) stay the AMD default.
     // SO-OFF-001: shader objects are off on every GPU, with no override: every game draw is a
-    // compiled pipeline. RYGT_SHADER_OBJECT is ignored, so VK_EXT_shader_object is not enabled.
-    const char* so_env = nullptr;
-    const bool amd_so_off = true;
+    // compiled pipeline and VK_EXT_shader_object is not enabled. FIX-366-GTS had made them
+    // opt-in (RYGT_SHADER_OBJECT=1); that is ignored too. On AMD they lost the GPU device in the
+    // menus on an RX 7600 (driver 2.0.416) while tessellated pipelines were drawn (AMD-SO-001).
+    constexpr bool shader_objects_allowed = false;
     LOG_WARNING(Render_Vulkan, "SO-OFF-001: shader objects are off on every GPU");
-    if (const char* env = so_env; !after_loss && !amd_so_off && !(env && env[0] == '0')) {
+    if (shader_objects_allowed && !after_loss) {
         const auto& d3 = dynamic_state_3_features;
         const bool states = dynamic_state_3 && d3.extendedDynamicState3DepthClampEnable &&
                             d3.extendedDynamicState3PolygonMode &&
@@ -535,8 +532,8 @@ bool Instance::CreateDevice() {
         // SO-003: tessellated pipelines too. VK_EXT_shader_object itself provides the patch
         // control point and domain origin commands its shaders need (AMD's driver reports no
         // extendedDynamicState2PatchControlPoints feature, which only pipelines need).
-        // SO-011: on every GPU again, AMD included, now that shader objects are linked, cached on
-        // disk and set only changed state. RYGT_SHADER_OBJECT_TESS=0 keeps them pipelines.
+        // SO-011: available on supported GPUs when opted in, with linked shader objects cached
+        // on disk and only changed state set. RYGT_SHADER_OBJECT_TESS=0 keeps tessellation pipelines.
         // SO-006: VK_KHR_maintenance11's VK_SHADER_CREATE_INDEPENDENT_SETS_BIT_KHR lets shader
         // objects use the independent-sets layouts the pipelines bind their sets with (newer
         // than these headers: enabled by its name, feature structure type and flag value).
