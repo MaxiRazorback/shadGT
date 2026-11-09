@@ -463,7 +463,7 @@ bool Instance::CreateDevice() {
     // geometry shader) are drawn with vertex and fragment shader objects and dynamic state
     // instead of a compiled pipeline: no driver pipeline compile for them. Needs the dynamic
     // states of extended_dynamic_state3 that those pipelines otherwise fix.
-    // SO-011: on by default; RYGT_SHADER_OBJECT=0 builds pipelines as before.
+    // FIX-366-GTS: use pipelines by default; RYGT_SHADER_OBJECT=1 opts into shader objects.
     // SO-012: a start after a lost device with shader objects on uses pipelines once (the marker
     // is removed, so the start after that tries shader objects again).
     const auto lost_marker = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
@@ -479,7 +479,7 @@ bool Instance::CreateDevice() {
         }
     }
     if (const char* env = std::getenv("RYGT_SHADER_OBJECT");
-        !after_loss && !(env && env[0] == '0')) {
+        !after_loss && env && env[0] == '1') {
         const auto& d3 = dynamic_state_3_features;
         const bool states = dynamic_state_3 && d3.extendedDynamicState3DepthClampEnable &&
                             d3.extendedDynamicState3PolygonMode &&
@@ -500,8 +500,8 @@ bool Instance::CreateDevice() {
         // SO-003: tessellated pipelines too. VK_EXT_shader_object itself provides the patch
         // control point and domain origin commands its shaders need (AMD's driver reports no
         // extendedDynamicState2PatchControlPoints feature, which only pipelines need).
-        // SO-011: on every GPU again, AMD included, now that shader objects are linked, cached on
-        // disk and set only changed state. RYGT_SHADER_OBJECT_TESS=0 keeps them pipelines.
+        // SO-011: available on supported GPUs when opted in, with linked shader objects cached
+        // on disk and only changed state set. RYGT_SHADER_OBJECT_TESS=0 keeps tessellation pipelines.
         // SO-006: VK_KHR_maintenance11's VK_SHADER_CREATE_INDEPENDENT_SETS_BIT_KHR lets shader
         // objects use the independent-sets layouts the pipelines bind their sets with (newer
         // than these headers: enabled by its name, feature structure type and flag value).
