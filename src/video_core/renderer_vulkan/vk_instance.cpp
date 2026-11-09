@@ -435,11 +435,10 @@ bool Instance::CreateDevice() {
     // AMD (BIN-003): on an RX 7600 libraries captured or made from binaries no longer fast
     // linked (0.0 ms on average before, 27-1394 ms with it) and the driver refused many stored
     // binaries with ErrorOutOfHostMemory.
-    // FIX-368-GTS: retain NVIDIA's default-on policy and =0 override; other vendors opt in.
+    // PERF-376-GTS: opt in only; AMD remains disabled after the observed driver failures.
     const char* pipeline_binary_env = std::getenv("RYGT_PIPELINE_BINARIES");
-    const bool request_pipeline_binaries = properties.vendorID == 0x10de
-        ? !(pipeline_binary_env && pipeline_binary_env[0] == '0')
-        : properties.vendorID != 0x1002 && pipeline_binary_env && pipeline_binary_env[0] == '1';
+    const bool request_pipeline_binaries = properties.vendorID != 0x1002 &&
+        pipeline_binary_env && pipeline_binary_env[0] == '1' && pipeline_binary_env[1] == '\0';
     if (request_pipeline_binaries && maintenance_5) {
         const auto chain = physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
                                                         vk::PhysicalDevicePipelineBinaryFeaturesKHR>();
