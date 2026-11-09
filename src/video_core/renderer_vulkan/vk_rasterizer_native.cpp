@@ -1265,9 +1265,16 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
         // A never-GPU-written CPU texture can use RecordUploads' guarded staging
         // copy instead. Existing imports and every authoritative GPU source keep
         // the original path, including partial region overlays.
+        // AMD-PERF-003: AMD too (it was gated to the NVIDIA card it was tested on); AMD's
+        // driver pays the same per-view import cost. RYGT_AMD_TEXTURE_STAGING=0 turns it off.
+        static const bool amd_staging = [] {
+            const char* env = std::getenv("RYGT_AMD_TEXTURE_STAGING");
+            return !(env && env[0] == '0');
+        }();
+        const u32 vendor = r.instance.GetVendorID();
         if (entry.from_cpu && size > 4_MB && size <= 64_MB &&
             !entry.gpu_backing_written.load(std::memory_order_acquire) && !overlap &&
-            r.instance.GetVendorID() == 0x10de) {
+            (vendor == 0x10de || (vendor == 0x1002 && amd_staging))) {
             trace.Next(9);
             Native::UploadPhaseTrace<5> policy_trace{true,"cpu-staging-eligibility",
                 {"sources-lock", "gpu-history", "find-import", "readable-check", "cpu-source"}};
@@ -12322,9 +12329,19 @@ void NativeRenderer::EvictImages() {
     // watched, so a CPU write or an unmap still uploads them again at their next use. GT7's
     // license tests left the track's textures unused for over 4 s while a retry reloaded, and
     // at ~4 s into the next attempt 50-120 MB of them were made and uploaded again.
-    static const u64 texture_budget = [] {
+    // VRAM-KEEP-001: the 2048 MB default was tuned for GT7 on larger cards. On an 8 GB RX 7600
+    // GT Sport (with MR !20) then ran out of device memory for a 257 MB native buffer and
+    // aborted, so without the variable the budget is an eighth of the device-local budget,
+    // still at most 2048 MB (about 0.9 GB on an 8 GB card).
+    static const u64 texture_budget = [this] {
         const char* env = std::getenv("RYGT_NATIVE_KEEP_TEXTURES_MB");
-        return (env && *env ? std::strtoull(env, nullptr, 10) : u64{2048}) << 20;
+        if (env && *env) {
+            return std::strtoull(env, nullptr, 10) << 20;
+        }
+        const u64 scaled = r.instance.GetTotalMemoryBudget() / 8;
+        const u64 budget = std::min<u64>(u64{2048} << 20, scaled ? scaled : u64{2048} << 20);
+        LOG_INFO(Render_Vulkan, "VRAM-KEEP-001: idle textures kept up to {} MB", budget >> 20);
+        return budget;
     }();
     // PERF-GT7-011: only textures the game loaded and left alone: uploaded at most twice, never
     // rewritten by GPU work nor made of targets, and at most 4 at one address. Keeping every idle
@@ -12343,7 +12360,16 @@ void NativeRenderer::EvictImages() {
         return entry.sources.empty();
     };
     std::unordered_set<const Native::ImageEntry*> kept_textures;
-    if (texture_budget != 0) {
+    // VRAM-PRESSURE-001: a device allocation failed (a heavy track's 257 MB buffer on an 8 GB
+    // card, 17 failures and then an abort, while up to 805 MB of idle textures were kept).
+    // This pass keeps none of them, so the next attempt finds the room.
+    const bool pressure = Native::Rhi::g_device_memory_pressure.exchange(false,
+                                                                         std::memory_order_relaxed);
+    if (pressure) {
+        LOG_WARNING(Render_Vulkan, "VRAM-PRESSURE-001: device memory ran out; idle textures are "
+                                   "released instead of kept");
+    }
+    if (texture_budget != 0 && !pressure) {
         std::vector<Native::ImageEntry*> idle;
         registry->ForEachImage([&](Native::ImageEntry& entry) {
             if (entry.from_cpu && entry.image &&

@@ -429,6 +429,37 @@ bool Instance::CreateDevice() {
         LOG_WARNING(Render_Vulkan, "PERF-210: AMD Anti-Lag {}",
                     anti_lag ? "on" : "not supported by this driver");
     }
+    // BIN-001: pipeline binaries. AMD's Windows driver keeps
+    // nothing of its compiles in a VkPipelineCache, so every launch compiled every pipeline
+    // again; the renderer can store the driver's binaries itself and reuse them. Disabled on
+    // AMD (BIN-003): on an RX 7600 libraries captured or made from binaries no longer fast
+    // linked (0.0 ms on average before, 27-1394 ms with it) and the driver refused many stored
+    // binaries with ErrorOutOfHostMemory.
+    // FIX-368-GTS: retain NVIDIA's default-on policy and =0 override; other vendors opt in.
+    const char* pipeline_binary_env = std::getenv("RYGT_PIPELINE_BINARIES");
+    const bool request_pipeline_binaries = properties.vendorID == 0x10de
+        ? !(pipeline_binary_env && pipeline_binary_env[0] == '0')
+        : properties.vendorID != 0x1002 && pipeline_binary_env && pipeline_binary_env[0] == '1';
+    if (request_pipeline_binaries && maintenance_5) {
+        const auto chain = physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
+                                                        vk::PhysicalDevicePipelineBinaryFeaturesKHR>();
+        pipeline_binary = chain.get<vk::PhysicalDevicePipelineBinaryFeaturesKHR>().pipelineBinaries &&
+                          add_extension(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+        if (pipeline_binary) {
+            const auto props = physical_device.getProperties2<
+                vk::PhysicalDeviceProperties2, vk::PhysicalDevicePipelineBinaryPropertiesKHR>();
+            const auto& p = props.get<vk::PhysicalDevicePipelineBinaryPropertiesKHR>();
+            LOG_WARNING(Render_Vulkan,
+                        "BIN-001: pipeline binaries on (internal cache {}, prefers internal "
+                        "cache {}, precompiled internal cache {}, compressed {})",
+                        bool(p.pipelineBinaryInternalCache),
+                        bool(p.pipelineBinaryPrefersInternalCache),
+                        bool(p.pipelineBinaryPrecompiledInternalCache),
+                        bool(p.pipelineBinaryCompressedData));
+        } else {
+            LOG_WARNING(Render_Vulkan, "BIN-001: pipeline binaries not supported by this driver");
+        }
+    }
     attachment_feedback_loop =
         feature_chain.get<vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT>().attachmentFeedbackLoopLayout &&
         feature_chain.get<vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT>().attachmentFeedbackLoopDynamicState &&
@@ -478,8 +509,13 @@ bool Instance::CreateDevice() {
                                        "objects: this run builds pipelines");
         }
     }
-    if (const char* env = std::getenv("RYGT_SHADER_OBJECT");
-        !after_loss && env && env[0] == '1') {
+    // SO-OFF-001: shader objects are off on every GPU, with no override: every game draw is a
+    // compiled pipeline and VK_EXT_shader_object is not enabled. FIX-366-GTS had made them
+    // opt-in (RYGT_SHADER_OBJECT=1); that is ignored too. On AMD they lost the GPU device in the
+    // menus on an RX 7600 (driver 2.0.416) while tessellated pipelines were drawn (AMD-SO-001).
+    constexpr bool shader_objects_allowed = false;
+    LOG_WARNING(Render_Vulkan, "SO-OFF-001: shader objects are off on every GPU");
+    if (shader_objects_allowed && !after_loss) {
         const auto& d3 = dynamic_state_3_features;
         const bool states = dynamic_state_3 && d3.extendedDynamicState3DepthClampEnable &&
                             d3.extendedDynamicState3PolygonMode &&
@@ -649,6 +685,15 @@ bool Instance::CreateDevice() {
     LOG_INFO(Render_Vulkan,
              "VRAM paging enabled={}: supported device-local allocations may spill to system RAM",
              pageable_memory);
+    memory_priority = pageable_memory; // AMD-VRAM-003
+    // AMD-VRAM-002: AMD's driver may refuse device memory past the physical VRAM size by its own
+    // policy; VK_AMD_memory_overallocation_behavior set to "allowed" lets it page instead (the
+    // 8 GB RX 7600 failed allocations in races). RYGT_AMD_OVERALLOCATION=0 leaves the default.
+    const char* overallocation_setting = std::getenv("RYGT_AMD_OVERALLOCATION");
+    amd_overallocation = properties.vendorID == 0x1002 &&
+                         !(overallocation_setting && overallocation_setting[0] == '0') &&
+                         add_extension(VK_AMD_MEMORY_OVERALLOCATION_BEHAVIOR_EXTENSION_NAME);
+    LOG_INFO(Render_Vulkan, "AMD-VRAM-002: memory overallocation allowed: {}", amd_overallocation);
     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     if (shader_clock) {
         shader_clock_features = feature_chain.get<vk::PhysicalDeviceShaderClockFeaturesKHR>();
@@ -950,13 +995,22 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceAntiLagFeaturesAMD{
             .antiLag = true, // PERF-210
         },
+        vk::PhysicalDevicePipelineBinaryFeaturesKHR{
+            .pipelineBinaries = true, // BIN-001
+        },
         vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR{
             .shaderMaximalReconvergence = true, // AMD-306
         },
         vk::PhysicalDeviceShaderQuadControlFeaturesKHR{
             .shaderQuadControl = true, // AMD-306
         },
+        vk::DeviceMemoryOverallocationCreateInfoAMD{
+            .overallocationBehavior = vk::MemoryOverallocationBehaviorAMD::eAllowed, // AMD-VRAM-002
+        },
     };
+    if (!amd_overallocation) {
+        device_chain.unlink<vk::DeviceMemoryOverallocationCreateInfoAMD>();
+    }
     if (!quad_control) {
         device_chain.unlink<vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>();
         device_chain.unlink<vk::PhysicalDeviceShaderQuadControlFeaturesKHR>();
@@ -966,6 +1020,9 @@ bool Instance::CreateDevice() {
     }
     if (!anti_lag) {
         device_chain.unlink<vk::PhysicalDeviceAntiLagFeaturesAMD>();
+    }
+    if (!pipeline_binary) {
+        device_chain.unlink<vk::PhysicalDevicePipelineBinaryFeaturesKHR>();
     }
     if (!xess_mutable_descriptor) {
         device_chain.unlink<vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT>();
@@ -1122,8 +1179,18 @@ void Instance::CreateAllocator() {
         .vkGetDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr,
     };
 
+    // AMD-VRAM-003: VK_EXT_memory_priority was enabled, but VMA was never told, so every
+    // allocation had the same priority and AMD's driver could page a render target out as
+    // readily as an old texture. On AMD, VMA now passes each allocation's priority (render
+    // targets and depth high, see UniqueImage::Create). RYGT_AMD_MEMORY_PRIORITY=0 turns it off.
+    const char* priority_setting = std::getenv("RYGT_AMD_MEMORY_PRIORITY");
+    const bool use_priority = memory_priority && properties.vendorID == 0x1002 &&
+                              !(priority_setting && priority_setting[0] == '0');
+    LOG_INFO(Render_Vulkan, "AMD-VRAM-003: memory priorities passed to the driver: {}",
+             use_priority);
     const VmaAllocatorCreateInfo allocator_info = {
-        .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
+        .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT |
+                 (use_priority ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT : 0u),
         .physicalDevice = physical_device,
         .device = *device,
         // Small persistent images must not pin mostly empty 256 MiB scene blocks.

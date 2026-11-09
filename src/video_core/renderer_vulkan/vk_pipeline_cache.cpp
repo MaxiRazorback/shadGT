@@ -1677,12 +1677,19 @@ void PipelineCache::SaveDriverCache(bool wait) {
 }
 
 void PipelineCache::MaybeSaveDriverCache() {
+    using namespace std::chrono_literals;
 #ifdef RYTY_GPU
-    // FIX-165: never during play (the whole cache is read out and written each time).
+    // CACHE-KEEP-001 (was FIX-165: never during play). GT Sport saved the driver cache only when
+    // its window was closed, so a crash or a forced close lost every pipeline compiled in the
+    // session and the next run compiled them all again. The read and the write now run on their
+    // own thread (PERF-036), so save rarely: 256 new pipelines and 5 minutes since the last save.
+    if (num_new_pipelines - pipelines_at_driver_save >= 256 &&
+        std::chrono::steady_clock::now() - driver_cache_saved_at >= 5min) {
+        SaveDriverCache(false);
+    }
     return;
 #endif
     // New pipelines are compiled during play; save them in batches without blocking the frame.
-    using namespace std::chrono_literals;
     if (num_new_pipelines - pipelines_at_driver_save >= 64 &&
         std::chrono::steady_clock::now() - driver_cache_saved_at >= 30s) {
         SaveDriverCache(false);

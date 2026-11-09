@@ -300,6 +300,13 @@ static const std::array<u8, 1024>& GetUnorm10ToU8Lut() {
     return lut;
 }
 
+#ifdef RYTY_GPU
+// GTS-015, ryty_gpu/gts_replay_video.cpp
+extern "C" bool RytyReplayVideoWanted();
+extern "C" int RytyVideoExportState(int* seconds); // GTS-019
+extern "C" void RytyReplayVideoFrame(const u8* rgba, u32 width, u32 height);
+#endif
+
 static void CopyImageToReadback(const vk::CommandBuffer& cmdbuf, const vk::Image image,
                                 const vk::ImageLayout layout, ScreenshotReadback& readback) {
     const vk::BufferImageCopy copy_region = {
@@ -1495,6 +1502,50 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
                "Unexpected error resetting present done fence: {}", vk::to_string(reset_result));
 
     ImGuiID dockId = ImGui::Core::NewFrame(is_reusing_frame);
+#ifdef RYTY_GPU
+    // GTS-019: while a replay is exported to video, the screen shows only that (drawn on the
+    // swapchain, after the frame copy, so the recorded game frames stay clean).
+    {
+        int seconds = 0;
+        const int state = RytyVideoExportState(&seconds);
+        if (state != 0) {
+            const ImGuiViewport* view = ImGui::GetMainViewport();
+            ImGui::SetNextWindowPos(view->Pos);
+            ImGui::SetNextWindowSize(view->Size);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+            ImGui::PushStyleColor(ImGuiCol_WindowBg,
+                                  state == 1 ? IM_COL32(8, 10, 14, 255) : IM_COL32(8, 10, 14, 190));
+            if (ImGui::Begin("##rygt_video_export", nullptr,
+                             ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                                 ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoSavedSettings |
+                                 ImGuiWindowFlags_NoFocusOnAppearing)) {
+                static const char* dots[] = {"", ".", "..", "..."};
+                char line[64];
+                char sub[64];
+                if (state == 1) {
+                    std::snprintf(line, sizeof(line), "Exporting video%s", dots[seconds % 4]);
+                    std::snprintf(sub, sizeof(sub), "%d:%02d", seconds / 60, seconds % 60);
+                } else {
+                    std::snprintf(line, sizeof(line), "Video exported");
+                    std::snprintf(sub, sizeof(sub), "Saved to Videos\\Gran Turismo Sport");
+                }
+                ImGui::SetWindowFontScale(std::max(1.5f, view->Size.y / 360.0f));
+                const ImVec2 big = ImGui::CalcTextSize("Exporting video...");
+                ImGui::SetCursorPos(ImVec2((view->Size.x - big.x) * 0.5f, view->Size.y * 0.5f - big.y));
+                ImGui::TextUnformatted(line);
+                ImGui::SetWindowFontScale(std::max(1.0f, view->Size.y / 720.0f));
+                const ImVec2 small_text = ImGui::CalcTextSize(sub);
+                ImGui::SetCursorPos(
+                    ImVec2((view->Size.x - small_text.x) * 0.5f, view->Size.y * 0.5f + big.y * 0.25f));
+                ImGui::TextUnformatted(sub);
+            }
+            ImGui::End();
+            ImGui::PopStyleColor();
+            ImGui::PopStyleVar(2);
+        }
+    }
+#endif
 
     const vk::Image swapchain_image = swapchain.Image();
     const vk::ImageView swapchain_image_view = swapchain.ImageView();
@@ -1503,6 +1554,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
     const auto cmdbuf = scheduler.DirectCommandBuffer();
     const u32 capture_with_overlays_count = VideoCore::ConsumeWithOverlaysScreenshotRequests();
     std::optional<ScreenshotReadback> pending_screenshot;
+    std::optional<ScreenshotReadback> video_readback; // GTS-015
 
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
@@ -1551,6 +1603,48 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
             },
         };
 
+#ifdef RYTY_GPU
+        // GTS-015: while a replay plays, each new game frame is copied for the replay video.
+        if (RytyReplayVideoWanted() && is_game_frame && !is_reusing_frame &&
+            !Libraries::SystemService::IsSplashVisible() && frame->width != 0 && frame->height != 0) {
+            auto& readback = video_readback.emplace(
+                instance, ScreenshotKind::WithOverlays, std::vector<std::filesystem::path>{},
+                frame->width, frame->height, swapchain.GetSurfaceFormat().format, swapchain.GetHDR());
+            const vk::ImageSubresourceRange whole{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = VK_REMAINING_ARRAY_LAYERS,
+            };
+            const vk::ImageMemoryBarrier before_copy{
+                .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite |
+                                 vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite,
+                .dstAccessMask = vk::AccessFlagBits::eTransferRead,
+                .oldLayout = vk::ImageLayout::eGeneral,
+                .newLayout = vk::ImageLayout::eGeneral,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = frame->image,
+                .subresourceRange = whole,
+            };
+            cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                                   vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, before_copy);
+            CopyImageToReadback(cmdbuf, frame->image, vk::ImageLayout::eGeneral, readback);
+            const vk::ImageMemoryBarrier after_copy{
+                .srcAccessMask = vk::AccessFlagBits::eTransferRead,
+                .dstAccessMask = vk::AccessFlagBits::eNone,
+                .oldLayout = vk::ImageLayout::eGeneral,
+                .newLayout = vk::ImageLayout::eGeneral,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = frame->image,
+                .subresourceRange = whole,
+            };
+            cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                   vk::PipelineStageFlagBits::eAllCommands, {}, {}, {}, after_copy);
+        }
+#endif
         bool swapchain_copied_for_screenshot = false;
 
         cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
@@ -1698,6 +1792,16 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
         cmdbuf.endDebugUtilsLabelEXT();
     }
 
+#ifdef RYTY_GPU
+    if (video_readback) {
+        scheduler.DeferPriorityOperation([readback = std::move(video_readback)]() {
+            std::vector<u8> rgba;
+            if (ConvertReadbackToRgba8(readback.value(), rgba)) {
+                RytyReplayVideoFrame(rgba.data(), readback->width, readback->height);
+            }
+        });
+    }
+#endif
     // Flush vulkan commands.
     if (pending_screenshot) {
         scheduler.DeferPriorityOperation([deferred_screenshot = std::move(pending_screenshot)]() {
