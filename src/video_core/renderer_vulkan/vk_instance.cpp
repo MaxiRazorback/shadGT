@@ -429,14 +429,18 @@ bool Instance::CreateDevice() {
         LOG_WARNING(Render_Vulkan, "PERF-210: AMD Anti-Lag {}",
                     anti_lag ? "on" : "not supported by this driver");
     }
-    // BIN-001 (RYGT_PIPELINE_BINARIES=1 on): pipeline binaries. AMD's Windows driver keeps
+    // BIN-001: pipeline binaries. AMD's Windows driver keeps
     // nothing of its compiles in a VkPipelineCache, so every launch compiled every pipeline
-    // again; the renderer can store the driver's binaries itself and reuse them. Off by
-    // default (BIN-003): on an RX 7600 libraries captured or made from binaries no longer fast
+    // again; the renderer can store the driver's binaries itself and reuse them. Disabled on
+    // AMD (BIN-003): on an RX 7600 libraries captured or made from binaries no longer fast
     // linked (0.0 ms on average before, 27-1394 ms with it) and the driver refused many stored
     // binaries with ErrorOutOfHostMemory.
-    if (const char* env = std::getenv("RYGT_PIPELINE_BINARIES"); env && env[0] == '1' &&
-                                                                 maintenance_5) {
+    // FIX-368-GTS: retain NVIDIA's default-on policy and =0 override; other vendors opt in.
+    const char* pipeline_binary_env = std::getenv("RYGT_PIPELINE_BINARIES");
+    const bool request_pipeline_binaries = properties.vendorID == 0x10de
+        ? !(pipeline_binary_env && pipeline_binary_env[0] == '0')
+        : properties.vendorID != 0x1002 && pipeline_binary_env && pipeline_binary_env[0] == '1';
+    if (request_pipeline_binaries && maintenance_5) {
         const auto chain = physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
                                                         vk::PhysicalDevicePipelineBinaryFeaturesKHR>();
         pipeline_binary = chain.get<vk::PhysicalDevicePipelineBinaryFeaturesKHR>().pipelineBinaries &&
