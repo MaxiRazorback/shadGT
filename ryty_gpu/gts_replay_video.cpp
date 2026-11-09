@@ -14,7 +14,8 @@
 //    into "Replay <date time>.mp4", until the replay ends.
 //
 // The videos have the game's sound (AAC), captured with Windows' process loopback, so other
-// programs on the PC are not in them. RYGT_REPLAY_VIDEO=0 turns all of it off.
+// programs on the PC are not in them. Set RYGT_REPLAY_VIDEO=1 to enable recording and clips;
+// they are disabled by default.
 
 #include <windows.h>
 #include <audioclient.h>
@@ -88,7 +89,10 @@ u64 g_dropped = 0;
 bool Enabled() {
     static const bool enabled = [] {
         const char* env = std::getenv("RYGT_REPLAY_VIDEO");
-        return !(env && env[0] == '0');
+        const bool enabled = env && std::strcmp(env, "1") == 0;
+        std::fprintf(stderr, "[patch] GTS-015 video capture %s (RYGT_REPLAY_VIDEO=1 enables it)\n",
+                     enabled ? "enabled" : "disabled");
+        return enabled;
     }();
     return enabled;
 }
