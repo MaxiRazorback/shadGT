@@ -509,12 +509,11 @@ bool Instance::CreateDevice() {
     // GT Sport lost the GPU device in the menus on an RX 7600 (driver 2.0.416) while tessellated
     // pipelines were being drawn, and the MR that turned them on for every GPU was not tested on
     // AMD. Pipelines (with the AMD paths AMD-PERF-001..003) stay the AMD default.
-    const char* so_env = std::getenv("RYGT_SHADER_OBJECT");
-    const bool amd_so_off = properties.vendorID == 0x1002 && !(so_env && so_env[0] == '1');
-    if (amd_so_off) {
-        LOG_WARNING(Render_Vulkan, "AMD-SO-001: shader objects off on AMD (RYGT_SHADER_OBJECT=1 "
-                                   "turns them on)");
-    }
+    // SO-OFF-001: shader objects are off on every GPU, with no override: every game draw is a
+    // compiled pipeline. RYGT_SHADER_OBJECT is ignored, so VK_EXT_shader_object is not enabled.
+    const char* so_env = nullptr;
+    const bool amd_so_off = true;
+    LOG_WARNING(Render_Vulkan, "SO-OFF-001: shader objects are off on every GPU");
     if (const char* env = so_env; !after_loss && !amd_so_off && !(env && env[0] == '0')) {
         const auto& d3 = dynamic_state_3_features;
         const bool states = dynamic_state_3 && d3.extendedDynamicState3DepthClampEnable &&
