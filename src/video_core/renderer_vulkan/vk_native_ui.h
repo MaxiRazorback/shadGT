@@ -33,7 +33,9 @@ inline vk::ImageBlit2 NativeBlit(vk::Extent2D from, vk::Extent2D to) {
 
 inline void UpscaleNative(vk::CommandBuffer cmd, vk::Image image, vk::ImageView view,
                           vk::Format format, Proxy& proxy) {
-    const bool dlss = !proxy.dlss_failed && RytyDlss::CanScale(proxy.native, proxy.size);
+    proxy.full = false;
+    const bool dlss =
+        !Wide() && !proxy.dlss_failed && RytyDlss::CanScale(proxy.native, proxy.size);
     const auto input_layout =
         dlss ? vk::ImageLayout::eShaderReadOnlyOptimal : vk::ImageLayout::eTransferSrcOptimal;
     NativeBarrier(cmd, image, vk::ImageLayout::eGeneral, input_layout);
@@ -44,9 +46,13 @@ inline void UpscaleNative(vk::CommandBuffer cmd, vk::Image image, vk::ImageView 
         NativeBarrier(cmd, image, input_layout, vk::ImageLayout::eTransferSrcOptimal);
     }
     proxy.dlss_used = scaled;
-    ProxyBarrier(cmd, proxy, vk::ImageLayout::eTransferDstOptimal,
-                 vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
-    const auto region = NativeBlit(scaled ? proxy.size : proxy.native, proxy.size);
+    if (Wide()) {
+        ClearProxyForBlit(cmd, proxy); // WIDE-001: black beside the 16:9 picture
+    } else {
+        ProxyBarrier(cmd, proxy, vk::ImageLayout::eTransferDstOptimal,
+                     vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+    }
+    const auto region = IntoProxy(proxy, scaled ? proxy.size : proxy.native);
     if (scaled) {
         NativeBarrier(cmd, proxy.scaled, vk::ImageLayout::eGeneral,
                       vk::ImageLayout::eTransferSrcOptimal);
@@ -72,14 +78,14 @@ inline void ResolveNative(vk::CommandBuffer cmd, vk::Image image, Proxy& proxy, 
         ProxyBarrier(cmd, proxy, vk::ImageLayout::eTransferSrcOptimal,
                      vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
         NativeBarrier(cmd, image, vk::ImageLayout::eGeneral, vk::ImageLayout::eTransferDstOptimal);
-        const auto region = NativeBlit(proxy.size, proxy.native);
+        const auto regions = FromProxySpread(proxy, proxy.native); // WIDE-001/005
         cmd.blitImage2(vk::BlitImageInfo2{
             .srcImage = proxy.image,
             .srcImageLayout = vk::ImageLayout::eTransferSrcOptimal,
             .dstImage = image,
             .dstImageLayout = vk::ImageLayout::eTransferDstOptimal,
-            .regionCount = 1,
-            .pRegions = &region,
+            .regionCount = u32(regions.size()),
+            .pRegions = regions.data(),
             .filter = vk::Filter::eLinear,
         });
         NativeBarrier(cmd, image, vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eGeneral);

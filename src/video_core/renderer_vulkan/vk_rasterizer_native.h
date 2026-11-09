@@ -141,6 +141,7 @@ public:
         vk::ImageView ui_layer{};
         vk::Extent2D output_size{};
         bool dlss_scaled = false;
+        float side_x0 = 0.0f, side_x1 = 1.0f; // WIDE-042: ambient sides outside these
         std::string upscaler;
     };
     std::optional<Display> FindDisplay(const VideoCore::ImageInfo& info, vk::Format view_format,
@@ -567,6 +568,16 @@ private:
     u64 fsr_display_frame = ~u64{};
     VAddr fsr_display_address{};
     std::string fsr_display_backend;
+    bool fsr_wide_full = false; ///< WIDE-001: the composition being reconstructed is a race scene
+    /// WIDE-005: this draw is race HUD drawn in pieces; the 16:9 HUD rectangle in the proxy.
+    bool hud_spread = false;
+    bool menu_ui = false; // WIDE-019 (diagnosis): a menu UI draw, outside races
+    bool widen_flat = false; // WIDE-030: a menu 3D draw, its flattened cameras widened
+    bool widen_3d = false; // WIDE-031: a menu 3D draw, drawn into a narrowed viewport
+    vk::Rect2D hud_rect{};
+    vk::Image hud_image{};      // WIDE-022: the proxy a menu draw goes into (null: the UI layer)
+    vk::Extent2D hud_size{};
+    void SeedWideUi(const Native::ImageEntry& target, bool full);
 
     void ResolveUiDisplay(VAddr address, bool keep);
     void SyncUiReads(std::span<const Shader::Info* const> stages);

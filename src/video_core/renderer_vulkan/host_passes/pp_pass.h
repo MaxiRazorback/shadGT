@@ -37,7 +37,7 @@ public:
 
     void Render(vk::CommandBuffer cmdbuf, vk::ImageView input, vk::Extent2D input_size,
                 Frame& output, Settings settings, vk::ImageView ui_layer = {},
-                bool dlss_scaled = false);
+                bool dlss_scaled = false, float side_x0 = 0.0f, float side_x1 = 1.0f);
 
 private:
     vk::UniquePipeline pipeline{};

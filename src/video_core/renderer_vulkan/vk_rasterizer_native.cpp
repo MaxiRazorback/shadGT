@@ -80,10 +80,13 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <immintrin.h>
 #include <map>
+#include <optional>
+#include <unordered_map>
 
 #include <fmt/ranges.h>
 #include <magic_enum/magic_enum.hpp>
@@ -146,6 +149,15 @@ vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type);
 #else
 #define NATIVE_DIAGNOSTIC(...) __VA_ARGS__
 #endif
+namespace Ryty::Camera {
+bool RaceViewActive(); // ryty_camera_runtime.cpp (WIDE-003)
+bool RaceViewFrozen(); // the race is paused (WIDE-005)
+bool RaceFinished(); // the race has ended: results on screen (RACE-002)
+bool ReplayOn();     // a replay runs, any camera (WIDE-051)
+void EndReplay();    // the race session is over (WIDE-051)
+bool RaceCameraShown(); // a driving camera is on screen (WIDE-005)
+bool RaceCarStopped();  // the car stands still (WIDE-005)
+}
 
 namespace Vulkan {
 
@@ -528,6 +540,9 @@ static std::unique_ptr<Native::Rhi::Buffer> scene_indirect_buffer;
 static std::vector<SceneIndirectArgs> scene_indirect_args;
 
 bool RytyGtsInRace();
+bool RytyGtsRaceSession(); // WIDE-015
+int RytyGtsMenuScreen();   // WIDE-020
+float RytyDisplayAspect(); // GTS-009 (ryty_game_patch.cpp)
 extern std::atomic<u64> g_prepared_frames;
 bool RytyGtsMenuSnapshotsAllowed();
 namespace {
@@ -566,6 +581,640 @@ constexpr bool IsSceneCompositionShader(u64 hash) {
     return hash == 0xb33ec4df || hash == 0xcc4e73c3;
 }
 
+void LogWide(const char* what) {
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 12) {
+        std::fprintf(stderr, "[wide] %s\n", what);
+    }
+}
+
+// The race's composition while the camera is widened: it fills the whole wide output. Scenes
+// shot with a 16:9 camera (pre-race and result screens, menus) and the HUD keep the game's 16:9
+// in the middle, so nothing is stretched.
+
+// WIDE-017: per picture width (up to 8), whether its latest smoothing pass wrote the atlas turn,
+// and the frame it did; and the address the menus' boxes compose their pictures from.
+struct AtlasTurn {
+    std::atomic<u32> width{0};
+    std::atomic<bool> bad{false};
+    std::atomic<u64> frame{0};
+    std::atomic<s32> offset{0}; // where its turn in the history image goes (WIDE-018)
+};
+std::array<AtlasTurn, 8> g_atlas_turns;
+std::atomic<u64> g_menu_region_address{0};
+// WIDE-056: when the scene was last composed from a letterboxed corner (the replay's 1920x780).
+std::atomic<u64> g_letterbox_ms{0};
+// WIDE-018: the scene image the menus' smoothing pass (184b619c) writes in place (11-11-10
+// format), on the turns its own history image is missing.
+std::atomic<u64> g_taa_in_place{0};
+// WIDE-018: the smoothing pass's history atlas (16-bit float, the interior on the left, the car
+// right of it), the image the copy reads on the other turns.
+std::atomic<u64> g_taa_history{0};
+void NoteAtlasTurn(u32 width, bool bad, s32 offset) {
+    for (auto& turn : g_atlas_turns) {
+        u32 expected = 0;
+        if (turn.width.load(std::memory_order_relaxed) == width ||
+            turn.width.compare_exchange_strong(expected, width, std::memory_order_relaxed)) {
+            if (turn.width.load(std::memory_order_relaxed) != width) continue;
+            turn.bad.store(bad, std::memory_order_relaxed);
+            if (offset > 0) {
+                turn.offset.store(offset, std::memory_order_relaxed);
+            }
+            turn.frame.store(g_prepared_frames.load(std::memory_order_relaxed),
+                             std::memory_order_relaxed);
+            return;
+        }
+    }
+}
+
+// WIDE-013: the menus' composition (cc4e73c3) last sampled the whole scene (the pre-race
+// screen's overhead view) rather than a region of it (the colour selection's pictures).
+std::atomic<bool> g_menu_composition_full{false};
+
+bool IsWideRaceComposition(u64 hash) {
+    // Only the race renderer's composition: the menus' variant (cc4e73c3, colour and transmission
+    // selection) draws its scene into a part of the screen and flickered when redirected.
+    if (!UiHires::Wide()) {
+        return false;
+    }
+    // WIDE-013: while a race project runs (its cameras widened, ryty_game_patch.cpp), the
+    // menus' composition of the whole scene fills the output too.
+    if (hash == 0xcc4e73c3) {
+        // WIDE-041: the livery editor (screen 3) is shown like the main menu now (16:9, blurred
+        // sides), so its scene is no longer composed full width.
+        const bool wide = RytyWideViews() && RytyGtsRaceSession() &&
+                          g_menu_composition_full.load(std::memory_order_relaxed);
+        return wide;
+    }
+    if (hash != 0xb33ec4df) {
+        return false;
+    }
+    // WIDE-004 widens the race renderer's views (race cameras, pre-race and result screens), so
+    // its composition fills the output while a race runs. Menu scenes (car selection) keep their
+    // 16:9 projection and stay in the middle. Without WIDE-004 (GPU.wide_views=false) only race
+    // cameras are wide (WIDE-003).
+    const bool wide = Ryty::Camera::RaceViewActive() ||
+                      (RytyWideViews() && RytyGtsRaceSession()); // WIDE-041: not screen 3
+    return wide;
+}
+
+// WIDE-005: a race HUD draw is recorded once per HUD region (UiHires::HudPieces) it can reach,
+// with the region as its scissor, so each part of it lands in exactly one place.
+
+// WIDE-008: the race HUD's side elements moved to the screen's edges, whole.
+// - A draw with its own scissor (most HUD boxes, the pause and pit menus' items): the scissor
+//   says where it is. Inside a side zone: moved to that edge; elsewhere: left in the middle; a
+//   strip across the whole width at the top or bottom (the pit stop's black bars): not drawn.
+// - A draw over the whole HUD (text, icons, overlays): drawn once per zone of the HUD, each part
+//   moved with its zone (as WIDE-005 did), with an occlusion query per zone counting where its
+//   pixels fall. A few frames later that tells what it was: a strip across the whole width with
+//   nothing in the middle height (black bars) is not drawn any more; something covering the whole
+//   HUD (the pause menu's darkening) is stretched over the whole screen. Such draws are told
+//   apart by their shaders, index count and order among equal ones, and the verdict only holds
+//   while that order is unchanged (as many equal draws as when it was measured).
+namespace WideHud {
+enum class Place : u8 { Split, Left, Middle, Right, Bar, Fill, Count };
+struct Zone {
+    float u0, v0, u1, v1;
+    s32 side;
+    bool middle_band; // 20..80% of the height
+};
+constexpr u32 kZones = 12;
+constexpr u32 kMaxDraws = 2048;
+constexpr u32 kSlots = 6;
+constexpr std::array<Zone, kZones> Zones = [] {
+    std::array<Zone, kZones> zones{};
+    constexpr float rows[5]{0.0f, 0.2f, 0.7f, 0.8f, 1.0f};
+    for (u32 r = 0; r < 4; ++r) {
+        // The race HUD's layout (UiHires::HudPieces): sides 30% wide at the top, the gauges
+        // between 17% and 80% at the bottom.
+        // WIDE-049 moved this to 14% too, which cut the replay's "Camera target selection"
+        // hint (one text draw over the whole HUD) in two; only the scissor/geometry boundary
+        // (FromScissor) needs 14% for the tyre diagram.
+        const float a = r < 2 ? 0.30f : 0.17f;
+        const float b = r < 2 ? 0.70f : 0.82f; // WIDE-040: was 0.80
+        const float cols[4]{0.0f, a, b, 1.0f};
+        for (u32 c = 0; c < 3; ++c) {
+            zones[r * 3 + c] = Zone{cols[c], rows[r], cols[c + 1], rows[r + 1], s32(c) - 1,
+                                    r == 1 || r == 2};
+        }
+    }
+    return zones;
+}();
+struct Verdict {
+    Place place = Place::Split;
+    u32 equals = 0; // draws with the same key in the measured frame
+};
+struct Slot {
+    vk::QueryPool pool{};
+    u64 tick = 0;
+    u64 frame = 0;
+    bool pending = false;
+    std::vector<u64> ids, keys;
+    std::vector<u16> issued; // zones drawn, a bit each
+    std::unordered_map<u64, u32> equals;
+};
+struct State {
+    std::mutex mutex;
+    bool tried = false;
+    std::array<Slot, kSlots> slots;
+    u32 current = 0;
+    u64 frame = ~0ull;
+    u64 applied_frame = 0;
+    bool measuring = false;
+    double hud_area = 1.0;
+    std::unordered_map<u64, u32> seen, last_seen; // whole-HUD draws per key: this, last frame
+    std::unordered_map<u64, Verdict> verdicts;
+    std::array<u32, u32(Place::Count)> counts{};
+    u64 last_log_ms = 0;
+    bool overlay = false; // a whole-screen darkening was drawn this frame (WIDE-012)
+};
+State& Get() {
+    static State state;
+    return state;
+}
+// The frame the HUD draws belong to (the UI's flip count, read with the draws).
+u64 passes = 0;
+// WIDE-025: the same for the menus' UI draws.
+u64 menu_frame = 0;
+
+void Apply(vk::Device device, State& st, Slot& slot) {
+    slot.pending = false;
+    if (slot.frame <= st.applied_frame) {
+        return;
+    }
+    const u32 n = u32(slot.ids.size());
+    std::vector<u64> data(size_t(n) * kZones * 2);
+    if (n != 0) {
+        const auto result = device.getQueryPoolResults(
+            slot.pool, 0, n * kZones, data.size() * sizeof(u64), data.data(), 2 * sizeof(u64),
+            vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+        if (result != vk::Result::eSuccess && result != vk::Result::eNotReady) {
+            return;
+        }
+    }
+    std::unordered_map<u64, Verdict> verdicts;
+    for (u32 o = 0; o < n; ++o) {
+        const u16 issued = slot.issued[o];
+        u64 side[3]{}, band = 0, total = 0;
+        bool ok = issued != 0;
+        for (u32 z = 0; z < kZones && ok; ++z) {
+            if (!((issued >> z) & 1)) {
+                continue;
+            }
+            const u64* q = &data[(size_t(o) * kZones + z) * 2];
+            if (q[1] == 0) {
+                ok = false;
+                break;
+            }
+            side[Zones[z].side + 1] += q[0];
+            band += Zones[z].middle_band ? q[0] : 0;
+            total += q[0];
+        }
+        if (!ok || total == 0) {
+            continue;
+        }
+        const u64 small = std::max<u64>(total / 50, 1);
+        const bool l = side[0] > small, m = side[1] > small, r = side[2] > small;
+        Place place = Place::Split;
+        if (l && m && r && double(total) >= 0.85 * st.hud_area) {
+            place = Place::Fill;
+        } else if (l && r && band * 100 <= total && double(total) >= 0.04 * st.hud_area) {
+            place = Place::Bar;
+        }
+        if (place != Place::Split) {
+            const auto found = slot.equals.find(slot.keys[o]);
+            verdicts[slot.ids[o]] = Verdict{place, found != slot.equals.end() ? found->second : 0};
+        }
+    }
+    st.verdicts = std::move(verdicts);
+    st.applied_frame = slot.frame;
+}
+
+void BeginFrame(const Instance& instance, Scheduler& scheduler, State& st, u64 frame,
+                const vk::Rect2D& rect) {
+    if (st.frame == frame) {
+        return;
+    }
+    const vk::Device device = instance.GetDevice();
+    if (st.frame != ~0ull && st.measuring) {
+        // Its draws are in secondary lists submitted with the frame: by the next HUD pass the
+        // frame has been flipped, so they are in the batch this tick names or an earlier one.
+        auto& done = st.slots[st.current];
+        done.pending = true;
+        done.tick = scheduler.CurrentTick();
+        done.equals = st.seen;
+    }
+    st.frame = frame;
+    if (!st.tried) {
+        st.tried = true;
+        for (auto& slot : st.slots) {
+            const auto [result, pool] = device.createQueryPool(vk::QueryPoolCreateInfo{
+                .queryType = vk::QueryType::eOcclusion,
+                .queryCount = kMaxDraws * kZones,
+            });
+            if (result == vk::Result::eSuccess) {
+                slot.pool = pool;
+            }
+        }
+        std::fprintf(stderr, "[wide] HUD elements: occlusion queries %s\n",
+                     st.slots[0].pool ? "ready" : "not available");
+    }
+    std::array<Slot*, kSlots> order{};
+    for (u32 i = 0; i < kSlots; ++i) {
+        order[i] = &st.slots[i];
+    }
+    std::sort(order.begin(), order.end(),
+              [](const Slot* a, const Slot* b) { return a->frame < b->frame; });
+    for (Slot* slot : order) {
+        if (slot->pending && scheduler.IsFree(slot->tick)) {
+            Apply(device, st, *slot);
+        }
+    }
+    st.current = (st.current + 1) % kSlots;
+    auto& slot = st.slots[st.current];
+    st.measuring = slot.pool && !slot.pending;
+    if (st.measuring) {
+        device.resetQueryPool(slot.pool, 0, kMaxDraws * kZones);
+        slot.ids.clear();
+        slot.keys.clear();
+        slot.issued.clear();
+        slot.frame = frame;
+    }
+    st.last_seen = std::move(st.seen);
+    st.seen.clear();
+    st.hud_area = double(rect.extent.width) * double(rect.extent.height);
+    st.counts = {};
+    st.overlay = false;
+}
+
+// Where a draw with its own scissor goes, from the scissor (fractions of the HUD).
+Place FromScissor(float x0, float x1, float y0, float y1, float slack = 0.005f) {
+    if (x1 - x0 >= 0.98f && y1 - y0 <= 0.20f && (y0 <= 0.01f || y1 >= 0.99f)) {
+        return Place::Bar;
+    }
+    // WIDE-049: the bottom left ends at 14% (was 17%): the tyre diagram's left tyres (about
+    // 18-19%, within the 2.5% slack of 17%) counted as the left side and went to the screen's
+    // edge, away from the rest of the diagram. The lap time ends at about 10%.
+    const float left = y1 <= 0.70f ? 0.30f : 0.14f;
+    // WIDE-040: the bottom right starts at 82% (was 80%): the overtake gauge's button icon
+    // (from about 78%) counted as the right side and went to the screen's edge, cut off from
+    // the gauge. The course map's panel starts at 83%.
+    const float right = y1 <= 0.70f ? 0.70f : 0.82f;
+    if (x1 <= left + slack) {
+        return Place::Left;
+    }
+    if (x0 >= right - slack) {
+        return Place::Right;
+    }
+    return Place::Middle;
+}
+} // namespace WideHud
+
+// WIDE-023/030: the 3D cameras of the wide menu screens (Home, the livery editor's car, helmet
+// and suit) widened where their matrices reach the GPU. A perspective (view-)projection matrix
+// has rows 0, 1 and 3 (x, y, w) perpendicular, with |row0| / |row1| = P00 / P11 = 9 / 16 for a
+// 16:9 view, whatever scale an object's own matrix adds (WIDE-030: |row3| is not required to be
+// 1, so per-object world-view-projection matrices count). Scaling row0 by 16:9 / the screen's
+// aspect widens the view to the screen's shape. The UI's matrices (w = 2000 x |row3|) and
+// anything not finite are left alone. found(offset in floats, rows, |row0|, |row1|, |row3|).
+template <typename Found>
+void FindCameraMatrices(const float* data, size_t count, Found&& found, float ratio = 0.5625f) {
+    for (size_t o = 0; o + 16 <= count; o += 4) {
+        const float* a = data + o;
+        bool finite = true;
+        for (int i = 0; i < 16; ++i) finite &= std::isfinite(a[i]);
+        if (!finite) continue;
+        for (const bool rows : {true, false}) {
+            const auto at = [&](int r, int c) { return rows ? a[r * 4 + c] : a[c * 4 + r]; };
+            const auto len = [&](int r) {
+                return std::sqrt(at(r, 0) * at(r, 0) + at(r, 1) * at(r, 1) + at(r, 2) * at(r, 2));
+            };
+            const auto dot = [&](int p, int q) {
+                return at(p, 0) * at(q, 0) + at(p, 1) * at(q, 1) + at(p, 2) * at(q, 2);
+            };
+            const float l0 = len(0), l1 = len(1), l3 = len(3);
+            if (!(l1 > 1e-6f) || !(l3 > 1e-6f) || std::abs(at(3, 3)) > 100.0f * l3) continue;
+            if (std::abs(l0 / l1 - ratio) > 1e-3f) continue;
+            if (std::abs(dot(0, 1)) > 2e-3f * l0 * l1 || std::abs(dot(0, 3)) > 2e-3f * l0 * l3 ||
+                std::abs(dot(1, 3)) > 2e-3f * l1 * l3) continue;
+            found(o, rows, l0, l1, l3);
+            break;
+        }
+    }
+}
+
+float WideFactor() {
+    static const float aspect = RytyDisplayAspect();
+    return aspect > 1.9f ? (16.0f / 9.0f) / aspect : 1.0f;
+}
+
+void LogWidened(const char* where, u64 hash, u64 offset, bool rows, float l0, float l1, float l3) {
+    static std::mutex mutex;
+    static std::unordered_set<u64> seen;
+    const u64 key = (hash << 20) ^ (offset << 2) ^ (rows ? 1 : 0) ^ (u64(where[0]) << 56) ^
+                    (u64(RytyGtsMenuScreen()) << 16);
+    std::scoped_lock lock{mutex};
+    if (seen.size() < 200 && seen.insert(key).second) {
+        std::fprintf(stderr, "[wide] WIDE-030 screen %d camera widened (%s): vs %#llx at +%llu "
+                     "(%s), |r0| %.3f |r1| %.3f |r3| %.3f\n", RytyGtsMenuScreen(), where,
+                     static_cast<unsigned long long>(hash), static_cast<unsigned long long>(offset),
+                     rows ? "rows" : "columns", l0, l1, l3);
+    }
+}
+
+// WIDE-031: the camera a vertex shader is given (in its flattened user data or its constant
+// buffers), without changing anything: 1 a 16:9 one, 2 one already as wide as the screen, 0 none.
+int CameraShape(const Shader::Info& vs) {
+    static const float wide_ratio = 1.0f / RytyDisplayAspect();
+    int shape = 0;
+    const auto look = [&](const float* data, size_t count) {
+        FindCameraMatrices(data, count, [&](size_t, bool, float, float, float) { shape = 1; });
+        if (shape == 0) {
+            FindCameraMatrices(data, count, [&](size_t, bool, float, float, float) { shape = 2; },
+                               wide_ratio);
+        }
+    };
+    if (vs.flattened_ud_buf.size() >= 16) {
+        static thread_local std::vector<float> f;
+        f.resize(vs.flattened_ud_buf.size());
+        std::memcpy(f.data(), vs.flattened_ud_buf.data(), f.size() * 4);
+        look(f.data(), f.size());
+        if (shape != 0) return shape;
+    }
+    static thread_local std::vector<float> m;
+    for (const auto& buffer : vs.buffers) {
+        if (buffer.IsSpecial() || buffer.is_written) continue;
+        const auto sharp = buffer.GetSharp(vs);
+        const u64 size = std::min<u64>(sharp.GetSize(), 64_KB) & ~u64(3);
+        if (!sharp.base_address || size < 64) continue;
+        m.resize(size / 4);
+        if (!Core::RytyMemory::GuardedCopy(m.data(), reinterpret_cast<const void*>(sharp.base_address),
+                                           size)) continue;
+        look(m.data(), m.size());
+        if (shape != 0) return shape;
+    }
+    return 0;
+}
+
+// The cameras in a vertex shader's constant buffers (up to 64 KB each), widened in guest memory;
+// the write is reported (note_write) so the GPU's copy of those bytes is refreshed.
+template <typename NoteWrite>
+void WidenCameraMatrices(const Shader::Info& vs, NoteWrite&& note_write) {
+    const float factor = WideFactor();
+    if (factor == 1.0f) return;
+    static thread_local std::vector<float> m;
+    for (const auto& buffer : vs.buffers) {
+        if (buffer.IsSpecial() || buffer.is_written) continue;
+        const auto sharp = buffer.GetSharp(vs);
+        const u64 size = std::min<u64>(sharp.GetSize(), 64_KB) & ~u64(3);
+        if (!sharp.base_address || size < 64) continue;
+        m.resize(size / 4);
+        if (!Core::RytyMemory::GuardedCopy(m.data(), reinterpret_cast<const void*>(sharp.base_address),
+                                           size)) continue;
+        FindCameraMatrices(m.data(), m.size(), [&](size_t o, bool rows, float l0, float l1, float l3) {
+            const VAddr address = sharp.base_address + u64(o) * 4;
+            note_write(address, 64); // opens the pages and notes the write
+            float* guest = reinterpret_cast<float*>(address);
+            MEMORY_BASIC_INFORMATION info{};
+            if (!VirtualQuery(guest, &info, sizeof(info)) ||
+                !(info.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))) {
+                static std::atomic<u32> refused{};
+                if (refused.fetch_add(1) < 5) {
+                    std::fprintf(stderr, "[wide] WIDE-030 camera matrix at %#llx not writable\n",
+                                 static_cast<unsigned long long>(address));
+                }
+                return;
+            }
+            for (int c = 0; c < 4; ++c) {
+                float v = (rows ? m[o + c] : m[o + c * 4]) * factor;
+                std::memcpy(rows ? &guest[c] : &guest[c * 4], &v, 4);
+            }
+            LogWidened("buffer", vs.pgm_hash, o * 4, rows, l0, l1, l3);
+        });
+    }
+}
+
+// WIDE-030: the same in a copy of a shader's flattened user data (constants the shader reads
+// through user data pointers, copied when the draw was set up).
+void WidenFlattened(u64 hash, u8* data, u32 size) {
+    const float factor = WideFactor();
+    if (factor == 1.0f || size < 64) return;
+    static thread_local std::vector<float> m;
+    m.resize(size / 4);
+    std::memcpy(m.data(), data, m.size() * 4);
+    FindCameraMatrices(m.data(), m.size(), [&](size_t o, bool rows, float l0, float l1, float l3) {
+        for (int c = 0; c < 4; ++c) {
+            const size_t i = rows ? o + c : o + c * 4;
+            const float v = m[i] * factor;
+            std::memcpy(data + i * 4, &v, 4);
+        }
+        LogWidened("flattened", hash, o * 4, rows, l0, l1, l3);
+    });
+}
+
+// WIDE-034: the cameras a 3D draw's vertex shader reads through its user data pointers. The
+// shader reads them from guest memory when it runs (the flattened copy, WIDE-030, is only the
+// command thread's record of them), so they are widened there: each 16:9 camera found in the
+// flattened copy is looked up (its 64 bytes, exactly) in the memory the user data points at,
+// and its row0 is scaled in place, the write reported (note_write) like a CPU write. Once
+// widened, later reads find no 16:9 camera there, so nothing is widened twice.
+template <typename NoteWrite>
+void WidenUserDataCameras(const Shader::Info& vs, NoteWrite&& note_write) {
+    const float factor = WideFactor();
+    const auto& flat = vs.flattened_ud_buf;
+    if (factor == 1.0f || flat.size() < 16) return;
+    static thread_local std::vector<float> f;
+    f.resize(flat.size());
+    std::memcpy(f.data(), flat.data(), f.size() * 4);
+    static thread_local std::vector<std::pair<size_t, bool>> found;
+    found.clear();
+    FindCameraMatrices(f.data(), f.size(), [&](size_t o, bool rows, float, float, float) {
+        found.emplace_back(o, rows);
+    });
+    if (found.empty()) return;
+    // WIDE-036: where each flattened dword came from, as the walker reads it again (the
+    // recorder's copy keeps no sources); each camera's row0 written at its own source addresses.
+    {
+        auto& info = const_cast<Shader::Info&>(vs);
+        static thread_local std::vector<u32> saved;
+        saved.assign(flat.begin(), flat.end());
+        info.RefreshFlatBuf();
+        const auto& src = info.flattened_ud_src;
+        info.flattened_ud_buf.assign(saved.begin(), saved.end());
+        bool all = !found.empty();
+        for (const auto& [o, rows] : found) {
+            bool written = false;
+            for (int c = 0; c < 4; ++c) {
+                const size_t i = rows ? o + size_t(c) : o + size_t(c) * 4;
+                const VAddr address = i < src.size() ? src[i] : 0;
+                if (address == 0) continue;
+                note_write(address, 4);
+                float* guest = reinterpret_cast<float*>(address);
+                MEMORY_BASIC_INFORMATION mem{};
+                if (VirtualQuery(guest, &mem, sizeof(mem)) &&
+                    (mem.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))) {
+                    const float v = f[i] * factor;
+                    std::memcpy(guest, &v, 4);
+                    written = true;
+                }
+            }
+            all &= written;
+            static std::mutex mutex;
+            static std::unordered_set<u64> seen;
+            std::scoped_lock lock{mutex};
+            if (seen.size() < 200 &&
+                seen.insert((vs.pgm_hash << 16) ^ (u64(o) << 2) ^ (written ? 1 : 0)).second) {
+                std::fprintf(stderr, "[wide] WIDE-036 screen %d vs %#llx (direct %d) flattened +%zu: "
+                             "%s\n", RytyGtsMenuScreen(), static_cast<unsigned long long>(vs.pgm_hash),
+                             int(vs.uses_direct), o * 4,
+                             written ? "widened at its source in memory"
+                                     : "no source address; searching memory");
+            }
+        }
+        if (all) return;
+    }
+    static thread_local std::vector<VAddr> pointers;
+    pointers.clear();
+    const auto add = [&](u32 lo, u32 hi) {
+        const VAddr p = (u64(hi) << 32) | lo;
+        if (hi != 0 && hi < 0x100 && (p & 3) == 0 &&
+            std::find(pointers.begin(), pointers.end(), p) == pointers.end()) {
+            pointers.push_back(p);
+        }
+    };
+    for (size_t i = 0; i + 1 < vs.user_data.size(); ++i) add(vs.user_data[i], vs.user_data[i + 1]);
+    for (size_t i = 0; i + 1 < std::min<size_t>(flat.size(), 64); ++i) add(flat[i], flat[i + 1]);
+    constexpr u64 Window = 16_KB;
+    static thread_local std::vector<u8> memory;
+    memory.resize(Window);
+    for (const auto& [o, rows] : found) {
+        const u8* pattern = reinterpret_cast<const u8*>(flat.data() + o);
+        bool done = false;
+        for (const VAddr p : pointers) {
+            for (u64 chunk = 0; chunk < Window && !done; chunk += 4_KB) {
+                const u64 bytes = std::min<u64>(4_KB + 64, Window - chunk + 64);
+                if (!Core::RytyMemory::GuardedCopy(memory.data(),
+                                                   reinterpret_cast<const void*>(p + chunk), bytes)) {
+                    break;
+                }
+                for (u64 at = 0; at + 64 <= bytes; at += 4) {
+                    if (std::memcmp(memory.data() + at, pattern, 64) != 0) continue;
+                    const VAddr address = p + chunk + at;
+                    note_write(address, 64);
+                    float* guest = reinterpret_cast<float*>(address);
+                    MEMORY_BASIC_INFORMATION info{};
+                    if (VirtualQuery(guest, &info, sizeof(info)) &&
+                        (info.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))) {
+                        for (int c = 0; c < 4; ++c) {
+                            const size_t i = rows ? size_t(c) : size_t(c) * 4;
+                            const float v = f[o + i] * factor;
+                            std::memcpy(&guest[i], &v, 4);
+                        }
+                        static std::mutex mutex;
+                        static std::unordered_set<u64> seen;
+                        std::scoped_lock lock{mutex};
+                        if (seen.size() < 200 &&
+                            seen.insert((vs.pgm_hash << 16) ^ (u64(o) << 2) ^
+                                        u64(RytyGtsMenuScreen())).second) {
+                            std::fprintf(stderr, "[wide] WIDE-034 screen %d camera widened in "
+                                         "memory: vs %#llx, flattened +%zu at %#llx\n",
+                                         RytyGtsMenuScreen(),
+                                         static_cast<unsigned long long>(vs.pgm_hash), o * 4,
+                                         static_cast<unsigned long long>(address));
+                        }
+                    }
+                    done = true;
+                    break;
+                }
+            }
+            if (done) break;
+        }
+        if (!done) {
+            static std::mutex mutex;
+            static std::unordered_set<u64> seen;
+            std::scoped_lock lock{mutex};
+            if (seen.size() < 100 && seen.insert((vs.pgm_hash << 16) ^ (u64(o) << 2)).second) {
+                std::fprintf(stderr, "[wide] WIDE-034 screen %d vs %#llx flattened +%zu: camera "
+                             "not found in memory (%zu pointers)\n", RytyGtsMenuScreen(),
+                             static_cast<unsigned long long>(vs.pgm_hash), o * 4, pointers.size());
+            }
+        }
+    }
+}
+
+
+// WIDE-010: where a HUD draw lands, from its geometry: the UI's vertex shaders place their
+// vertices (attribute 0, x y in pixels) with a matrix in their first constant buffer (clip =
+// M * (x, y, 0, 1), its third column 0 0 -1 -1). The vertices' bounding box in fractions of the
+// HUD (0..1 left to right, top to bottom), or nothing when the draw is not of that kind.
+std::optional<std::array<float, 4>> HudBounds(const GraphicsPipeline& pipeline,
+                                              const AmdGpu::Regs& regs, const Shader::Info& vs) {
+    std::array<float, 16> m{};
+    bool have = false;
+    for (const auto& buffer : vs.buffers) {
+        if (buffer.IsSpecial() || buffer.is_written) continue;
+        const auto sharp = buffer.GetSharp(vs);
+        if (!sharp.base_address || sharp.GetSize() < sizeof(m)) break;
+        have = Core::RytyMemory::GuardedCopy(m.data(),
+                                             reinterpret_cast<const void*>(sharp.base_address),
+                                             sizeof(m));
+        break;
+    }
+    if (!have || std::abs(m[10] + 1.0f) > 1e-3f || std::abs(m[11] + 1.0f) > 1e-3f ||
+        !(m[15] > 0.0f)) {
+        return std::nullopt;
+    }
+    VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+    VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+    VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
+    VertexInputs<AmdGpu::Buffer> guest;
+    pipeline.GetVertexInputs(attributes, bindings, divisors, guest, regs.vgt_instance_step_rate_0,
+                             regs.vgt_instance_step_rate_1);
+    const vk::VertexInputAttributeDescription2EXT* position = nullptr;
+    for (const auto& a : attributes) {
+        if (a.location == 0) position = &a;
+    }
+    if (!position || position->binding >= guest.size() ||
+        (position->format != vk::Format::eR32G32Sfloat &&
+         position->format != vk::Format::eR32G32B32Sfloat &&
+         position->format != vk::Format::eR32G32B32A32Sfloat)) {
+        return std::nullopt;
+    }
+    const auto& vb = guest[position->binding];
+    const u64 stride = vb.GetStride();
+    if (!vb.base_address || stride < 8 || stride > 128 || position->offset + 8 > stride) {
+        return std::nullopt;
+    }
+    const u64 count = std::min<u64>(vb.GetSize() / stride, 64);
+    if (count == 0) {
+        return std::nullopt;
+    }
+    std::vector<u8> bytes(count * stride);
+    if (!Core::RytyMemory::GuardedCopy(bytes.data(), reinterpret_cast<const void*>(vb.base_address),
+                                       bytes.size())) {
+        return std::nullopt;
+    }
+    float u0 = 1e9f, u1 = -1e9f, v0 = 1e9f, v1 = -1e9f;
+    for (u64 i = 0; i < count; ++i) {
+        float xy[2];
+        std::memcpy(xy, bytes.data() + i * stride + position->offset, sizeof(xy));
+        if (!std::isfinite(xy[0]) || !std::isfinite(xy[1])) continue;
+        const float cx = m[0] * xy[0] + m[4] * xy[1] + m[12];
+        const float cy = m[1] * xy[0] + m[5] * xy[1] + m[13];
+        const float cw = m[3] * xy[0] + m[7] * xy[1] + m[15];
+        if (!(std::abs(cw) > 1e-6f)) continue;
+        const float u = (cx / cw + 1.0f) * 0.5f, v = (1.0f - cy / cw) * 0.5f;
+        u0 = std::min(u0, u); u1 = std::max(u1, u);
+        v0 = std::min(v0, v); v1 = std::max(v1, v);
+    }
+    if (u1 < u0 || v1 < v0) {
+        return std::nullopt;
+    }
+    return std::array<float, 4>{u0, u1, v0, v1};
+}
+
+
 // The experimental scene leaves GT Sport's final composition T# at output size.
 // Resolve that one sampled view against a matching, already-rendered physical target.
 // False means a preparing worker must defer to the ordered recorder, where earlier
@@ -575,18 +1224,31 @@ bool MatchExperimentalCompositionTexture(AmdGpu::Image& sharp, const Shader::Inf
                                          Native::ImageRegistry& registry) {
     static const bool enabled = [] {
         const char* env = std::getenv("RYGT_EXPERIMENTAL_SCENE_VIEWPORT");
-        return env && std::strcmp(env, "1") == 0;
+        return (env && std::strcmp(env, "1") == 0) || RytyWideScene(); // WIDE-001
     }();
-    static const u32 scene_width = [] {
-        const char* value = std::getenv("RYGT_SCENE_WIDTH");
-        return value ? u32(std::strtoul(value, nullptr, 10)) : 960u;
-    }();
-    static const u32 scene_height = [] {
-        const char* value = std::getenv("RYGT_SCENE_HEIGHT");
-        return value ? u32(std::strtoul(value, nullptr, 10)) : 540u;
-    }();
-    if (scene_width < 320 || scene_width > 3840 || scene_height < 180 || scene_height > 2160 ||
+    static const u32 scene_width = RytySceneSize().width; // WIDE-001
+    static const u32 scene_height = RytySceneSize().height;
+    if (scene_width < 320 || scene_width > 7680 || scene_height < 180 || scene_height > 2160 ||
         (scene_width == 1920 && scene_height == 1080)) return true;
+    // WIDE-018: the colour selection's car flashed black every other frame. The game smooths
+    // it into one of two history images in turn; with the wide scene the second one is never
+    // made (its texture descriptor has address 0, likely the game's menu memory pool running
+    // out at 5120x1440), so on those turns the pass writes into the scene image itself and the
+    // copy that follows (5589ec47) read nothing. That copy now reads the scene image the pass
+    // just wrote.
+    if (sharp.Address() == 0 && stage.pgm_hash == 0x5589ec47 && sharp.width + 1 == scene_width &&
+        sharp.height + 1 == scene_height) {
+        // The copy reads the atlas then: on these turns it holds the car smoothed on the
+        // previous turn, laid out exactly as the copy expects (it reads it on the other turns).
+        if (const u64 history = g_taa_history.load(std::memory_order_relaxed)) {
+            sharp.base_address = history >> 8;
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 5) {
+                std::fprintf(stderr, "[wide] WIDE-018 missing history image read from the atlas %#llx\n",
+                             static_cast<unsigned long long>(history));
+            }
+        }
+    }
     if (enabled && IsSceneCompositionShader(stage.pgm_hash) && !resource.is_written && !resource.is_depth &&
         sharp.GetType() == AmdGpu::ImageType::Color2D && sharp.width + 1 == scene_width &&
         sharp.height + 1 == scene_height) {
@@ -601,13 +1263,36 @@ bool MatchExperimentalCompositionTexture(AmdGpu::Image& sharp, const Shader::Inf
         if (observed) RytyUpscalerStatus::ObserveScene(observed->info.size.width, observed->info.size.height);
     }
     const bool full_scene = sharp.width == 1919 && sharp.height == 1079;
+    if (stage.pgm_hash == 0xcc4e73c3 && !resource.is_written) {
+        // WIDE-013: only the scene's own image counts (the menus also compose other pictures,
+        // like the 500x500 one elsewhere, with this shader).
+        static std::atomic<u64> scene_address{0};
+        if (full_scene) {
+            scene_address.store(sharp.Address(), std::memory_order_relaxed);
+            g_menu_composition_full.store(true, std::memory_order_relaxed);
+        } else if (sharp.Address() == scene_address.load(std::memory_order_relaxed)) {
+            g_menu_composition_full.store(false, std::memory_order_relaxed);
+        }
+    }
     // This menu path builds sampled T# dimensions in 1080p logical coordinates.
     // Its scene setter already scales the viewport; repair only the sampled region,
     // and only after finding the known physical scene allocation below.
     const bool menu_region = stage.pgm_hash == 0xcc4e73c3 &&
         sharp.width < 1920 && sharp.height < 1080;
-    if (!enabled || !IsSceneCompositionShader(stage.pgm_hash) || resource.is_written || resource.is_depth ||
-        sharp.GetType() != AmdGpu::ImageType::Color2D || (!full_scene && !menu_region) ||
+    // WIDE-050: the replay renders its letterboxed picture as 1920x780 (DIAG-129) and the race
+    // composition reads that corner, which was not repaired: it showed the left half of the
+    // wide picture, enlarged. Scaled like the menus' regions (3840x780 of the 3840x1080 scene).
+    // WIDE-053: not only the composition: the replay's other passes (depth of field, motion
+    // blur) read the same 1920x780 corner of the scene and got a stale copy of memory instead
+    // of the rendered picture (TV and track cameras all blurred or grey). Any shader reading
+    // that corner is linked to the rendered scene the same way; only where a scene-sized
+    // rendered image sits at that address (found below), otherwise nothing changes.
+    const bool replay_region = sharp.width + 1 == 1920 &&
+        sharp.height + 1 < 1080 && sharp.height + 1 >= 540;
+    const bool scaled_region = menu_region || replay_region;
+    if (!enabled || (!IsSceneCompositionShader(stage.pgm_hash) && !replay_region) ||
+        resource.is_written || resource.is_depth ||
+        sharp.GetType() != AmdGpu::ImageType::Color2D || (!full_scene && !scaled_region) ||
         sharp.NumLevels() != 1 ||
         sharp.NumLayers() != 1 || sharp.base_level != 0) {
         return true;
@@ -623,13 +1308,23 @@ bool MatchExperimentalCompositionTexture(AmdGpu::Image& sharp, const Shader::Inf
     }, true);
     // Auxiliary menu textures are not scene regions. Leave them untouched when
     // there is no matching physical scene allocation at their address.
-    if (!target) return menu_region && !full_scene;
-    const auto extent = menu_region
-        ? ScaleSceneRegion(sharp.width + 1, sharp.height + 1, scene_width, scene_height)
-        : SceneRegionExtent{scene_width, scene_height};
+    if (!target) {
+        return scaled_region && !full_scene;
+    }
+    const u32 used_width = scene_width;
+    const auto extent = scaled_region
+        ? ScaleSceneRegion(sharp.width + 1, sharp.height + 1, used_width, scene_height)
+        : SceneRegionExtent{used_width, scene_height};
     const auto [width, height] = extent;
-    if (!width || !height || width > target->info.size.width || height > target->info.size.height)
+    if (!width || !height || width > target->info.size.width || height > target->info.size.height) {
         return false;
+    }
+    if (replay_region && stage.pgm_hash == 0xb33ec4df) {
+        g_letterbox_ms.store(GetTickCount64(), std::memory_order_relaxed); // WIDE-056
+    }
+    if (menu_region) {
+        g_menu_region_address.store(sharp.Address(), std::memory_order_relaxed); // WIDE-017
+    }
     // Keep the real tiled row pitch. ImageRegistry::PlaceOf links this corner crop
     // to the rendered target, rather than uploading a second interpretation of RAM.
     sharp.width = width - 1;
@@ -1025,7 +1720,10 @@ void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Ta
         valid = std::ranges::all_of(constants, [](float v) { return std::isfinite(v); }) &&
             std::abs(constants[14] - size.width * .5f) <= .01f &&
             std::abs(constants[15] + size.height * .5f) <= .01f &&
-            constants[16] == size.width && constants[17] == size.height &&
+            ((constants[16] == size.width && constants[17] == size.height) ||
+             // WIDE-062: with the wide scene the game leaves these two at 0 (the half-size pair
+             // above still matches); only that pair and the jitter are used by the capture.
+             (RytyWideScene() && constants[16] == 0.f && constants[17] == 0.f)) &&
             std::abs(constants[20] * constants[14]) <= 1.f &&
             std::abs(constants[21] * constants[15]) <= 1.f;
         break;
@@ -1096,6 +1794,7 @@ bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, const Targ
     r.temporalDlss.PrepareScene(now, TemporalImage(**scene));
     Begin();
     UiHires::Get().scale = 0.f;
+    fsr_wide_full = IsWideRaceComposition(fs->pgm_hash); // WIDE-001
     return true;
 }
 
@@ -1121,6 +1820,7 @@ void NativeRenderer::FinishNativeFsr(const Targets& targets) {
         [this](vk::Format) { return *fsr_composition->view; }, [] {}};
     const auto now = g_prepared_frames.load(std::memory_order_relaxed);
     if (r.temporalDlss.ResolveNativeComposition(now, scene, TemporalImage(*target))) {
+        SeedWideUi(*target, fsr_wide_full); // WIDE-001: the reconstruction at full size
         fsr_display_address = target->info.guest_address;
         fsr_display_frame = frame;
         fsr_display_backend = r.temporalDlss.BackendName();
@@ -4628,6 +5328,45 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GatherOnGpu(VAddr addr
     return std::pair{dst, u64{0}};
 }
 
+// WIDE-001: temporal DLSS reconstructed the composed scene at the output's size; the display
+// buffer only got a 1080p copy of it. That reconstruction becomes the proxy's picture (whole for a
+// race scene, else in the 16:9 middle), and the HUD then draws over it.
+void NativeRenderer::SeedWideUi(const Native::ImageEntry& target, bool full) {
+    if (!UiHires::Wide()) {
+        return;
+    }
+    auto& state = UiHires::Get();
+    std::scoped_lock lock{state.mutex};
+    const auto found = state.proxies.find(target.info.guest_address);
+    if (found == state.proxies.end() || found->second.size.width == 0 ||
+        found->second.phase != UiHires::Phase::Idle) {
+        return;
+    }
+    auto& proxy = found->second;
+    if (!UiHires::CreateImages(r.instance, proxy, target.info.pixel_format)) {
+        proxy.phase = UiHires::Phase::Off;
+        return;
+    }
+    r.scheduler.EndRendering();
+    const vk::CommandBuffer cmd = r.scheduler.DirectCommandBuffer();
+    UiHires::ClearProxyForBlit(cmd, proxy);
+    const vk::Rect2D rect = full ? vk::Rect2D{{0, 0}, proxy.size} : UiHires::UiRect(proxy);
+    const bool seeded = r.temporalDlss.BlitOutputInto(proxy.image, rect);
+    UiHires::ProxyBarrier(cmd, proxy, vk::ImageLayout::eGeneral, UiHires::DrawStages,
+                          UiHires::DrawAccess);
+    if (!seeded) {
+        return; // the next draw takes the display buffer's copy (UpscaleNative)
+    }
+    UiHires::ClearUiLayer(cmd, proxy);
+    proxy.dlss_used = true;
+    proxy.full = full;
+    proxy.phase = UiHires::Phase::Ui;
+    // A race picture is wider than what the display buffer got: reads take the 16:9 middle.
+    UiHires::MarkStale(proxy, full);
+    LogWide(full ? "race picture: DLSS reconstruction at the full output size"
+                 : "menu picture: DLSS reconstruction in the 16:9 middle");
+}
+
 void NativeRenderer::ResolveUiDisplay(VAddr address, bool keep) {
     auto& state = UiHires::Get();
     std::scoped_lock lock{state.mutex};
@@ -4724,6 +5463,8 @@ void NativeRenderer::SyncUiRange(VAddr address, u64 size, bool keep) {
 bool NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& pipeline) {
     auto& state = UiHires::Get();
     state.scale = 0.f;
+    hud_spread = false;
+    menu_ui = false;
     const bool ui_layer = pipeline.GetGraphicsKey().color_buffers[0].hdr_ui_layer;
     if (!UiHires::Enabled()) {
         return !ui_layer;
@@ -4758,9 +5499,22 @@ bool NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
             }
             return !ui_layer;
         }
+        // WIDE-001: the race's composition draws straight into the proxy, filling it.
+        bool full = false;
         if (!ui_layer && proxy.phase == UiHires::Phase::Idle) {
-            proxy.phase = UiHires::Phase::Scene;
-            return true;
+            const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
+            if (fs && IsWideRaceComposition(fs->pgm_hash) &&
+                UiHires::CreateImages(r.instance, proxy, targets.color_formats[cb])) {
+                Splice();
+                r.scheduler.EndRendering();
+                UiHires::StartWithoutScene(r.scheduler, proxy);
+                proxy.full = true;
+                full = true;
+                LogWide("race picture: composed at the full output size");
+            } else {
+                proxy.phase = UiHires::Phase::Scene;
+                return true;
+            }
         }
         if (proxy.phase != UiHires::Phase::Ui) {
             if (!UiHires::CreateImages(r.instance, proxy, targets.color_formats[cb])) {
@@ -4800,7 +5554,50 @@ bool NativeRenderer::PrepareUiTarget(Targets& targets, const GraphicsPipeline& p
         targets.state.height = proxy.size.height;
         proxy.ui_used |= ui_layer;
         UiHires::MarkStale(proxy, true);
-        state.scale = float(proxy.size.width) / proxy.native.width;
+        UiHires::SetMapping(state, proxy, full); // WIDE-001: the HUD in the 16:9 middle
+        // WIDE-008: while the race camera runs (driving, paused, in the pits) the HUD's side
+        // elements go to the screen's edges; what is in the middle stays. The screens before
+        // the start and the results keep their layout.
+        // WIDE-014: only once the race camera has run for a moment, so the pre-race screen
+        // fading out over the first race frames keeps its layout.
+        static std::atomic<u64> race_view_since{0};
+        bool race_view_settled = false;
+        if (Ryty::Camera::RaceViewActive()) {
+            const u64 now = GetTickCount64();
+            u64 since = race_view_since.load(std::memory_order_relaxed);
+            if (since == 0) {
+                race_view_since.store(now, std::memory_order_relaxed);
+                since = now;
+            }
+            race_view_settled = now - since >= 400;
+        } else {
+            race_view_since.store(0, std::memory_order_relaxed);
+        }
+        // WIDE-051: a replay's TV and track cameras spread the HUD too, like its driving cameras
+        // (the replay is known from those; it ends with the race session).
+        if (!RytyGtsRaceSession()) {
+            Ryty::Camera::EndReplay();
+        }
+        // WIDE-056: and only while the replay's letterboxed picture is on screen: the pre-race
+        // screen after a replay (same race session) was spread too.
+        const bool replay_any_camera =
+            Ryty::Camera::ReplayOn() && RytyGtsRaceSession() &&
+            GetTickCount64() - g_letterbox_ms.load(std::memory_order_relaxed) < 1000;
+        // RACE-002: once the race has ended the results keep their 16:9 layout.
+        if (!full && UiHires::Wide() && RytyHudSpread() &&
+            (race_view_settled || replay_any_camera) && !Ryty::Camera::RaceFinished()) {
+            hud_spread = true; // WIDE-005
+            WideHud::passes = state.frames;
+            hud_rect = UiHires::UiRect(proxy);
+            proxy.spread = true;
+        } else if (!full && UiHires::Wide() && proxy.phase == UiHires::Phase::Ui &&
+                   !RytyGtsRaceSession()) {
+            menu_ui = true; // WIDE-019
+            WideHud::menu_frame = state.frames; // WIDE-025
+            hud_rect = UiHires::UiRect(proxy);
+            hud_image = ui_layer ? vk::Image{} : vk::Image{proxy.image};
+            hud_size = proxy.size;
+        }
         if (++ui_draws == 1) {
             LOG_INFO(Render_Vulkan,
                      "Native UI: drawing {}x{} over a {}x{} scene; DLSS {}, HDR layer {}",
@@ -5244,6 +6041,9 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                 if (size != 0) {
                     const auto [buffer, offset, data] = Allocate(size, alignment);
                     std::memcpy(data, stage.flattened_ud_buf.data(), size);
+                    if (widen_flat && stage.sw_stage == Shader::SwStage::Vertex) {
+                        WidenFlattened(stage.pgm_hash, reinterpret_cast<u8*>(data), size); // WIDE-030
+                    }
                     info = {buffer, offset, size};
                 }
                 break;
@@ -7450,11 +8250,64 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     if (r.FrameDumpActive() || Rasterizer::ExposureLogOn()) {
         r.FrameDumpPass(regs, targets.state, pipeline); // NAT-117
     }
+    // WIDE-031: the menus' 3D scenes (Home, the livery editor's car, helmet and suit) shot wide.
+    // Their cameras are 16:9 and the scene is the screen's shape, so the picture came out
+    // stretched. Changing the camera's numbers (WIDE-023..030) did not reach the GPU's draws
+    // reliably; instead each 3D draw into the scene is drawn into a viewport narrowed around its
+    // centre by 16:9 / the screen's aspect, which is the same as a camera that wide. A 3D draw:
+    // into the scene's depth buffer (its size) with more than 6 vertices.
+    widen_flat = false;
+    widen_3d = false;
+    if (targets.depth && RytyWideViews() &&
+        (RytyGtsMenuScreen() == 2 || RytyGtsMenuScreen() == 3)) {
+        static const auto scene = RytySceneSize();
+        const auto& depth_size = targets.depth->info.size;
+        const auto* vs = pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
+        if (vs && depth_size.width == scene.width && depth_size.height == scene.height &&
+            WideFactor() != 1.0f) {
+            const int shape = CameraShape(*vs);
+            // WIDE-034: the narrowed viewport (WIDE-031) clipped everything outside the middle
+            // (black sides); the cameras themselves are widened instead, where the shader reads
+            // them: in guest memory (its constant buffers and what its user data points at) and
+            // in the flattened copy the bindings are made from (here, not the job thread's).
+            widen_3d = false;
+            // WIDE-037: off. None of WIDE-023..036 changed what the menus' 3D views show (the
+            // cameras the GPU draws with are not these copies); widening some of them only
+            // broke the pictures (black lines, smears, wings). Home and the livery editor are
+            // back to their stretched pictures until the cameras are widened where the game
+            // sets them up.
+            constexpr bool widen_menu_cameras = false;
+            if (widen_menu_cameras && shape == 1) {
+                const auto note = [this](VAddr address, u64 size) {
+                    OnCpuWrite(address, size, size);
+                };
+                WidenUserDataCameras(*vs, note);
+                WidenCameraMatrices(*vs, note);
+                widen_flat = true;
+            }
+            static std::mutex mutex;
+            static std::unordered_set<u64> seen;
+            const auto* fs_stage = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+            const u64 key = (vs->pgm_hash << 8) ^ (fs_stage ? fs_stage->pgm_hash : 0) ^
+                            (u64(widen_3d) << 63) ^ (u64(RytyGtsMenuScreen()) << 60) ^
+                            (u64(shape) << 56);
+            std::scoped_lock lock{mutex};
+            if (seen.size() < 400 && seen.insert(key).second) {
+                std::fprintf(stderr, "[wide] WIDE-031 screen %d vs %#llx fs %#llx %u vertices, "
+                             "camera %s: %s\n", RytyGtsMenuScreen(),
+                             static_cast<unsigned long long>(vs->pgm_hash),
+                             static_cast<unsigned long long>(fs_stage ? fs_stage->pgm_hash : 0),
+                             u32(regs.num_indices),
+                             shape == 1 ? "16:9" : shape == 2 ? "already wide" : "none found",
+                             widen_flat ? "camera widened" : "as the game drew it");
+            }
+        }
+    }
     // OPT-010: the bindings the job thread worked out ahead, when they hold.
     bool from_prepared = false;
     bool buffer_freshness_certified = false;
     u64 buffer_freshness_seq = 0;
-    if (prepared) {
+    if (prepared && !widen_flat) {
         PhaseClock clock{stats.phase_ns[2]};
         from_prepared = CommitPrepared(*prepared, *pipeline, regs, trusted);
         if (from_prepared) {
@@ -8706,7 +9559,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         }
         // A streaming reservation covers each descriptor snapshot before its
         // immutable slot becomes visible to the recording worker.
-        const bool eligible=!pipeline->UsesShaderObjects() && descriptor_safe && parallel_descriptor_bytes<=
+        // WIDE-008/031/060: the 32:9 draws set their own viewports and scissors around the
+        // draw (record_wide_draw), which a worker's captured draw does not replay.
+        const bool wide_draw=hud_spread || widen_3d || widen_flat || RytyGtsPhotoMode();
+        const bool eligible=!wide_draw && !pipeline->UsesShaderObjects() && descriptor_safe && parallel_descriptor_bytes<=
             Native::Parallel::PassCoordinator::StreamDescriptorBytesPerDraw;
         if(eligible) {NATIVE_DIAGNOSTIC(++parallel->eligible);
             if(parallel->active)NATIVE_DIAGNOSTIC(++parallel->eligible_in_active_scope);
@@ -8906,6 +9762,35 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             s.dynamic.SetViewports(viewports);
             s.dynamic.SetScissors(scissors);
         }
+        // WIDE-017: the colour selection's car takes turns between two pictures: every other
+        // frame its smoothing pass (184b619c) writes it beside the interior's place (an atlas), and
+        // what the game then shows from that turn comes out black in the wide scene. Note, per
+        // picture width, whether its latest smoothing pass was such a turn; the menu box keeps
+        // its previous picture then (RefreshSources).
+        if (!Ryty::Camera::RaceViewActive() && targets.colors[0] &&
+            !s.dynamic.viewports.empty()) {
+            const auto* frag = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+            static const auto scene = RytySceneSize();
+            const auto& info = targets.colors[0]->info;
+            if (frag && frag->pgm_hash == 0x184b619c && scene.width > 1920 &&
+                info.size.width == scene.width && info.size.height == scene.height &&
+                info.pixel_format == vk::Format::eB10G11R11UfloatPack32) {
+                g_taa_in_place.store(info.guest_address, std::memory_order_relaxed); // WIDE-018
+            }
+            if (frag && frag->pgm_hash == 0x184b619c && scene.width > 1920 &&
+                info.size.width == scene.width && info.size.height == scene.height &&
+                info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
+                g_taa_history.store(info.guest_address, std::memory_order_relaxed); // WIDE-018
+            }
+            if (frag && frag->pgm_hash == 0x184b619c && scene.width > 1920 &&
+                info.size.width == scene.width && info.size.height == scene.height) {
+                NoteAtlasTurn(u32(std::lround(s.dynamic.viewports[0].width)),
+                              s.dynamic.viewports[0].x > 0.5f,
+                              info.pixel_format == vk::Format::eB10G11R11UfloatPack32
+                                  ? 0
+                                  : s32(std::lround(s.dynamic.viewports[0].x)));
+            }
+        }
         if(!parallel_draw) s.dynamic.Commit(r.instance, CmdBuf{s.cmd});
         Rasterizer::t_dynamic_state = saved;
     }
@@ -9067,7 +9952,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                                vs_hash, fs_hash, count);
             });
         }
-        const auto record_draw = [&] {
+        // WIDE-008/031/060: the draw is split from its preparation, so the 32:9 paths can
+        // issue it with their own viewports and scissors (several times for a split HUD element).
+        const auto prepare_draw = [&] {
         retired_pipeline_owners.Hold(pipeline_owner);
         if (depth_snapshot) {
             // Preparation may splice after the copy. Retain the image again in
@@ -9075,6 +9962,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             Native::ReserveAdditional(s.writeback_plan_leases, 1);
             s.writeback_plan_leases.push_back(depth_snapshot);
         }
+        };
+        const auto issue = [&] {
         if (quad_triangles) {
             if (index_count != 0) {
                 cmdbuf.drawIndexed(index_count, instances, 0, s32(vertex_offset),
@@ -9086,6 +9975,272 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         } else {
             cmdbuf.draw(regs.num_indices, instances, vertex_offset, instance_offset);
         }
+        };
+        const auto record_draw = [&] {
+            prepare_draw();
+            issue();
+        };
+        const auto record_wide_draw = [&] {
+            prepare_draw();
+            // WIDE-060: photo mode's settings pages show the camera's picture in a box (1380x946 of
+            // the 16:9 page). In the race session the camera is widened, so the picture in the box
+            // was squeezed sideways. Drawn twice as wide around the box's centre, its scissor keeping
+            // it inside the box, it shows the middle of the picture at its proper shape.
+            const bool photo_box = fs && fs->pgm_hash == 0xcc4e73c3 && RytyGtsPhotoMode() &&
+                                   !s.dynamic.viewports.empty() && targets.colors[0] &&
+                                   UiHires::KnownAddress(targets.colors[0]->info.guest_address) &&
+                                   std::abs(s.dynamic.viewports[0].width) < 1900.0f;
+            if (photo_box) {
+                const auto viewports = s.dynamic.viewports;
+                auto vps = viewports;
+                for (auto& v : vps) {
+                    const float centre = v.x + v.width * 0.5f;
+                    v.width *= 2.0f;
+                    v.x = centre - v.width * 0.5f;
+                }
+                s.cmd.setViewportWithCount(vk::ArrayProxy<const vk::Viewport>(u32(vps.size()), vps.data()));
+                issue();
+                s.cmd.setViewportWithCount(vk::ArrayProxy<const vk::Viewport>(u32(viewports.size()), viewports.data()));
+            } else if (hud_spread && !s.dynamic.viewports.empty() &&
+                s.dynamic.viewports.size() == s.dynamic.scissors.size()) {
+                // WIDE-008: where the element goes (WideHud), then drawn there.
+                const auto viewports = s.dynamic.viewports;
+                const auto scissors = s.dynamic.scissors;
+                auto& hud = WideHud::Get();
+                std::scoped_lock hud_lock{hud.mutex};
+                WideHud::BeginFrame(r.instance, r.scheduler, hud, WideHud::passes, hud_rect);
+                const float hx = float(hud_rect.offset.x), hy = float(hud_rect.offset.y);
+                const float w = float(hud_rect.extent.width), h = float(hud_rect.extent.height);
+                const auto& sc0 = scissors[0];
+                const float fx0 = std::max(0.0f, (float(sc0.offset.x) - hx) / w);
+                const float fx1 = std::min(1.0f, (float(sc0.offset.x + s32(sc0.extent.width)) - hx) / w);
+                const float fy0 = std::max(0.0f, (float(sc0.offset.y) - hy) / h);
+                const float fy1 = std::min(1.0f, (float(sc0.offset.y + s32(sc0.extent.height)) - hy) / h);
+                const bool whole_hud = fx0 <= 0.002f && fx1 >= 0.998f && fy0 <= 0.002f && fy1 >= 0.998f;
+                WideHud::Place place = WideHud::Place::Split;
+                u64 key = 0, id = 0;
+                float item_y0 = -1.0f; // WIDE-055: top of an element placed on its own
+                // WIDE-010: from the geometry where it can be read (the scissor still clips it).
+                std::optional<std::array<float, 4>> bounds;
+                if (fx1 > fx0 && fy1 > fy0) {
+                    bounds = HudBounds(*pipeline, regs, vs_info);
+                }
+                if (bounds) {
+                    const auto [u0, u1, v0, v1] = *bounds;
+                    const float bx0 = std::max(u0, fx0), bx1 = std::min(u1, fx1);
+                    const float by0 = std::max(v0, fy0), by1 = std::min(v1, fy1);
+                    item_y0 = by0;
+                    if (bx1 <= bx0 || by1 <= by0) {
+                        place = WideHud::Place::Middle; // off the HUD: as the game drew it
+                    } else if (bx0 <= 0.01f && bx1 >= 0.99f && by0 <= 0.01f && by1 >= 0.99f) {
+                        place = WideHud::Place::Fill;
+                    } else {
+                        // A panel reaching a little past its side's edge still belongs to it.
+                        place = WideHud::FromScissor(bx0, bx1, by0, by1, 0.025f);
+                    }
+                } else if (!whole_hud) {
+                    item_y0 = fy0;
+                    place = fx1 > fx0 && fy1 > fy0 ? WideHud::FromScissor(fx0, fx1, fy0, fy1)
+                                                   : WideHud::Place::Bar; // outside the HUD
+                } else if (fs && IsSceneCompositionShader(fs->pgm_hash)) {
+                    // WIDE-038: a 3D scene composed in the HUD's pass (the results screen's driver)
+                    // covers the whole screen: always a fill, so what is drawn over it stays whole.
+                    // Its place was worked out frame by frame (whole-screen draws without readable
+                    // geometry) and came out "fill" in some frames and "split" in others, so the
+                    // results screen flickered between its 16:9 layout and one spread to the edges.
+                    place = WideHud::Place::Fill;
+                } else {
+                    key = (u64(vs_info.pgm_hash) << 32) ^ u64(fs ? fs->pgm_hash : 0) ^
+                          (u64(regs.num_indices) << 20);
+                    const u32 nth = hud.seen[key]++;
+                    id = key ^ (u64(nth + 1) * 0x9e3779b97f4a7c15ull);
+                    if (const auto found = hud.verdicts.find(id); found != hud.verdicts.end()) {
+                        const auto last = hud.last_seen.find(key);
+                        if (last != hud.last_seen.end() && last->second == found->second.equals) {
+                            place = found->second.place;
+                        }
+                    }
+                }
+                // WIDE-012: what is drawn over a whole-screen darkening (the pause menu, its cursor)
+                // stays whole in the middle, where the game expects it.
+                if (place == WideHud::Place::Fill) {
+                    hud.overlay = true;
+                } else if (hud.overlay && place != WideHud::Place::Bar) {
+                    place = WideHud::Place::Middle;
+                }
+                // WIDE-055: the replay's control bar (bottom 16%: the camera hint, lap time, buttons,
+                // progress line, exit) stays whole in the middle: spread, its pieces landed apart
+                // (the hint's last letters, the restart button, the exit sign).
+                if (Ryty::Camera::ReplayOn() && item_y0 >= 0.84f &&
+                    (place == WideHud::Place::Left || place == WideHud::Place::Right)) {
+                    place = WideHud::Place::Middle;
+                }
+                ++hud.counts[u32(place)];
+                const s32 shift = hud_rect.offset.x;
+                if (place == WideHud::Place::Left || place == WideHud::Place::Middle ||
+                    place == WideHud::Place::Right) {
+                    // Whole, on its side (clipped to the HUD as before).
+                    const s32 dx = place == WideHud::Place::Left    ? -shift
+                                 : place == WideHud::Place::Right ? shift
+                                                                   : 0;
+                    auto vps = viewports;
+                    auto scs = scissors;
+                    bool any = false;
+                    for (size_t i = 0; i < scs.size(); ++i) {
+                        const s32 x0 = std::max<s32>(scs[i].offset.x, hud_rect.offset.x);
+                        const s32 y0 = std::max<s32>(scs[i].offset.y, hud_rect.offset.y);
+                        const s32 x1 = std::min<s32>(scs[i].offset.x + s32(scs[i].extent.width),
+                                                     hud_rect.offset.x + s32(hud_rect.extent.width));
+                        const s32 y1 = std::min<s32>(scs[i].offset.y + s32(scs[i].extent.height),
+                                                     hud_rect.offset.y + s32(hud_rect.extent.height));
+                        if (x1 <= x0 || y1 <= y0) {
+                            scs[i] = vk::Rect2D{{0, 0}, {0, 0}};
+                            continue;
+                        }
+                        any = true;
+                        scs[i] = vk::Rect2D{{std::max<s32>(x0 + dx, 0), y0},
+                                            {u32(x1 - x0), u32(y1 - y0)}};
+                        vps[i].x += float(dx);
+                    }
+                    if (any) {
+                        s.cmd.setViewportWithCount(vk::ArrayProxy<const vk::Viewport>(u32(vps.size()), vps.data()));
+                        s.cmd.setScissorWithCount(vk::ArrayProxy<const vk::Rect2D>(u32(scs.size()), scs.data()));
+                        issue();
+                    }
+                } else if (place == WideHud::Place::Fill) {
+                    // Over the whole screen: the HUD's width stretched to the output's.
+                    const float k = float(2 * hud_rect.offset.x + s32(hud_rect.extent.width)) / w;
+                    // WIDE-039: a 16:9 copy of the screen (the time trial results' blurred backdrop)
+                    // is enlarged evenly instead, so it keeps its proportions; its top and bottom
+                    // fall off the screen. The scene's own picture is wide and still stretched.
+                    bool screen_copy = false, scene_picture = false;
+                    {
+                        static const auto scene = RytySceneSize();
+                        for (const auto* e : b.sampled) {
+                            if (!e) continue;
+                            const auto& size = e->info.size;
+                            if ((size.width == scene.width && size.height == scene.height) ||
+                                (size.width == 3840 && size.height == 2160)) {
+                                scene_picture = true;
+                            } else if (size.width >= 900 && e->from_cpu &&
+                                       size.width * 9 >= size.height * 15 &&
+                                       size.width * 9 <= size.height * 17) {
+                                std::scoped_lock sources_lock{
+                                    const_cast<Native::ImageEntry*>(e)->sources_mutex};
+                                screen_copy |= !e->sources.empty();
+                            }
+                        }
+                    }
+                    const bool even = screen_copy && !scene_picture;
+                    if (even) {
+                        static std::atomic<u32> logged{};
+                        if (logged.fetch_add(1, std::memory_order_relaxed) < 3) {
+                            std::fprintf(stderr, "[wide] WIDE-048 screen copy backdrop not drawn "
+                                                 "(fs %#llx)\n",
+                                         static_cast<unsigned long long>(fs ? fs->pgm_hash : 0));
+                        }
+                    }
+                    const float cy = hy + h * 0.5f;
+                    if (even) {
+                        // WIDE-048: during the race that copy is the pause menus' backdrop (Driving
+                        // Options, the replay's save question): the game's 16:9 copy of the screen,
+                        // made from the widened picture, so it showed two mismatched views
+                        // (WIDE-039 enlarged it, WIDE-046 kept it 16:9 with black sides). It is not
+                        // drawn: the race picture stays behind the menu, as with the pause menu.
+                    } else {
+                    auto vps = viewports;
+                    auto scs = scissors;
+                    for (size_t i = 0; i < scs.size(); ++i) {
+                        vps[i].x = (vps[i].x - hx) * k;
+                        vps[i].width *= k;
+                        if (even) {
+                            vps[i].y = cy + (vps[i].y - cy) * k;
+                            vps[i].height *= k;
+                        }
+                        scs[i] = vk::Rect2D{{0, scs[i].offset.y},
+                                            {u32(2 * hud_rect.offset.x) + hud_rect.extent.width,
+                                             scs[i].extent.height}};
+                    }
+                    s.cmd.setViewportWithCount(vk::ArrayProxy<const vk::Viewport>(u32(vps.size()), vps.data()));
+                    s.cmd.setScissorWithCount(vk::ArrayProxy<const vk::Rect2D>(u32(scs.size()), scs.data()));
+                    issue();
+                    } // WIDE-046
+                } else if (place == WideHud::Place::Split) {
+                    // Once per zone, each part moved with its zone, its pixels counted.
+                    auto& slot = hud.slots[hud.current];
+                    s32 ordinal = -1;
+                    if (whole_hud && hud.measuring && slot.ids.size() < WideHud::kMaxDraws) {
+                        ordinal = s32(slot.ids.size());
+                        slot.ids.push_back(id);
+                        slot.keys.push_back(key);
+                        slot.issued.push_back(0);
+                    }
+                    for (u32 z = 0; z < WideHud::kZones; ++z) {
+                        const auto& zone = WideHud::Zones[z];
+                        const s32 px0 = hud_rect.offset.x + s32(std::lround(zone.u0 * w));
+                        const s32 px1 = hud_rect.offset.x + s32(std::lround(zone.u1 * w));
+                        const s32 py0 = hud_rect.offset.y + s32(std::lround(zone.v0 * h));
+                        const s32 py1 = hud_rect.offset.y + s32(std::lround(zone.v1 * h));
+                        const s32 dx = zone.side * shift;
+                        auto vps = viewports;
+                        auto scs = scissors;
+                        bool any = false;
+                        for (size_t i = 0; i < scs.size(); ++i) {
+                            const s32 x0 = std::max<s32>(scs[i].offset.x, px0);
+                            const s32 y0 = std::max<s32>(scs[i].offset.y, py0);
+                            const s32 x1 =
+                                std::min<s32>(scs[i].offset.x + s32(scs[i].extent.width), px1);
+                            const s32 y1 =
+                                std::min<s32>(scs[i].offset.y + s32(scs[i].extent.height), py1);
+                            if (x1 <= x0 || y1 <= y0) {
+                                scs[i] = vk::Rect2D{{0, 0}, {0, 0}};
+                                continue;
+                            }
+                            any = true;
+                            scs[i] = vk::Rect2D{{std::max<s32>(x0 + dx, 0), y0},
+                                                {u32(x1 - x0), u32(y1 - y0)}};
+                            vps[i].x += float(dx);
+                        }
+                        if (!any) {
+                            continue;
+                        }
+                        s.cmd.setViewportWithCount(vk::ArrayProxy<const vk::Viewport>(u32(vps.size()), vps.data()));
+                        s.cmd.setScissorWithCount(vk::ArrayProxy<const vk::Rect2D>(u32(scs.size()), scs.data()));
+                        if (ordinal >= 0) {
+                            const vk::QueryPool pool = slot.pool;
+                            const u32 query = u32(ordinal) * WideHud::kZones + z;
+                            s.cmd.Invoke([=](vk::CommandBuffer cmd) { cmd.beginQuery(pool, query, {}); });
+                            issue();
+                            s.cmd.Invoke([=](vk::CommandBuffer cmd) { cmd.endQuery(pool, query); });
+                            slot.issued[ordinal] |= u16(1u << z);
+                        } else {
+                            issue();
+                        }
+                    }
+                }
+                // Back to what the dynamic state cache recorded.
+                s.cmd.setViewportWithCount(vk::ArrayProxy<const vk::Viewport>(u32(viewports.size()), viewports.data()));
+                s.cmd.setScissorWithCount(vk::ArrayProxy<const vk::Rect2D>(u32(scissors.size()), scissors.data()));
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) == 0) {
+                    std::fprintf(stderr, "[wide] race HUD spread to the screen's edges\n");
+                }
+            } else if (widen_3d && !s.dynamic.viewports.empty()) {
+                // WIDE-031: the 3D draw narrowed around its viewport's centre.
+                const auto viewports = s.dynamic.viewports;
+                auto vps = viewports;
+                const float factor = WideFactor();
+                for (auto& v : vps) {
+                    const float centre = v.x + v.width * 0.5f;
+                    v.width *= factor;
+                    v.x = centre - v.width * 0.5f;
+                }
+                s.cmd.setViewportWithCount(vk::ArrayProxy<const vk::Viewport>(u32(vps.size()), vps.data()));
+                issue();
+                s.cmd.setViewportWithCount(vk::ArrayProxy<const vk::Viewport>(u32(viewports.size()), viewports.data()));
+            } else {
+                issue();
+            }
         };
         bool lds_used = false;
         bool lds_deferred = false;
@@ -9184,7 +10339,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 BindGraphics(s, *pipeline, pipeline_owner);
                 PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
             }
-            record_draw();
+            record_wide_draw(); // WIDE-008/031/060
         }
         if (lds_used) {
             s.cmd.pushConstants(pipeline->GetLayout(), AllGraphicsStageBits,
@@ -12956,6 +14111,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     Splice();
     Display display{vk::Image{Handle<VkImage_T>(source->image->NativeHandle())}, view,
                     source->info.size.width, source->info.size.height};
+    r.scheduler.EndRendering(); // WIDE-042: TakeFrame may blit
 #ifndef NDEBUG
     display.capture_format = static_cast<vk::Format>(source->image->Desc().format);
     display.capture_transfer_src =
@@ -12963,11 +14119,14 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
 #endif
     if (const auto shown =
             UiHires::TakeFrame(r.instance, r.scheduler.DirectCommandBuffer(), info.guest_address,
-                               {display.width, display.height}, output_size, view_format)) {
+                               {display.width, display.height}, output_size, view_format,
+                               display.image, vk::ImageLayout::eGeneral)) {
         display.output_view = shown->view;
         display.ui_layer = shown->ui;
         display.output_size = shown->size;
         display.dlss_scaled = shown->dlss;
+        display.side_x0 = shown->side_x0;
+        display.side_x1 = shown->side_x1;
     }
     if (!fsr_display_backend.empty()) {
         static u32 fsr_present_logged{};

@@ -558,6 +558,27 @@ bool GtsDlssPass::ResolveNativeComposition(u64 frame, GtsSceneImage scene,
     return true;
 }
 
+bool GtsDlssPass::BlitOutputInto(vk::Image dst, vk::Rect2D rect) {
+    if (failed || !static_cast<vk::Image>(native.image) || !outputSize.width ||
+        !outputSize.height || !rect.extent.width || !rect.extent.height) {
+        return false;
+    }
+    scheduler.EndRendering();
+    transit(native, vk::ImageLayout::eTransferSrcOptimal);
+    vk::ImageBlit blit{};
+    blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+    blit.dstSubresource = blit.srcSubresource;
+    blit.srcOffsets[1] = vk::Offset3D{s32(outputSize.width), s32(outputSize.height), 1};
+    blit.dstOffsets[0] = vk::Offset3D{rect.offset.x, rect.offset.y, 0};
+    blit.dstOffsets[1] = vk::Offset3D{rect.offset.x + s32(rect.extent.width),
+                                      rect.offset.y + s32(rect.extent.height), 1};
+    const bool same = rect.extent == outputSize;
+    scheduler.DirectCommandBuffer().blitImage(native.image, vk::ImageLayout::eTransferSrcOptimal,
+        dst, vk::ImageLayout::eTransferDstOptimal, blit,
+        same ? vk::Filter::eNearest : vk::Filter::eLinear);
+    return true;
+}
+
 bool GtsDlssPass::isActive(u64 frame, u64 uid) const {
     return !failed && uid && uid == displayUid && frame == outputFrame;
 }

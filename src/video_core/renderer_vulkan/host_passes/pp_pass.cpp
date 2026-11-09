@@ -15,6 +15,7 @@
 #endif
 
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -26,9 +27,13 @@ namespace {
 struct PostProcessingConstants {
     PostProcessingPass::Settings settings;
     float dlss_sharpening = 0.0f;
+    // WIDE-042: the ambient sides (outside side_x0..side_x1 of the width) dimmed by side_dim.
+    float side_x0 = 0.0f;
+    float side_x1 = 1.0f;
+    float side_dim = 1.0f;
 };
 static_assert(offsetof(PostProcessingConstants, dlss_sharpening) == 44);
-static_assert(sizeof(PostProcessingConstants) == 48);
+static_assert(sizeof(PostProcessingConstants) == 60);
 } // namespace
 
 void PostProcessingPass::Create(vk::Device device, const vk::Format surface_format) {
@@ -205,7 +210,8 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
 
 void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                                 vk::Extent2D input_size, Frame& frame, Settings settings,
-                                vk::ImageView ui_layer, bool dlss_scaled) {
+                                vk::ImageView ui_layer, bool dlss_scaled, float side_x0,
+                                float side_x1) {
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
             .pLabelName = "Host/Post processing",
@@ -270,9 +276,21 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
 
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
 
+    // WIDE-009: a 16:9 picture (the boot screens, shown before the high-resolution UI takes
+    // over) on a wide window goes between black bars instead of being stretched over it.
+    vk::Rect2D area{{0, 0}, {frame.width, frame.height}};
+    if (input_size.width != 0 && input_size.height != 0 && frame.height != 0) {
+        const double input_aspect = double(input_size.width) / input_size.height;
+        const double frame_aspect = double(frame.width) / frame.height;
+        if (input_aspect < frame_aspect * 0.8) {
+            const u32 width = u32(std::lround(frame.height * input_aspect));
+            area = vk::Rect2D{{s32((frame.width - width) / 2), 0}, {width, frame.height}};
+        }
+    }
     const std::array viewports = {
         vk::Viewport{
-            .width = static_cast<float>(frame.width),
+            .x = static_cast<float>(area.offset.x),
+            .width = static_cast<float>(area.extent.width),
             .height = static_cast<float>(frame.height),
             .minDepth = 0.0f,
             .maxDepth = 1.0f,
@@ -280,12 +298,7 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
     };
 
     cmdbuf.setViewport(0, viewports);
-    cmdbuf.setScissor(0, vk::Rect2D{
-                             .extent{
-                                 .width = frame.width,
-                                 .height = frame.height,
-                             },
-                         });
+    cmdbuf.setScissor(0, area);
 
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, set_writes);
     float dlss_sharpening = 0.0f;
@@ -324,7 +337,21 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         dlss_sharpening = dlss_scaled ? sharpening : 0.0f;
     }
 #endif
-    const PostProcessingConstants constants{settings, dlss_sharpening};
+    float side_dim = 1.0f;
+#ifdef RYTY_GPU
+    if (side_x0 > 0.0f || side_x1 < 1.0f) {
+        // WIDE-042: GPU.ambient_brightness in percent (default 45).
+        static float brightness = 0.45f;
+        static auto next = std::chrono::steady_clock::time_point{};
+        if (const auto now = std::chrono::steady_clock::now(); now >= next) {
+            next = now + std::chrono::seconds(2);
+            const double value = Ryty::ConfigNumber("ambient_brightness", 45.0);
+            brightness = std::isfinite(value) ? float(std::clamp(value, 0.0, 100.0) / 100.0) : 0.45f;
+        }
+        side_dim = brightness;
+    }
+#endif
+    const PostProcessingConstants constants{settings, dlss_sharpening, side_x0, side_x1, side_dim};
     cmdbuf.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0,
                          sizeof(constants), &constants);
 
