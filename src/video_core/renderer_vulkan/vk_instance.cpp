@@ -509,12 +509,14 @@ bool Instance::CreateDevice() {
                                        "objects: this run builds pipelines");
         }
     }
-    // SO-OFF-001: shader objects are off on every GPU, with no override: every game draw is a
-    // compiled pipeline and VK_EXT_shader_object is not enabled. FIX-366-GTS had made them
-    // opt-in (RYGT_SHADER_OBJECT=1); that is ignored too. On AMD they lost the GPU device in the
-    // menus on an RX 7600 (driver 2.0.416) while tessellated pipelines were drawn (AMD-SO-001).
-    constexpr bool shader_objects_allowed = false;
-    LOG_WARNING(Render_Vulkan, "SO-OFF-001: shader objects are off on every GPU");
+    // FIX-374-GTS: pipelines are the default; exact RYGT_SHADER_OBJECT=1 opts in on non-AMD GPUs.
+    // AMD (0x1002) remains hard-disabled after device losses with shader objects on.
+    const char* shader_object_env = std::getenv("RYGT_SHADER_OBJECT");
+    constexpr u32 amd_vendor_id = 0x1002;
+    const bool shader_objects_allowed = properties.vendorID != amd_vendor_id && shader_object_env &&
+                                        shader_object_env[0] == '1' && shader_object_env[1] == '\0';
+    LOG_WARNING(Render_Vulkan, "SO-014: shader objects {}; AMD hard-disabled",
+                shader_objects_allowed ? "requested" : "off");
     if (shader_objects_allowed && !after_loss) {
         const auto& d3 = dynamic_state_3_features;
         const bool states = dynamic_state_3 && d3.extendedDynamicState3DepthClampEnable &&
