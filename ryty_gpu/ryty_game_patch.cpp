@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <cmath>
 #include <atomic>
@@ -19,6 +20,7 @@
 #include <cwctype>
 #include <iterator>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -41,6 +43,14 @@
 
 namespace Vulkan {
 void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label); // DIAG-067
+struct RytySceneExtent {
+    std::uint32_t width{}, height{};
+};
+RytySceneExtent RytySceneSize(); // WIDE-001
+bool RytyWideScene();
+bool RytyWideViews();
+bool RytyGtsInRace();
+float RytyDisplayAspect();
 }
 
 namespace {
@@ -609,6 +619,39 @@ void LoadScriptReplacements() {
 // (dialogs, the meter, the pause menu) don't change it. The renderer skips draws for new
 // pipelines only in races; in the menus some scenes draw once into a texture they keep showing.
 std::atomic<bool> g_in_race{false};
+// WIDE-015: the race "session" for the wide picture: from a race_* project until the menus proper.
+// The pre-race screen's own pages (Change Conditions, Change Car, Select Course) load menu projects
+// (course_select, car_select, garage, ...) on top of the race and return to it without reloading
+// it, so those keep the session (and the race's wide cameras) going.
+std::atomic<bool> g_race_session{false};
+// WIDE-059: the replay's photo mode is open (photo, with gallery loaded along).
+std::atomic<bool> g_photo_mode{false};
+std::atomic<int> g_menu_screen{0}; // WIDE-020: 1 main menu, 2 Home, 3 livery editor
+
+// WIDE-013: the cameras the race's own screens create (the pre-race screen's overhead view) take
+// their aspect from two constructor defaults (fov 60, near 0.1, far 5000, aspect 16:9 at
+// 0x141dee040 (0x6bea53) and 0x141dee0c0 (0x714ea3)). The game's menus use them too and are
+// composed 16:9, so they are widened only while a race project is loaded.
+u8* g_wide_base = nullptr;
+float g_wide_aspect = 0.0f;
+
+void SetRaceViewDefaults(bool race) {
+    if (!g_wide_base || g_wide_aspect <= 0.0f) {
+        return;
+    }
+    const float value = race ? g_wide_aspect : 16.0f / 9.0f;
+    for (const u64 rva : {0x1dee04cull, 0x1dee0ccull}) {
+        u8* target = g_wide_base + rva;
+        DWORD old_protect = 0;
+        if (!VirtualProtect(target, 4, PAGE_READWRITE, &old_protect)) {
+            continue;
+        }
+        std::memcpy(target, &value, 4);
+        DWORD ignored = 0;
+        VirtualProtect(target, 4, old_protect, &ignored);
+    }
+    std::fprintf(stderr, "[patch] WIDE-013 race view defaults: aspect %.3f\n", value);
+}
 
 
 extern "C" void RytyReplayVideoSetReplay(bool replay); // GTS-015, gts_replay_video.cpp
@@ -647,6 +690,41 @@ void NoteProjectScript(const u8* data, s64 read) {
         return;
     }
     RytyReplayVideoSetReplay(name == "race_replay"); // GTS-015
+    // WIDE-058: the replay's photo mode (photo, with gallery loaded along) is part of the session
+    // too: as a menu it set the views back to 16:9 and the replay stayed 16:9 in the middle
+    // with its TV cameras until the replay was loaded again.
+    static constexpr std::string_view race_pages[] = {
+        "course_select", "car_select", "garage", "event_setting", "preview", "car_preview",
+        "option", "photo", "gallery"};
+    const bool session = race || (g_race_session.load(std::memory_order_relaxed) &&
+                                  std::find(std::begin(race_pages), std::end(race_pages), name) !=
+                                      std::end(race_pages));
+    g_photo_mode.store(name == "photo" || (name == "gallery" && g_photo_mode.load()),
+                       std::memory_order_relaxed); // WIDE-059
+    if (g_race_session.exchange(session) != session) {
+        std::fprintf(stderr, "[patch] WIDE-015 %.*s: %s\n", static_cast<int>(name.size()),
+                     name.data(), session ? "race screens (wide)" : "menus");
+    }
+    // WIDE-020: the menu screens shown wide (their 3D scenes full width): the main menu (gtmode),
+    // Home (garage) and the livery editor (livery2, which loads gallery along with it).
+    int screen = 0;
+    if (!session) {
+        if (name == "gtmode") screen = 1;
+        else if (name == "garage") screen = 2;
+        else if (name == "livery2") screen = 3;
+        else if (name == "gallery" && g_menu_screen.load(std::memory_order_relaxed) == 3) screen = 3;
+    }
+    // WIDE-041: the menu screens show the game's 16:9 picture in the middle with ambient sides,
+    // so their views keep the game's 16:9 aspect.
+    if (g_menu_screen.exchange(screen) != screen) {
+        std::fprintf(stderr, "[patch] WIDE-020 %.*s: menu screen %d\n", static_cast<int>(name.size()),
+                     name.data(), screen);
+    }
+    const bool wide_views = session; // WIDE-041: not on the menu screens
+    static std::atomic<int> views_were{-1};
+    if (views_were.exchange(wide_views ? 1 : 0) != (wide_views ? 1 : 0)) {
+        SetRaceViewDefaults(wide_views);
+    }
     if (g_in_race.exchange(race) != race) {
         std::fprintf(stderr, "[patch] FIX-110 %.*s: %s\n", static_cast<int>(name.size()),
                      name.data(), race ? "race, new pipelines are built in the background"
@@ -1178,6 +1256,91 @@ float RytyDisplayAspect() {
     }();
     return aspect;
 }
+
+// WIDE-001: a genuine wide picture. With a camera wider than 16:9 (GTS-009), the high-resolution
+// UI (ui_hires) and the native renderer, the scene is allocated at the screen's shape instead of
+// 16:9, the race picture is composed at the window's full size, and the HUD and menus are drawn
+// 16:9 in its middle (nothing is stretched). Opt-in: GPU.wide_scene=true or RYGT_WIDE_SCENE=1
+// turns it on; off, a wider screen keeps GTS-009's 16:9 picture.
+bool RytyWideScene() {
+    static const bool wide = [] {
+        if (RytyDisplayAspect() <= 16.0f / 9.0f + 0.01f) {
+            return false; // only wider screens
+        }
+        if (const char* env = std::getenv("RYGT_WIDE_SCENE")) {
+            return env[0] == '1';
+        }
+        return ConfigFlag("wide_scene", false) && ConfigFlag("ui_hires", false) &&
+               ConfigFlag("native_renderer", false);
+    }();
+    return wide;
+}
+
+// WIDE-002/004: the game's 3D views widened to the screen's shape (their 16:9 constants patched).
+// GPU.wide_views=false or RYGT_WIDE_VIEWS=0 leaves them at 16:9.
+bool RytyWideViews() {
+    static const bool views = [] {
+        if (!RytyWideScene()) return false;
+        if (const char* env = std::getenv("RYGT_WIDE_VIEWS")) return env[0] == '1';
+        return ConfigFlag("wide_views", true);
+    }();
+    return views;
+}
+
+// WIDE-005: the race HUD's left and right parts moved out to the screen's edges.
+// GPU.wide_hud_spread=false or RYGT_WIDE_HUD_SPREAD=0 keeps the HUD 16:9 in the middle.
+bool RytyHudSpread() {
+    static const bool spread = [] {
+        if (!RytyWideScene()) return false;
+        if (const char* env = std::getenv("RYGT_WIDE_HUD_SPREAD")) return env[0] == '1';
+        return ConfigFlag("wide_hud_spread", true);
+    }();
+    return spread;
+}
+
+// The scene's size when it is not the game's own 1920x1080: the launcher's scene render scale
+// (RYGT_SCENE_WIDTH/HEIGHT, always 16:9), widened to the screen's shape with WIDE-001.
+// {0, 0} when the game's own size applies.
+RytySceneExtent RytySceneSize() {
+    static const RytySceneExtent size = [] {
+        RytySceneExtent result{};
+        const char* viewport = std::getenv("RYGT_EXPERIMENTAL_SCENE_VIEWPORT");
+        if (viewport && std::strcmp(viewport, "1") == 0) {
+            const char* w = std::getenv("RYGT_SCENE_WIDTH");
+            const char* h = std::getenv("RYGT_SCENE_HEIGHT");
+            result.width = w ? u32(std::strtoul(w, nullptr, 10)) : 960u;
+            result.height = h ? u32(std::strtoul(h, nullptr, 10)) : 540u;
+        }
+        // GPU.wide_scene_alloc=false keeps the scene's allocation 16:9 (the wide picture is then
+        // composed from it at a lower horizontal resolution); for tests.
+        if (RytyWideScene() && ConfigFlag("wide_scene_alloc", true)) {
+            if (!result.width || !result.height) {
+                result = {1920, 1080};
+            }
+            // GPU.wide_scene_height (e.g. 1440 for 5120x1440 on a 32:9 screen) overrides the height.
+            if (const u32 wanted = u32(std::atoi(ConfigValue("wide_scene_height").c_str()));
+                wanted >= 360 && wanted <= 2160) {
+                result.height = wanted;
+            }
+            const double aspect = RytyDisplayAspect();
+            constexpr double max_pixels = 3840.0 * 2160.0; // what the scene scale allows at 16:9
+            u32 height = result.height;
+            if (double(height) * height * aspect > max_pixels) {
+                height = u32(std::sqrt(max_pixels / aspect)) & ~7u;
+            }
+            const u32 width = std::min<u32>(u32(std::lround(height * aspect / 16.0)) * 16, 7680);
+            std::fprintf(stderr, "[patch] WIDE-001 scene %ux%u (was %ux%u), camera aspect %.3f\n",
+                         width, height, result.width, result.height, aspect);
+            result = {width, height};
+        }
+        if (result.width < 320 || result.width > 7680 || result.height < 180 ||
+            result.height > 2160 || (result.width == 1920 && result.height == 1080)) {
+            return RytySceneExtent{};
+        }
+        return result;
+    }();
+    return size;
+}
 } // namespace Vulkan
 
 // GTS-009: the race camera's view is set up with a 16:9 aspect
@@ -1192,8 +1355,46 @@ static void InstallWideCamera(u8* base) {
     std::memcpy(from.data(), &original, 4);
     std::memcpy(to.data(), &aspect, 4);
     if (Apply(base, Patch{0x5f7185, from, to, fmt::format("GTS-009 camera aspect {:.3f}", aspect)})) {
-        std::fprintf(stderr, "[patch] GTS-009: picture stretched to the window\n");
+        std::fprintf(stderr, Vulkan::RytyWideScene()
+                                 ? "[patch] GTS-009: wide picture (WIDE-001), HUD and menus 16:9\n"
+                                 : "[patch] GTS-009: picture stretched to the window\n");
     }
+    if (!Vulkan::RytyWideScene()) {
+        return;
+    }
+    // WIDE-002: the 16:9 that the patch above does not reach.
+    // - The camera code sets the active view's aspect to 16:9 every frame (GTSport.exe 0x85fb6b:
+    //   movss xmm0, [0x141ddf260]; movss [r13+0x2c], xmm0), which it then copies into the global
+    //   the camera's FOV code reads (0x8708d6 -> [0x142b84100]).
+    // - Render views are constructed with a 16:9 projection aspect (aspect, 0, 0, near 0.1 at
+    //   view+0x5c, from the vectors at 0x141db2890, 0x141def5a0, 0x141def5c0, 0x141def5e0;
+    //   constructors around 0x8cf170), which the FOV code divides by (0x892e83).
+    // GPU.wide_views=false or RYGT_WIDE_VIEWS=0 leaves them at 16:9.
+    if (!Vulkan::RytyWideViews()) {
+        return;
+    }
+    for (const u64 rva : {0x1ddf260ull, 0x1db2890ull, 0x1def5a0ull, 0x1def5c0ull, 0x1def5e0ull}) {
+        Apply(base, Patch{rva, from, to, fmt::format("WIDE-002 view aspect {:.3f}", aspect)});
+    }
+    // WIDE-004: the race renderer's own 16:9 (the camera's aspect, view[23], is ignored there):
+    // 0x141dddd14 (0x641ab4, 0x641ef4), 0x141dddd40 (0x6455c5, 0x6457f5), 0x141dddd4c (0x647336,
+    // 0x647574), 0x141dddeac (0x6a231d) and the frame setup's 0x141decd78 (0x199c4c4:
+    // width = tan(fov / 2) * 16 / 9). Each constant is read only there.
+    for (const u64 rva : {0x1dddd14ull, 0x1dddd40ull, 0x1dddd4cull, 0x1dddeacull, 0x1decd78ull}) {
+        Apply(base, Patch{rva, from, to, fmt::format("WIDE-004 render aspect {:.3f}", aspect)});
+    }
+    // WIDE-013: checked here, written when a race project loads (SetRaceViewDefaults).
+    if (std::memcmp(base + 0x1dee04c, from.data(), 4) == 0 &&
+        std::memcmp(base + 0x1dee0cc, from.data(), 4) == 0) {
+        g_wide_base = base;
+        g_wide_aspect = aspect;
+    }
+    // Views with an aspect set by the game's scripts (flag [r12+0x4f0], value [r12+0x4f4], set to
+    // 16:9 by the setter at 0x8593f0) take it instead (0x86015f: vmovss xmm0, [r12+0x4f4]). That
+    // load reads the patched constant at 0x141ddf260 instead (vmovss xmm0, [rip+...]; nop).
+    Apply(base, Patch{0x86015f, {0xc4, 0xc1, 0x7a, 0x10, 0x84, 0x24, 0xf4, 0x04, 0x00, 0x00},
+                      {0xc5, 0xfa, 0x10, 0x05, 0xf9, 0xf0, 0x57, 0x01, 0x66, 0x90},
+                      "WIDE-002 scripted view aspect"});
 }
 
 void InstallMirrorHalfRate(u8* base) {
@@ -1579,14 +1780,8 @@ void PS4_SYSV_ABI MatchExperimentalSceneViewport(
     u64 self, u64 output, u64 auxiliary, u64 scene, u64 depth, u64 motion,
     float x, float y, float width, float height, float scene_x, float scene_y,
     u64 extra_a, u64 extra_b) {
-    static const u32 scene_width = [] {
-        const char* value = std::getenv("RYGT_SCENE_WIDTH");
-        return value ? u32(std::strtoul(value, nullptr, 10)) : 960u;
-    }();
-    static const u32 scene_height = [] {
-        const char* value = std::getenv("RYGT_SCENE_HEIGHT");
-        return value ? u32(std::strtoul(value, nullptr, 10)) : 540u;
-    }();
+    static const u32 scene_width = Vulkan::RytySceneSize().width;   // WIDE-001
+    static const u32 scene_height = Vulkan::RytySceneSize().height;
     u32 output_extent{}, scene_extent{};
     // These are verified color-target hint fields, not guessed ImageInfo offsets.
     if (output && scene && scene_x == 1.0f && scene_y == 1.0f &&
@@ -1594,7 +1789,7 @@ void PS4_SYSV_ABI MatchExperimentalSceneViewport(
             reinterpret_cast<const void*>(output + 0x44), sizeof(output_extent)) &&
         Core::RytyMemory::GuardedCopy(&scene_extent,
             reinterpret_cast<const void*>(scene + 0x44), sizeof(scene_extent)) &&
-        output_extent == 0x04380780 && scene_width >= 320 && scene_width <= 3840 &&
+        output_extent == 0x04380780 && scene_width >= 320 && scene_width <= 7680 &&
         scene_height >= 180 && scene_height <= 2160 &&
         scene_extent == ((scene_height << 16) | scene_width)) {
         scene_x = float(scene_width) / 1920.f;
@@ -1611,13 +1806,9 @@ void PS4_SYSV_ABI MatchExperimentalSceneViewport(
 // origin in 1080p coordinates. Scale those local X/Y values before history writes
 // and copy UVs are generated; leave the output object's UI placement unchanged.
 void InstallSceneHistoryOrigins(u8* base) {
-    const auto read_size = [](const char* name, u32 fallback) {
-        const char* value = std::getenv(name);
-        return value ? u32(std::strtoul(value, nullptr, 10)) : fallback;
-    };
-    const u32 width = read_size("RYGT_SCENE_WIDTH", 960);
-    const u32 height = read_size("RYGT_SCENE_HEIGHT", 540);
-    if (width < 320 || width > 3840 || height < 180 || height > 2160 ||
+    const u32 width = Vulkan::RytySceneSize().width; // WIDE-001
+    const u32 height = Vulkan::RytySceneSize().height;
+    if (width < 320 || width > 7680 || height < 180 || height > 2160 ||
         (width == 1920 && height == 1080)) return;
     const std::array<u8, 6> original_x{0x48,0x8b,0x03,0x48,0x89,0xdf};
     const std::array<u8, 8> original_y{0x48,0x89,0x84,0x24,0xb0,0,0,0};
@@ -1655,7 +1846,8 @@ void InstallSceneHistoryOrigins(u8* base) {
 }
 void InstallExperimentalSceneViewport(u8* base) {
     const char* enabled = std::getenv("RYGT_EXPERIMENTAL_SCENE_VIEWPORT");
-    if (!enabled || std::strcmp(enabled, "1") != 0) return;
+    if ((!enabled || std::strcmp(enabled, "1") != 0) && !Vulkan::RytyWideScene()) return;
+    if (Vulkan::RytySceneSize().width == 0) return;
     InstallSceneHistoryOrigins(base);
     Native::NearCode code{base};
     constexpr std::array<u8, 6> original{0x55, 0x48, 0x89, 0xe5, 0x41, 0x57};
@@ -1664,6 +1856,82 @@ void InstallExperimentalSceneViewport(u8* base) {
         reinterpret_cast<void*>(&MatchExperimentalSceneViewport), "experimental scene viewport scale"));
 }
 
+// WIDE-001: the scene allocated at the screen's shape. The same three sites the launcher's scene
+// render scale patches (RenderResolution.cs), from the game's bytes or from the launcher's.
+static void InstallWideSceneAllocation(u8* base) {
+    if (!Vulkan::RytyWideScene() || !ConfigFlag("wide_scene_alloc", true)) {
+        return;
+    }
+    const auto [width, height] = Vulkan::RytySceneSize();
+    if (!width || !height) {
+        return;
+    }
+    const auto le = [](u32 value) {
+        std::array<u8, 4> bytes{};
+        std::memcpy(bytes.data(), &value, 4);
+        return bytes;
+    };
+    const auto current = [&](u64 rva, size_t size) {
+        return std::vector<u8>(base + rva, base + rva + size);
+    };
+    // mov rcx, (height << 32) | width
+    auto size_from = current(0x1988ad3, 10);
+    if (size_from[0] != 0x48 || size_from[1] != 0xb9) {
+        std::fprintf(stderr, "[patch] WIDE-001: scene size site differs; not applied\n");
+        return;
+    }
+    std::vector<u8> size_to{0x48, 0xb9};
+    for (const u8 b : le(width)) size_to.push_back(b);
+    for (const u8 b : le(height)) size_to.push_back(b);
+    // mov ecx, [rip+...] (the game) or mov ecx, imm32; nop (the launcher) -> mov ecx, imm32; nop
+    const auto one = [&](u64 rva, std::array<u8, 6> original, u32 value) {
+        auto from = current(rva, 6);
+        const bool game = std::equal(from.begin(), from.end(), original.begin());
+        const bool launcher = from[0] == 0xb9 && from[5] == 0x90;
+        if (!game && !launcher) {
+            return std::optional<Patch>{};
+        }
+        std::vector<u8> to{0xb9};
+        for (const u8 b : le(value)) to.push_back(b);
+        to.push_back(0x90);
+        return std::optional<Patch>{Patch{rva, from, to, fmt::format("WIDE-001 scene {}", value)}};
+    };
+    const auto w = one(0x1988ab0, {0x8b, 0x0d, 0x72, 0xea, 0x23, 0x01}, width);
+    const auto h = one(0x1988ab9, {0x8b, 0x0d, 0x6d, 0xea, 0x23, 0x01}, height);
+    if (!w || !h) {
+        std::fprintf(stderr, "[patch] WIDE-001: scene width/height sites differ; not applied\n");
+        return;
+    }
+    if (size_from != size_to) {
+        Apply(base, Patch{0x1988ad3, size_from, size_to,
+                          fmt::format("WIDE-001 scene allocation {}x{}", width, height)});
+    }
+    if (w->original != w->replacement) Apply(base, *w);
+    if (h->original != h->replacement) Apply(base, *h);
+}
+
+static void ApplyEnvironmentPatches(u8* base) {
+    char buffer[4096];
+    const DWORD length = GetEnvironmentVariableA("RYGT_PATCH", buffer, sizeof(buffer));
+    if (length == 0 || length >= sizeof(buffer)) {
+        return;
+    }
+    std::string list{buffer, length};
+    size_t start = 0;
+    while (start < list.size()) {
+        const size_t end = std::min(list.find(',', start), list.size());
+        const std::string item = list.substr(start, end - start);
+        const size_t a = item.find(':');
+        const size_t b = item.find(':', a + 1);
+        if (a != std::string::npos && b != std::string::npos) {
+            Patch patch{std::strtoull(item.substr(0, a).c_str(), nullptr, 16),
+                        ParseHex(item.substr(a + 1, b - a - 1)), ParseHex(item.substr(b + 1)),
+                        "RYGT_PATCH " + item.substr(0, a)};
+            Apply(base, patch);
+        }
+        start = end + 1;
+    }
+}
 void InstallPhotoExport(); // GTS-010, gts_photo_export.cpp
 void InstallFileShareDelete(); // GTS-014, gts_file_share.cpp
 
@@ -1711,32 +1979,26 @@ void RytyApplyGamePatches() {
         SyncDecals();
     }
     auto* base = reinterpret_cast<u8*>(GetModuleHandleA(nullptr));
-    char buffer[4096];
-    const DWORD length = GetEnvironmentVariableA("RYGT_PATCH", buffer, sizeof(buffer));
-    if (length == 0 || length >= sizeof(buffer)) {
-        return;
-    }
-    std::string list{buffer, length};
-    size_t start = 0;
-    while (start < list.size()) {
-        const size_t end = std::min(list.find(',', start), list.size());
-        const std::string item = list.substr(start, end - start);
-        const size_t a = item.find(':');
-        const size_t b = item.find(':', a + 1);
-        if (a != std::string::npos && b != std::string::npos) {
-            Patch patch{std::strtoull(item.substr(0, a).c_str(), nullptr, 16),
-                        ParseHex(item.substr(a + 1, b - a - 1)), ParseHex(item.substr(b + 1)),
-                        "RYGT_PATCH " + item.substr(0, a)};
-            Apply(base, patch);
-        }
-        start = end + 1;
-    }
+    ApplyEnvironmentPatches(base);
+    InstallWideSceneAllocation(base); // WIDE-001: after the launcher's scene size
 }
 
 namespace Vulkan {
 // FIX-110: true while a race project runs (see NoteProjectScript).
 bool RytyGtsInRace() {
     return g_in_race.load(std::memory_order_relaxed);
+}
+// WIDE-015: true from a race project until the menus proper (its own pages included).
+bool RytyGtsRaceSession() {
+    return g_race_session.load(std::memory_order_relaxed);
+}
+// WIDE-059: the replay's photo mode is open.
+bool RytyGtsPhotoMode() {
+    return g_photo_mode.load(std::memory_order_relaxed);
+}
+// WIDE-020: the menu screen shown wide (1 main menu, 2 Home, 3 livery editor), or 0.
+int RytyGtsMenuScreen() {
+    return g_menu_screen.load(std::memory_order_relaxed);
 }
 bool RytyGtsMenuCaptureCanContinue() {
     return g_scoped_menu_compiles && g_capture_compiles.CanContinue();

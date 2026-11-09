@@ -1,3 +1,7 @@
+#include <cstdio>
+namespace Vulkan {
+bool RytyWideScene(); // WIDE-001 (ryty_game_patch.cpp)
+}
 #include "ryty_gpu/native/unique_upload_batch.h"
 #include "ryty_gpu/native/upload_cause.h"
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
@@ -1142,6 +1146,19 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
             }
             // Retain ownership even after clears/source links/force flags are consumed.
             entry.gpu_backing_written.store(true, std::memory_order_release);
+            // WIDE-006: a texture made of targets (a crop of the scene) takes its picture from
+            // them; a fill over it clears the targets, not it. Clearing the crop too blanked the
+            // car selection's car every other frame with the wide scene (a fill now covered the
+            // crop, which takes its picture from the scene only when the scene was drawn again).
+            // WIDE-061: only fills, and only with the wide scene. Skipping every GPU write (copies,
+            // compute writes) left stale data in textures the 11-07 renderer links to targets:
+            // grass grew all over the Nordschleife's track, also with the wide scene off.
+            if (pattern && Vulkan::RytyWideScene()) {
+                std::scoped_lock lock{entry.sources_mutex};
+                if (!entry.sources.empty()) {
+                    return;
+                }
+            }
             // NAT-133: a fill that covers the whole texture fills it on the GPU at its next use
             // (GT Sport clears its environment cube and motion targets with fills, and textures
             // over that memory were uploaded again 60 times a second).
@@ -1454,6 +1471,20 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
                     info.pitch, info.resources.levels, info.resources.layers);
             }
             continue;
+        }
+        {
+            // WIDE-006 (diagnosis): a texture made of targets uploaded from guest memory.
+            bool made_of_targets;
+            {
+                std::scoped_lock lock{entry->sources_mutex};
+                made_of_targets = !entry->sources.empty();
+            }
+            static std::atomic<u32> logged{};
+            if (made_of_targets && logged.fetch_add(1, std::memory_order_relaxed) < 60) {
+                std::fprintf(stderr, "[wide] upload of a crop %#llx %ux%u (forced %d)\n",
+                             static_cast<unsigned long long>(info.guest_address), info.size.width,
+                             info.size.height, int(entry->force_upload.load()));
+            }
         }
         trace.Next(2);
         if (upload_hook && entry->from_cpu) {

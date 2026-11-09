@@ -23,6 +23,10 @@ layout (push_constant) uniform settings {
     float ui_white_nits;
     float hdr_saturation;
     float dlss_sharpening;
+    // ryGT WIDE-042: the ambient sides (outside side_x0..side_x1 of the width) dimmed by side_dim.
+    float side_x0;
+    float side_x1;
+    float side_dim;
 } pp;
 
 #define A_GPU 1
@@ -110,6 +114,9 @@ void main() {
         FsrRcasF(sharpened.r, sharpened.g, sharpened.b, uvec2(pixel),
                  uvec4(floatBitsToUint(pp.dlss_sharpening), 0u, 0u, 0u));
         color_linear.rgb = sharpened;
+    }
+    if (pp.side_dim < 1.0 && (uv.x < pp.side_x0 || uv.x > pp.side_x1)) {
+        color_linear.rgb *= pp.side_dim;
     }
     if (pp.hdr && pp.sdr_input) {
         // SDR frame on the HDR10 swapchain: BT.709 linear to BT.2020, at the SDR white level.

@@ -57,6 +57,9 @@ public:
     void PrepareScene(u64 frame, GtsSceneImage resolved);
     void Resolve(u64 frame, GtsSceneImage display);
     bool ResolveNativeComposition(u64 frame, GtsSceneImage scene, GtsSceneImage display);
+    /// WIDE-001: the last reconstructed picture (outputSize) into `rect` of `dst`, which is in the
+    /// transfer-destination layout. False when there is none.
+    bool BlitOutputInto(vk::Image dst, vk::Rect2D rect);
     bool OverrideHud(u64 frame, u64 uid, RenderState& state);
     void FallbackHud(u64 frame, GtsSceneImage display, vk::ImageLayout restoreLayout);
     void SyncGuestRead(u64 frame, GtsSceneImage display);

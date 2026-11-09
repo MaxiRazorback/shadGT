@@ -4,11 +4,21 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstring>
+#include <mutex>
+#include <string>
 #include <fstream>
 #include <cstdio>
 #include <sstream>
 #include <vector>
+#include <utility>
+
+namespace Vulkan {
+float RytyDisplayAspect(); // ryty_game_patch.cpp (GTS-009)
+bool RytyWideScene();      // WIDE-001
+int RytyGtsMenuScreen();   // WIDE-020: 2 = Home
+}
 
 namespace Ryty::Camera {
 namespace {
@@ -81,6 +91,104 @@ std::uintptr_t NativeMethod(void* object, unsigned offset) {
     const auto fn = *reinterpret_cast<const std::uintptr_t*>(table + offset);
     return fn >= image + 0x10000 && fn < image + 0x1d00000 ? fn : 0;
 }
+// Wall-clock time for the race-state log lines (RACE-002, WIDE-047).
+void LogWall(char* out, std::size_t size) {
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    std::snprintf(out, size, "%02d:%02d:%02d.%03d", now.wHour, now.wMinute, now.wSecond,
+                  now.wMilliseconds);
+}
+
+// RACE-002: when the race is over, so its results keep the game's 16:9 layout.
+// - race+0x9c: 1 while a race (arcade, custom race) runs, 0 when it ends (RACE-001 logs:
+//   0 -> 1 at the start, 1 -> 0 as the results come up).
+// - race+0x30 (RACE-003): in a time trial 0x9c stays 0; 0x30 went 1 -> 0 as the results' second
+//   page (the lap times) came up. The first page is already kept whole by its darkening.
+//   It also turns 0 on Retry (the HUD then stayed in the middle until the start line), so
+//   RACE-005: a time trial counts as over only while race+0x1294 is 0 too, for 600 ms: after
+//   Exit it went 0 and stayed 0; after a Retry it was back to 1 within about 200 ms (RACE-004
+//   logs: two retries, one exit).
+// Finished = one of them was 1 and is 0 now. Both are forgotten when the race camera has
+// stopped for a second (a new race), so nothing changes before a flag turns 1.
+std::atomic<bool> race_finished{};
+// WIDE-047: a replay is on screen. RACE-006 logs (race, replay, time trial, drift trial): a
+// replay's driving cameras run on a race object of their own, on which 0x30 is already 1 and
+// 0x9c 0 the first time it is seen. A race starts with both 0, a time trial with 0x30 0 (it
+// turns 1 at the start line). Decided when the race object changes; a replay is checked
+// again after any break of its cameras (TV cameras), so the next race clears it. A paused
+// time trial (same object, 0x30 1) keeps its verdict.
+std::atomic<bool> replay_view{};
+// WIDE-051: set when the race session ends (a menu is shown): the next camera start checks for
+// a replay again, even on the same race object (a replay watched a second time).
+std::atomic<bool> replay_recheck{};
+struct RaceFlag {
+    const char* name;
+    std::size_t offset;
+    std::size_t hold_offset; // 0: none; else this value must be 0 as well, for 600 ms
+    bool seen = false;
+    int last = -1;
+    std::uint64_t since = 0;
+    bool reported = false;
+};
+void TrackRaceFinished(unsigned char* race) {
+    static unsigned char* tracked = nullptr;
+    static std::uint64_t last_call = 0;
+    static RaceFlag flags[] = {{"race end (0x9c)", 0x9c, 0}, {"time trial end (0x30)", 0x30, 0x1294}};
+    if (!Readable(race, 0x1298)) return;
+    const auto now = Milliseconds();
+    const bool new_object = race != tracked;
+    const bool fresh = new_object || now - last_call > 1000;
+    if (fresh && (new_object || replay_view.load(std::memory_order_relaxed) ||
+                  replay_recheck.exchange(false, std::memory_order_relaxed))) { // WIDE-047/051
+        const bool replay = *reinterpret_cast<const std::uint32_t*>(race + 0x30) != 0 &&
+                            *reinterpret_cast<const std::uint32_t*>(race + 0x9c) == 0;
+        if (replay != replay_view.load(std::memory_order_relaxed)) {
+            char wall[16];
+            LogWall(wall, sizeof(wall));
+            std::fprintf(stderr, "[race-state] %s WIDE-047 replay: %s (race %p)\n", wall,
+                         replay ? "yes" : "no", static_cast<void*>(race));
+            replay_view.store(replay, std::memory_order_relaxed);
+        }
+    }
+    last_call = now;
+    tracked = race;
+    bool finished = false;
+    for (auto& flag : flags) {
+        if (fresh) { flag.seen = false; flag.last = -1; flag.since = 0; flag.reported = false; }
+        const int on = *reinterpret_cast<const std::uint32_t*>(race + flag.offset) != 0;
+        if (on) flag.seen = true;
+        bool over = flag.seen && !on;
+        if (over && flag.hold_offset) {
+            const bool held = *reinterpret_cast<const std::uint32_t*>(race + flag.hold_offset) == 0;
+            if (!held) {
+                flag.since = 0;
+                over = false;
+            } else {
+                if (flag.since == 0) flag.since = now;
+                over = now - flag.since >= 600;
+            }
+        } else if (!over) {
+            flag.since = 0;
+        }
+        finished = finished || over;
+        char wall[16];
+        if (on != flag.last) {
+            LogWall(wall, sizeof(wall));
+            std::fprintf(stderr, "[race-state] %s RACE-002 %s: %s (race %p)\n", wall, flag.name,
+                         on ? "on" : flag.seen ? "off" : "off (not started)",
+                         static_cast<void*>(race));
+            flag.last = on;
+        }
+        if (over != flag.reported) {
+            LogWall(wall, sizeof(wall));
+            std::fprintf(stderr, "[race-state] %s RACE-002 %s: %s\n", wall, flag.name,
+                         over ? "FINISHED (results keep 16:9)" : "running again");
+            flag.reported = over;
+        }
+    }
+    race_finished.store(finished, std::memory_order_relaxed);
+}
+
 void ObserveContext(void* camera, float* view, void* context) {
     // BaseCamera::prepare (8a5560) uses context+8 as IRaceStatus and
     // view+bc as the viewed car index. The context is a stack structure:
@@ -115,6 +223,7 @@ void ObserveContext(void* camera, float* view, void* context) {
     const auto id = reinterpret_cast<Code>(get_code)(car);
     ++native_samples; observed_car_id.store(id);
     PublishIdentity(id);
+    TrackRaceFinished(race); // RACE-002
 }
 using PrepareFunction = std::uintptr_t(__attribute__((sysv_abi)) *)(void*, float*, void*, void*, float);
 std::uintptr_t __attribute__((sysv_abi)) PrepareView(void* camera, float* view, void* context, void* input, float dt) {
@@ -181,6 +290,48 @@ void Offset(float* view, float height, float forward) {
     view[1] += 2 * (y*z - w*x) * backward + height;
     view[2] += (1 - 2 * (x*x + y*y)) * backward;
 }
+// WIDE-003: when a race camera last built its view (the race picture is then shot by a camera the
+// renderer can show full width), and a probe of that view for a 16:9 aspect.
+std::atomic<std::uint64_t> race_view_ms{};
+// WIDE-005: the race is paused when the camera's position and orientation stay bit-identical
+// (a running simulation always moves them a little, even standing still).
+std::atomic<unsigned> frozen_views{};
+// WIDE-005: when the car last moved (view[8..10], its velocity), to keep the HUD whole while it
+// stands still (the pit stop's screen, with black bars across the whole width).
+std::atomic<std::uint64_t> last_moving_ms{};
+void WideProbe(float* view, unsigned camera, std::uintptr_t flags, bool shown) {
+    race_view_ms.store(Milliseconds(), std::memory_order_relaxed);
+    // Horizontal speed over 0.5 m/s: the jacks lifting the car during a tyre change, or a
+    // twitch while it stands, don't count as moving.
+    if (std::hypot(view[8], view[10]) > 0.5f) {
+        last_moving_ms.store(Milliseconds(), std::memory_order_relaxed);
+    }
+    {
+        static std::mutex mutex;
+        static float last[8]{};
+        static unsigned last_camera = ~0u;
+        std::lock_guard lock(mutex);
+        if (camera == last_camera && std::memcmp(last, view, sizeof(last)) == 0) {
+            frozen_views.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            frozen_views.store(0, std::memory_order_relaxed);
+        }
+        std::memcpy(last, view, sizeof(last));
+        last_camera = camera;
+    }
+    (void)flags;
+    (void)shown;
+    if (!Vulkan::RytyWideScene()) return;
+    const float aspect = Vulkan::RytyDisplayAspect();
+    for (int i = 0; i < 56; ++i) {
+        if (std::fabs(view[i] - 16.0f / 9.0f) < 1e-4f) {
+            static std::atomic<std::uint64_t> logged{};
+            if (!(logged.fetch_or(1ull << i) & (1ull << i)))
+                std::fprintf(stderr, "[wide] camera view[%d] was 16:9; set to %.3f\n", i, double(aspect));
+            view[i] = aspect;
+        }
+    }
+}
 template<View camera>
 std::uintptr_t __attribute__((sysv_abi)) CameraView(void* a, void* b, void* c, float* view, std::uintptr_t flags) {
     constexpr unsigned index = static_cast<unsigned>(camera);
@@ -203,6 +354,7 @@ std::uintptr_t __attribute__((sysv_abi)) CameraView(void* a, void* b, void* c, f
         if (valid && settings.orbit) std::memcpy(reinterpret_cast<unsigned char*>(view) + 0xd8, look_back.data(), 8);
     }
     if (!valid) return result;
+    WideProbe(view, index, flags, a == active_camera && Milliseconds() - active_updated <= 250);
     if (a == active_camera && Milliseconds() - active_updated <= 250) {
         current_view.store(camera, std::memory_order_relaxed);
         view_updated.store(Milliseconds(), std::memory_order_release);
@@ -345,6 +497,30 @@ std::string CarName(std::uint32_t id) {
 }
 void PublishStick(float x, float y, bool focused) {
     std::lock_guard lock(input_mutex); stick = {x, y, focused, Milliseconds()};
+}
+bool RaceViewActive() { return Milliseconds() - race_view_ms.load(std::memory_order_relaxed) < 250; } // WIDE-003
+bool RaceFinished() { return RaceViewActive() && race_finished.load(std::memory_order_relaxed); } // RACE-002
+// WIDE-051: a replay is running, whatever its camera (TV cameras included): known from its last
+// driving camera, until the race session ends (EndReplay) or 5 minutes without one.
+bool ReplayOn() {
+    return replay_view.load(std::memory_order_relaxed) &&
+           Milliseconds() - race_view_ms.load(std::memory_order_relaxed) < 300000;
+}
+void EndReplay() {
+    if (replay_view.exchange(false, std::memory_order_relaxed)) {
+        char wall[16];
+        LogWall(wall, sizeof(wall));
+        std::fprintf(stderr, "[race-state] %s WIDE-051 replay over (menu)\n", wall);
+    }
+    replay_recheck.store(true, std::memory_order_relaxed);
+}
+bool RaceViewFrozen() { return frozen_views.load(std::memory_order_relaxed) >= 10; } // WIDE-005
+bool RaceCarStopped() { // WIDE-005: standing still for more than a second
+    return Milliseconds() - last_moving_ms.load(std::memory_order_relaxed) > 1000;
+}
+// WIDE-005: one of the driving cameras is the one on screen (not a pit stop or other scene camera).
+bool RaceCameraShown() {
+    return Milliseconds() - view_updated.load(std::memory_order_acquire) <= 250;
 }
 float NativeFov(View view) { return hooks[static_cast<unsigned>(view)].native_fov.load(); }
 float MinimumHeight(View view) { return hooks[static_cast<unsigned>(view)].minimum.load(); }

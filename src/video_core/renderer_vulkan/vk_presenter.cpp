@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <deque>
+#include <thread>
 #include <array>
 #include <atomic>
 #include <cctype>
@@ -168,6 +169,7 @@ struct ScreenshotReadback {
     u32 height{};
     vk::Format format{};
     bool hdr_encoded{};
+    bool recorder{}; // DIAG-127: a frame for the flight recorder only (counted while in flight)
 
     ScreenshotReadback(const Instance& instance, ScreenshotKind kind_,
                        std::vector<std::filesystem::path> paths_, const u32 width_,
@@ -546,12 +548,22 @@ static void CheckFlashFrame(const ScreenshotReadback& readback) {
             const auto dir = Common::FS::GetUserPath(Common::FS::PathType::ScreenshotsDir) /
                              fmt::format("recorder_{}", stamp);
             std::filesystem::create_directories(dir);
-            u32 n = 0;
-            for (const auto& f : ring) {
-                WritePng(dir / fmt::format("{:03}.png", n++), f.px, f.w, f.h);
-            }
-            LOG_WARNING(Render_Vulkan, "DIAG-127: saved the last {} frames to {}", n,
-                        dir.string());
+            // DIAG-127: written as uncompressed BMPs on a thread of their own (240 PNGs took 25 s
+            // on the present thread, which stalled the game while frames piled up).
+            std::thread([frames = std::deque<Small>(ring), dir] {
+                u32 n = 0;
+                for (const auto& f : frames) {
+                    const auto path = dir / fmt::format("{:03}.bmp", n++);
+                    Common::FS::IOFile file(path, Common::FS::FileAccessMode::Create);
+                    if (!file.IsOpen()) continue;
+                    auto callback = [](void* context, void* data, int size) {
+                        static_cast<Common::FS::IOFile*>(context)->WriteRaw<u8>(data, size);
+                    };
+                    stbi_write_bmp_to_func(callback, &file, int(f.w), int(f.h), 4, f.px.data());
+                }
+                LOG_WARNING(Render_Vulkan, "DIAG-127: saved the last {} frames to {}", n,
+                            dir.string());
+            }).detach();
         }
         return;
     }
@@ -581,15 +593,25 @@ static void CheckFlashFrame(const ScreenshotReadback& readback) {
     previous = std::move(rgba);
 }
 #else
+static constexpr int FlashWatchMode() { return 0; }
 static constexpr bool FlashWatchEnabled() { return false; }
 static constexpr bool FlashWatchScreen() { return false; }
 #endif
+
+// DIAG-127: the flight recorder's frames read back and not yet handled. Each is a buffer the
+// size of the screen (29 MB at 5120x1440); taking one every frame while the previous ones were
+// still waiting ran the GPU out of memory (ErrorOutOfDeviceMemory on the present thread), so a
+// frame is skipped while 3 are in flight.
+static std::atomic<int> g_recorder_in_flight{0};
 
 static void SavePendingScreenshot(const ScreenshotReadback& readback) {
     if (readback.paths.empty()) {
 #ifndef NDEBUG
         CheckFlashFrame(readback); // DIAG-125
 #endif
+        if (readback.recorder) {
+            g_recorder_in_flight.fetch_sub(1, std::memory_order_relaxed);
+        }
         return;
     }
 
@@ -991,8 +1013,11 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     std::string upscaler; // FSR-204: for the window title
     const vk::Extent2D game_size = image_size;
 #ifdef RYTY_GPU
+    float side_x0 = 0.0f, side_x1 = 1.0f; // WIDE-042
     const auto shown = UiHires::TakeFrame(instance, pass_cmdbuf, cpu_address, image_size,
-                                          {frame->width, frame->height}, view_info.format);
+                                          {frame->width, frame->height}, view_info.format,
+                                          image.GetImage(),
+                                          vk::ImageLayout::eShaderReadOnlyOptimal);
     if (temporalView) {
         image_view = temporalView;
         image_size = temporalDlss.OutputSize();
@@ -1006,6 +1031,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         dlss_scaled = shown->dlss;
         scaled = true;
         upscaler = shown->dlss ? "DLSS" : "high-resolution UI";
+        side_x0 = shown->side_x0;
+        side_x1 = shown->side_x1;
     }
     // ryGT: DLSS (when its plugin is on and can scale to the window size) replaces FSR.
     if (const auto dlss_view = scaled ? image_view :
@@ -1050,8 +1077,13 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // the post process pass still sRGB encoded and has to be decoded there instead.
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
+#ifdef RYTY_GPU
+    pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, pp_settings, ui_layer_view,
+                   dlss_scaled, side_x0, side_x1);
+#else
     pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, pp_settings, ui_layer_view,
                    dlss_scaled);
+#endif
 
     DebugState.game_resolution = {image_size.width, image_size.height};
     DebugState.output_resolution = {frame->width, frame->height};
@@ -1317,7 +1349,8 @@ Frame* Presenter::PrepareNativeFrame(NativeRenderer& native,
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
     PrepareHudlessReference(*frame, pass_cmdbuf, view_format);
     pp_pass.Render(pass_cmdbuf, image_view, image_size, *frame, pp_settings, ui_layer_view,
-                   dlss_scaled);
+                   dlss_scaled, display->output_view ? display->side_x0 : 0.0f,
+                   display->output_view ? display->side_x1 : 1.0f);
     const vk::ImageMemoryBarrier2 back{
         .srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader |
                         vk::PipelineStageFlagBits2::eComputeShader,
@@ -1431,6 +1464,8 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread, Frame* frame) {
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame, u64 anti_lag_frame) {
+    if (is_game_frame && !is_reusing_frame) {
+    }
 #ifndef NDEBUG
     auto* trace = Common::FrameQueueTrace::current;
     struct TracePresentScope {
@@ -1712,7 +1747,10 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
         ImGui::Core::Render(cmdbuf, swapchain_image_view, swapchain.GetExtent());
 
         // Not of a minimized window (a 0x0 swapchain: a 0-byte readback buffer stopped the game).
-        if ((capture_with_overlays_count > 0 || FlashWatchScreen()) && extent.width != 0 &&
+        const bool recorder_frame =
+            capture_with_overlays_count == 0 && FlashWatchScreen() &&
+            (FlashWatchMode() < 3 || g_recorder_in_flight.load(std::memory_order_relaxed) < 3);
+        if ((capture_with_overlays_count > 0 || recorder_frame) && extent.width != 0 &&
             extent.height != 0) {
             auto& readback = pending_screenshot.emplace(
                 instance, ScreenshotKind::WithOverlays,
@@ -1721,6 +1759,10 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame,
                 swapchain.GetHDR() ? vk::Format::eA2B10G10R10UnormPack32
                                    : swapchain.GetSurfaceFormat().format,
                 swapchain.GetHDR());
+            if (capture_with_overlays_count == 0) {
+                readback.recorder = true;
+                g_recorder_in_flight.fetch_add(1, std::memory_order_relaxed);
+            }
 
             const vk::ImageMemoryBarrier to_transfer{
                 .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
