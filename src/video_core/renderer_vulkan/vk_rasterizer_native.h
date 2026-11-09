@@ -560,7 +560,7 @@ private:
     GtsSceneImage TemporalImage(const Native::ImageEntry& entry);
     void CaptureNativeFsr(const GraphicsPipeline& pipeline, const Targets& targets,
                           const DrawBindings& bindings);
-    bool BeginNativeFsr(const GraphicsPipeline& pipeline, const Targets& targets,
+    bool BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& targets,
                         const DrawBindings& bindings);
     void FinishNativeFsr(const Targets& targets);
     struct FsrComposition;
@@ -569,6 +569,11 @@ private:
     VAddr fsr_display_address{};
     std::string fsr_display_backend;
     bool fsr_wide_full = false; ///< WIDE-001: the composition being reconstructed is a race scene
+    /// WIDE-063: the race composition is drawn at the DLSS scene's size into the reconstruction's
+    /// input (the wide scene is wider than the game's display buffer); the game's size it was
+    /// set up for, which its viewports are scaled from.
+    bool fsr_wide_drawn = false;
+    vk::Extent2D fsr_game_extent{};
     /// WIDE-005: this draw is race HUD drawn in pieces; the 16:9 HUD rectangle in the proxy.
     bool hud_spread = false;
     bool menu_ui = false; // WIDE-019 (diagnosis): a menu UI draw, outside races
