@@ -249,10 +249,16 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       // sparks) no longer reached guest memory before the game's CPU used them, and sparks
       // came with exploded vertices. GDS-WINDOW-001: the split now requires the drain's whole
       // 512 KB download window to hold only the pending GDS copies, so those nearby results
-      // still take the drain. Off again by default: the first run with it on loaded much more
-      // slowly and crashed before a race on an RX 7600. RYGT_SPLIT_GDS_WRITE_FAULTS=1 trials it.
-      split_gds_write_faults{[] {
+      // still take the drain. FIX-367-GTS: disable on AMD after the RX 7600 loading crash;
+      // keep NVIDIA enabled by default. Other vendors retain explicit opt-in.
+      split_gds_write_faults{[&instance_] {
+          if (instance_.GetVendorID() == 0x1002) {
+              return false;
+          }
           const char* env = std::getenv("RYGT_SPLIT_GDS_WRITE_FAULTS");
+          if (instance_.GetVendorID() == 0x10de) {
+              return !(env && env[0] == '0');
+          }
           return env && env[0] == '1' && env[1] == '\0';
       }()} {
     if (split_gds_write_faults) {
