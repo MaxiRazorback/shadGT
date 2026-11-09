@@ -142,18 +142,24 @@ bool WriteThroughCachedAlias(VAddr address, const void* source, u64 size) {
     auto& cache = GetAliasCache();
     void* retired = nullptr;
     bool written = false;
-    {
+    void* pending_alias = nullptr;
+    try {
         std::scoped_lock lk{cache.mutex};
         auto found = cache.views.Find(first);
         if (!found) {
-            void* alias = map_alias(first, AliasPage);
-            retired = cache.views.Insert(first, alias);
-            found = alias;
+            pending_alias = map_alias(first, AliasPage);
+            retired = cache.views.Insert(first, pending_alias);
+            found = pending_alias;
+            pending_alias = nullptr;
         }
         if (*found) {
             std::memcpy(static_cast<u8*>(*found) + (address - first), source, size);
             written = true;
         }
+    } catch (...) {
+        // Insert did not take ownership; release the new view after unlocking.
+        if (pending_alias) unmap_alias(pending_alias);
+        throw;
     }
     // Capacity pressure retires one cold alias, never all 4096 at once.
     if (retired) unmap_alias(retired);
