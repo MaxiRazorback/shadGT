@@ -196,7 +196,7 @@ public:
         return depth_range_unrestricted;
     }
 
-    /// SO-001: plain pipelines are drawn with shader objects (RYGT_SHADER_OBJECT=1).
+    /// SO-001: exact RYGT_SHADER_OBJECT=1 opts into shader objects on non-AMD GPUs.
     bool IsShaderObjectEnabled() const {
         return shader_object;
     }
