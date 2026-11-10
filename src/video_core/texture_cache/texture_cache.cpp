@@ -1102,7 +1102,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt, FindMemo* memo)
         // DIAG-140 (SHADGT_DIAG_FROSTED=1): the other images at the address of GT Sport's
         // frosted-glass picture when it is looked up.
         static const bool diag_frosted = [] {
-            const char* env = Common::DebugEnv("SHADGT_DIAG_FROSTED");
+            const char* env = Common::DiagEnv("SHADGT_DIAG_FROSTED");
             return env && env[0] == '1';
         }();
         if (diag_frosted && info.guest_address == 0x1009bc0000 && info.size.width == 960 &&
@@ -1165,7 +1165,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt, FindMemo* memo)
     // DIAG-074: SHADGT_LOG_IMAGES=1 logs which cached image each large lookup resolves to, once
     // per (lookup, result) pair, to find images sampled through a different image's layout.
     static const bool log_images = [] {
-        const char* env = Common::DebugEnv("SHADGT_LOG_IMAGES");
+        const char* env = std::getenv("SHADGT_LOG_IMAGES");
         return env && env[0] == '1';
     }();
     if (log_images && info.size.width >= 256 && info.size.height >= 8) {
@@ -1835,7 +1835,7 @@ void TextureCache::GarbageCollectUnusedImages() {
 void TextureCache::ReportMemoryBreakdown() {
 #ifndef NDEBUG
     static const bool enabled = [] {
-        const char* value = Common::DebugEnv("RYGT_VRAM_DIAGNOSTICS");
+        const char* value = Common::DiagEnv("RYGT_VRAM_DIAGNOSTICS");
         return value && value[0] == '1';
     }();
     const auto now = std::chrono::steady_clock::now();

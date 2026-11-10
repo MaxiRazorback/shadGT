@@ -120,7 +120,7 @@ const std::vector<VAddr>& WatchedTextures() {
 #ifndef NDEBUG
     static const std::vector<VAddr> watched = [] {
         std::vector<VAddr> list;
-        const char* env = std::getenv("RYGT_NATIVE_WATCH_TEXTURE");
+        const char* env = Common::DiagEnv("RYGT_NATIVE_WATCH_TEXTURE");
         for (const char* at = env; at && *at;) {
             char* end = nullptr;
             const VAddr address = std::strtoull(at, &end, 16);
@@ -151,7 +151,7 @@ bool WatchedTexture(VAddr begin, VAddr end) {
     // DIAG-167 (RYGT_NATIVE_WATCH_RANGE=<hex lo>-<hex hi>): images starting in that range too
     // (pictures whose address changes from run to run).
     static const std::pair<VAddr, VAddr> range = [] {
-        const char* env = std::getenv("RYGT_NATIVE_WATCH_RANGE");
+        const char* env = Common::DiagEnv("RYGT_NATIVE_WATCH_RANGE");
         if (!env || !*env) {
             return std::pair<VAddr, VAddr>{};
         }
@@ -632,7 +632,7 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         // (diagnosis) RYGT_NATIVE_ZERO_NEW_TARGETS=1: a new target starts as zeros instead.
         // =<hex lo>-<hex hi>: only targets starting in that range.
         static const std::pair<VAddr, VAddr> zero_range = [] {
-            const char* env = Common::DiagEnv("RYGT_NATIVE_ZERO_NEW_TARGETS");
+            const char* env = std::getenv("RYGT_NATIVE_ZERO_NEW_TARGETS");
             if (!env || !*env) {
                 return std::pair<VAddr, VAddr>{};
             }
@@ -1518,7 +1518,7 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
     }
 #ifndef NDEBUG
     if (WatchedTexture(address, address + std::max<u64>(size, 1)) && WatchSample()) {
-        static const bool dump_on_fill = std::getenv("RYGT_FRAME_DUMP_ON_FILL") != nullptr;
+        static const bool dump_on_fill = Common::DiagEnv("RYGT_FRAME_DUMP_ON_FILL") != nullptr;
         if (pattern && dump_on_fill) {
             g_dump_request = true; // FIX-156 (diagnosis): dump the next frame
         }

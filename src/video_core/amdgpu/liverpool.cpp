@@ -1635,7 +1635,7 @@ void Liverpool::Process(std::stop_token stoken) {
                         // 200 s, times relative to the first one (ms): submit, decoded,
                         // recorded, GPU done, and the jobs pushed and finished by then.
                         static const bool timeline = [] {
-                            const char* env = Common::DebugEnv("SHADGT_DIAG_TIMELINE");
+                            const char* env = Common::DiagEnv("SHADGT_DIAG_TIMELINE");
                             return env && env[0] == '1';
                         }();
                         if (timeline) {
@@ -3850,7 +3850,7 @@ u64 ibs_unseen{};
 
 bool TessSubmitCheckEnabled() {
     static const bool enabled = [] {
-        const char* env = Common::DebugEnv("SHADGT_TESS_SUBMIT_CHECK");
+        const char* env = std::getenv("SHADGT_TESS_SUBMIT_CHECK");
         return env && *env && *env != '0';
     }();
     return enabled;

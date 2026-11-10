@@ -1234,10 +1234,8 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.hw.fs.en_flags = regs.ps_input_ena;
         info.hw.fs.addr_flags = regs.ps_input_addr;
         info.hw.fs.num_inputs = regs.num_interp;
-        static const bool direct_barycentric_requested = [] {
-            const char* value = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC");
-            return !value || std::strcmp(value, "0") != 0;
-        }();
+        // FIX-419-GTS (follows FIX-GT7-061): the launcher's opt-in, off when unset.
+        static const bool direct_barycentric_requested = SingleSampleBarycentricRequested();
         // shadgt7 FIX-217: only for the fragment shaders 217d4011 is about (a V_INTERP_MOV reading
         // a vertex's own value, P10 or P20); every other shader keeps the hardware interpolation
         // and its translation and cache entries. On for all fragment shaders, it made AMD
@@ -2118,8 +2116,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
     };
-    if (const char* value = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC");
-        (!value || std::strcmp(value, "0") != 0) && instance.GetVendorID() == 0x1002) {
+    if (SingleSampleBarycentricRequested() && instance.GetVendorID() == 0x1002) { // FIX-GT7-061
         LOG_WARNING(Render_Vulkan, "AMD-BARY: single-sample compiler path enabled; KHR {}",
                     profile.supports_fragment_shader_barycentric);
     }
@@ -2130,12 +2127,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     profile.native_cube_sampling = NativeModeRequested() && instance.IsImageCubeArraySupported();
     SetNativeCubeCacheEnabled(profile.native_cube_sampling);
 #endif
-    const char* barycentric_env = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC");
     SetVertexOrderCheckCacheEnabled(profile.vertex_order_check); // AMD-307
     SetDiscardKillCacheEnabled(profile.discard_kills);           // FIX-223
     SetSingleSampleBarycentricCacheEnabled(UseSingleSampleBarycentric(
         instance.GetVendorID(), profile.supports_fragment_shader_barycentric, 1,
-        !barycentric_env || std::strcmp(barycentric_env, "0") != 0));
+        SingleSampleBarycentricRequested())); // FIX-419-GTS (FIX-GT7-061)
     CreateDriverCache();
     if (WarmComputeOn()) {
         try {
@@ -2164,10 +2160,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             LOG_WARNING(Render_Vulkan, "PERF-GT7-108: compile pack unavailable: {}", e.what());
         }
     } else if (CompilePack::CompileOn()) {
-        // The pack's recipes are shader object sets, and SPIR-V is kept only with shader objects
-        // on; with pipelines (shadGT's default) there is nothing to compile.
-        LOG_WARNING(Render_Vulkan, "PERF-GT7-108: the compile pack needs shader objects "
-                                   "(RYGT_SHADER_OBJECT=1{}): no start-up compile",
+        // FIX-GT7-136: the pack's recipes are shader object sets, and SPIR-V is kept only with
+        // shader objects on; with pipelines (AMD's default) there is nothing to compile.
+        LOG_WARNING(Render_Vulkan, "PERF-GT7-108: the compile pack needs shader objects (see "
+                                   "SO-001; RYGT_SHADER_OBJECT=1 on AMD{}): no start-up compile",
                     so_cache ? "" : "; RYGT_SO_CACHE not 0");
     }
     bool pretranslate_wanted = false;
@@ -2750,6 +2746,10 @@ void PipelineCache::FinishBuild(PipelineBuild& build) {
       const bool foreground = build.urgent.load(std::memory_order_acquire);
       if (foreground) Common::BeginForegroundCompile();
       SCOPE_EXIT { if (foreground) Common::EndForegroundCompile(); };
+      // FIX-419-GTS (follows FIX-GT7-030): a build a draw waits for does not wait for another
+      // build's shared libraries.
+      g_pipeline_build_urgent = foreground;
+      SCOPE_EXIT { g_pipeline_build_urgent = false; };
       try {
         build.pipeline = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, build.key, *pipeline_cache, build.infos,
@@ -2920,8 +2920,10 @@ void PipelineCache::QueueBuild(const std::shared_ptr<PipelineBuild>& build, Buil
         build->infos[u32(Shader::SwStage::TessellationControl)] != nullptr) {
         kind = BuildQueue::Kind::Tessellated;
     }
+    // PERF-419-GTS (PERF-172): with RYGT_TESS_BUILDS above 1 (the default 4), HeavyBuildGate's
+    // memory check limits tessellated builds, not the queue's single heavy slot.
     build_workers->Push(std::move(job), kind,
-        Common::PerfFeatureEnabled(79) &&
+        Common::PerfFeatureEnabled(79) && TessBuildsAsked() <= 1 &&
         QueueWholeTessellation(build->infos[u32(Shader::SwStage::TessellationControl)] != nullptr,
             build->preloading, PrecompileHoldsGame(),
             SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(), build->preloading)));
@@ -6494,12 +6496,12 @@ static bool SaneTessConstants(const Shader::Info& hull, const AmdGpu::Liverpool*
 // race start waited 1.5 s for 211-233 of them, one after another (first frames 500-900 ms). Past
 // the budget the tessellated draw is skipped and comes back once its translation is done (one or
 // two frames); its factor writes are only read by the draw itself.
-// RYGT_HS_WAIT_BUDGET_MS=<ms> (shadgt7 uses 8). shadGT: 0 (waits as before) unless set, so GT
-// Sport's tessellated draws are never skipped by default.
+// RYGT_HS_WAIT_BUDGET_MS=<ms> (8, as shadgt7's PERF-GT7-115 since PERF-419-GTS), 0: waits as
+// before.
 static std::chrono::milliseconds HsWaitBudget() {
     static const std::chrono::milliseconds budget = [] {
         const char* env = std::getenv("RYGT_HS_WAIT_BUDGET_MS");
-        return std::chrono::milliseconds{env && *env ? std::strtol(env, nullptr, 0) : 0};
+        return std::chrono::milliseconds{env && *env ? std::strtol(env, nullptr, 0) : 8};
     }();
     return budget;
 }

@@ -172,7 +172,7 @@ public:
     static bool PrepareEnabled();
     /// Whether the prepared draws are used (the recorder takes them, the command thread trusts them).
     static bool PreparedOn();
-    /// PERF-GT7-010 (PERF-314: opt-in): whether the native threads run above normal priority.
+    /// PERF-GT7-010 (on by default, PERF-419-GTS): whether the native threads run above normal priority.
     static bool BoostOn();
     /// PERF-GT7-013..016 (RYGT_NATIVE_NEXT=1, A/B mode C): the draw path's next changes under test.
     static bool NextOn();
@@ -1488,7 +1488,7 @@ private:
 #if !defined(NDEBUG)
         // PERF-GT7-001: collecting per-binding page coverage is opt-in.
         static const bool on = [] {
-            const char* env = std::getenv("RYGT_NATIVE_INPLACE_STATS");
+            const char* env = Common::DiagEnv("RYGT_NATIVE_INPLACE_STATS");
             return env && env[0] == '1';
         }();
         return on && (frame & 7) == 0;

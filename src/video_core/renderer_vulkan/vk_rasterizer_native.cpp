@@ -1785,8 +1785,8 @@ bool NativeRenderer::PreparedOn() {
     return PrepareEnabled();
 }
 
-// PERF-GT7-010 as shadGT adapted it (PERF-314): the native threads' priority is opt-in
-// (RYGT_NATIVE_GPU_PRIORITY=1), see Common::NativeCpuPriorityRequested.
+// PERF-GT7-010 (on; RYGT_NATIVE_GPU_PRIORITY=0 off since PERF-419-GTS, as in shadgt7): the
+// native threads run above normal priority, see Common::NativeCpuPriorityRequested.
 bool NativeRenderer::BoostOn() {
     return Common::NativeCpuPriorityRequested();
 }

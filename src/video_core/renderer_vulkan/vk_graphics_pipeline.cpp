@@ -216,10 +216,10 @@ private:
 // the process went from 11 GB to 100 GB in seconds and the driver's compiler ran out of memory.
 // Admit one heavy compile at a time: two simultaneous builds exhausted system
 // commit inside NVIDIA LLVM. -DisablePerf 79 disables this final driver-call gate.
-// PERF-172 (GT7): RYGT_TESS_BUILDS=N (2..16) lets up to N tessellated pipelines build at once
-// while the process commits under half the RAM and 4 GB stay free, two otherwise (GT7's
-// unoptimized tessellated pipelines, FIX-057/PERF-081, held its cars back two at a time).
-// Unset (or 1), the shared one-at-a-time gate above applies.
+// PERF-172 (GT7): RYGT_TESS_BUILDS=N (2..16, default 4 since PERF-419-GTS as in shadgt7) lets
+// up to N tessellated pipelines build at once while the process commits under half the RAM and
+// 4 GB stay free, two otherwise (GT7's unoptimized tessellated pipelines, FIX-057/PERF-081, held
+// its cars back two at a time). RYGT_TESS_BUILDS=1: the shared one-at-a-time gate above applies.
 class HeavyBuildGate {
 public:
     explicit HeavyBuildGate(bool heavy) {
@@ -278,16 +278,10 @@ private:
         static Gate gate;
         return gate;
     }
-    /// PERF-172: RYGT_TESS_BUILDS, or 0 when unset (the shared semaphore is used then).
+    /// PERF-172: RYGT_TESS_BUILDS (default 4), or 0 when it is 1 (the shared semaphore then).
     static u32 Asked() {
-        static const u32 asked = [] {
-            if (const char* env = std::getenv("RYGT_TESS_BUILDS"); env && *env) {
-                const u32 n = std::clamp(static_cast<u32>(std::strtoul(env, nullptr, 10)), 1u, 16u);
-                return n > 1 ? n : 0u;
-            }
-            return 0u;
-        }();
-        return asked;
+        const u32 n = TessBuildsAsked();
+        return n > 1 ? n : 0u;
     }
     static u32 Limit() {
         const u32 asked = Asked();
@@ -1261,17 +1255,23 @@ GraphicsPipeline::GraphicsPipeline(
         std::array<vk::Pipeline, 4> library_handles{};
         library_handles[0] = create_library(0);
         library_handles[3] = create_library(3);
+        // FIX-419-GTS (follows FIX-GT7-030's may_wait): a build a draw waits for
+        // (g_pipeline_build_urgent) makes its own copy of a library another build is making.
+        const auto may_share = [&](u64 hash) {
+            return share_libraries &&
+                   !(g_pipeline_build_urgent && library_cache.Pending(device, hash).valid());
+        };
         // Fill independent fragments on the existing worker pool before waiting for
         // the single tessellation compiler. No nested threads, no extra heavy jobs.
         if (!fragment_library) {
-            auto [owner, reused] = library_cache.GetOrCreate(device, fragment_hash, share_libraries,
+            auto [owner, reused] = library_cache.GetOrCreate(device, fragment_hash, may_share(fragment_hash),
                 [&] { return create_library(2); });
             fragment_owner = std::move(owner);
             fragment_reused = reused;
             fragment_library = **fragment_owner;
         }
         if (!pre_raster_library) {
-            auto [owner, reused] = library_cache.GetOrCreate(device, pre_raster_hash, share_libraries,
+            auto [owner, reused] = library_cache.GetOrCreate(device, pre_raster_hash, may_share(pre_raster_hash),
                 [&] { return create_library(1); });
             pre_raster_owner = std::move(owner);
             pre_raster_reused = reused;

@@ -111,6 +111,8 @@ std::string GetReadableVersion(u32 version) {
 // AMD-300 (SHADGT_SIMULATE_GPU=gcn|rdna1|rdna2): the device reports only what an older Radeon's
 // Windows driver offers (gpuinfo.org: RX 580/RX Vega 2.0.283, RX 5700 XT/RX 6800 2.0.353), so a
 // newer card exercises the paths those cards take. It cannot change the hardware's wave size.
+// Nor the vendor ID: on a non-AMD card rdna1|rdna2 keep shader objects on, while a real Radeon
+// draws pipelines by default (FIX-GT7-136); add RYGT_SHADER_OBJECT=0 to mimic one.
 enum class SimulatedGpu { None, Gcn, Rdna1, Rdna2 };
 
 SimulatedGpu GetSimulatedGpu() {
@@ -493,17 +495,26 @@ bool Instance::CreateDevice() {
     depth_clip_control = add_extension(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
     depth_clip_enable = add_extension(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
     vertex_input_dynamic_state = add_extension(VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
-    // SO-001 (RYGT_SHADER_OBJECT=1): VK_EXT_shader_object. Plain pipelines (no tessellation or
-    // geometry shader) are drawn with vertex and fragment shader objects and dynamic state
-    // instead of a compiled pipeline: no driver pipeline compile for them. Needs the dynamic
-    // states of extended_dynamic_state3 that those pipelines otherwise fix.
-    // FIX-366-GTS: use pipelines by default; RYGT_SHADER_OBJECT=1 opts into shader objects.
-    // SO-012: a start after a lost device with shader objects on uses pipelines once (the marker
-    // is removed, so the start after that tries shader objects again).
-    const auto lost_marker = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
-                             "shader_objects" / "device_lost.txt";
+    // SO-001: VK_EXT_shader_object. Plain pipelines (no tessellation or geometry shader) are drawn
+    // with vertex and fragment shader objects and dynamic state instead of a compiled pipeline: no
+    // driver pipeline compile for them. Needs the dynamic states of extended_dynamic_state3 that
+    // those pipelines otherwise fix.
+    // FIX-419-GTS (follows FIX-GT7-136, replaces FIX-366-GTS/FIX-374-GTS): off by default on AMD
+    // GPUs (crashes reported with shader objects on AMD), on by default elsewhere.
+    // RYGT_SHADER_OBJECT=1 turns them on, =0 off, on any GPU; any other value keeps the GPU's
+    // default.
+    // SO-012: a start that wants shader objects after a lost device with shader objects on uses
+    // pipelines once (the marker is removed, so the next start that wants them tries them again).
+    // A start that doesn't want them leaves the marker for that next one.
+    const char* shader_object_env = std::getenv("RYGT_SHADER_OBJECT");
+    const char shader_object_forced = shader_object_env ? shader_object_env[0] : '\0';
+    const bool amd_gpu = properties.vendorID == 0x1002;
+    const bool shader_object_asked =
+        shader_object_forced == '1' || (shader_object_forced != '0' && !amd_gpu);
     bool after_loss = false;
-    {
+    if (shader_object_asked) {
+        const auto lost_marker = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+                                 "shader_objects" / "device_lost.txt";
         std::error_code ec;
         if (std::filesystem::exists(lost_marker, ec)) {
             after_loss = true;
@@ -511,16 +522,13 @@ bool Instance::CreateDevice() {
             LOG_WARNING(Render_Vulkan, "SO-012: the GPU device was lost in the last run with shader "
                                        "objects: this run builds pipelines");
         }
+    } else if (shader_object_forced == '0') {
+        LOG_WARNING(Render_Vulkan, "SO-001: shader objects off (RYGT_SHADER_OBJECT=0)");
+    } else {
+        LOG_WARNING(Render_Vulkan, "SO-001: shader objects off (FIX-GT7-136: off by default on "
+                                   "AMD GPUs, RYGT_SHADER_OBJECT=1 turns them on)");
     }
-    // FIX-374-GTS: pipelines are the default; exact RYGT_SHADER_OBJECT=1 opts in on non-AMD GPUs.
-    // AMD (0x1002) remains hard-disabled after device losses with shader objects on.
-    const char* shader_object_env = std::getenv("RYGT_SHADER_OBJECT");
-    constexpr u32 amd_vendor_id = 0x1002;
-    const bool shader_objects_allowed = properties.vendorID != amd_vendor_id && shader_object_env &&
-                                        shader_object_env[0] == '1' && shader_object_env[1] == '\0';
-    LOG_WARNING(Render_Vulkan, "SO-014: shader objects {}; AMD hard-disabled",
-                shader_objects_allowed ? "requested" : "off");
-    if (shader_objects_allowed && !after_loss) {
+    if (shader_object_asked && !after_loss) {
         const auto& d3 = dynamic_state_3_features;
         const bool states = dynamic_state_3 && d3.extendedDynamicState3DepthClampEnable &&
                             d3.extendedDynamicState3PolygonMode &&
@@ -541,8 +549,10 @@ bool Instance::CreateDevice() {
         // SO-003: tessellated pipelines too. VK_EXT_shader_object itself provides the patch
         // control point and domain origin commands its shaders need (AMD's driver reports no
         // extendedDynamicState2PatchControlPoints feature, which only pipelines need).
-        // SO-011: available on supported GPUs when opted in, with linked shader objects cached
-        // on disk and only changed state set. RYGT_SHADER_OBJECT_TESS=0 keeps tessellation pipelines.
+        // SO-011: whenever shader objects are on (on AMD only with RYGT_SHADER_OBJECT=1 since
+        // FIX-GT7-136), tessellated pipelines are shader objects too, now that shader objects are
+        // linked, cached on disk and set only changed state. RYGT_SHADER_OBJECT_TESS=0 keeps them
+        // pipelines.
         // SO-006: VK_KHR_maintenance11's VK_SHADER_CREATE_INDEPENDENT_SETS_BIT_KHR lets shader
         // objects use the independent-sets layouts the pipelines bind their sets with (newer
         // than these headers: enabled by its name, feature structure type and flag value).
@@ -567,8 +577,9 @@ bool Instance::CreateDevice() {
         }
         LOG_WARNING(Render_Vulkan, "SO-006: shader objects with independent sets: {}",
                     shader_independent_sets ? "yes" : "no (using pipelines)");
-        LOG_WARNING(Render_Vulkan, "SO-001: shader objects {}; tessellated pipelines {}",
+        LOG_WARNING(Render_Vulkan, "SO-001: shader objects {} ({}); tessellated pipelines {}",
                     shader_object ? "on" : "not available (driver lacks a needed feature)",
+                    shader_object_forced == '1' ? "RYGT_SHADER_OBJECT=1" : "default on this GPU",
                     shader_object_tessellation ? "too (SO-003)" : "as pipelines");
     }
     // Games excessively leave restart enabled with lists when it isn't actually needed, and it
@@ -593,15 +604,12 @@ bool Instance::CreateDevice() {
              amd_vertex_order);
     amd_shader_explicit_vertex_parameter =
         add_extension(VK_AMD_SHADER_EXPLICIT_VERTEX_PARAMETER_EXTENSION_NAME);
-    // AMD-314: AMD's older shader compiler (RX 6000 and older) smeared textures with KHR
-    // barycentrics (AMD-305), and AMD-307 already finds its vertex order, so there the
-    // single-sample path is opt-in; RX 7000 and newer keep it by default.
-    // FIX-GT7-061: RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC (1, true, on or yes turns it on, any other
-    // value off) overrides that default; RYGT_AMD_EXPLICIT_VERTEX=1 turns it off (see
-    // single_sample_barycentric.h).
     {
+        // FIX-GT7-061: KHR barycentrics are off unless asked for (the launcher's option, off by
+        // default): an RX 6600 XT failed to build shaders with them on. FIX-419-GTS: replaces
+        // AMD-314's on-by-default for RX 7000 and newer.
         const std::string model{GetModelName()};
-        AmdBarycentricDefault() = !IsAmdLegacyShaderCompiler();
+        AmdBarycentricDefault() = false;
         LOG_INFO(Render_Vulkan, "FIX-GT7-061: AMD barycentric fix default {} ({}), in use {}",
                  AmdBarycentricDefault() ? "on" : "off", model,
                  properties.vendorID == 0x1002 && SingleSampleBarycentricRequested());
@@ -609,7 +617,7 @@ bool Instance::CreateDevice() {
     const bool direct_barycentric_candidate =
         properties.vendorID == 0x1002 && SingleSampleBarycentricRequested();
     if (!amd_shader_explicit_vertex_parameter || direct_barycentric_candidate) {
-        // Keep AMD explicit-vertex support for multisampled shaders; the AMD default path
+        // Keep AMD explicit-vertex support for multisampled shaders; the opt-in candidate
         // additionally enables KHR for separately specialized one-sample fragments.
         fragment_shader_barycentric =
             add_extension(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);

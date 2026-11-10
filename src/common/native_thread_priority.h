@@ -11,10 +11,12 @@ namespace Common {
 inline bool ExactNativePriorityOptIn(const char* value) {
     return value && value[0] == '1' && value[1] == '\0';
 }
+// PERF-419-GTS (follows shadgt7 PERF-GT7-010, replaces PERF-314's opt-in): the recorder and the
+// command processor run above normal priority by default; RYGT_NATIVE_GPU_PRIORITY=0 turns it off.
 inline bool NativeCpuPriorityRequested() {
     static const bool enabled = [] {
         const char* value = std::getenv("RYGT_NATIVE_GPU_PRIORITY");
-        return ExactNativePriorityOptIn(value);
+        return !(value && value[0] == '0');
     }();
 #ifndef NDEBUG
     static const bool compare = [] {
