@@ -22,6 +22,17 @@ include(FetchContent)
 option(ENABLE_DISCORD_RPC "Enable the Discord RPC integration" ON)
 option(ENABLE_UPDATER "Enables the options to updater" ON)
 option(ENABLE_TESTS "Build unit tests (requires GTest)" OFF)
+# Window branding: shadGT (the default) titles the window "GTSport" with shadGT's icon; RyGT7
+# titles it like ryGT7 does (the game's param.sfo TITLE) and uses ryGT7's icon for the window and
+# the executable. CI selects it with -DSHADGT_BRANDING=RyGT7.
+set(SHADGT_BRANDING "shadGT" CACHE STRING "Window title and icon branding (shadGT or RyGT7)")
+set_property(CACHE SHADGT_BRANDING PROPERTY STRINGS shadGT RyGT7)
+if (SHADGT_BRANDING STREQUAL "RyGT7")
+    add_compile_definitions(SHADGT_BRANDING_RYGT7=1)
+elseif (NOT SHADGT_BRANDING STREQUAL "shadGT")
+    message(FATAL_ERROR "SHADGT_BRANDING must be shadGT or RyGT7, not '${SHADGT_BRANDING}'")
+endif()
+message(STATUS "Window branding: ${SHADGT_BRANDING}")
 # DIAG-056: path to the nvtx3 headers of an NVIDIA Nsight Systems install, for timeline ranges.
 set(SHADGT_NVTX_INCLUDE "" CACHE PATH "nvtx3 include directory (Nsight Systems timeline ranges)")
 option(ENABLE_SYSTEM_LIBRARIES "Enable building against system libraries" OFF)
@@ -1461,6 +1472,7 @@ cmrc_add_resource_library(embedded-resources
         src/resources/bronze.png
         src/resources/gold.png
         src/resources/platinum.png
+        src/resources/rygt7.png
         src/resources/shadps4.png
         src/resources/silver.png
         src/resources/trophy.wav)

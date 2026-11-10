@@ -35,6 +35,15 @@ SPDX-FileCopyrightText = "shadPS4 Emulator Project"
 SPDX-License-Identifier = "GPL-2.0-or-later"
 
 [[annotations]]
+path = [
+    "src/dist/rygt7.ico",
+    "src/resources/rygt7.png",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "ryGT7 project (loader/ryGT7.ico)"
+SPDX-License-Identifier = "GPL-2.0-or-later"
+
+[[annotations]]
 path = "externals/cmake-modules/**"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2009-2010 Iowa State University"

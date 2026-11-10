@@ -580,7 +580,11 @@ void SetWindowIcon(SDL_Window* window, const std::vector<u8>& png) {
 
 void SetDefaultWindowIcon(SDL_Window* window) {
     const auto resource = cmrc::res::get_filesystem();
+#ifdef SHADGT_BRANDING_RYGT7
+    const auto file = resource.open("src/resources/rygt7.png");
+#else
     const auto file = resource.open("src/resources/shadps4.png");
+#endif
     const std::vector<u8> texData = std::vector<u8>(file.begin(), file.end());
     SetWindowIcon(window, texData);
 }

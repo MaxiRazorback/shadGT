@@ -18,6 +18,15 @@ TEST(MenuCompilePolicy, KeepGoingMenusRequireVerifiedIdleCaptureHooks) {
     }
 }
 
+// FIX-GT7-140: without GT Sport's project hook (GT7) shadgt7's rule: keep going never waits.
+TEST(MenuCompilePolicy, NoProjectHooksFollowsShadgt7) {
+    for (unsigned mode = 0; mode != 3; ++mode) {
+        EXPECT_EQ(Native::MenuCompileMustWait(mode, false, false, false, false), mode != 2);
+        EXPECT_FALSE(Native::MenuCompileMustWait(mode, true, false, false, false));
+        EXPECT_TRUE(Native::MenuCompileMustWait(mode, false, true, false, false));
+    }
+}
+
 TEST(MenuCaptureCompileGuard, OwnerIdentityAndFailedStatePreventPinRelease) {
     int controller, object, owner, foreign_owner;
     MenuCaptureCompileGuard guard;
