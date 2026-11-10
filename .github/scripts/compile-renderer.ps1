@@ -33,9 +33,13 @@ if ($LASTEXITCODE) { throw 'Python scripts path lookup failed' }
 $env:PATH = "$llvm/bin;$scripts;$env:PATH"
 $env:LIB = "$($builtins.DirectoryName);$env:LIB"
 
+# Window title and icon: shadGT's (default) or ryGT7's (SHADGT_BRANDING=RyGT7).
+$branding = if ($env:SHADGT_BRANDING) { $env:SHADGT_BRANDING } else { 'shadGT' }
+if ($branding -cnotin @('shadGT', 'RyGT7')) { throw "SHADGT_BRANDING must be shadGT or RyGT7, not '$branding'" }
+Write-Host "Window branding: $branding"
 Invoke-Checked 'cmake' @('-S', '.', '-B', 'Build/pr-compile', '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
     '-DCMAKE_C_COMPILER=clang-cl', '-DCMAKE_CXX_COMPILER=clang-cl', '-DCMAKE_LINKER=lld-link',
-    '-DHAVE_ENDIAN_H=OFF', '-DSHADGT_RYTY_GPU=ON', '-DENABLE_DISCORD_RPC=ON')
+    '-DHAVE_ENDIAN_H=OFF', '-DSHADGT_RYTY_GPU=ON', '-DENABLE_DISCORD_RPC=ON', "-DSHADGT_BRANDING=$branding")
 # Build the renderer and the companion host modules packaged with it.
 Invoke-Checked 'cmake' @('--build', 'Build/pr-compile', '--target',
     'ryty_gpu', 'ryty_audio3d', 'ryty_ajm', 'ryty_ngs2', 'ryty_zlib',

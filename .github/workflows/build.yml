@@ -5,6 +5,12 @@ name: Legacy Windows Build and Tests (manual)
 
 on:
   workflow_dispatch:
+    inputs:
+      branding:
+        description: Window title and icon (shadGT, or ryGT7's)
+        type: choice
+        options: [shadGT, RyGT7]
+        default: shadGT
 
 permissions:
   contents: read
@@ -50,13 +56,13 @@ jobs:
       - name: Add LLVM to PATH
         run: '"C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append'
       - name: Configure Release
-        run: cmake --preset x64-Clang-Release -DHAVE_ENDIAN_H=OFF
+        run: cmake --preset x64-Clang-Release -DHAVE_ENDIAN_H=OFF -DSHADGT_BRANDING=${{ inputs.branding }}
       - name: Build shadGT
         run: cmake --build Build/x64-Clang-Release --target shadps4 --parallel $env:NUMBER_OF_PROCESSORS
       - name: Upload Windows executable
         uses: actions/upload-artifact@v7
         with:
-          name: shadGT-win64-${{ github.sha }}
+          name: shadGT-win64-${{ inputs.branding }}-${{ github.sha }}
           path: Build/x64-Clang-Release/shadGT.exe
           if-no-files-found: error
       - name: Configure unit tests
