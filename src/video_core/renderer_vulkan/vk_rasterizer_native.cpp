@@ -3531,6 +3531,19 @@ void NativeRenderer::BindGraphics(Stream& s, const GraphicsPipeline& pipeline,
             bound->BindShaderObjects(cmd, known ? &previous : nullptr, known ? &shaders : nullptr);
         });
         if (!known) s.pipelines.Invalidate();
+        // FIX-420: a bind that changes the shader objects also forgets the push constants and
+        // descriptor sets OPT-014 remembers (binding_commands): the next PushBindings issues them
+        // again. With pipelines they stay bound across binds of a compatible layout; after
+        // vkCmdBindShadersEXT of other shaders they did not reliably (GT Sport's grass tufts drew
+        // over the road a while into a race, from the previous draw's buffer offsets). Draws that
+        // keep the same shaders keep the memo. RYGT_SO_KEEP_BINDINGS=1: as before.
+        static const bool keep_bindings = [] {
+            const char* env = std::getenv("RYGT_SO_KEEP_BINDINGS");
+            return env && env[0] == '1';
+        }();
+        if (!keep_bindings && !(known && shaders == pipeline.ShaderObjects())) {
+            s.binding_commands.Invalidate();
+        }
         s.so_epoch = s.pipelines.InvalidationEpoch();
         s.so_known = true;
         s.so_state = pipeline.GetShaderObjectState();
