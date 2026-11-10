@@ -623,6 +623,7 @@ void LoadScriptReplacements() {
 // (dialogs, the meter, the pause menu) don't change it. The renderer skips draws for new
 // pipelines only in races; in the menus some scenes draw once into a texture they keep showing.
 std::atomic<bool> g_in_race{false};
+std::atomic<bool> g_project_hooks{false}; // FIX-GT7-140: the GTS-003 script-read hook is in
 // WIDE-015: the race "session" for the wide picture: from a race_* project until the menus proper.
 // The pre-race screen's own pages (Change Conditions, Change Car, Select Course) load menu projects
 // (course_select, car_select, garage, ...) on top of the race and return to it without reloading
@@ -922,10 +923,12 @@ void InstallScriptPatches(u8* base) {
         return;
     }
     g_file_read = reinterpret_cast<FileReadFn>(base + kFileRead + kTextRvaShift);
+    bool hooked = false;
     for (size_t i = 0; i < std::size(kStreamRefillCalls); ++i) {
-        RedirectCall(base, stubs + i * 16, kStreamRefillCalls[i], kFileRead,
-                     reinterpret_cast<void*>(&StreamRefillHook), "GTS-003 script reads");
+        hooked |= RedirectCall(base, stubs + i * 16, kStreamRefillCalls[i], kFileRead,
+                               reinterpret_cast<void*>(&StreamRefillHook), "GTS-003 script reads");
     }
+    g_project_hooks.store(hooked, std::memory_order_relaxed); // FIX-GT7-140
 #ifndef NDEBUG
     InstallShaderLoadScan(base);
 #endif
@@ -3206,6 +3209,10 @@ namespace Vulkan {
 // FIX-110: true while a race project runs (see NoteProjectScript).
 bool RytyGtsInRace() {
     return g_in_race.load(std::memory_order_relaxed);
+}
+// FIX-GT7-140: GT Sport's script-read hook is in, so RytyGtsInRace follows the game's projects.
+bool RytyGtsProjectHooks() {
+    return g_project_hooks.load(std::memory_order_relaxed);
 }
 // WIDE-015: true from a race project until the menus proper (its own pages included).
 bool RytyGtsRaceSession() {
