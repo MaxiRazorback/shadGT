@@ -666,6 +666,24 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         if (token.stop_requested()) {
             break;
         }
+        // FIX-GT7-139: the ticks keep an absolute schedule, so time a late tick lost is made up;
+        // but at most MaxCatchUp vblank periods of it. A longer stall (a present or driver hitch,
+        // a flip blocked behind a compile hold) is not made up, so no burst of vblanks tells the
+        // game that time passed while the emulator, not the game, was stuck.
+        // RYGT_VBLANK_CATCHUP=0: every missed tick is made up, as before.
+        {
+            static const bool catch_up_limit = [] {
+                const char* env = std::getenv("RYGT_VBLANK_CATCHUP");
+                return !(env && env[0] == '0');
+            }();
+            constexpr int MaxCatchUp = 6; // ~100 ms at 60 Hz: a 3-vblank frame at 20 fps and more
+            if (catch_up_limit) {
+                const auto max_behind = vblank_period * MaxCatchUp;
+                if (const auto now_tick = Clock::now(); now_tick - next_tick > max_behind) {
+                    next_tick = now_tick - max_behind;
+                }
+            }
+        }
         const bool overdue = Clock::now() > next_tick;
         next_tick += tick_period;
 
