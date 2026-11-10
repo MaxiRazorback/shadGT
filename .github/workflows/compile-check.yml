@@ -3,12 +3,19 @@ name: Renderer PR compile check
 on:
   pull_request:
     branches: [ryty-gpu]
+  workflow_dispatch:
+    inputs:
+      branding:
+        description: Window title and icon (shadGT, or ryGT7's)
+        type: choice
+        options: [shadGT, RyGT7]
+        default: shadGT
 
 permissions:
   contents: read
 
 concurrency:
-  group: pr-compile-${{ github.event.pull_request.number }}
+  group: pr-compile-${{ github.event.pull_request.number || github.ref }}-${{ inputs.branding || 'shadGT' }}
   cancel-in-progress: true
 
 jobs:
@@ -28,4 +35,6 @@ jobs:
           python-version: '3.12'
       - name: Compile PR merge checkout
         shell: pwsh
+        env:
+          SHADGT_BRANDING: ${{ inputs.branding || 'shadGT' }}
         run: ./.github/scripts/compile-renderer.ps1

@@ -577,6 +577,10 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     std::string window_title = "";
     std::string remote_url(Common::g_scm_remote_url);
     std::string remote_host = Common::GetRemoteNameFromLink();
+#ifdef SHADGT_BRANDING_RYGT7
+    // ryGT7 titles its window with the game's param.sfo TITLE alone.
+    window_title = title;
+#else
     if (Common::g_is_release) {
         if (remote_host == "shadps4-emu" || remote_url.length() == 0) {
             window_title = fmt::format("shadGT v{} | {}", Common::g_version, game_title);
@@ -594,6 +598,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
             window_title = fmt::format("{} - Current Build", title);
         }
     }
+#endif
     window = std::make_unique<Frontend::WindowSDL>(EmulatorSettings.GetWindowWidth(),
                                                    EmulatorSettings.GetWindowHeight(), controllers,
                                                    window_title);
