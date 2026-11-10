@@ -234,6 +234,7 @@ bool CompilationInProgress() {
 
 #ifdef RYTY_GPU
 bool RytyGtsInRace(); // FIX-110, ryty_game_patch.cpp
+bool RytyGtsProjectHooks(); // FIX-GT7-140
 bool RytyGtsMenuCaptureCanContinue();
 bool RytyGtsMenuCaptureAvailable();
 #endif
@@ -2579,13 +2580,16 @@ bool PipelineCache::MenusWait() {
     // may skip cosmetic work; an unavailable/ambiguous capture hook fails closed.
 #ifdef RYTY_GPU
     static const bool logged = [] {
-        LOG_INFO(Render_Vulkan, "Compile policy: mode={} (0=pause, 1=slow motion, 2=keep going), capture guard idle={}",
-                 CompileMode(), RytyGtsMenuCaptureCanContinue());
+        LOG_INFO(Render_Vulkan, "Compile policy: mode={} (0=pause, 1=slow motion, 2=keep going), capture guard idle={}, "
+                 "GT Sport project hooks={}",
+                 CompileMode(), RytyGtsMenuCaptureCanContinue(), RytyGtsProjectHooks());
         return true;
     }();
     (void)logged;
+    // FIX-GT7-140: without GT Sport's project hook (GT7) shadgt7's rule applies, see the policy.
     return Native::MenuCompileMustWait(CompileMode(), RytyGtsInRace(),
-                                       RytyGtsMenuCaptureAvailable(), RytyGtsMenuCaptureCanContinue());
+                                       RytyGtsMenuCaptureAvailable(), RytyGtsMenuCaptureCanContinue(),
+                                       RytyGtsProjectHooks());
 #else
     return false;
 #endif
