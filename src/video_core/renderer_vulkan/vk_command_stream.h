@@ -221,7 +221,6 @@ private:
     alignas(64) std::atomic<u64> tail{};
     alignas(64) std::atomic<u32> wake{};
     std::atomic<bool> sleeping{};
-    u32 adaptive_spin{128}; ///< PERF-416: command thread only
 };
 
 /// PERF-084: what Scheduler::CommandBuffer() returns. Records into the scheduler's command ring
