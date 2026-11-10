@@ -17,6 +17,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/diagnostics.h"
 #include "common/div_ceil.h"
 #include "common/read_capture.h"
 #include "common/path_util.h"
@@ -785,6 +786,16 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                 FreeImage(cache_image_id);
             }
             return {merged_image_id, -1, -1};
+        }
+
+        // FIX-191: the same surface with more padding in its guest size (GT7's 960x540 R11G11B10
+        // buffer at 0x100a0b0000: 0x240000 bytes as one descriptor, 0x400000 as another; same
+        // format, size, pitch, tiling, mips and layers). The cached image holds every texel, so
+        // it serves both; this was an assertion that ended the Deep Forest flyover.
+        if (image_info.type == cache_image.info.type && image_info.size == cache_image.info.size &&
+            image_info.pitch == cache_image.info.pitch &&
+            image_info.resources == cache_image.info.resources) {
+            return {merged_image_id ? merged_image_id : cache_image_id, -1, -1};
         }
 
         // Enhanced debug logging for unreachable case
@@ -1672,6 +1683,19 @@ void TextureCache::GarbageCollectImages() {
     if (instance.CanReportMemoryUsage()) {
         total_used_memory = instance.GetDeviceMemoryUsage();
     }
+    // NAT-VRAM-001: how many cached images the budget evicted, every 10 s while it does.
+    if (const auto now = std::chrono::steady_clock::now();
+        vram_evicted_images != vram_logged_images && now - vram_log_time >= std::chrono::seconds{10}) {
+        LOG_WARNING(Render_Vulkan,
+                    "NAT-VRAM-001: {} images evicted ({} MB) so far; used {} MB, budget {} MB, "
+                    "pressure at {} MB, critical at {} MB",
+                    vram_evicted_images, vram_evicted_bytes >> 20, total_used_memory >> 20,
+                    instance.GetTotalMemoryBudget() >> 20, pressure_gc_memory >> 20,
+                    critical_gc_memory >> 20);
+        vram_logged_images = vram_evicted_images;
+        vram_log_time = now;
+    }
+
     if (total_used_memory < trigger_gc_memory) {
         return;
     }
@@ -1704,6 +1728,10 @@ void TextureCache::GarbageCollectImages() {
         const auto image_id = slot_images.GetSlotId(image);
         if (download) {
             DownloadImageMemory(image_id);
+        }
+        if (pressured) { // NAT-VRAM-001: not the age-based cleanup; sized as total_used_memory is
+            ++vram_evicted_images;
+            vram_evicted_bytes += Common::AlignUp(image.info.guest_size, 1024);
         }
         FreeImage(image_id);
         if (total_used_memory < critical_gc_memory) {

@@ -9,19 +9,37 @@ layout (location = 0) out vec4 color;
 
 layout (binding = 0) uniform sampler2D texSampler;
 layout (binding = 1) uniform sampler2D uiSampler; // ryGT HDR-UI: the UI layer
+// GT7-UW: the HUD drawn over black and over white, laid over the picture at 16:9.
+layout (binding = 2) uniform sampler2D hudBlack;
+layout (binding = 3) uniform sampler2D hudWhite;
+// GT7-UW: HUD pieces placed elsewhere: src (x, y, w, h of the 16:9 HUD), dst (of the output).
+struct HudWidget {
+    vec4 src;
+    vec4 dst;
+};
+layout (std140, binding = 4) uniform HudLayout {
+    uvec4 count;
+    HudWidget widgets[16];
+} layout_;
 
 layout (push_constant) uniform settings {
+    // Must match PostProcessingConstants (PostProcessingPass::Settings first) in pp_pass.cpp.
+    // Flags are uint (u32 on the C++ side).
     float gamma;
-    bool hdr;
-    bool srgb_input;
+    uint hdr;
+    uint srgb_input;
     float hdr_peak_nits;
     float hdr_gain;
-    bool sdr_input;
+    uint sdr_input;
     float sdr_white_nits;
-    bool hdr_input_709;
-    bool ui_layer;
+    uint hdr_input_709;
+    uint ui_layer;
     float ui_white_nits;
     float hdr_saturation;
+    // GT7-UW: the HUD laid over the picture between hud_x0 and hud_x1 of the width.
+    uint hud;
+    float hud_x0;
+    float hud_x1;
     float dlss_sharpening;
     // ryGT WIDE-042: the ambient sides (outside side_x0..side_x1 of the width) dimmed by side_dim.
     float side_x0;
@@ -69,7 +87,7 @@ vec3 hdr_adjust(vec3 pq) {
     // Saturation around the BT.2020 luminance.
     float lum = dot(nits, vec3(0.2627, 0.6780, 0.0593));
     nits = max(vec3(lum) + (nits - vec3(lum)) * pp.hdr_saturation, vec3(0.0));
-    if (pp.hdr_input_709) {
+    if (pp.hdr_input_709 != 0u) {
         nits = max(bt709_to_bt2020 * nits, vec3(0.0));
     }
     if (pp.hdr_peak_nits <= 0.0) {
@@ -105,6 +123,10 @@ vec3 degamma(vec3 rgb) {
     );
 }
 
+bool inside(vec2 p, vec4 rect) {
+    return p.x >= rect.x && p.y >= rect.y && p.x < rect.x + rect.z && p.y < rect.y + rect.w;
+}
+
 void main() {
     vec4 color_linear = texture(texSampler, uv);
     if (pp.dlss_sharpening > 0.0) {
@@ -118,12 +140,45 @@ void main() {
     if (pp.side_dim < 1.0 && (uv.x < pp.side_x0 || uv.x > pp.side_x1)) {
         color_linear.rgb *= pp.side_dim;
     }
-    if (pp.hdr && pp.sdr_input) {
+    if (pp.hud != 0u) {
+        // Where on the 16:9 HUD this pixel shows: a placed piece's, else the centred HUD's
+        // (but not what a piece shows elsewhere).
+        bool shown = false;
+        vec2 hud_uv = vec2(0.0);
+        const uint count = min(layout_.count.x, 16u);
+        for (uint i = 0u; i < count; ++i) {
+            const HudWidget w = layout_.widgets[i];
+            if (inside(uv, w.dst)) {
+                hud_uv = w.src.xy + (uv - w.dst.xy) / w.dst.zw * w.src.zw;
+                shown = true;
+                break;
+            }
+        }
+        if (!shown && uv.x >= pp.hud_x0 && uv.x <= pp.hud_x1) {
+            hud_uv = vec2((uv.x - pp.hud_x0) / (pp.hud_x1 - pp.hud_x0), uv.y);
+            shown = true;
+            for (uint i = 0u; i < count; ++i) {
+                if (inside(hud_uv, layout_.widgets[i].src)) {
+                    shown = false;
+                    break;
+                }
+            }
+        }
+        if (shown) {
+            // Over black the HUD left its colour times its coverage; over white also
+            // 1 - coverage. Blended as the game blends it, in the display buffer's encoding.
+            const vec3 black = texture(hudBlack, hud_uv).rgb;
+            const vec3 white = texture(hudWhite, hud_uv).rgb;
+            const float coverage = clamp(1.0 - dot(white - black, vec3(1.0 / 3.0)), 0.0, 1.0);
+            color_linear.rgb = color_linear.rgb * (1.0 - coverage) + black;
+        }
+    }
+    if ((pp.hdr != 0u) && (pp.sdr_input != 0u)) {
         // SDR frame on the HDR10 swapchain: BT.709 linear to BT.2020, at the SDR white level.
-        vec3 lin = pp.srgb_input ? degamma(color_linear.rgb) : color_linear.rgb;
+        vec3 lin = (pp.srgb_input != 0u) ? degamma(color_linear.rgb) : color_linear.rgb;
         vec3 nits = max(bt709_to_bt2020 * lin, vec3(0.0)) * pp.sdr_white_nits;
         color = vec4(nits_to_pq(nits.r), nits_to_pq(nits.g), nits_to_pq(nits.b), color_linear.a);
-    } else if (pp.hdr && pp.ui_layer) {
+    } else if ((pp.hdr != 0u) && (pp.ui_layer != 0u)) {
         // HDR-UI: the scene (PQ) with the SDR UI layer over it, composed in linear light.
         vec3 scene = hdr_adjust(color_linear.rgb);
         vec3 scene_nits = vec3(pq_to_nits(scene.r), pq_to_nits(scene.g), pq_to_nits(scene.b));
@@ -132,10 +187,10 @@ void main() {
         vec3 ui_lin = a > 0.0 ? degamma(clamp(ui.rgb / a, 0.0, 1.0)) * a : vec3(0.0);
         vec3 nits = scene_nits * (1.0 - a) + max(bt709_to_bt2020 * ui_lin, vec3(0.0)) * pp.ui_white_nits;
         color = vec4(nits_to_pq(nits.r), nits_to_pq(nits.g), nits_to_pq(nits.b), 1.0);
-    } else if (pp.hdr) {
+    } else if (pp.hdr != 0u) {
         color = vec4(hdr_adjust(color_linear.rgb), color_linear.a);
     } else {
-        if (pp.srgb_input) color_linear.rgb = degamma(color_linear.rgb);
+        if (pp.srgb_input != 0u) color_linear.rgb = degamma(color_linear.rgb);
         color = vec4(gamma(color_linear.rgb), color_linear.a);
     }
 }

@@ -366,11 +366,9 @@ std::optional<std::array<Id, 3>> EmitContext::FindVertexOrder() {
         OpInterpolateAtVertexAMD(F32[4], order_vertex_in, ConstU32(2U))};
     const Id reference = OpLoad(F32[4], order_ref_in);
     const Id ones = ConstF32(1.0f, 1.0f, 1.0f, 1.0f);
-    constexpr std::array<std::array<u32, 3>, 6> orders{
-        {{0, 1, 2}, {1, 2, 0}, {2, 0, 1}, {0, 2, 1}, {2, 1, 0}, {1, 0, 2}}};
     Id best_error{};
     std::array<Id, 3> best{};
-    for (const auto& order : orders) {
+    for (const auto& order : AmdVertexOrders) {
         Id blend = OpVectorTimesScalar(F32[4], corners[order[0]], weights[0]);
         blend = OpFAdd(F32[4], blend, OpVectorTimesScalar(F32[4], corners[order[1]], weights[1]));
         blend = OpFAdd(F32[4], blend, OpVectorTimesScalar(F32[4], corners[order[2]], weights[2]));
@@ -1171,12 +1169,26 @@ Id ImageType(EmitContext& ctx, const ImageResource& desc, Id sampled_type) {
         return ctx.TypeImage(sampled_type, spv::Dim::Dim2D, false, true, false, sampled, format);
     case AmdGpu::ImageType::Color2DMsaa:
         return ctx.TypeImage(sampled_type, spv::Dim::Dim2D, false, false, true, sampled, format);
+    case AmdGpu::ImageType::Color2DMsaaArray:
+        if (!MsaaArrayEnabled()) {
+            break;
+        }
+        // FIX-GT7-125: a multisampled array; a storage one needs ImageMSArray.
+        if (sampled == 2) {
+            ctx.AddCapability(spv::Capability::ImageMSArray);
+        }
+        return ctx.TypeImage(sampled_type, spv::Dim::Dim2D, false, true, true, sampled, format);
     case AmdGpu::ImageType::Color3D:
         return ctx.TypeImage(sampled_type, spv::Dim::Dim3D, false, false, false, sampled, format);
     default:
         break;
     }
-    UNREACHABLE_MSG("Invalid texture type {}", type);
+    // FIX-GT7-125: which program and T#.
+    UNREACHABLE_MSG("Invalid texture type {} (program {:#x}, T# {:#x} format {}/{} {}x{}, {} "
+                    "samples)",
+                    type, ctx.info.pgm_hash, image.Address(), u32(image.GetDataFmt()),
+                    u32(image.GetNumberFmt()), image.width + 1, image.height + 1,
+                    image.NumSamples());
 }
 
 void EmitContext::DefineImagesAndSamplers() {

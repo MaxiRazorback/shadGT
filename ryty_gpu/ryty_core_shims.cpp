@@ -707,6 +707,11 @@ bool IsWritableTarget(VAddr virtual_addr, u64 size) {
     if (virtual_addr == 0 || size == 0) {
         return false;
     }
+    // FIX-GT7-037: GT7's race once asked for occlusion results at -8. The end of that range wraps
+    // to 8, so the checks below saw an empty range and said yes, and the write crashed the recorder.
+    if (virtual_addr + size < virtual_addr) {
+        return false;
+    }
     if (IsGuestReadable(virtual_addr, size)) {
         return true; // Guest memory: tracking protections fault and are handled.
     }
@@ -961,7 +966,23 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
             if (!IsCommitted(info)) {
                 std::memset(dest, 0, chunk);
             } else if (IsReadable(info.Protect)) {
-                std::memcpy(dest, reinterpret_cast<const void*>(virtual_addr), chunk);
+                // FIX-GT7-003: the game can release the range between the query and the copy
+                // (GT7 unloads textures while a license test restarts, and the recorder stopped
+                // on a plain copy of one): guarded, page by page once it faults, with zeros
+                // where nothing can be read any more.
+                if (!RytyMemory::GuardedCopy(dest, reinterpret_cast<const void*>(virtual_addr),
+                                             chunk)) {
+                    for (u64 done = 0; done < chunk;) {
+                        const VAddr page = virtual_addr + done;
+                        const u64 part = std::min<u64>(chunk - done, 4096 - (page & 4095));
+                        if (!RytyMemory::GuardedCopy(dest + done, reinterpret_cast<const void*>(page),
+                                                     part) &&
+                            !CopyThroughAlias(page, dest + done, nullptr, part)) {
+                            std::memset(dest + done, 0, part);
+                        }
+                        done += part;
+                    }
+                }
             } else if (!CopyThroughAlias(virtual_addr, dest, nullptr, chunk)) {
                 std::memset(dest, 0, chunk);
             }

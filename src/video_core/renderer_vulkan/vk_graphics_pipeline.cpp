@@ -22,12 +22,16 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/assert.h"
+#include "common/elf_info.h"
+#include "common/singleton.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "common/perf_monitor.h"
 #include "common/thread.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
+#include "video_core/renderer_vulkan/compile_pack.h"
+#include "video_core/renderer_vulkan/compile_pack_pipeline.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/shared_build_map.h"
 #include "video_core/renderer_vulkan/shader_object_cache.h"
@@ -212,6 +216,10 @@ private:
 // the process went from 11 GB to 100 GB in seconds and the driver's compiler ran out of memory.
 // Admit one heavy compile at a time: two simultaneous builds exhausted system
 // commit inside NVIDIA LLVM. -DisablePerf 79 disables this final driver-call gate.
+// PERF-172 (GT7): RYGT_TESS_BUILDS=N (2..16) lets up to N tessellated pipelines build at once
+// while the process commits under half the RAM and 4 GB stay free, two otherwise (GT7's
+// unoptimized tessellated pipelines, FIX-057/PERF-081, held its cars back two at a time).
+// Unset (or 1), the shared one-at-a-time gate above applies.
 class HeavyBuildGate {
 public:
     explicit HeavyBuildGate(bool heavy) {
@@ -220,7 +228,15 @@ public:
             return;
         }
         const auto start = std::chrono::steady_clock::now();
-        Semaphore().acquire();
+        if (Asked() == 0) {
+            Semaphore().acquire();
+            semaphore = true;
+        } else {
+            auto& gate = State();
+            std::unique_lock lk{gate.mutex};
+            gate.cv.wait(lk, [&] { return gate.running < Limit(); });
+            ++gate.running;
+        }
         held = true;
         const auto waited = std::chrono::steady_clock::now() - start;
         if (waited >= std::chrono::seconds{1}) {
@@ -234,16 +250,75 @@ public:
         }
     }
     ~HeavyBuildGate() {
-        if (held) {
-            Semaphore().release();
+        if (!held) {
+            return;
         }
+        if (semaphore) {
+            Semaphore().release();
+            return;
+        }
+        auto& gate = State();
+        {
+            std::scoped_lock lk{gate.mutex};
+            --gate.running;
+        }
+        gate.cv.notify_all();
     }
 
 private:
     static std::counting_semaphore<64>& Semaphore() {
         return HeavyPipelineGate();
     }
+    struct Gate {
+        std::mutex mutex;
+        std::condition_variable cv;
+        u32 running = 0;
+    };
+    static Gate& State() {
+        static Gate gate;
+        return gate;
+    }
+    /// PERF-172: RYGT_TESS_BUILDS, or 0 when unset (the shared semaphore is used then).
+    static u32 Asked() {
+        static const u32 asked = [] {
+            if (const char* env = std::getenv("RYGT_TESS_BUILDS"); env && *env) {
+                const u32 n = std::clamp(static_cast<u32>(std::strtoul(env, nullptr, 10)), 1u, 16u);
+                return n > 1 ? n : 0u;
+            }
+            return 0u;
+        }();
+        return asked;
+    }
+    static u32 Limit() {
+        const u32 asked = Asked();
+        if (asked <= 2) {
+            return asked;
+        }
+#ifdef _WIN32
+        MEMORYSTATUSEX status{.dwLength = sizeof(MEMORYSTATUSEX)};
+        PROCESS_MEMORY_COUNTERS_EX counters{};
+        if (GlobalMemoryStatusEx(&status) &&
+            K32GetProcessMemoryInfo(GetCurrentProcess(),
+                                    reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                                    sizeof(counters))) {
+            const bool tight = counters.PrivateUsage > status.ullTotalPhys / 2 ||
+                               status.ullAvailPhys < (4ull << 30);
+            if (tight) {
+                static std::atomic<bool> logged{};
+                if (!logged.exchange(true)) {
+                    LOG_WARNING(Render_Vulkan,
+                                "PERF-172: memory is tight ({} MB committed, {} MB free); "
+                                "tessellated pipelines build two at a time",
+                                counters.PrivateUsage >> 20, status.ullAvailPhys >> 20);
+                }
+                return 2;
+            }
+        }
+#endif
+        return asked;
+    }
     bool held = false;
+    bool semaphore = false;
 };
 
 } // namespace
@@ -934,6 +1009,8 @@ GraphicsPipeline::GraphicsPipeline(
               SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(),preloading),
               tessellated && (Common::PerfFeatureEnabled(80) || !Mr14SharedTessellationEnabled(LinkTimeOptimization())),
               tessellated, LinkTimeOptimization(), is_rect_list || is_quad_list);
+    // AMD-322 / SHD-001: whether libraries keep link-time data for a second, optimized link.
+    const bool lto_relink = compile_policy.background_optimization;
     if (compile_policy.libraries) {
         // PERF-017: a pipeline first needed during play is built from four separately compiled
         // libraries and linked without cross-stage optimization, which the driver does in a
@@ -1015,6 +1092,62 @@ GraphicsPipeline::GraphicsPipeline(
                 part_info.layout = *fragment_layout; // SHD-002
             }
         }
+        // PERF-GT7-108: a shader library the driver compiled, kept as a compile pack recipe.
+        const auto record_library = [&](size_t i) {
+            CompilePack::LayoutDesc layout{
+                .flags = static_cast<u32>(VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT),
+                .push_stages =
+                    static_cast<u32>(static_cast<VkShaderStageFlags>(push_constants.stageFlags)),
+                .push_size = push_constants.size,
+            };
+            const bool fragment = i == 2;
+            for (u32 set = 0; set < num_sets; ++set) { // as library_layout (SHD-002)
+                const bool fragment_set =
+                    set == Shader::Backend::StageSet(u32(Shader::SwStage::Fragment));
+                if (fragment_set != fragment || set_layout_hashes[set] == 0) {
+                    continue;
+                }
+                layout.sets.resize(set + 1);
+                CompilePack::SetLayout desc;
+                desc.flags = set == push_set
+                                 ? static_cast<u32>(VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR)
+                                 : 0u;
+                for (const auto& binding : pack_bindings[set]) {
+                    if (binding.pImmutableSamplers) {
+                        return;
+                    }
+                    desc.bindings.push_back(
+                        {binding.binding, static_cast<u32>(binding.descriptorType),
+                         binding.descriptorCount,
+                         static_cast<u32>(static_cast<VkShaderStageFlags>(binding.stageFlags))});
+                }
+                layout.sets[set] = std::move(desc);
+            }
+            std::vector<u8> raw;
+            if (!CompilePack::SerializeLibrary(
+                    part_infos[i], layout, [&](vk::ShaderModule m) { return ModuleCode(device, m); }, raw,
+                    false)) {
+                static std::atomic<u32> refused{};
+                if (++refused <= 5) {
+                    LOG_INFO(Render_Vulkan, "PERF-GT7-108: {} library of {} not kept (state not known)",
+                             fragment ? "fragment" : "pre-raster", debug_str);
+                }
+                return;
+            }
+            static const auto pack_dir = CompilePack::Dir(
+                Common::FS::GetUserPath(Common::FS::PathType::CacheDir),
+                Common::Singleton<Common::ElfInfo>::Instance()->GameSerial(), instance.GetVendorID(),
+                instance.GetDeviceID());
+            const auto file =
+                pack_dir / fmt::format("lib-{:016x}.pack", XXH3_64bits(raw.data(), raw.size()));
+            std::error_code ec;
+            static std::atomic<u32> kept{};
+            if (!std::filesystem::exists(file, ec) && CompilePack::WriteLibraryFile(file, raw)) {
+                if (const u32 n = ++kept; n == 1 || n % 200 == 0) {
+                    LOG_INFO(Render_Vulkan, "PERF-GT7-108: {} library recipes kept", n);
+                }
+            }
+        };
         const auto create_library = [&](size_t i) {
             // Only this subset contains the tessellation shaders. Interface/fragment
             // compilation does not need to monopolize the heavy admission token.
@@ -1042,9 +1175,23 @@ GraphicsPipeline::GraphicsPipeline(
                 library_result = retried.result;
                 library = retried.value;
             }
+            if (library_result != vk::Result::eSuccess) {
+                auto retried = CreateWithRetries("library of", debug_str, [&] {
+                    return PipelineBinaryStore::CreateGraphics(instance, device, pipeline_cache,
+                                                               part_infos[i]);
+                }); // FIX-GT7-101
+                library_result = retried.result;
+                library = retried.value;
+            }
             ASSERT_MSG(library_result == vk::Result::eSuccess,
                        "Failed to create graphics pipeline library: {}",
                        vk::to_string(library_result));
+            // FIX-GT7-136: a library recipe holds its stages' SPIR-V, kept only with shader
+            // objects on (without them every recipe was refused as "state not known").
+            if ((i == 1 || i == 2) && CompilePack::RecordingOn() &&
+                instance.IsShaderObjectEnabled()) {
+                record_library(i);
+            }
             return library;
         };
 
@@ -1074,6 +1221,8 @@ GraphicsPipeline::GraphicsPipeline(
             pre_raster_key.Add(state);
         }
 
+        // AMD-320: libraries with and without link-time data are different libraries.
+        pre_raster_key.Add(lto_relink);
         LibraryKey fragment_key{2};
         fragment_key.Add(part_infos[2].flags);
         // SHD-002: the fragment stage's set only.
@@ -1085,6 +1234,11 @@ GraphicsPipeline::GraphicsPipeline(
         // shading. The old key could link a cached 1x FS library to 4x output.
         AddFragmentMultisampleKey(fragment_key, sdata.multisampling);
         fragment_key.Add(pipeline_rendering_ci.viewMask);
+        // FIX-GT7-030: tessellated pipelines' libraries are not optimized (FIX-057): the others must
+        // not draw with them.
+        fragment_key.Add(lto_relink);
+        fragment_key.Add(static_cast<bool>(pipeline_info.flags &
+                                           vk::PipelineCreateFlagBits::eDisableOptimization));
         for (const auto state : dynamic_states) {
             fragment_key.Add(state);
         }
@@ -1139,7 +1293,9 @@ GraphicsPipeline::GraphicsPipeline(
             .flags = pipeline_info.flags,
             .layout = *pipeline_layout,
         };
-        auto [link_result, linked] = device.createGraphicsPipelineUnique(pipeline_cache, link_info);
+        auto [link_result, linked] = CreateWithRetries("link of", debug_str, [&] {
+            return device.createGraphicsPipelineUnique(pipeline_cache, link_info);
+        }); // FIX-GT7-101
         ASSERT_MSG(link_result == vk::Result::eSuccess, "Failed to link graphics pipeline: {}",
                    vk::to_string(link_result));
         pipeline = std::move(linked);
@@ -1150,13 +1306,14 @@ GraphicsPipeline::GraphicsPipeline(
             LOG_WARNING(
                 Render_Vulkan,
                 "Graphics pipeline {}: libraries {:.1f} ms (pre-raster {}, fragment {}), fast "
-                "link {:.1f} ms",
+                "link {:.1f} ms; PERF-GT7-041 shared waits {}",
                 debug_str,
                 library_ms,
                 pre_raster_reused ? "reused" : "compiled", fragment_reused ? "reused" : "compiled",
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
                                                           libraries_done)
-                    .count());
+                    .count(),
+                library_cache.shared_waits.load());
         }
 
         if (!compile_policy.background_optimization) {
@@ -1226,8 +1383,9 @@ GraphicsPipeline::GraphicsPipeline(
     if (!preloading) {
         whole_watch.emplace(debug_str, "whole pipeline compile");
     }
-    auto [pipeline_result, pipe] =
-        device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+    auto [pipeline_result, pipe] = CreateWithRetries("pipeline", debug_str, [&] {
+        return device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+    }); // FIX-GT7-101
     whole_watch.reset();
     // PERF-DIAG-013: driver compile time of graphics pipelines created at runtime.
     if (!preloading) {
@@ -1520,6 +1678,54 @@ bool GraphicsPipeline::CreateShaderObjects(
                 }
             }
 #endif
+            // PERF-GT7-108: a set the driver compiled from SPIR-V, kept as a compile pack recipe.
+            if (result == VK_SUCCESS && !from_binary && use_cache && CompilePack::RecordingOn()) {
+                static const auto pack_dir = CompilePack::Dir(
+                    Common::FS::GetUserPath(Common::FS::PathType::CacheDir),
+                    Common::Singleton<Common::ElfInfo>::Instance()->GameSerial(),
+                    instance.GetVendorID(), instance.GetDeviceID());
+                const auto pack_file = CompilePack::File(pack_dir, share_key);
+                std::error_code pack_ec;
+                if (!std::filesystem::exists(pack_file, pack_ec)) {
+                    CompilePack::Recipe recipe{
+                        .key = share_key,
+                        .flags = static_cast<u32>(static_cast<VkShaderCreateFlagsEXT>(flags)),
+                        .push_stages =
+                            static_cast<u32>(static_cast<VkShaderStageFlags>(push_constants.stageFlags)),
+                        .push_size = push_constants.size,
+                    };
+                    bool recordable = true;
+                    recipe.sets.resize(num_sets);
+                    for (u32 set = 0; set < num_sets; ++set) {
+                        recipe.sets[set].flags =
+                            set == push_set
+                                ? static_cast<u32>(VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR)
+                                : 0u;
+                        for (const auto& binding : pack_bindings[set]) {
+                            recordable = recordable && binding.pImmutableSamplers == nullptr;
+                            recipe.sets[set].bindings.push_back(
+                                {binding.binding, static_cast<u32>(binding.descriptorType),
+                                 binding.descriptorCount,
+                                 static_cast<u32>(static_cast<VkShaderStageFlags>(binding.stageFlags))});
+                        }
+                    }
+                    for (const auto& info : create_infos) {
+                        auto& stage = recipe.stages.emplace_back();
+                        stage.stage = static_cast<u32>(info.stage);
+                        stage.next = static_cast<u32>(static_cast<VkShaderStageFlags>(info.nextStage));
+                        const auto* words = static_cast<const u32*>(info.pCode);
+                        stage.code.assign(words, words + info.codeSize / sizeof(u32));
+                    }
+                    static std::atomic<u32> recorded{};
+                    if (recordable && CompilePack::Write(pack_file, recipe)) {
+                        const u32 n = ++recorded;
+                        if (n == 1 || n % 500 == 0) {
+                            LOG_INFO(Render_Vulkan, "PERF-GT7-108: {} compile pack recipes kept ({})",
+                                     n, pack_dir.string());
+                        }
+                    }
+                }
+            }
             if (result != VK_SUCCESS) {
                 static std::atomic<u32> logged{};
                 if (++logged <= 8) {
@@ -1819,6 +2025,11 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
     const vk::Device device = instance.GetDevice();
     num_sets = 0;
     set_layout_hashes = {};
+    if (CompilePack::RecordingOn()) { // PERF-GT7-108
+        for (u32 set = 0; set < set_bindings.size(); ++set) {
+            pack_bindings[set].assign(set_bindings[set].begin(), set_bindings[set].end());
+        }
+    }
     for (u32 set = 0; set < set_bindings.size(); ++set) {
         auto& bindings = set_bindings[set];
         if (bindings.empty()) {

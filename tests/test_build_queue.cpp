@@ -331,3 +331,137 @@ TEST(BuildQueue, StartupBoostIgnoresGameplayReadAheadPacing) {
     Finish(queue, second);
     Finish(queue, first);
 }
+
+// shadgt7's queue tests, on shadGT's queue (no background workers).
+TEST(BuildQueue, MergedOrderWithTessellatedReadAhead) {
+    // Urgent (last first), then FIX-GT7-009's screen jobs, PERF-GT7-025's soon ones, PERF-171's
+    // tessellated read-ahead ones and the normal ones, each in order.
+    BuildQueue queue{4, 0};
+    std::vector<std::string> order;
+    queue.Push([&] { order.push_back("normal"); }, BuildQueue::Kind::Normal);
+    queue.Push([&] { order.push_back("tess1"); }, BuildQueue::Kind::Tessellated);
+    queue.Push([&] { order.push_back("soon1"); }, BuildQueue::Kind::Soon);
+    queue.Push([&] { order.push_back("screen1"); }, BuildQueue::Kind::Screen);
+    queue.Push([&] { order.push_back("urgent1"); }, BuildQueue::Kind::Urgent);
+    queue.Push([&] { order.push_back("tess2"); }, BuildQueue::Kind::Tessellated);
+    queue.Push([&] { order.push_back("soon2"); }, BuildQueue::Kind::Soon);
+    queue.Push([&] { order.push_back("screen2"); }, BuildQueue::Kind::Screen);
+    queue.Push([&] { order.push_back("urgent2"); }, BuildQueue::Kind::Urgent);
+    EXPECT_EQ(queue.Pending(), 9u);
+    for (int i = 0; i < 9; ++i) {
+        auto popped = Pop(queue);
+        ASSERT_TRUE(popped.success);
+        EXPECT_EQ(popped.read_ahead, i >= 6);
+        popped.job();
+        Finish(queue, popped);
+    }
+    EXPECT_EQ(order, (std::vector<std::string>{"urgent2", "urgent1", "screen1", "screen2",
+                                               "soon1", "soon2", "tess1", "tess2", "normal"}));
+    EXPECT_TRUE(queue.ForegroundIdle());
+}
+
+TEST(BuildQueue, ExtraRunningWidens) {
+    // PERF-GT7-021.
+    BuildQueue queue{1, 0};
+    queue.Push([] {}, BuildQueue::Kind::Tessellated);
+    queue.Push([] {}, BuildQueue::Kind::Normal);
+    queue.SetExtraRunning(1);
+    auto first = Pop(queue);
+    ASSERT_TRUE(first.success);
+    WaitingPop second(queue);
+    ASSERT_TRUE(second.Ready()) << "two may run with one extra";
+    auto popped = second.Get();
+    ASSERT_TRUE(popped.success);
+    Finish(queue, first);
+    Finish(queue, popped);
+    EXPECT_TRUE(queue.ForegroundIdle());
+}
+
+TEST(BuildQueue, BackgroundLimitHoldsReadAheadOnly) {
+    // FIX-GT7-022: read-ahead jobs (tessellated, normal) start only under the background limit;
+    // the jobs of draws (urgent, screen, soon) up to the full limit.
+    BuildQueue queue{4, 0};
+    queue.SetBackgroundLimit(1);
+    std::vector<std::string> order;
+    queue.Push([&] { order.push_back("normal"); }, BuildQueue::Kind::Normal);
+    queue.Push([&] { order.push_back("tess"); }, BuildQueue::Kind::Tessellated);
+    queue.Push([&] { order.push_back("screen"); }, BuildQueue::Kind::Screen);
+    queue.Push([&] { order.push_back("soon"); }, BuildQueue::Kind::Soon);
+    queue.Push([&] { order.push_back("urgent"); }, BuildQueue::Kind::Urgent);
+    std::vector<Popped> running;
+    for (int i = 0; i < 3; ++i) {
+        running.push_back(Pop(queue));
+        ASSERT_TRUE(running.back().success);
+        running.back().job();
+    }
+    EXPECT_EQ(order, (std::vector<std::string>{"urgent", "screen", "soon"}));
+    WaitingPop waiter(queue);
+    EXPECT_FALSE(waiter.Ready(50ms)) << "no read-ahead job starts while three draw jobs run";
+    for (const auto& popped : running) {
+        Finish(queue, popped);
+    }
+    ASSERT_TRUE(waiter.Ready());
+    auto next = waiter.Get();
+    ASSERT_TRUE(next.success);
+    next.job();
+    EXPECT_EQ(order.back(), "tess");
+    Finish(queue, next);
+    EXPECT_EQ(queue.Pending(), 1u);
+}
+
+TEST(BuildQueue, DrawJobTakesTheFreeWorker) {
+    // FIX-GT7-022: with read-ahead jobs held at the background limit, a draw's job queued later
+    // starts at once on a free worker.
+    BuildQueue queue{2, 0};
+    queue.SetBackgroundLimit(1);
+    queue.Push([] {}, BuildQueue::Kind::Normal);
+    queue.Push([] {}, BuildQueue::Kind::Normal);
+    auto first = Pop(queue);
+    ASSERT_TRUE(first.success);
+    bool drawn = false;
+    WaitingPop waiter(queue);
+    EXPECT_FALSE(waiter.Ready(50ms)) << "the second read-ahead job waits";
+    queue.Push([&] { drawn = true; }, BuildQueue::Kind::Soon);
+    ASSERT_TRUE(waiter.Ready());
+    auto next = waiter.Get();
+    ASSERT_TRUE(next.success);
+    next.job();
+    EXPECT_TRUE(drawn) << "the draw's job took the free worker";
+    Finish(queue, first);
+    Finish(queue, next);
+    EXPECT_EQ(queue.Pending(), 1u);
+}
+
+TEST(BuildQueue, MaxRunningNarrows) {
+    // PERF-GT7-034.
+    BuildQueue queue{2, 0};
+    queue.SetMaxRunning(1);
+    queue.Push([] {}, BuildQueue::Kind::Normal);
+    queue.Push([] {}, BuildQueue::Kind::Normal);
+    auto first = Pop(queue);
+    ASSERT_TRUE(first.success);
+    WaitingPop second(queue);
+    EXPECT_FALSE(second.Ready(50ms)) << "one job at a time after SetMaxRunning(1)";
+    Finish(queue, first);
+    ASSERT_TRUE(second.Ready());
+    auto next = second.Get();
+    ASSERT_TRUE(next.success);
+    Finish(queue, next);
+}
+
+TEST(BuildQueue, BuildJobsCountQueuedAndRunning) {
+    // FIX-GT7-100: the compile notice's count.
+    BuildQueue queue{2, 1};
+    const u32 before = Vulkan::g_build_jobs.load();
+    queue.Push([] {}, BuildQueue::Kind::Soon);
+    queue.Push([] {}, BuildQueue::Kind::Background);
+    EXPECT_EQ(Vulkan::g_build_jobs.load(), before + 2);
+    auto soon = Pop(queue);
+    auto background = Pop(queue);
+    ASSERT_TRUE(soon.success && background.success);
+    EXPECT_TRUE(background.background);
+    EXPECT_EQ(Vulkan::g_build_jobs.load(), before + 2);
+    Finish(queue, soon);
+    Finish(queue, background);
+    EXPECT_EQ(Vulkan::g_build_jobs.load(), before);
+}

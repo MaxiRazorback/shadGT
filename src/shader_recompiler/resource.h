@@ -168,6 +168,25 @@ inline bool FMaskKeyEnabled() {
     return enabled;
 }
 
+/// FIX-GT7-125: an MSAA array T# (Color2DMsaaArray, kept by array instructions) is translated:
+/// samples and loads read it as a multisampled array, its size is queried without a level. The
+/// translation stopped at the image type before (no SPIR-V type, no sample coordinates for it),
+/// and GT7's draws with such a T# were queued again and again and never drawn (one failed
+/// translation every 2 s in quiet race stretches of 11-08). RYGT_MSAA_ARRAY_SAMPLE=0: as before.
+inline bool MsaaArrayEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_MSAA_ARRAY_SAMPLE");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
+
+/// FIX-GT7-125: the multisampled view types the translation handles.
+inline bool IsMsaaView(AmdGpu::ImageType type) {
+    return type == AmdGpu::ImageType::Color2DMsaa ||
+           (type == AmdGpu::ImageType::Color2DMsaaArray && MsaaArrayEnabled());
+}
+
 enum class MipStorageFallbackMode : u16 {
     None,
     DynamicIndex,
@@ -232,8 +251,7 @@ struct ImageResource {
     }
 
     u32 NumBindings(const auto& info) const {
-        // PERF-038: the T# is read only when it decides the count (a background pipeline build
-        // has no user data to read it from).
+        // The T# is read only when it decides the count.
         if (mip_fallback_mode != MipStorageFallbackMode::DynamicIndex) {
             return 1;
         }
@@ -246,11 +264,21 @@ struct ImageResource {
 };
 using ImageResourceList = boost::container::static_vector<ImageResource, NUM_IMAGES>;
 
+/// FIX-215: whether samplers of cube maps clamp at the faces' edges (RYGT_CUBE_SAMPLER_CLAMP=0 off).
+inline bool CubeSamplerClampEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_CUBE_SAMPLER_CLAMP");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
+
 struct SamplerResource {
     SharpFetch<AmdGpu::Sampler> sharp_fetch{};
     SharpFetchPostOp post_op{};
     SharpLocation post_op_tsharp_dw3_off{};
     bool is_depth{};
+    bool is_cube{}; ///< FIX-215: sampled with a cube image (read as a 2D array of its faces)
 
     constexpr AmdGpu::Sampler GetSharp(const auto& info) const noexcept {
         AmdGpu::Sampler sampler{};
@@ -272,12 +300,22 @@ struct SamplerResource {
             sampler.max_aniso.Assign(AmdGpu::AnisoRatio::One);
             sampler.aniso_threshold.Assign(0);
         }
+        if (is_cube && CubeSamplerClampEnabled()) {
+            // FIX-215: the hardware samples a cube map seamlessly whatever the sampler's address
+            // modes; here its faces are layers of a 2D array, so a wrapping sampler filtered the
+            // texels of a face's far edge into its near one: a bright line where the sky cube's
+            // faces meet (GT7). Each face is clamped at its edges instead.
+            sampler.clamp_x.Assign(AmdGpu::ClampMode::ClampLastTexel);
+            sampler.clamp_y.Assign(AmdGpu::ClampMode::ClampLastTexel);
+        }
         return sampler;
     }
 };
 using SamplerResourceList = boost::container::static_vector<SamplerResource, NUM_SAMPLERS>;
 
 struct FMaskResource {
+    // FIX-GT7-043: as the image's own fetch. Eight dwords read in a row from the first one's place
+    // went past the buffer's end for a T# of four, and were another T# for one with scattered dwords.
     SharpFetch<AmdGpu::Image> sharp_fetch{};
     bool is_r128{};
     bool size_read{};
@@ -299,7 +337,9 @@ struct PushData {
     static constexpr u32 BufOffsetIndex = 4;
     /// After the six buffer-offset vectors.
     static constexpr u32 QuadSampleMaskIndex = 10;
-    // FIX-227: scratch address aliases the all-ones sample mask on eligible draws.
+    /// FIX-227: the hull shader LDS scratch address (bit 0: the writer pass), in the quad sample
+    /// mask's place (only draws whose mask is all ones use it), so the push block keeps its size
+    /// and every cached pipeline stays valid.
     static constexpr u32 LdsScratchIndex = QuadSampleMaskIndex;
 
     float xoffset;

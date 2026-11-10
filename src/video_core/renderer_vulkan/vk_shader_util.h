@@ -19,6 +19,8 @@ namespace Vulkan {
 vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device, bool keep_code = false);
 
 std::vector<u32> ModuleCode(vk::Device device, vk::ShaderModule module);
+/// shadgt7 form: looks the module up on every device (handles are unique per device).
+std::vector<u32> ModuleCode(vk::ShaderModule module);
 void ForgetModuleCode(vk::Device device, vk::ShaderModule module);
 void ClearModuleCode(vk::Device device);
 

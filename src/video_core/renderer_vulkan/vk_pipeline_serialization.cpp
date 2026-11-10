@@ -428,7 +428,8 @@ void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx)
 }
 
 bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
-                    Shader::StageSpecialization& spec, size_t& perm_idx) {
+                    Shader::StageSpecialization& spec, size_t& perm_idx,
+                    bool* other_cube_sampling) {
     Serialization::Reader meta{ar};
 
     u32 meta_version{};
@@ -468,7 +469,12 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
                           meta_version != Serialization::ShaderMetaVersionWithoutAttributeFlags))
         return false;
     if (!StoredCubesFit(spec, info, face_cubes,
-                        native_cube_cache_enabled.load(std::memory_order_relaxed))) return false;
+                        native_cube_cache_enabled.load(std::memory_order_relaxed))) {
+        if (other_cube_sampling) {
+            *other_cube_sampling = true; // FIX-GT7-088
+        }
+        return false; // FIX-GT7-083: made by the other engine's cube sampling
+    }
     if (binary_version != ShaderBinaryVersionFor(spec, Serialization::UsesScalarPrefix(info))) {
         return false;
     }
@@ -750,7 +756,7 @@ extern "C" __declspec(dllexport) int RytyTraceTessMeta(const char* directory, co
             for(auto hash:hashes)for(size_t i=0;i+8<=bytes.size();++i){u64 value;std::memcpy(&value,bytes.data()+i,8);if(value==hash){found=true;break;}}
             if(!found)continue;
             Serialization::Archive ar{std::move(bytes)};Shader::Info info{};Shader::StageSpecialization spec{};size_t permutation{};
-            if(!Vulkan::LoadShaderMeta(ar,info,spec,permutation))continue;
+            if(!Vulkan::LoadShaderMeta(ar,info,spec,permutation,nullptr))continue;
             if(info.pgm_hash!=hashes[0]&&info.pgm_hash!=hashes[1])continue;
             if(count++)result+=",";
             const auto stride=info.sw_stage==Shader::SwStage::TessellationEval?spec.runtime_info.sw.tes.hs_output_cp_stride:spec.runtime_info.sw.tcs.hs_output_cp_stride;

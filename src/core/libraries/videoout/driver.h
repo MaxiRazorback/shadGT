@@ -101,6 +101,12 @@ public:
     bool SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false,
                     u64 anti_lag_frame = 0);
 
+    /// PERF-111: with SHADGT_FPS_LOCK a game's submit-and-flip returns once the frames it
+    /// submitted before are on screen, so it runs one frame ahead of the screen instead of as
+    /// many as it has display buffers for (GT7 queued three: ~100 ms more input lag).
+    void NoteEopFlipRequested();
+    void PaceFlipSubmit();
+
 private:
     struct Request {
         Vulkan::Frame* frame;
@@ -131,6 +137,10 @@ private:
     VideoOutPort main_port{};
     std::jthread present_thread;
     std::queue<Request> requests;
+    // PERF-111: EOP flips requested and not shown yet.
+    std::atomic<s32> eop_flips_in_flight{0};
+    std::mutex pace_mutex;
+    std::condition_variable pace_cv;
 };
 
 } // namespace Libraries::VideoOut

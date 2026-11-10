@@ -29,6 +29,12 @@ struct Liverpool;
 
 namespace Vulkan {
 
+#ifdef RYTY_GPU
+/// GT7-UW: a display buffer's address, for the native renderer (vk_rasterizer_native.cpp, which
+/// only the Ryty renderer library builds).
+void NoteDisplayAddress(VAddr address);
+#endif
+
 struct Frame {
     u32 width;
     u32 height;
@@ -92,7 +98,11 @@ public:
             return;
         }
 #ifndef RYTY_GPU
-        swapchain.SetHDR(enable);
+        if (enable != swapchain.GetHDR()) {
+            // FIX-218: this waits for the device and remakes the swapchain, as Present's recreate.
+            std::scoped_lock submit_lock{Scheduler::submit_mutex};
+            swapchain.SetHDR(enable);
+        }
 #endif
         // ryGT: whether the game's frames are HDR10; the swapchain is HDR10 throughout.
         pp_settings.hdr = enable ? 1 : 0;
@@ -101,6 +111,9 @@ public:
     VideoCore::Image& RegisterVideoOutSurface(
         const Libraries::VideoOut::BufferAttributeGroup& attribute, VAddr cpu_address) {
         vo_buffers_addr.emplace_back(cpu_address);
+#ifdef RYTY_GPU
+        NoteDisplayAddress(cpu_address); // GT7-UW
+#endif
         auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
         const auto image_id = texture_cache.FindImage(desc);
         auto& image = texture_cache.GetImage(image_id);
@@ -124,6 +137,10 @@ public:
     void Present(Frame* frame, bool is_reusing_frame = false, bool is_game_frame = true,
                  u64 anti_lag_frame = 0);
     Frame* PrepareLastFrame();
+
+    /// FIX-193: in native mode, waits until the GPU has drawn the frame (a flip is only
+    /// reported to the game after that).
+    void WaitFrameDrawn(const Frame* frame);
 
 private:
     Frame* GetRenderFrame();

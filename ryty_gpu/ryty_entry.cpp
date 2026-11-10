@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -18,6 +19,7 @@
 #include "common/guest_clock.h"
 #include "common/mapping_writeback_gate.h"
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "common/perf_monitor.h"
 #include "common/scm_rev.h"
 #include "common/singleton.h"
@@ -41,6 +43,7 @@
 #include "ryty_gpu/ryty_upscaler_status.h"
 #include "ryty_gpu/native/gts_hooks.h"
 #include "ryty_gpu/native/image_registry.h"
+#include "ryty_gpu/native/job_walker.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
@@ -51,6 +54,7 @@
 #endif
 #ifdef ENABLE_DISCORD_RPC
 #include "common/discord_rpc_handler.h"
+#include "core/file_format/psf.h"
 #endif
 #include <chrono>
 #include <cmath>
@@ -118,6 +122,8 @@ void RunWindowThread() {
         LOG_WARNING(Render_Vulkan, "CACHE-EXIT: save failed: {}", error.what());
     }
     Common::Log::Flush();
+    std::fprintf(stderr, "[window] closed: the game ends\n");
+    std::fflush(stderr);
     TerminateProcess(GetCurrentProcess(), 0);
 }
 
@@ -151,8 +157,6 @@ void StartFirstDrawWatcher() {
     }).detach();
 }
 
-// The FPS counter (shadGT's Show FPS Counter setting): the game's frames per second, in small
-// type in the window's top left corner, over the game and the splash screen.
 // PERF-098: the precompile of stored shaders and pipelines, as a translucent blue bar with
 // shadowed white text near the bottom of the splash screen (and of the game, if it is still
 // going when the game starts drawing).
@@ -214,8 +218,8 @@ void DrawPrecompileProgress() {
     draw->AddText(at, IM_COL32(255, 255, 255, a(235)), text);
 }
 
-// PERF-100: while a new shader compiles and the game is held, the same translucent style: a
-// notice with a moving bar over the last frame. Not for compiles shorter than 0.15 s.
+// PERF-100: while a new shader compiles and the game is held, a translucent notice with a
+// moving bar over the last frame. Not for compiles shorter than 0.15 s.
 void DrawCompileNotice() {
     using Clock = std::chrono::steady_clock;
     static Clock::time_point paused_since{};
@@ -289,6 +293,8 @@ void DrawWatermark() {
     draw->AddText(font, font_size, at, IM_COL32(235, 235, 235, 80), g_watermark.c_str());
 }
 
+// The FPS counter (shadGT's Show FPS Counter setting): the game's frames per second, in small
+// type in the window's top left corner, over the game and the splash screen.
 void DrawFpsCounter() {
     DrawWatermark();
     Ryty::DrawControllerOverlay();
@@ -584,10 +590,32 @@ void Ryty::RytyLibraryInitialize() {
     Ryty::SetOverlayDraw(&DrawFpsCounter);
 #ifdef ENABLE_DISCORD_RPC
     if (EmulatorSettings.IsDiscordRPCEnabled()) {
+        // The game's title and id from app0\sce_sys\param.sfo next to the exe (GT7's runtime
+        // has one; GT Sport's when there is none), so GT7 shows as GT7.
+        std::string title = "Gran Turismo Sport";
+        std::string serial = "CUSA03220";
+        const auto sfo = Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path() /
+                         "app0" / "sce_sys" / "param.sfo";
+        std::error_code error;
+        if (PSF psf; std::filesystem::exists(sfo, error) && psf.Open(sfo)) {
+            if (const auto name = psf.GetString("TITLE")) {
+                title.assign(name->begin(), name->end());
+                // "Gran Turismo® 7": without the mark.
+                for (const std::string_view mark : {"\xC2\xAE", "\xE2\x84\xA2"}) {
+                    for (size_t at; (at = title.find(mark)) != std::string::npos;) {
+                        title.erase(at, mark.size());
+                    }
+                }
+            }
+            if (const auto id = psf.GetString("TITLE_ID")) {
+                serial.assign(id->begin(), id->end());
+            }
+        }
+        LOG_INFO(Render_Vulkan, "Discord presence: {} ({})", title, serial);
         auto* rpc = Common::Singleton<DiscordRPCHandler::RPC>::Instance();
-        rpc->init();
-        rpc->setStatusPlaying("Gran Turismo Sport", "CUSA03220");
-        LOG_INFO(Render_Vulkan, "DISCORD-RPC: compiled in; Gran Turismo Sport presence initialized");
+        rpc->init(title, serial);
+        rpc->setStatusPlaying(title, serial);
+        LOG_INFO(Render_Vulkan, "DISCORD-RPC: compiled in; {} presence initialized", title);
     } else {
         LOG_INFO(Render_Vulkan, "DISCORD-RPC: compiled in; disabled by saved game setting");
     }
@@ -623,11 +651,21 @@ extern "C" __declspec(dllexport) void RytyGpuUnmapMemory(u64 address, u64 size) 
     }
 }
 
+// FIX-GT7-085: the recorder's cache of readable 64 KB granules (NAT-147) forgets the range at each
+// report that follows a change. Ryty reports an unmap before it unmaps, and the recorder could
+// read the old pages in between and note their granules readable again; memory mapped there next
+// without CPU access (or protected by the game) then passed Native::Readable, and quad index
+// expansion read it.
+static void ForgetReadableAfterChange(u64 address, u64 size) {
+    Native::ForgetReadable(address, size);
+}
+
 // Ryty calls this after any change to guest mappings or protections (after an unmap completes,
 // for example), so lookups cached in between are not kept.
 extern "C" __declspec(dllexport) void RytyGpuMappingChanged(u64 address, u64 size) {
     Native::ForgetReadable(address, size);
     Core::RytyMemory::NoteMappingChange(address, size);
+    ForgetReadableAfterChange(address, size); // FIX-GT7-085
 }
 
 // Ryty calls this after the game changed the protection of guest memory (sceKernelMprotect),
@@ -641,6 +679,7 @@ extern "C" __declspec(dllexport) void RytyGpuProtectionChanged(u64 address, u64 
     }
 #endif
     Core::RytyMemory::NoteMappingChange(address, size);
+    ForgetReadableAfterChange(address, size); // FIX-GT7-085
     if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
         rasterizer->GetPageManager().ReapplyProtection(address, size);
     }
@@ -655,7 +694,9 @@ extern "C" __declspec(dllexport) void RytyGpuMapMemory(u64 address, u64 size) {
     }
 #endif
     Core::RytyMemory::NoteMappingChange(address, size);
+    ForgetReadableAfterChange(address, size); // FIX-GT7-085
     if (auto* rasterizer = Core::Memory::Instance()->GetRasterizer()) {
+        rasterizer->OnNewMapping(address, size); // FIX-GT7-077
         rasterizer->MapMemory(address, size);
         rasterizer->RegisterMemory(address, size);
         // FIX-153: new memory comes writable. Pages the renderer still tracks there (tracked

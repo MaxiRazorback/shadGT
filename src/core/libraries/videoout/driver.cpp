@@ -252,6 +252,33 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
     return 0;
 }
 
+namespace {
+// PERF-075: SHADGT_FPS_LOCK=<fps> (30 in run_gt7.cmd and Run-GTSportPerformance.ps1) paces
+// flips evenly at that rate; GT Sport's races vary between 25 and 40 FPS, which shows as judder.
+u32 FpsLock() {
+    static const u32 fps_lock = [] {
+        const char* env = std::getenv("SHADGT_FPS_LOCK");
+        const u32 fps = env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0;
+        if (fps != 0) {
+            LOG_WARNING(Lib_VideoOut, "PERF-075: flips locked to at most {} per second", fps);
+        }
+        return fps;
+    }();
+    return fps_lock;
+}
+
+// SHADGT_FPS_LOCK_AFTER=<seconds>: the lock starts that long after the first vblank or flip (a
+// test can go through the menus at full rate first).
+bool FpsLockActive() {
+    static const auto lock_from = [] {
+        const char* env = std::getenv("SHADGT_FPS_LOCK_AFTER");
+        return std::chrono::steady_clock::now() +
+               std::chrono::seconds(env ? std::strtoul(env, nullptr, 10) : 0);
+    }();
+    return FpsLock() != 0 && std::chrono::steady_clock::now() >= lock_from;
+}
+} // namespace
+
 // PERF-DIAG-002: flip pacing. Submit-to-flip latency, Present() time, and queued flips at each
 // vblank, reported every 2 s.
 #ifndef NDEBUG
@@ -261,6 +288,8 @@ struct FlipStats {
     std::chrono::steady_clock::time_point window{};
     u32 flips{}, vblanks{}, idle_vblanks{}, max_queue{}, early_flips{};
     double latency_ms{}, max_latency_ms{}, present_ms{}, max_present_ms{};
+    u32 paced{}, pace_timeouts{}; // PERF-111
+    double paced_ms{};
 };
 FlipStats g_flip_stats;
 
@@ -276,12 +305,16 @@ void ReportFlipStats() {
     }
     LOG_WARNING(Lib_VideoOut,
                 "Flips in {:.1f} s: {} flips ({} between vblanks), {} vblanks ({} with no flip ready), max queued {}, "
-                "submit-to-flip avg {:.2f} ms max {:.2f} ms, Present avg {:.2f} ms max {:.2f} ms",
+                "submit-to-flip avg {:.2f} ms max {:.2f} ms, Present avg {:.2f} ms max {:.2f} ms; "
+                "PERF-111: {} submits paced, avg wait {:.2f} ms, {} timeouts",
                 std::chrono::duration<double>(now - s.window).count(), s.flips, s.early_flips, s.vblanks,
                 s.idle_vblanks, s.max_queue, s.flips ? s.latency_ms / s.flips : 0.0,
-                s.max_latency_ms, s.flips ? s.present_ms / s.flips : 0.0, s.max_present_ms);
+                s.max_latency_ms, s.flips ? s.present_ms / s.flips : 0.0, s.max_present_ms,
+                s.paced, s.paced ? s.paced_ms / s.paced : 0.0, s.pace_timeouts);
     s.flips = s.vblanks = s.idle_vblanks = s.max_queue = s.early_flips = 0;
     s.latency_ms = s.max_latency_ms = s.present_ms = s.max_present_ms = 0;
+    s.paced = s.pace_timeouts = 0;
+    s.paced_ms = 0;
     s.window = now;
 }
 } // namespace
@@ -302,6 +335,13 @@ void VideoOutDriver::Flip(const Request& req) {
 #endif
     // Update HDR status before presenting.
     presenter->SetHDR(req.port->is_hdr);
+    // FIX-193: the game learns of the flip once the GPU has drawn the frame.
+#ifndef NDEBUG
+    const auto wait_start = std::chrono::steady_clock::now(); // DIAG-GT7-007
+#endif
+    if (req.index != -1) {
+        presenter->WaitFrameDrawn(req.frame);
+    }
 
     // Present the frame.
 #ifndef NDEBUG
@@ -315,6 +355,9 @@ void VideoOutDriver::Flip(const Request& req) {
     #ifndef NDEBUG
     {
         const auto now = std::chrono::steady_clock::now();
+        RyDiag::Timeline('P', RyDiag::Seconds(req.submitted), RyDiag::Seconds(wait_start),
+                         RyDiag::Seconds(present_start), RyDiag::Seconds(now),
+                         u64(u32(req.index))); // DIAG-GT7-007
         std::scoped_lock lk{g_flip_stats.mutex};
         auto& st = g_flip_stats;
         const double present_ms =
@@ -376,6 +419,56 @@ void VideoOutDriver::Flip(const Request& req) {
     }
     // save to prev buf index
     port->prev_index = req.index;
+
+    if (req.eop) {
+        // PERF-111: a submit-and-flip waiting for this frame to be shown goes on.
+        if (eop_flips_in_flight.fetch_sub(1, std::memory_order_acq_rel) <= 0) {
+            eop_flips_in_flight.store(0, std::memory_order_release);
+        }
+        std::scoped_lock lk{pace_mutex};
+        pace_cv.notify_all();
+    }
+}
+
+void VideoOutDriver::NoteEopFlipRequested() {
+    eop_flips_in_flight.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void VideoOutDriver::PaceFlipSubmit() {
+    // Opt-in while untested: SHADGT_FPS_PACE=1.
+    static const bool pace = [] {
+        const char* env = std::getenv("SHADGT_FPS_PACE");
+        return env && env[0] == '1';
+    }();
+    if (!pace || !FpsLockActive()) {
+        return;
+    }
+    // The frame just submitted may stay in flight; the ones before it must be on screen. A flip
+    // that does not come (frames held for a compile, a closed port) holds the game a few frames
+    // at most.
+#ifndef NDEBUG
+    const auto start = std::chrono::steady_clock::now();
+#endif
+    bool shown = true;
+    {
+        std::unique_lock lk{pace_mutex};
+        shown = pace_cv.wait_for(lk, std::chrono::milliseconds(250), [this] {
+            return eop_flips_in_flight.load(std::memory_order_acquire) <= 1;
+        });
+    }
+#ifndef NDEBUG
+    const double waited_ms = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - start)
+                                 .count();
+    std::scoped_lock lk{g_flip_stats.mutex};
+    ++g_flip_stats.paced;
+    g_flip_stats.paced_ms += waited_ms;
+    if (!shown) {
+        ++g_flip_stats.pace_timeouts;
+    }
+#else
+    (void)shown;
+#endif
 }
 
 void VideoOutDriver::DrawBlankFrame() {
@@ -400,6 +493,8 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
                                 bool is_eop, u64 anti_lag_frame) {
     auto trace = Common::FrameQueueTrace::Start();
     RyDiag::Mark(RyDiag::Zone::GameFlip, u64(index));
+    RyDiag::Timeline('R', RyDiag::Seconds(std::chrono::steady_clock::now()), 0.0, 0.0, 0.0,
+                     u64(u32(index)) | (u64(is_eop) << 32)); // DIAG-GT7-007
     {
         std::unique_lock lock{port->port_mutex};
         if (index != -1 && port->flip_status.flip_pending_num > 16) {
@@ -461,6 +556,10 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
 #endif
         });
     }
+#ifndef NDEBUG
+    RyDiag::Timeline('Q', RyDiag::Seconds(std::chrono::steady_clock::now()), 0.0, 0.0, 0.0,
+                     u64(u32(index)) | (u64(is_eop) << 32)); // DIAG-GT7-007
+#endif
     request_cv.notify_one();
 }
 
@@ -499,15 +598,9 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     auto next_tick = Clock::now();
     auto last_flip_time = Clock::time_point{};
     const auto current_flip_rate = [&] {
-        static const u32 fps_lock = [] {
-            const char* env = std::getenv("SHADGT_FPS_LOCK");
-            const u32 fps = env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0;
-            if (fps != 0) {
-                LOG_WARNING(Lib_VideoOut, "PERF-075: flips locked to at most {} per second", fps);
-            }
-            return fps;
-        }();
-        return LockedFlipRate(main_port.flip_rate.load(std::memory_order_relaxed), fps_lock,
+        // PERF-075: SHADGT_FPS_LOCK, from SHADGT_FPS_LOCK_AFTER seconds on.
+        return LockedFlipRate(main_port.flip_rate.load(std::memory_order_relaxed),
+                              FpsLockActive() ? FpsLock() : 0,
                               EmulatorSettings.GetVblankFrequency());
     };
     const auto early_allowed = [&] {
@@ -573,6 +666,24 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         if (token.stop_requested()) {
             break;
         }
+        // FIX-GT7-139: the ticks keep an absolute schedule, so time a late tick lost is made up;
+        // but at most MaxCatchUp vblank periods of it. A longer stall (a present or driver hitch,
+        // a flip blocked behind a compile hold) is not made up, so no burst of vblanks tells the
+        // game that time passed while the emulator, not the game, was stuck.
+        // RYGT_VBLANK_CATCHUP=0: every missed tick is made up, as before.
+        {
+            static const bool catch_up_limit = [] {
+                const char* env = std::getenv("RYGT_VBLANK_CATCHUP");
+                return !(env && env[0] == '0');
+            }();
+            constexpr int MaxCatchUp = 6; // ~100 ms at 60 Hz: a 3-vblank frame at 20 fps and more
+            if (catch_up_limit) {
+                const auto max_behind = vblank_period * MaxCatchUp;
+                if (const auto now_tick = Clock::now(); now_tick - next_tick > max_behind) {
+                    next_tick = now_tick - max_behind;
+                }
+            }
+        }
         const bool overdue = Clock::now() > next_tick;
         next_tick += tick_period;
 
@@ -630,9 +741,12 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         }
         if (vblank_status.count % (flip_rate + 1) == 0) {
 #ifndef NDEBUG
+            const auto tick_start = Clock::now();
+            size_t queued_flips = 0; // DIAG-GT7-007
             {
                 std::scoped_lock lk{mutex, g_flip_stats.mutex};
                 ++g_flip_stats.vblanks;
+                queued_flips = requests.size();
                 g_flip_stats.max_queue =
                     std::max<u32>(g_flip_stats.max_queue, static_cast<u32>(requests.size()));
                 if (requests.empty()) {
@@ -643,6 +757,10 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 #endif
             const auto request = ticks_per_vblank == 1 || Clock::now() >= flip_allowed_at()
                                      ? receive_request() : Request{};
+#ifndef NDEBUG
+            RyDiag::Timeline('V', RyDiag::Seconds(tick_start), double(queued_flips), 0.0, 0.0,
+                             request ? 1 : 0); // DIAG-GT7-007
+#endif
             if (!request) {
                 if (overdue) { // Dont draw too fast
                     if (!main_port.is_open) {

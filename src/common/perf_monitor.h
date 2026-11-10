@@ -9,8 +9,8 @@
 #if defined(_WIN32) || defined(__x86_64__)
 #include <intrin.h>
 #endif
-#include "common/types.h"
 #include "common/diagnostics.h"
+#include "common/types.h"
 
 namespace Common {
 
@@ -23,16 +23,26 @@ std::string SampleThreadCpuUsage(size_t max_threads);
 inline std::string SampleThreadCpuUsage(size_t) { return {}; }
 #endif
 
-#ifndef SHADGT_DIAGNOSTICS
-// Reporting counters have no Release readers. Draws remains atomic for boot/save progress.
-struct DiagnosticCounter {
-    constexpr u64 operator++() noexcept { return 0; }
-    constexpr void operator+=(u64) noexcept {}
-    constexpr u64 fetch_add(u64, std::memory_order = std::memory_order_seq_cst) noexcept { return 0; }
-    constexpr u64 load(std::memory_order = std::memory_order_seq_cst) const noexcept { return 0; }
-};
-#else
+#ifdef SHADGT_DIAGNOSTICS
 using DiagnosticCounter = std::atomic<u64>;
+#else
+/// Without diagnostics, a counter only the reports read: counting compiles to nothing.
+/// Reporting counters have no Release readers. Draws remains atomic for boot/save progress.
+struct DiagnosticCounter {
+    constexpr u64 operator++() noexcept {
+        return 0;
+    }
+    constexpr DiagnosticCounter& operator+=(u64) noexcept {
+        return *this;
+    }
+    constexpr u64 fetch_add(u64, std::memory_order = std::memory_order_seq_cst) noexcept {
+        return 0;
+    }
+    constexpr void store(u64, std::memory_order = std::memory_order_seq_cst) noexcept {}
+    constexpr u64 load(std::memory_order = std::memory_order_seq_cst) const noexcept {
+        return 0;
+    }
+};
 #endif
 
 /// PERF-DIAG-010: work done by the emulator's GPU frontend, read and reset by the monitor.
@@ -73,6 +83,7 @@ inline WorkCounters& GetWorkCounters() {
 
 /// Experimental-branch switch: false when the PERF id (e.g. 14 for PERF-014) is listed in the
 /// SHADGT_DISABLE_PERF environment variable (comma separated), for A/B runs without rebuilding.
+/// Kept in every build (DIAG-246): the PERF switches stay functional without diagnostics.
 bool PerfFeatureEnabled(u32 id);
 
 /// PERF-DIAG-011: command thread time per step of a draw, in TSC ticks, reported every 2 s.
@@ -113,8 +124,12 @@ enum class Phase : u32 {
 std::array<std::atomic<u64>, size_t(Phase::Count)>& GetPhaseTicks();
 #endif
 
-// Functional frame cadence for compile admission, retained when diagnostics are disabled.
-struct GameFrameTotals { u64 frames; u64 us; };
+/// PERF-GT7-033: the game frames presented so far, and their total time in microseconds.
+/// Functional frame cadence for compile admission, retained when diagnostics are disabled.
+struct GameFrameTotals {
+    u64 frames;
+    u64 us;
+};
 void NoteGameFrameCadence();
 GameFrameTotals GetGameFrameTotals();
 
@@ -166,6 +181,8 @@ private:
     Phase phase;
     u64 start;
 #else
+    // Without diagnostics the timers cost nothing: about 30 of them run per draw, each with two
+    // TSC reads and an atomic add on cache lines the decode and recorder threads share.
     explicit constexpr PhaseTimer(Phase) noexcept {}
     static constexpr bool Enabled() noexcept { return false; }
     static constexpr u64 ReadTsc() noexcept { return 0; }

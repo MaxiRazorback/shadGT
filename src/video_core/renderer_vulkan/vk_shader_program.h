@@ -35,6 +35,7 @@ struct Program {
 
     ModuleList modules{};
     /// PERF-GT7-058: else_scope_checked was looked at for this program object.
+    bool use_checked{};
 
     /// PERF-044: the inputs of the last permutation search and its outcome. A specialization is
     /// made from the permutation's info, the runtime info, the start bindings and the sharps,
@@ -52,6 +53,9 @@ struct Program {
     } match_memo;
     /// R7: the permutation the last search found; tried first next time.
     size_t last_match{~size_t{0}};
+    /// FIX-GT7-045 / FIX-288: the same for read-ahead states. A state can match several permutations (an
+    /// unbound resource isn't compared, nor a buffer bound empty by its addressing), so what they
+    /// find must not decide the permutation of the draw being processed when its key is made again.
     MatchMemo ahead_memo;
     size_t ahead_last_match{~size_t{0}};
 

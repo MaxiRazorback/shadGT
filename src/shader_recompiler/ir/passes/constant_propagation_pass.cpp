@@ -342,10 +342,11 @@ void ConstantPropagation(IR::Block& block, IR::Inst& inst) {
                 return;
             }
         }
-        FoldWhenAllImmediates(inst, [](u32 a, u32 b) {
-            ASSERT_MSG(b != 0, "Folding UDiv32 with divisor 0");
-            return a / b;
-        });
+        // FIX-217: a constant divisor of 0 is left to the shader instead of stopping translation.
+        if (inst.Arg(1).IsImmediate() && inst.Arg(1).U32() == 0) {
+            return;
+        }
+        FoldWhenAllImmediates(inst, [](u32 a, u32 b) { return a / b; });
         return;
     case IR::Opcode::UMod32:
         if (!inst.Arg(0).IsImmediate() && inst.Arg(1).IsImmediate()) {
@@ -356,10 +357,11 @@ void ConstantPropagation(IR::Block& block, IR::Inst& inst) {
                 return;
             }
         }
-        FoldWhenAllImmediates(inst, [](u32 a, u32 b) {
-            ASSERT_MSG(b != 0, "Folding UMod32 with modulo 0");
-            return a % b;
-        });
+        // FIX-217: a constant divisor of 0 is left to the shader instead of stopping translation.
+        if (inst.Arg(1).IsImmediate() && inst.Arg(1).U32() == 0) {
+            return;
+        }
+        FoldWhenAllImmediates(inst, [](u32 a, u32 b) { return a % b; });
         return;
     case IR::Opcode::ShiftLeftLogical32:
         FoldWhenAllImmediates(inst, [](u32 a, u32 b) { return static_cast<u32>(a << b); });

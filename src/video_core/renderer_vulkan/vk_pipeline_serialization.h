@@ -14,7 +14,7 @@ namespace Vulkan {
 void SetSingleSampleBarycentricCacheEnabled(bool enabled);
 void SetVertexOrderCheckCacheEnabled(bool enabled); // AMD-307
 void SetDiscardKillCacheEnabled(bool enabled);      // FIX-223
-void SetNativeCubeCacheEnabled(bool enabled);
+void SetNativeCubeCacheEnabled(bool enabled);       // FIX-GT7-083
 
 void RegisterPipelineData(const ComputePipelineKey& key,
                           ComputePipeline::SerializationSupport& sdata);
@@ -24,8 +24,11 @@ void RegisterShaderMeta(const Shader::Info& info,
                         const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
                         const Shader::StageSpecialization& spec, size_t perm_hash, size_t perm_idx);
 void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx);
+/// FIX-GT7-088: `other_cube_sampling` is set when a whole entry was refused only because the other
+/// engine's cube sampling made it (FIX-GT7-083): its index is that translation's, not a free one.
 bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
-                    Shader::StageSpecialization& spec, size_t& perm_idx);
+                    Shader::StageSpecialization& spec, size_t& perm_idx,
+                    bool* other_cube_sampling = nullptr);
 /// PERF-038: the program hash and permutation index of stored shader metadata, without decoding
 /// the rest (decoding registers SRT walker code, which only the GPU thread may do).
 bool PeekShaderMeta(std::vector<u8>&& blob, u64& pgm_hash, size_t& perm_idx);

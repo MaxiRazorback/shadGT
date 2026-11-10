@@ -23,6 +23,15 @@ std::vector<u32> ModuleCode(vk::Device device, vk::ShaderModule module) {
     return it != by_device->second.end() ? it->second : std::vector<u32>{};
 }
 
+std::vector<u32> ModuleCode(vk::ShaderModule module) {
+    std::scoped_lock lock{code_mutex};
+    for (const auto& [device, modules] : module_code) {
+        if (const auto it = modules.find(static_cast<VkShaderModule>(module)); it != modules.end())
+            return it->second;
+    }
+    return {};
+}
+
 void ForgetModuleCode(vk::Device device, vk::ShaderModule module) {
     std::scoped_lock lock{code_mutex};
     if (const auto it = module_code.find(static_cast<VkDevice>(device)); it != module_code.end())

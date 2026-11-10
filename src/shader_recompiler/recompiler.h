@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <optional>
 #include <string>
 
 #include "common/object_pool.h"
@@ -37,10 +38,15 @@ struct Pools {
 /// FIX-020: true when the code reads single lanes or lane masks and has a loop (a backward
 /// branch). On hosts with 32-wide subgroups, translations before FIX-020 left those reads 32-wide
 /// in compute shaders with more than 32 invocations per workgroup.
+[[nodiscard]] bool HasLaneReads(std::span<const u32> code);
 [[nodiscard]] bool HasLaneReadsAndLoop(std::span<const u32> code);
 
 /// Whether the code contains lane reads or lane-mask operations.
 [[nodiscard]] bool HasLaneReads(std::span<const u32> code);
+
+/// FIX-190: true when a branch body turns every lane on (a wave-wide sum, see
+/// Gcn::FindWholeWaveRegions). Translations before FIX-190 left the inactive lanes out of it.
+[[nodiscard]] bool HasWholeWaveRegions(std::span<const u32> code);
 
 /// FIX-101: true when the code uses V_MAD_LEGACY_F32 or V_MAC_LEGACY_F32, whose translations
 /// before FIX-101 made NaN from 0 * Inf.
@@ -49,6 +55,14 @@ struct Pools {
 [[nodiscard]] bool HasMemoryWrites(std::span<const u32> code);
 
 [[nodiscard]] bool HasSdwaCompareDestination(std::span<const u32> code);
+
+/// FIX-189: the user data register holding a vertex shader's fetch shader address (the operand
+/// of its s_swappc_b64), when it calls one.
+[[nodiscard]] std::optional<u32> FetchShaderSgprBase(std::span<const u32> code);
+
+/// FIX-189: a fetch shader's length in dwords, through its s_setpc_b64, when code holds all of
+/// it. code must be followed by two readable dwords (a literal may be read past its end).
+[[nodiscard]] std::optional<size_t> FetchShaderLength(std::span<const u32> code);
 
 /// DIAG-031: a readable listing of GCN code (pc, opcode, operands, memory offsets).
 [[nodiscard]] std::string ListGcnCode(std::span<const u32> code);

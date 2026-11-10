@@ -7,6 +7,7 @@
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/polyfill_thread.h"
+#include "common/scm_rev.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/lane_read_policy.h"
@@ -20,6 +21,7 @@
 
 #include <miniz.h>
 
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <future>
@@ -36,6 +38,31 @@ bool ar_is_read_only{true};
 } // namespace
 
 namespace Storage {
+
+namespace {
+
+// SHD-010 (shadgt7) cleared a store filled by another renderer build. FIX-271 keeps that intent
+// without build or GPU identity purges: stores carry a translation version (FIX-213) and an
+// incompatible store is preserved while a compatible numbered sibling is opened instead.
+
+// Tests: a store of its own for this tag. A test keeps one store per renderer and switches.
+std::string StoreTag() {
+    const char* env = std::getenv("RYGT_SHADER_STORE_TAG");
+    return env && *env ? std::string{"-"} + env : std::string{};
+}
+
+} // namespace
+
+std::filesystem::path RetranslationMarksPath() {
+    return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+           fmt::format("{}{}.else-scope-fix", Common::ElfInfo::Instance().GameSerial(), StoreTag());
+}
+
+bool StoreMayHoldOtherBuilds() {
+    // FIX-271: stores are never cleared for another build, so they may always hold its
+    // translations (FIX-GT7-055's retranslation checks stay on).
+    return true;
+}
 
 void ProcessIO(const std::stop_token& stoken) {
     Common::SetCurrentThreadName("shadGT:PipelineCacheIO");
@@ -79,7 +106,6 @@ void DataBase::Open() {
 
         cache_path = GetUserPath(PathType::CacheDir) /
                      std::filesystem::path{game_info.GameSerial()}.replace_extension(".zip");
-
         if (!mz_zip_reader_init_file(&zip_ar, cache_path.string().c_str(),
                                      MZ_ZIP_FLAG_READ_ALLOW_WRITING) ||
             !mz_zip_validate_archive(&zip_ar, 0)) {
@@ -99,6 +125,7 @@ void DataBase::Open() {
             // SHD-002: stage descriptor sets: translations of their own.
             cache_path += "-direct-sets";
         }
+        cache_path += StoreTag(); // RYGT_SHADER_STORE_TAG (tests)
         // FIX-213: translations from incompatible shader policies must not be reused.
         // FIX-271 preserves existing stores and opens a compatible sibling instead.
         // Raise the version whenever a change makes stored translations wrong.
@@ -169,6 +196,10 @@ void DataBase::Close() {
 
     io_worker.request_stop();
     io_worker.join();
+    if (tidy_worker.joinable()) {
+        tidy_worker.request_stop();
+        tidy_worker.join();
+    }
 
     if (archived) {
         mz_zip_writer_finalize_archive(&zip_ar);

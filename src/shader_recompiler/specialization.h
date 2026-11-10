@@ -285,7 +285,7 @@ struct StageSpecialization {
                 const auto sharp = desc.GetSharp(info);
                 if (!sharp) {
                     out.push_back(0);
-                } else if (Common::PerfFeatureEnabled(83) && sharp.GetSize() >= (u64{1} << 30)) {
+                } else if (Gcn::VertexAttribute::IsGarbage(sharp)) {
                     out.push_back(1);
                 } else {
                     out.push_back(2 | u64(AmdGpu::GetNumberClass(sharp.GetNumberFmt())) << 8 |
@@ -295,6 +295,7 @@ struct StageSpecialization {
         }
         out.push_back(0xb0f5);
         const bool usage_known = info.resource_usage_known;
+        static const bool empty_without_addressing = Common::PerfFeatureEnabled(172);
         for (size_t i = 0; i < info.buffers.size(); ++i) {
             const auto& desc = info.buffers[i];
             const auto sharp = desc.GetSharp(info);
@@ -304,8 +305,12 @@ struct StageSpecialization {
             }
             u64 w = 1;
             // Keep empty-address buffers distinct even where directional matching
-            // permits them to reuse an existing specialization.
-            if (!desc.IsSpecial() && sharp.base_address == 0) w |= 2;
+            // permits them to reuse an existing specialization. FIX-GT7-024: as are those the
+            // rasterizer binds empty (IsBoundEmpty), as the constructor marks them.
+            if (!desc.IsSpecial() &&
+                (sharp.base_address == 0 || (empty_without_addressing && IsBoundEmpty(sharp)))) {
+                w |= 2;
+            }
             w |= u64(!usage_known || info.buffer_stride_used[i] ? sharp.GetStride() : 0) << 2;
             if (usage_known) {
                 w |= u64(sharp.add_tid_enable) << 16;

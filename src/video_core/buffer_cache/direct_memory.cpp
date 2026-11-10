@@ -301,7 +301,7 @@ bool DirectMemory::ImportView(VAddr address, VAddr want_end) {
         return fail("not whole pages");
     }
     if (end <= address) {
-        return fail("the address is past the piece");
+        return fail("the address is past the piece"); // PERF-GT7-022: not expected
     }
     const auto map_alias = MapAlias();
     if (!map_alias) {
@@ -678,6 +678,25 @@ void DirectMemory::OnUnmap(VAddr address, u64 size) {
     // On queue failure the owners remain in held_native_releases until a later
     // successful retirement or GPU-idle teardown.
 }
+
+bool DirectMemory::ViewsOver(VAddr address, u64 size) {
+    std::scoped_lock lk{mutex};
+    const VAddr end = address + std::max<u64>(size, 1);
+    std::erase_if(failed, [&](const auto& view) { return view.first < end && view.second > address; });
+    auto it = views.upper_bound(address);
+    if (it != views.begin() && std::prev(it)->second.end > address) {
+        return true;
+    }
+    return it != views.end() && it->first < end;
+}
+
+// FIX-205: views dropped at an unmap are leased (ImportedViewLease) and, in native mode, held in
+// held_native_releases until the native list that may use them is spliced
+// (HoldNativeReleases / ReleaseHeldAfterSplice). The static pair below is kept for callers of the
+// earlier interface; the leases already give them the same guarantee.
+void DirectMemory::HoldReleasesForSplice() {}
+
+void DirectMemory::ReleaseHeldAfter(u64) {}
 
 DirectMemory::Stats DirectMemory::GetStats() const {
     std::scoped_lock lk{mutex};

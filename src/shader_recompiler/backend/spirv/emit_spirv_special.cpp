@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <fmt/format.h>
 #include "common/recoverable.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
@@ -24,8 +25,16 @@ static void EmitLdsEmulationPrologue(EmitContext& ctx) {
     const u32 num_attrs = (tcs.ls_stride + 15) / 16;
     // GCN generic interface has 32 vec4 locations. The same rounded stride
     // is used by the reader and the renderer's scratch allocation.
+    // FIX-GT7-119: the scratch follows the stride; 4 attributes was a leftover limit (GT7's hull
+    // shaders of an 80-byte LS stride failed to translate at every race start).
+    // FIX-GT7-124: which program, and whether its constants were its draw's (pinned when queued).
     if (num_attrs == 0 || num_attrs > 32 || num_cp > 32)
-        throw Common::RecoverableFailure{"Tessellation LDS stride exceeds generic interface"};
+        throw Common::RecoverableFailure{fmt::format(
+            "Tessellation LDS stride exceeds generic interface: LS stride {}, {} control points "
+            "(hs {:#x}, {})",
+            tcs.ls_stride, num_cp, ctx.info.pgm_hash,
+            ctx.info.pinned_tess_constants ? "constants of its draw"
+                                           : "constants read at translation")};
     const Id push_ptr = ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1]);
     const auto push_word = [&](u32 index) {
         return ctx.OpLoad(ctx.U32[1],

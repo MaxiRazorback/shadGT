@@ -18,6 +18,21 @@
 
 namespace Vulkan {
 
+namespace {
+/// The subgroup size compute pipelines are built with on this device, and whether it is asked
+/// for (FIX-GT7-026: the same rule for a pipeline and for a recipe built ahead).
+u32 RequiredSubgroup(const Instance& instance) {
+    return instance.IsSubgroupSize64Supported() ? 64u : 32u;
+}
+
+bool UseSubgroupControl(const Instance& instance) {
+    // FIX-188: Intel Arc (#65) runs compute in 32-wide subgroups when it can't do 64.
+    return instance.IsSubgroupSize64Supported() ||
+           (instance.IsIntel() && instance.IsSubgroupSizeControlSupported() &&
+            instance.SubgroupSize() == 32u);
+}
+} // namespace
+
 ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
                                  DescriptorHeap& desc_heap, const Shader::Profile& profile,
                                  vk::PipelineCache pipeline_cache, ComputePipelineKey compute_key_,
@@ -30,15 +45,11 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     canonical_stages[int(Shader::SwStage::Compute)] = &info_;
     const auto debug_str = GetDebugString();
 
-    const u32 required_subgroup = instance.IsSubgroupSize64Supported() ? 64u : 32u;
+    const u32 required_subgroup = RequiredSubgroup(instance);
     const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
         .requiredSubgroupSize = required_subgroup,
     };
-    // FIX-188: Intel Arc (#65) runs compute in 32-wide subgroups when it can't do 64.
-    const bool use_subgroup_control =
-        instance.IsSubgroupSize64Supported() ||
-        (instance.IsIntel() && instance.IsSubgroupSizeControlSupported() &&
-         instance.SubgroupSize() == 32u);
+    const bool use_subgroup_control = UseSubgroupControl(instance);
     const vk::PipelineShaderStageCreateInfo shader_ci = {
         .pNext = use_subgroup_control ? &subgroup_size_ci : nullptr,
         .stage = vk::ShaderStageFlagBits::eCompute,
@@ -122,8 +133,10 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         .stage = shader_ci,
         .layout = *pipeline_layout,
     };
-    auto [pipeline_result, pipe] =
-        instance.GetDevice().createComputePipelineUnique(pipeline_cache, compute_pipeline_ci);
+    auto [pipeline_result, pipe] = CreateWithRetries("compute pipeline", debug_str, [&] {
+        return instance.GetDevice().createComputePipelineUnique(pipeline_cache,
+                                                                compute_pipeline_ci);
+    }); // FIX-GT7-101
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create compute pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
@@ -236,6 +249,20 @@ bool ComputePipeline::WarmFromRecipe(const Instance& instance, const Shader::Pro
             .descriptorCount = words[at + 2],
             .stageFlags = vk::ShaderStageFlagBits::eCompute,
         });
+    }
+    // FIX-GT7-026: a recipe goes to the driver only as this device would build its pipeline:
+    // the same subgroup size request, and push descriptors exactly when the constructor would
+    // use them. Another one is skipped, never left to the driver to refuse.
+    if (subgroup_control != UseSubgroupControl(instance) ||
+        (subgroup_control && subgroup != RequiredSubgroup(instance))) {
+        return false;
+    }
+    u32 next_binding = 0;
+    for (const auto& b : bindings) {
+        next_binding += b.descriptorCount;
+    }
+    if (push != (next_binding < instance.MaxPushDescriptors())) {
+        return false;
     }
     const u32 spirv_words = words[at++];
     const auto device = instance.GetDevice();

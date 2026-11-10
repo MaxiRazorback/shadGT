@@ -111,16 +111,29 @@ void Translator::EmitPrologue(IR::Block* first_block) {
                             ir.GetAttributeU32(IR::Attribute::BaseInstance));
         }
 
-        // v0: vertex ID, always present
+        // FIX-192 (upstream shadPS4 643c7997a, #5348): Vulkan adds an indirect draw's base vertex
+        // and first instance to the vertex and instance ids; GCN does not, so every indirect draw
+        // takes them off again unless its fetch shader adds them through its own SGPRs. Before,
+        // GT7's instanced indirect draws (vegetation, glare) indexed their instances twice off.
+        const bool is_indirect = runtime_info.sw.vs.is_indirect;
+
         IR::U32 vertex_id = ir.GetAttributeU32(IR::Attribute::VertexId);
-        if (base_vertex_sgpr != -1) {
-            if (!fetch_data.Empty() || fetch_data.vertex_offset_sgpr == -1) {
-                vertex_id = ir.ISub(vertex_id, ir.GetAttributeU32(IR::Attribute::BaseVertex));
-            } else {
-                ASSERT_MSG(fetch_data.vertex_offset_sgpr == base_vertex_sgpr,
-                           "Fetch shader in indirect draw uses wrong base vertex");
-            }
+        if (is_indirect && (fetch_data.Empty() || fetch_data.vertex_offset_sgpr == -1)) {
+            vertex_id = ir.ISub(vertex_id, ir.GetAttributeU32(IR::Attribute::BaseVertex));
+        } else if (base_vertex_sgpr != -1) {
+            ASSERT_MSG(fetch_data.vertex_offset_sgpr == base_vertex_sgpr,
+                       "Fetch shader in indirect draw uses wrong base vertex");
         }
+
+        IR::U32 instance_id = ir.GetAttributeU32(IR::Attribute::InstanceId);
+        if (is_indirect && (fetch_data.Empty() || fetch_data.instance_offset_sgpr == -1)) {
+            instance_id = ir.ISub(instance_id, ir.GetAttributeU32(IR::Attribute::BaseInstance));
+        } else if (base_instance_sgpr != -1) {
+            ASSERT_MSG(fetch_data.instance_offset_sgpr == base_instance_sgpr,
+                       "Fetch shader in indirect draw uses wrong base instance");
+        }
+
+        // v0: vertex ID, always present
         ir.SetVectorReg(dst_vreg++, vertex_id);
 
         if (info.hw_stage == HwStage::Local) {
@@ -137,8 +150,7 @@ void Translator::EmitPrologue(IR::Block* first_block) {
             if (runtime_info.props.num_input_vgprs > 0) {
                 if (runtime_info.sw.vs.step_rate_0 != 0) {
                     ir.SetVectorReg(dst_vreg++,
-                                    ir.IDiv(ir.GetAttributeU32(IR::Attribute::InstanceId),
-                                            ir.Imm32(runtime_info.sw.vs.step_rate_0)));
+                                    ir.IDiv(instance_id, ir.Imm32(runtime_info.sw.vs.step_rate_0)));
                 } else {
                     ir.SetVectorReg(dst_vreg++, ir.Imm32(0));
                 }
@@ -147,8 +159,7 @@ void Translator::EmitPrologue(IR::Block* first_block) {
             if (runtime_info.props.num_input_vgprs > 1) {
                 if (runtime_info.sw.vs.step_rate_1 != 0) {
                     ir.SetVectorReg(dst_vreg++,
-                                    ir.IDiv(ir.GetAttributeU32(IR::Attribute::InstanceId),
-                                            ir.Imm32(runtime_info.sw.vs.step_rate_1)));
+                                    ir.IDiv(instance_id, ir.Imm32(runtime_info.sw.vs.step_rate_1)));
                 } else {
                     ir.SetVectorReg(dst_vreg++, ir.Imm32(0));
                 }
@@ -157,16 +168,6 @@ void Translator::EmitPrologue(IR::Block* first_block) {
 
         // v3: instance ID, plain
         if (runtime_info.props.num_input_vgprs > 2) {
-            IR::U32 instance_id = ir.GetAttributeU32(IR::Attribute::InstanceId);
-            if (base_instance_sgpr != -1) {
-                if (!fetch_data.Empty() || fetch_data.instance_offset_sgpr == -1) {
-                    instance_id =
-                        ir.ISub(instance_id, ir.GetAttributeU32(IR::Attribute::BaseInstance));
-                } else {
-                    ASSERT_MSG(fetch_data.instance_offset_sgpr == base_instance_sgpr,
-                               "Fetch shader in indirect draw uses wrong base instance");
-                }
-            }
             ir.SetVectorReg(dst_vreg++, instance_id);
         }
         break;
@@ -1160,7 +1161,10 @@ void Translator::EmitFetch(const GcnInst& inst) {
 
     info.has_fetch_shader = true;
     info.fetch_shader_sgpr_base = code_sgpr_base;
-    ASSERT(ParseFetchShader(info, fetch_data));
+    if (!ParseFetchShader(info, fetch_data)) {
+        fetch_data = {}; // FIX-211: not a fetch shader there (logged): no attributes
+        return;
+    }
     info.translated_fetch_shader = std::make_shared<const FetchShaderData>(fetch_data);
     if (info.pin_fetch_sharps) {
         for (const auto& attrib : fetch_data.attributes) {

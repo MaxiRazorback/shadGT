@@ -7,6 +7,7 @@
 #include <memory>
 #include "common/alignment.h"
 #include "common/types.h"
+#include "core/address_space.h"
 #include "video_core/buffer_cache/region_definitions.h"
 
 namespace Vulkan {
@@ -14,6 +15,16 @@ class Rasterizer;
 }
 
 namespace VideoCore {
+
+/// FIX-233: the protection a page gets on the host. x86 has no write-only pages: a page whose
+/// reads are watched (GPU-written data, precise readbacks) and whose writes are not becomes
+/// no-access; its CPU write faults too and is handled as a read first (PageManager).
+constexpr Core::MemoryPermission HostPermission(bool read_watched, bool write_watched) {
+    if (read_watched) {
+        return Core::MemoryPermission::None;
+    }
+    return write_watched ? Core::MemoryPermission::Read : Core::MemoryPermission::ReadWrite;
+}
 
 struct UffdImpl;
 struct SignalImpl;
@@ -41,6 +52,9 @@ public:
     /// Updates watches in the pages touching the specified region.
     void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) const;
 
+    /// PERF-105: the native renderer's own write watch of the pages (at most one a page).
+    void UpdateNativeWatch(VAddr addr, u64 size, bool watch) const;
+
     /// Updates watches in the pages touching the inclusive bounds using a mask.
     void UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,
                                      const RegionBits& write_mask, const RegionBits& read_mask,
@@ -60,6 +74,10 @@ public:
     /// PERF-063: whether a CPU write to the page goes unnoticed (no write or read watcher, so
     /// the page is neither write- nor read-protected). Any thread; a racy but word-sized read.
     bool IsUnwatched(VAddr page) const;
+
+    /// PERF-GT7-030: whether the native renderer watches the page. Any thread; a racy but
+    /// word-sized read.
+    bool IsNativeWatched(VAddr page) const;
 
     /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {

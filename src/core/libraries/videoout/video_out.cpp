@@ -17,6 +17,7 @@
 #include "ryty_gpu/ryty_pro_mode.h"
 #include "ryty_gpu/ryty_hdr_ui.h"
 #endif
+#include "ryty_gpu/ryty_diag.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
@@ -379,6 +380,8 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
     const u64 anti_lag_frame = driver->AntiLagInput();
+    // DIAG-GT7-007: the game asks for a flip at the end of the command buffers it submits next.
+    RyDiag::Timeline('E', RyDiag::Seconds(std::chrono::steady_clock::now()), 0.0, 0.0, 0.0, buf_id);
 
     Platform::IrqC::Instance()->RegisterOnce(
         Platform::InterruptId::GfxFlip, [=](Platform::InterruptId irq) {
@@ -387,8 +390,13 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
             const auto result = driver->SubmitFlip(port, buf_id, flip_arg, true, anti_lag_frame);
             ASSERT_MSG(result, "EOP flip submission failed");
         });
+    driver->NoteEopFlipRequested(); // PERF-111
 
     return ORBIS_OK;
+}
+
+void PaceFlipSubmit() {
+    driver->PaceFlipSubmit();
 }
 
 s32 PS4_SYSV_ABI sceVideoOutGetDeviceCapabilityInfo(

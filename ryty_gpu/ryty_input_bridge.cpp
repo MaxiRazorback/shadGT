@@ -2,6 +2,8 @@
 // states (keyboard bindings and SDL gamepads), and this thread forwards them to Ryty's libScePad,
 // which is what the game reads. The game's rumble and light bar requests travel back the same way.
 
+#include <filesystem>
+#include "common/ryty_config.h"
 #include <windows.h>
 #include <algorithm>
 #include <array>
@@ -101,18 +103,8 @@ std::uint32_t ButtonFromName(std::string_view name) {
     return 0;
 }
 
-void RunTestScript(std::string script) {
-    const auto start = std::chrono::steady_clock::now();
-    std::size_t position = 0;
-    while (position < script.size()) {
-        const auto end = std::min(script.find(';', position), script.size());
-        const std::string step = script.substr(position, end - position);
-        position = end + 1;
-        const auto colon = step.find(':');
-        if (colon == std::string::npos) continue;
-        const double at = std::stod(step.substr(0, colon));
-        const std::string action = step.substr(colon + 1);
-        std::this_thread::sleep_until(start + std::chrono::milliseconds(static_cast<long long>(at * 1000)));
+// One test-script action; `at` (seconds after the renderer started) is for the log.
+void RunTestAction(const std::string& action, double at) {
         if (action == "r2on" || action == "r2off") {
             g_scripted_r2 = action == "r2on";
             LOG_INFO(Input, "Ryty test script: {} at {} s", action, at);
@@ -143,6 +135,60 @@ void RunTestScript(std::string script) {
             g_scripted_buttons &= ~button;
             LOG_INFO(Input, "Ryty test script: pressed {} at {} s", action, at);
         }
+}
+
+void RunTestScript(std::string script) {
+    const auto start = std::chrono::steady_clock::now();
+    std::size_t position = 0;
+    while (position < script.size()) {
+        const auto end = std::min(script.find(';', position), script.size());
+        const std::string step = script.substr(position, end - position);
+        position = end + 1;
+        const auto colon = step.find(':');
+        if (colon == std::string::npos) continue;
+        const double at = std::stod(step.substr(0, colon));
+        const std::string action = step.substr(colon + 1);
+        std::this_thread::sleep_until(start + std::chrono::milliseconds(static_cast<long long>(at * 1000)));
+        RunTestAction(action, at);
+    }
+}
+
+// Test hook: RYTY_TEST_SCRIPT_FILE=<file> runs every line added to the file as an action as soon
+// as it appears ("cross", "shot", "r2on", ...), so a test can look at the screen before choosing
+// its next press. Lines already in the file when the renderer starts run first.
+void RunTestScriptFile(std::string path) {
+    const auto start = std::chrono::steady_clock::now();
+    std::size_t consumed = 0;
+    std::string pending;
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::ifstream file{path, std::ios::binary};
+        if (!file) {
+            continue;
+        }
+        file.seekg(0, std::ios::end);
+        const auto size = static_cast<std::size_t>(file.tellg());
+        if (size < consumed) {
+            consumed = 0; // the file was replaced
+        }
+        if (size == consumed) {
+            continue;
+        }
+        file.seekg(static_cast<std::streamoff>(consumed));
+        std::string text(size - consumed, '\0');
+        file.read(text.data(), static_cast<std::streamsize>(text.size()));
+        consumed = size;
+        pending += text;
+        for (auto newline = pending.find('\n'); newline != std::string::npos;
+             newline = pending.find('\n')) {
+            std::string action = pending.substr(0, newline);
+            pending.erase(0, newline + 1);
+            std::erase_if(action, [](char c) { return c == '\r' || c == ' ' || c == '\t'; });
+            if (!action.empty()) {
+                const auto now = std::chrono::steady_clock::now();
+                RunTestAction(action, std::chrono::duration<double>(now - start).count());
+            }
+        }
     }
 }
 
@@ -169,23 +215,8 @@ std::atomic<bool> g_overlay_open{false};
 
 // The GT Sport config next to GTSport.exe (user/custom_configs/CUSA03220.json) as text.
 std::string ReadGameConfig() {
-    char path[MAX_PATH];
-    const DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
-    if (length == 0 || length >= MAX_PATH) {
-        return {};
-    }
-    std::string config{path, length};
-    config = config.substr(0, config.find_last_of("/\\") + 1) + "user/custom_configs/CUSA03220.json";
-    std::FILE* file = std::fopen(config.c_str(), "rb");
-    if (!file) {
-        return {};
-    }
-    std::string text;
-    char chunk[4096];
-    while (const size_t n = std::fread(chunk, 1, sizeof(chunk), file)) {
-        text.append(chunk, n);
-    }
-    std::fclose(file);
+    // FIX-230: Unicode and long-path safe.
+    std::string text = Common::RytyReadGameConfig();
     return text;
 }
 
@@ -357,7 +388,13 @@ void ForwardInput() {
             }
             // Telemetry describes the locally driven car (player 1 only). Explicit
             // game trigger commands take priority, including an explicit release.
-            const unsigned strength = TriggerStrength();
+            // RYGT_ADAPTIVE_TRIGGERS=1 forces the effects on even with the slider at 0%.
+            static const bool forced = [] {
+                const char* env = std::getenv("RYGT_ADAPTIVE_TRIGGERS");
+                return env && env[0] == '1';
+            }();
+            const unsigned slider = TriggerStrength();
+            const unsigned strength = forced && slider == 0 ? 100 : slider;
             const auto feedback = slot == 0 ? Input::TriggerFeedback::CurrentOutput(strength)
                                            : Input::TriggerFeedback::Output{};
             u8 left_rumble = feedback.left_rumble, right_rumble = feedback.right_rumble;
@@ -380,6 +417,24 @@ void ForwardInput() {
                 left_rumble = right_rumble = 0;
             }
             controller.SetTriggerFeedback(left, right, left_rumble, right_rumble);
+            {
+                // (diagnosis) RYGT_ADAPTIVE_TRIGGERS_LOG=1: the trigger effects sent, at each change.
+                static const bool log = [] {
+                    const char* env = std::getenv("RYGT_ADAPTIVE_TRIGGERS_LOG");
+                    return env && env[0] == '1';
+                }();
+                static Input::TriggerFeedback::Effect logged_left{}, logged_right{};
+                if (log && slot == 0 && (left != logged_left || right != logged_right)) {
+                    logged_left = left;
+                    logged_right = right;
+                    std::fprintf(stderr,
+                                 "[triggers] slot 0: L %02x %02x %02x %02x  R %02x %02x %02x %02x  "
+                                 "rumble %u/%u strength %u%%%s\n",
+                                 left[0], left[1], left[2], left[3], right[0], right[1], right[2],
+                                 right[3], left_rumble, right_rumble, strength,
+                                 saved.triggerTouched ? " (game's own command)" : "");
+                }
+            }
             const auto state = controller.ReadState();
             if (slot == 0) {
                 DWORD foreground_pid{};
@@ -577,11 +632,7 @@ void SetControllerPortChoice(int player, const std::string& key) {
     }
     LOG_INFO(Input, "Ryty: controller ports changed in game: {}", joined);
     // Kept for the next start and the launcher (Input.controller_ports).
-    char path[MAX_PATH];
-    const DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
-    if (length != 0 && length < MAX_PATH) {
-        std::string file{path, length};
-        file = file.substr(0, file.find_last_of("/\\") + 1) + "user/custom_configs/CUSA03220.json";
+    if (const std::wstring file = Common::RytyGameConfigPathW(); !file.empty()) { // FIX-230
         auto config = nlohmann::json::parse(ReadGameConfig(), nullptr, false);
         if (config.is_discarded() || !config.is_object()) {
             config = nlohmann::json::object();
@@ -590,7 +641,7 @@ void SetControllerPortChoice(int player, const std::string& key) {
             config["Input"] = nlohmann::json::object();
         }
         config["Input"]["controller_ports"] = joined;
-        std::ofstream out{file, std::ios::binary | std::ios::trunc};
+        std::ofstream out{std::filesystem::path{file}, std::ios::binary | std::ios::trunc};
         out << config.dump();
     }
     // The window thread puts every gamepad in its new port.
@@ -604,6 +655,9 @@ void StartInputBridge() {
 #ifndef NDEBUG
     if (const char* script = std::getenv("RYTY_TEST_SCRIPT"); script != nullptr && *script != 0) {
         std::thread(RunTestScript, std::string(script)).detach();
+    }
+    if (const char* file = std::getenv("RYTY_TEST_SCRIPT_FILE"); file != nullptr && *file != 0) {
+        std::thread(RunTestScriptFile, std::string(file)).detach();
     }
 #endif
 }
