@@ -180,15 +180,37 @@ void CommandRing::WaitForWork(u64 seen, const std::stop_token& stoken) {
     // The recorder hands over commands steadily while it works; spin briefly before sleeping.
     // PERF-125: SHADGT_CMD_SPIN pauses (default 128). The spin was most of this thread's
     // CPU time (replay itself ~23% busy).
+    // PERF-416/417: when the recorder hands commands over just slower than the spin lasts, this
+    // thread slept after almost every command and the recorder woke it for each next one
+    // (WakeByAddress in Publish): on GT Sport's transmission screen with a car of many draws,
+    // a third of the recorder's draw recording. A longer pause spin removed the wakes but kept a
+    // core busy (PERF-416's adaptive spin: ~22% of the game's CPU). After the short spin, this
+    // thread now yields for up to RYGT_CMD_YIELD_US (default 200 us) before it sleeps: it stays
+    // awake, so the recorder needs no wake, but gives its core to any other ready thread. The
+    // time goes to waiting only on a core nothing else wants. RYGT_CMD_YIELD_US=0: spin, then
+    // sleep, as before.
     static const u32 spin = [] {
         const char* env = std::getenv("SHADGT_CMD_SPIN");
         return env && *env ? u32(std::strtoul(env, nullptr, 10)) : 128u;
+    }();
+    static const std::chrono::microseconds yield_for = [] {
+        const char* env = std::getenv("RYGT_CMD_YIELD_US");
+        return std::chrono::microseconds{env && *env ? std::strtoul(env, nullptr, 10) : 200ul};
     }();
     for (u32 i = 0; i < spin; ++i) {
         if (head.load(std::memory_order_acquire) != seen) {
             return;
         }
         _mm_pause();
+    }
+    if (yield_for.count() > 0) {
+        const auto until = std::chrono::steady_clock::now() + yield_for;
+        do {
+            std::this_thread::yield();
+            if (head.load(std::memory_order_acquire) != seen) {
+                return;
+            }
+        } while (!stoken.stop_requested() && std::chrono::steady_clock::now() < until);
     }
     const u32 wake_value = wake.load(std::memory_order_acquire);
     sleeping.store(true, std::memory_order_seq_cst);

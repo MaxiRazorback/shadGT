@@ -214,6 +214,16 @@ public:
     /// translated, loaded, built or waited for, and the selection made by the threads above is
     /// left as it was. Hold LookupMutex.
     const GraphicsPipeline* LookupBuiltPipeline(const DrawIndirectParams params);
+    /// PERF-415: stored pipelines are waiting to be installed (InstallPrewarmed has work), so a
+    /// recorder lookup should take the full path, which does that work.
+    bool PrewarmPending() const {
+        return prewarm_queued.load(std::memory_order_relaxed) != 0;
+    }
+    /// PERF-415: draws the recorder looked up with LookupBuiltPipeline count towards the
+    /// stored-shader scan cadence as GetGraphicsPipeline's do. Hold LookupMutex exclusively.
+    void NoteDrawsWithoutLookup(u32 draws) {
+        draws_since_scan += draws;
+    }
     /// NAT-030: why the last LookupBuiltPipeline found nothing.
     const char* LookupMiss() const {
         return t_last_miss;

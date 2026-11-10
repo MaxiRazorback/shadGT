@@ -504,6 +504,8 @@ private:
         std::chrono::steady_clock::time_point since;
     } select_stats{};
     u64 select_verify_count{};
+    std::atomic<u32> shared_lookup_turn{};  ///< PERF-415
+    std::atomic<u32> shared_lookup_draws{}; ///< PERF-415: not yet counted by the cache
     Common::Recycler<SelectedPipeline, 4096> selected_recycler;
     const Common::ReadCapture* read_capture{}; // PERF-063
     const char* capture_failure{};
@@ -565,6 +567,13 @@ private:
     /// PERF-055: the dispatch's compute pipeline, as selected ahead or looked up here.
     const ComputePipeline* AcquireComputePipeline();
     void CopySelectedStages(std::array<SelectedStage, Shader::MaxStageTypes>& out);
+    /// PERF-415: an already built pipeline for the draw, looked up under the shared lookup lock
+    /// as game job threads do (NAT-031), with its stages installed; nullptr when the full,
+    /// exclusive lookup must run instead.
+    const GraphicsPipeline* AcquireBuiltPipelineShared(const DrawIndirectParams& params,
+                                                       std::shared_ptr<const void>* owner);
+    /// PERF-415: under the exclusive lookup lock, before a full lookup.
+    void CountSharedLookups();
     void SeedStage(SelectedStage& selected, const Shader::Info* info);
     // FIX-046: bumped on every unmap (any thread); the decoded T#s are checked again after it.
     std::atomic<u64> tsharp_epoch{};
