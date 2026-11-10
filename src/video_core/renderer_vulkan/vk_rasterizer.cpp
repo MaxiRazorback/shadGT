@@ -1331,7 +1331,9 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
 }
 
 const GraphicsPipeline* Rasterizer::AcquireGraphicsPipelineWaiting(
-    const DrawIndirectParams& params, std::chrono::steady_clock::time_point deadline) {
+    const DrawIndirectParams& params, std::chrono::steady_clock::time_point deadline,
+    std::shared_ptr<const void>* owner) {
+    if (owner) owner->reset();
     const bool bounded = deadline != std::chrono::steady_clock::time_point::max(); // FIX-GT7-109
     std::array<SelectedStage, Shader::MaxStageTypes> stages{};
     const GraphicsPipeline* pipeline = nullptr;
@@ -1366,9 +1368,11 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipelineWaiting(
             pipeline_cache.SetShadersUnlocked(false);
             pipeline_cache.SetWaitForShaders(false);
             if (pipeline) {
-                if (SelectsPipelinesAhead()) {
-                    CopySelectedStages(stages);
-                }
+                // As AcquireGraphicsPipeline: the recorder keeps the pipeline alive and always
+                // reinstalls its stages from this lookup (a cached pipeline may still point at a
+                // per-race shadow).
+                if (owner) *owner = pipeline_cache.KeepAlive(pipeline);
+                CopySelectedStages(stages);
                 found = true;
             } else {
                 build = pipeline_cache.TakeSkippedBuild();
@@ -1401,14 +1405,16 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipelineWaiting(
         pipeline_cache.SetForceWait(true);
         pipeline = pipeline_cache.GetGraphicsPipeline(params);
         pipeline_cache.SetForceWait(false);
-        if (!pipeline || !SelectsPipelinesAhead()) {
-            return pipeline;
+        if (!pipeline) {
+            return nullptr;
         }
+        if (owner) *owner = pipeline_cache.KeepAlive(pipeline);
         CopySelectedStages(stages);
-    } else if (!SelectsPipelinesAhead()) {
-        return pipeline;
     }
-    InstallDrawStages(pipeline, stages, false);
+    if (!InstallDrawStages(pipeline, stages, false)) {
+        if (owner) owner->reset();
+        return nullptr;
+    }
     return pipeline;
 }
 

@@ -12393,8 +12393,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         PhaseClock clock{stats.phase_ns[0]};
         const auto wait_start = std::chrono::steady_clock::now();
         pipeline = r.AcquireGraphicsPipelineWaiting(
-            params, harmful_wait ? std::chrono::steady_clock::time_point::max()
-                                 : OneOffDeadline()); // FIX-GT7-109, FIX-GT7-121
+            params,
+            harmful_wait ? std::chrono::steady_clock::time_point::max() : OneOffDeadline(),
+            &pipeline_owner); // FIX-GT7-109, FIX-GT7-121
         one_off_wait_ns_frame += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          std::chrono::steady_clock::now() - wait_start)
                                          .count()); // FIX-GT7-102

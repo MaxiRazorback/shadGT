@@ -550,7 +550,8 @@ private:
     /// then (the draw is skipped; they keep building on the workers).
     const GraphicsPipeline* AcquireGraphicsPipelineWaiting(
         const DrawIndirectParams& params,
-        std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max());
+        std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max(),
+        std::shared_ptr<const void>* owner = nullptr);
     /// Points the pipeline's stages at copies holding the given user data; with `validate`,
     /// false if a stage's flattened user data now differs from what selection used.
     /// PERF-065: the selection's flattened user data is moved into the stage (swapped).
