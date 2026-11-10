@@ -1963,7 +1963,7 @@ void NativeRenderer::CaptureNativeFsr(const GraphicsPipeline& pipeline, const Ta
 #endif
 }
 
-bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, const Targets& targets,
+bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, Targets& targets,
                                    const DrawBindings& bindings) {
     if (!r.temporalDlss.Enabled()) return false;
     const auto* fs = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
@@ -1983,7 +1983,12 @@ bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, const Targ
     });
     if (scene == bindings.sampled.end()) return false;
     const auto size = r.temporalDlss.RenderSize();
-    if (size.width > desc.width || size.height > desc.height) return false;
+    // WIDE-063: the wide race scene is wider than the game's display buffer (3840x1080 against
+    // 1920x1080), so the composition cannot be drawn into it at the scene's size. It is drawn
+    // into the reconstruction's input image instead (below), and the reconstruction is shown
+    // at the full output size (SeedWideUi).
+    const bool wide = UiHires::Wide() && IsWideRaceComposition(fs->pgm_hash);
+    if (!wide && (size.width > desc.width || size.height > desc.height)) return false;
     const auto features = r.instance.GetPhysicalDevice().getFormatProperties(
         target->info.pixel_format).optimalTilingFeatures;
     const auto required = vk::FormatFeatureFlagBits::eBlitSrc | vk::FormatFeatureFlagBits::eBlitDst |
@@ -1998,7 +2003,8 @@ bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, const Targ
         auto scratch_desc = desc;
         scratch_desc.width = size.width; scratch_desc.height = size.height;
         scratch_desc.usage = Native::Rhi::ImageUsageSampled | Native::Rhi::ImageUsageTransferSrc |
-                             Native::Rhi::ImageUsageTransferDst;
+                             Native::Rhi::ImageUsageTransferDst |
+                             Native::Rhi::ImageUsageColorTarget; // WIDE-063: drawn into
         scratch_desc.name = "Native FSR scene composition";
         scratch->image = device->CreateImage(scratch_desc);
         if (!scratch->image) return false;
@@ -2017,6 +2023,22 @@ bool NativeRenderer::BeginNativeFsr(const GraphicsPipeline& pipeline, const Targ
     Begin();
     UiHires::Get().scale = 0.f;
     fsr_wide_full = IsWideRaceComposition(fs->pgm_hash); // WIDE-001
+    fsr_game_extent = {targets.state.width, targets.state.height};
+    fsr_wide_drawn = wide && (size.width > desc.width || size.height > desc.height);
+    if (fsr_wide_drawn) {
+        // WIDE-063: the composition goes straight into the reconstruction's input, at its size.
+        auto& attachment = targets.state.color_attachments[0];
+        attachment.image_view = *fsr_composition->view;
+        attachment.image_layout = vk::ImageLayout::eGeneral;
+        targets.state.width = size.width;
+        targets.state.height = size.height;
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+            std::fprintf(stderr, "[wide] WIDE-063 race composition drawn at %ux%u for DLSS "
+                                 "(display buffer %ux%u)\n",
+                         size.width, size.height, desc.width, desc.height);
+        }
+    }
     return true;
 }
 
@@ -2032,7 +2054,13 @@ void NativeRenderer::FinishNativeFsr(const Targets& targets) {
         .srcSubresource{vk::ImageAspectFlagBits::eColor, 0, 0, 1},
         .dstSubresource{vk::ImageAspectFlagBits::eColor, 0, 0, 1},
         .extent{size.width, size.height, 1}};
-    s.cmd.copyImage(source, vk::ImageLayout::eGeneral, scratch, vk::ImageLayout::eGeneral, copy);
+    // WIDE-063: a wide composition was drawn into the scratch image itself.
+    const bool drawn_in_scratch = fsr_wide_drawn;
+    fsr_wide_drawn = false;
+    if (!drawn_in_scratch) {
+        s.cmd.copyImage(source, vk::ImageLayout::eGeneral, scratch, vk::ImageLayout::eGeneral,
+                        copy);
+    }
     Splice();
     // This is a real scene-sized image, not a cropped view of the full-sized game target.
     auto info = target->info;
@@ -2052,6 +2080,13 @@ void NativeRenderer::FinishNativeFsr(const Targets& targets) {
                 size.width, size.height, r.temporalDlss.OutputSize().width,
                 r.temporalDlss.OutputSize().height, target->info.size.width, target->info.size.height);
     } else {
+        if (drawn_in_scratch) {
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+                std::fprintf(stderr, "[wide] WIDE-063 DLSS reconstruction of the wide scene "
+                                     "failed; showing the composition scaled\n");
+            }
+        }
         // Preserve a complete output picture even if the optional provider fails.
         auto& fallback = Begin();
         GlobalBarrier();
@@ -14323,8 +14358,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         if (native_fsr_composition) {
             auto viewports = s.dynamic.viewports;
             auto scissors = s.dynamic.scissors;
-            const float sx = float(fsr_composition->size.width) / targets.state.width;
-            const float sy = float(fsr_composition->size.height) / targets.state.height;
+            // WIDE-063: from the game's size (targets now has the wide scene's size).
+            const float sx = float(fsr_composition->size.width) / fsr_game_extent.width;
+            const float sy = float(fsr_composition->size.height) / fsr_game_extent.height;
             for (auto& v : viewports) {
                 v.x *= sx; v.width *= sx; v.y *= sy; v.height *= sy;
             }
