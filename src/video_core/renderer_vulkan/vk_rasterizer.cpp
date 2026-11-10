@@ -1179,6 +1179,69 @@ bool Rasterizer::InstallDrawStages(const Pipeline* pipeline,
     return true;
 }
 
+// PERF-415: the recorder looked every draw's pipeline up under the exclusive lookup lock, even
+// when it was long built. Since GT7-PREP, four prepare workers look a pipeline up for each
+// prepared draw under the shared lock, and NAT-031's readers step aside while a writer waits:
+// on GT Sport's transmission screen with a car of many draws, the recorder and the workers spent
+// most of their lookups taking, waiting for and handing over the lock (the recorder's lookups
+// ~60% of its draw recording once the command ring stopped sleeping). A pipeline already built
+// is now found as the job threads find theirs (LookupBuiltPipeline: nothing translated, built or
+// waited for), under the shared lock. The full lookup still runs on a miss, while stored
+// pipelines wait to be installed, and every RYGT_RECORDER_SHARED_LOOKUP-th lookup (default 8)
+// so its other work (read-ahead builds, PERF-034) goes on; 0 or 1: every lookup is the full one.
+const GraphicsPipeline* Rasterizer::AcquireBuiltPipelineShared(
+    const DrawIndirectParams& params, std::shared_ptr<const void>* owner) {
+    static const u32 every = [] {
+        const char* env = std::getenv("RYGT_RECORDER_SHARED_LOOKUP");
+        return env && *env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 8u;
+    }();
+    if (every <= 1 || shared_lookup_turn.fetch_add(1, std::memory_order_relaxed) % every == 0 ||
+        pipeline_cache.PrewarmPending()) {
+        return nullptr;
+    }
+    std::array<SelectedStage, Shader::MaxStageTypes> stages{};
+    const GraphicsPipeline* pipeline;
+    std::shared_ptr<const void> keepalive;
+    {
+        std::shared_lock lk{pipeline_cache.LookupMutex()};
+        pipeline = pipeline_cache.LookupBuiltPipeline(params);
+        if (!pipeline) {
+            return nullptr;
+        }
+        keepalive = pipeline_cache.KeepAlive(pipeline);
+        // As InstallPrepared: the lookup's own copies of the infos, with this draw's user data.
+        const auto& infos = PipelineCache::JobInfos();
+        for (u32 stage = 0; stage < Shader::MaxStageTypes; ++stage) {
+            auto& selected = stages[stage];
+            const Shader::Info* info = stage < infos.size() ? infos[stage] : nullptr;
+            selected.present = info != nullptr;
+            if (!info) {
+                continue;
+            }
+            selected.pgm_base = info->pgm_base;
+            selected.num_user_data = static_cast<u32>(info->user_data.size());
+            ASSERT(selected.num_user_data <= selected.user_data.size());
+            std::ranges::copy(info->user_data, selected.user_data.begin());
+            selected.flattened = info->flattened_ud_buf;
+        }
+    }
+    // Not validated, as the full lookup's stages: the sharps are read again here.
+    if (!InstallDrawStages(pipeline, stages, false)) {
+        return nullptr;
+    }
+    shared_lookup_draws.fetch_add(1, std::memory_order_relaxed);
+    if (owner) {
+        *owner = std::move(keepalive);
+    }
+    return pipeline;
+}
+
+void Rasterizer::CountSharedLookups() {
+    if (const u32 draws = shared_lookup_draws.exchange(0, std::memory_order_relaxed)) {
+        pipeline_cache.NoteDrawsWithoutLookup(draws);
+    }
+}
+
 const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectParams& params,
                                                             bool selected_allowed,
                                                             std::shared_ptr<const void>* owner) {
@@ -1186,10 +1249,14 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
     if (!SelectsPipelinesAhead()) {
         // A cached pipeline may still point at a per-race shadow. Reinstall a
         // recorder-owned stage from the current lookup after leaving race mode.
+        if (const GraphicsPipeline* built = AcquireBuiltPipelineShared(params, owner)) {
+            return built; // PERF-415
+        }
         std::array<SelectedStage, Shader::MaxStageTypes> stages{};
         const GraphicsPipeline* pipeline;
         {
             std::unique_lock lk{pipeline_cache.LookupMutex()};
+            CountSharedLookups();
             pipeline = pipeline_cache.GetGraphicsPipelineUnlocked(params, lk);
             if (!pipeline) return nullptr;
             if (owner) *owner = pipeline_cache.KeepAlive(pipeline);
@@ -1312,10 +1379,14 @@ const GraphicsPipeline* Rasterizer::AcquireGraphicsPipeline(const DrawIndirectPa
         ++stats.recorder;
 #endif
     }
+    if (const GraphicsPipeline* built = AcquireBuiltPipelineShared(params, owner)) {
+        return built; // PERF-415
+    }
     std::array<SelectedStage, Shader::MaxStageTypes> stages{};
     const GraphicsPipeline* pipeline;
     {
         std::unique_lock lk{pipeline_cache.LookupMutex()};
+        CountSharedLookups();
         pipeline = pipeline_cache.GetGraphicsPipelineUnlocked(params, lk);
         if (!pipeline) {
             return nullptr;
