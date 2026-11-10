@@ -3531,17 +3531,18 @@ void NativeRenderer::BindGraphics(Stream& s, const GraphicsPipeline& pipeline,
             bound->BindShaderObjects(cmd, known ? &previous : nullptr, known ? &shaders : nullptr);
         });
         if (!known) s.pipelines.Invalidate();
-        // FIX-420: a bind that changes the shader objects also forgets the push constants and
-        // descriptor sets OPT-014 remembers (binding_commands): the next PushBindings issues them
-        // again. With pipelines they stay bound across binds of a compatible layout; after
-        // vkCmdBindShadersEXT of other shaders they did not reliably (GT Sport's grass tufts drew
-        // over the road a while into a race, from the previous draw's buffer offsets). Draws that
-        // keep the same shaders keep the memo. RYGT_SO_KEEP_BINDINGS=1: as before.
-        static const bool keep_bindings = [] {
-            const char* env = std::getenv("RYGT_SO_KEEP_BINDINGS");
-            return env && env[0] == '1';
+        // FIX-GTS-420/421: a shader-object bind forgets the push constants and descriptor sets
+        // OPT-014 remembers (binding_commands), so the next PushBindings issues them again.
+        // With shader objects and the memo on, GT Sport's grass tufts drew over the road a while
+        // into a race; every run with the memo off for shader-object draws was correct.
+        // RYGT_SO_BINDINGS: always (default) at every shader-object bind; change only when the
+        // bind changes the shaders (FIX-GTS-420); keep as before.
+        static const int so_bindings = [] {
+            const char* env = std::getenv("RYGT_SO_BINDINGS");
+            const std::string_view value = env ? env : "";
+            return value == "keep" ? 0 : value == "change" ? 1 : 2;
         }();
-        if (!keep_bindings && !(known && shaders == pipeline.ShaderObjects())) {
+        if (so_bindings == 2 || (so_bindings == 1 && !(known && shaders == pipeline.ShaderObjects()))) {
             s.binding_commands.Invalidate();
         }
         s.so_epoch = s.pipelines.InvalidationEpoch();
