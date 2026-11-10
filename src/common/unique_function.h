@@ -62,6 +62,10 @@ public:
         requires(!std::is_same_v<std::remove_cvref_t<Functor>, UniqueFunction> &&
                  std::is_invocable_r_v<ResultType, std::decay_t<Functor>&, Args...>)
     UniqueFunction(Functor&& functor)
+        // FIX-GT7-098: a named const lambda deduces Functor as const Lambda&.
+        // Storing that reference left queued commands pointing into a dead local
+        // or coroutine frame (occlusion writes then corrupted host heap objects).
+        // Own the decayed callable; borrowing requires an explicit std::ref.
         : callable{std::make_unique<Callable<std::decay_t<Functor>>>(
               std::forward<Functor>(functor))} {}
 

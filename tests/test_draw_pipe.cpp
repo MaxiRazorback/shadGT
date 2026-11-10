@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <semaphore>
@@ -10,8 +11,11 @@
 #include <vector>
 #include <gtest/gtest.h>
 
+#include "common/logging/log.h"
+#include "common/thread.h"
 #include "video_core/amdgpu/draw_pipe.h"
 #include "video_core/amdgpu/regs_delta.h"
+#include "video_core/buffer_cache/direct_memory.h"
 
 namespace {
 
@@ -124,7 +128,7 @@ TEST(DrawPipe, DrainWaitsForWorkAlreadyRunning) {
 TEST(DrawPipe, DrainWaitsForAnIdleHookAlreadyUsingTheCaches) {
     using namespace std::chrono_literals;
     std::binary_semaphore entered{0}, release{0}, drained{0};
-    bool armed = false;
+    bool armed = false; // only the recorder reads or writes this flag
     AmdGpu::DrawPipe pipe{nullptr, AmdGpu::DrawPipe::DefaultMaxPending, [&] {
         if (std::exchange(armed, false)) { entered.release(); release.acquire(); }
     }};
@@ -138,10 +142,13 @@ TEST(DrawPipe, DrainWaitsForAnIdleHookAlreadyUsingTheCaches) {
 
 TEST(DrawPipe, IdleWorkCompletesAfterReleaseWithoutAnotherPush) {
     using namespace std::chrono_literals;
-    bool pending = false;
+    bool pending = false; // only accessed on the recorder
     std::binary_semaphore done{0};
     AmdGpu::DrawPipe pipe{nullptr, AmdGpu::DrawPipe::DefaultMaxPending, [&] {
-        if (std::exchange(pending, false)) done.release();
+        if (std::exchange(pending, false)) {
+            EXPECT_FALSE(pipe.IsExclusive());
+            done.release();
+        }
     }};
     for (int i = 0; i < 100; ++i) {
         pipe.Push([&] { pending = true; });
@@ -267,4 +274,26 @@ TEST(DrawPipe, UrgentWorkNeverOverlapsTheDrainedCaller) {
     sender.join();
     EXPECT_FALSE(overlap.load());
     EXPECT_GT(urgent_done.load(), 0);
+}
+
+// draw_pipe.cpp names its threads, places them on performance cores, and reports its stage
+// barriers (DIAG-069) and recorder core placement (PERF-088) through the logger every few
+// seconds; none of it is what these tests check.
+std::array<Common::Log::Level, Common::Log::NUM_LOG_CLASSES> Common::Log::g_class_levels{};
+
+void Common::Log::VLog(Class, Level, const char*, int, const char*, fmt::string_view,
+                       fmt::format_args) {}
+
+namespace Common {
+void SetCurrentThreadName(const char*) {}
+void PreferPerformanceCores() {}
+void UpdateCoreOwner(u32, bool) {}
+int CurrentCoreIsFast() {
+    return -1; // not known, as on a CPU without performance and efficiency cores
+}
+} // namespace Common
+
+// The buffer stage is on by default with the direct renderer (buffer_cache/direct_memory.cpp).
+bool VideoCore::DirectMemory::Enabled() {
+    return true;
 }

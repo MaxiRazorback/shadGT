@@ -375,8 +375,33 @@ void ReleaseCompileCores() {
     compile_selection.clear();
 }
 
+// FIX-GT7-107: "every core" for compile work. With a core owner (PERF-GT7-048) the process
+// default CPU set is the game's cores but the owners' (compile cores excluded): a thread without
+// a set of its own runs there only, so compiles "widened" for a waiting draw, a catch-up or a
+// backlog left the 3 compile cores for the game's 4 (a first race filled in at ~3.9 pipelines a
+// second either way, ~7 with RYGT_COMPILE_CORES=0). Every core but the owners' then, explicitly.
+std::mutex g_wide_mutex;
+std::vector<ULONG> g_wide_ids; ///< empty: no owner, the process default is every core
+
+void SetWideCores(HANDLE thread) {
+    std::scoped_lock lk{g_wide_mutex};
+    // Fail closed (PERF-259): sets no longer available fall back to the process default.
+    if (g_wide_ids.empty() || !CpuSetsStillAvailable(g_wide_ids)) {
+        CallSetThreadSelectedCpuSets(thread, nullptr, 0);
+    } else {
+        CallSetThreadSelectedCpuSets(thread, g_wide_ids.data(), ULONG(g_wide_ids.size()));
+    }
+}
+
+// A selection SetWideCores could have applied: none, or the explicit wide set.
+bool IsWideSelection(const std::vector<ULONG>& current) {
+    std::scoped_lock lk{g_wide_mutex};
+    return current.empty() ||
+           (!g_wide_ids.empty() && std::ranges::is_permutation(current, g_wide_ids));
+}
+
 void AllowAllCores() {
-    CallSetThreadSelectedCpuSets(GetCurrentThread(), nullptr, 0);
+    SetWideCores(GetCurrentThread());
 }
 
 // PERF-GT7-048 (RYGT_CORE_OWNERS=<mask>: 1 command processor, 2 recorder, 4 Vulkan commands; 0 none):
@@ -462,6 +487,16 @@ void UpdateCoreOwner(u32 slot, bool wanted) {
         }
         owned_process_default = wanted ? rest : std::vector<ULONG>{};
         owner_policy_default = owned_process_default;
+        // FIX-GT7-107: compile work's "every core" is the rest and the compile cores.
+        std::scoped_lock lk{g_wide_mutex};
+        g_wide_ids.clear();
+        if (wanted) {
+            g_wide_ids = rest;
+            if (CompileCoresOn()) {
+                g_wide_ids.insert(g_wide_ids.end(), classes.compile_ids.begin(),
+                                  classes.compile_ids.end());
+            }
+        }
     }
     applied = state;
 }
@@ -492,6 +527,8 @@ struct DriverCompileThreads {
     // (FIX-GT7-008).
     int waits = 0;
     int catch_up = 0;
+    int backlog = 0; ///< FIX-GT7-106
+    bool in_play = false; ///< FIX-GT7-109
     int foreground = 0;
     bool applied_wide = false;
     bool applied_low = false;
@@ -511,7 +548,7 @@ DriverCompileThreads& DriverThreads() {
 void ApplyCompileCores(HANDLE thread, bool wide) {
     const auto& ids = GetCoreClasses().compile_ids;
     if (wide) {
-        CallSetThreadSelectedCpuSets(thread, nullptr, 0);
+        SetWideCores(thread); // FIX-GT7-107
     } else if (CpuSetsStillAvailable(ids)) {
         CallSetThreadSelectedCpuSets(thread, ids.data(), static_cast<ULONG>(ids.size()));
     }
@@ -531,8 +568,17 @@ void ApplyCompilePriority(DriverCompileThreads::Thread& thread, bool low) {
 // for). A build a thread waits for on itself: the compile cores, below normal (it goes first). A
 // catch-up: every core, below normal (the time the game's and the renderer's threads leave).
 void ApplyCompileState(DriverCompileThreads& d) {
-    const bool wide = d.waits > 0 || (d.catch_up > 0 && d.foreground == 0);
-    const bool low = d.waits == 0 && (d.foreground > 0 || d.catch_up > 0 || CompileAlwaysLow());
+    // FIX-GT7-106: a backlog of draws on screen: every core (FIX-GT7-107), foreground or not,
+    // below normal priority: Monza's first race filled in at 7.7 pipelines a second, the same as at
+    // normal priority. RYGT_COMPILE_BACKLOG_LOW=0: the driver threads' own priority.
+    const bool wide = !d.in_play && // FIX-GT7-109
+                      (d.waits > 0 || d.backlog > 0 || (d.catch_up > 0 && d.foreground == 0));
+    static const bool backlog_low = [] {
+        const char* env = std::getenv("RYGT_COMPILE_BACKLOG_LOW");
+        return !(env && env[0] == '0');
+    }();
+    const bool low = d.waits == 0 && (d.backlog == 0 || backlog_low) &&
+                     (d.foreground > 0 || d.catch_up > 0 || d.backlog > 0 || CompileAlwaysLow());
     d.wide_now.store(wide, std::memory_order_relaxed);
     d.low_now.store(low, std::memory_order_relaxed);
     if (!ProcessPolicyStillAllowed()) return;
@@ -552,7 +598,8 @@ void ApplyCompileState(DriverCompileThreads& d) {
             std::vector<ULONG> current;
             const auto& expected = GetCoreClasses().compile_ids;
             if (ReadThreadCpuSelection(thread.handle, current) &&
-                (previous_wide ? current.empty() : std::ranges::is_permutation(current, expected)))
+                (previous_wide ? IsWideSelection(current)
+                               : std::ranges::is_permutation(current, expected)))
                 ApplyCompileCores(thread.handle, wide);
         }
         if (priority) {
@@ -771,7 +818,8 @@ void ReleaseDriverCompileThreads() {
         if (thread.confined) {
             std::vector<ULONG> current;
             if (ReadThreadCpuSelection(thread.handle, current) &&
-                std::ranges::is_permutation(current, GetCoreClasses().compile_ids))
+                (std::ranges::is_permutation(current, GetCoreClasses().compile_ids) ||
+                 (d.applied_wide && IsWideSelection(current))))
                 CallSetThreadSelectedCpuSets(thread.handle, nullptr, 0);
             if (thread.priority_owned && GetThreadPriority(thread.handle) == thread.applied_priority)
                 SetThreadPriority(thread.handle, thread.priority);
@@ -800,6 +848,20 @@ void SetCompileCatchUp(bool on) {
     auto& d = DriverThreads();
     std::scoped_lock lk{d.mutex};
     d.catch_up += on ? 1 : -1;
+    ApplyCompileState(d);
+}
+
+void SetCompileBacklog(bool on) {
+    auto& d = DriverThreads();
+    std::scoped_lock lk{d.mutex};
+    d.backlog += on ? 1 : -1;
+    ApplyCompileState(d);
+}
+
+void SetCompileInPlay(bool on) {
+    auto& d = DriverThreads();
+    std::scoped_lock lk{d.mutex};
+    d.in_play = on;
     ApplyCompileState(d);
 }
 
@@ -959,6 +1021,8 @@ bool ForEachProcessThread(unsigned long, const std::function<bool(void*, unsigne
 void SetCompileCoresWide(bool) {}
 bool CompileCoresWide() { return false; }
 void SetCompileCatchUp(bool) {}
+void SetCompileBacklog(bool) {}
+void SetCompileInPlay(bool) {}
 bool CompileThreadsLow() { return false; }
 void BeginForegroundCompile() {}
 void EndForegroundCompile() {}

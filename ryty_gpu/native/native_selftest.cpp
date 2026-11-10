@@ -300,7 +300,7 @@ bool RunCase(Rhi::Device& device, ImageRegistry& registry, Rhi::Fence& fence, u6
         list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
         list->FillBuffer(batch_echo.get(), 256, size, 0x5a5a5a5a);
     }
-    registry.RecordUploads(*list);
+    registry.RecordUploads(*list); // Initialize the target before replacing it with the pattern.
     list->Barrier(Rhi::ScopeTransfer | Rhi::ScopeCompute, Rhi::ScopeTransfer);
     list->CopyBufferToImage(pattern.get(), target->image.get(), MipCopies(target_info));
     list->Barrier(Rhi::ScopeTransfer, Rhi::ScopeTransfer);
@@ -1589,6 +1589,24 @@ bool RunImageSelfTest(std::string& log) {
         log += fmt::format("shared upload scratch: {} created, {} uses, {} transient; {}\n",
             reuse.scratch_created.load(), reuse.scratch_reused.load(),
             reuse.scratch_transient.load(), scratch_ok ? "passed" : "FAILED");
+        const auto remapped = MakeInfo(AmdGpu::TileMode::DisplayLinearAligned, 32, 32, 1,
+                                       0x7000'8000'0000ULL);
+        auto* original = registry.Find(remapped, true, 2);
+        if (original) {
+            original->write_version.store(1);
+            registry.Invalidate(remapped.guest_address, 64, ImageRegistry::Stale::CpuWrite);
+            const bool cpu_write_preserves_target = registry.Find(remapped, true, 3) == original;
+            registry.Invalidate(remapped.guest_address, 64, ImageRegistry::Stale::Unmap);
+            auto* replacement = registry.Find(remapped, true, 4);
+            const bool unmap_replaces_target = original->reused.load() && replacement &&
+                replacement != original && !replacement->reused.load();
+            log += fmt::format("active target lifetime: CPU write preserves {}, unmap replaces {}\n",
+                               cpu_write_preserves_target, unmap_replaces_target);
+            ok = cpu_write_preserves_target && unmap_replaces_target && ok;
+        } else {
+            log += "active target lifetime: setup failed\n";
+            ok = false;
+        }
         const auto& stats = registry.GetStats();
         log += fmt::format("registry: {} lookups, {} textures, {} render targets, {} uploads\n",
                            stats.lookups.load(), stats.created_textures.load(),

@@ -1237,6 +1237,10 @@ int PS4_SYSV_ABI sceGnmMapComputeQueue(u32 pipe_id, u32 queue_id, VAddr ring_bas
 
     const auto& queue = liverpool->asc_queues[vqid];
     *queue.read_addr = 0u;
+    // A new ring starts at its beginning. GT7 unmaps compute queues and maps others that reuse the
+    // vqueue; with the previous ring's end offset kept, the first ding-dong submitted the new
+    // ring's unwritten tail (Invalid PM4 type 0).
+    asc_next_offs_dw[vqid.index] = 0;
 
     return gnm_vqid;
 }
@@ -2302,17 +2306,24 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     auto* cmdbuf = dcb_gpu_addrs[count - 1];
     const auto size_dw = dcb_sizes_in_bytes[count - 1] / 4;
 
-    std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
+    s32 result = ORBIS_OK;
+    {
+        std::scoped_lock lk{m_submit_lock};
+        WaitGpuIdle();
 
-    const s32 patch_result =
-        PatchFlipRequest(cmdbuf, size_dw, vo_handle, buf_idx, flip_mode, flip_arg, nullptr /*unk*/);
-    if (patch_result != ORBIS_OK) {
-        return patch_result;
+        const s32 patch_result = PatchFlipRequest(cmdbuf, size_dw, vo_handle, buf_idx, flip_mode,
+                                                  flip_arg, nullptr /*unk*/);
+        if (patch_result != ORBIS_OK) {
+            return patch_result;
+        }
+
+        result = PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
+                               const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);
     }
-
-    return PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
-                         const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);
+    // PERF-111: with the FPS lock the game goes on to its next frame once the frames before this
+    // one are on screen (its work is queued already; other threads can submit meanwhile).
+    VideoOut::PaceFlipSubmit();
+    return result;
 }
 
 s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,

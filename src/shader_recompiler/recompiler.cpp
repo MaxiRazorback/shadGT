@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <fmt/format.h>
 #include <magic_enum/magic_enum.hpp>
+#include "common/logging/log.h"
 #include "common/logging/classes.h"
 #include "shader_recompiler/frontend/control_flow_graph.h"
 #include "shader_recompiler/frontend/decode.h"
@@ -154,6 +155,37 @@ bool HasLaneReadsAndLoop(std::span<const u32> code) {
     return lane_reads && loop;
 }
 
+std::optional<u32> FetchShaderSgprBase(std::span<const u32> code) {
+    using namespace Gcn;
+    GcnCodeSlice slice(code.data(), code.data() + code.size());
+    GcnDecodeContext decoder;
+    while (!slice.atEnd()) {
+        const GcnInst inst = decoder.decodeInstruction(slice);
+        if (inst.opcode == Opcode::S_SWAPPC_B64) {
+            return inst.src[0].code;
+        }
+        if (inst.opcode == Opcode::S_ENDPGM) {
+            break;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<size_t> FetchShaderLength(std::span<const u32> code) {
+    using namespace Gcn;
+    GcnCodeSlice slice(code.data(), code.data() + code.size());
+    GcnDecodeContext decoder;
+    size_t bytes = 0;
+    while (!slice.atEnd() && bytes < code.size_bytes()) {
+        const GcnInst inst = decoder.decodeInstruction(slice);
+        bytes += inst.length;
+        if (inst.opcode == Opcode::S_SETPC_B64) {
+            return bytes <= code.size_bytes() ? std::optional{bytes / sizeof(u32)} : std::nullopt;
+        }
+    }
+    return std::nullopt;
+}
+
 bool HasMemoryWrites(std::span<const u32> code) {
     using namespace Gcn;
     Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
@@ -212,6 +244,16 @@ bool HasSdwaCompareDestination(std::span<const u32> code) {
         }
     }
     return false;
+}
+
+bool HasWholeWaveRegions(std::span<const u32> code) {
+    Gcn::GcnCodeSlice slice(code.data(), code.data() + code.size());
+    Gcn::GcnDecodeContext decoder;
+    std::vector<Gcn::GcnInst> list;
+    while (!slice.atEnd()) {
+        list.emplace_back(decoder.decodeInstruction(slice));
+    }
+    return !Gcn::FindWholeWaveRegions(list).empty();
 }
 
 bool HasEmptyScopeBeforeElse(std::span<const u32> code) {
@@ -312,6 +354,15 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     SrtArenaTrace::FrontendScope arena_trace_scope;
 #endif
     auto profile = device_profile;
+    if (runtime_info.sw_stage == SwStage::TessellationControl) { // FIX-227 (diagnosis)
+        static int logged = 0;
+        if (logged++ < 10) {
+            LOG_WARNING(Render_Recompiler, "FIX-227: translating hull shader, LDS emulation {} "
+                        "patches {} input cp {}",
+                        u32(runtime_info.sw.tcs.lds_emulation), u32(runtime_info.sw.tcs.num_patches),
+                        runtime_info.sw.tcs.num_input_control_points);
+        }
+    }
     // AMD explicit interpolation and KHR per-vertex arrays are alternative ABIs.
     // Both extensions may be enabled on the device, but a shader must select one.
     if (profile.supports_amd_shader_explicit_vertex_parameter) {

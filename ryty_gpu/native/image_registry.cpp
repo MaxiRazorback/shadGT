@@ -7,10 +7,12 @@ bool RytyWideScene(); // WIDE-001 (ryty_game_patch.cpp)
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <algorithm>
 #include <bit>
 #include <cstring>
 
+#include "common/diagnostics.h"
 #include "common/logging/log.h"
 #include "core/guest_hash.h"
 #include "core/memory.h"
@@ -146,8 +148,19 @@ bool WatchedTexture(VAddr begin, VAddr end) {
             return true;
         }
     }
-
-    return false;
+    // DIAG-167 (RYGT_NATIVE_WATCH_RANGE=<hex lo>-<hex hi>): images starting in that range too
+    // (pictures whose address changes from run to run).
+    static const std::pair<VAddr, VAddr> range = [] {
+        const char* env = std::getenv("RYGT_NATIVE_WATCH_RANGE");
+        if (!env || !*env) {
+            return std::pair<VAddr, VAddr>{};
+        }
+        char* end_at = nullptr;
+        const VAddr lo = std::strtoull(env, &end_at, 16);
+        const VAddr hi = end_at && *end_at == '-' ? std::strtoull(end_at + 1, nullptr, 16) : lo + 1;
+        return std::pair<VAddr, VAddr>{lo, hi};
+    }();
+    return range.first < range.second && begin >= range.first && begin < range.second;
 #else
     (void)begin; (void)end;
     return false;
@@ -343,32 +356,107 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
             exact->last_use.store(frame, std::memory_order_relaxed);
             return exact;
         }
-        if (!render_target && !info.props.is_depth &&
-            Vulkan::LiverpoolToVK::IsFormatDepthCompatible(info.pixel_format)) {
+        if (!render_target && (info.props.is_depth || Vulkan::LiverpoolToVK::IsFormatDepthCompatible(
+                                                          info.pixel_format))) {
             // NAT-040: a depth buffer read as a texture (the T# names R32/R16, the image is
             // D32/D16): the depth image itself, viewed through its depth aspect. NAT-121: before a
             // texture of the same layout (an upload of the memory under the depth buffer, made
             // before it existed, would hide it: GT Sport's shadow cascades, a 256x256 depth
             // target with 14 layers read with 13). NAT-126: only for depth-like formats (a
             // B10G11R11 bloom picture in the scratch pool matched a bigger depth buffer there).
+            // FIX-206: also a T# the shader samples as depth (a compare sampler: the format is
+            // promoted to D32/D16): GT7's shadow cascades are a 256x256 D32S8 target with 12
+            // layers, read as D32 with 2 to 11; they were uploaded from memory, which never holds
+            // what the GPU drew, and nothing had a shadow. Of the depth targets there (GT7 also
+            // draws a 5-layer one at that address), the one drawn last.
+            static const bool depth_textures = [] {
+                const char* env = std::getenv("RYGT_NATIVE_DEPTH_TEXTURES"); // FIX-206 off: =0
+                return !(env && env[0] == '0');
+            }();
+            ImageEntry* depth = nullptr;
             for (auto it = first; it != last; ++it) {
                 const auto& cached = it->second->info;
                 if (cached.props.is_depth && cached.num_bits == info.num_bits &&
+                    (depth_textures || !info.props.is_depth) &&
                     !it->second->reused.load(std::memory_order_relaxed) &&
                     cached.resources.layers >= info.resources.layers &&
                     CompatibleLayerStrides(cached, info) &&
                     ((cached.size.width == info.size.width &&
                       cached.size.height == info.size.height) ||
                      (cached.pitch == info.pitch && cached.size.width >= info.size.width &&
-                      cached.size.height >= info.size.height))) { // NAT-113
-#ifndef NDEBUG
-                    ++stats.hits;
-#endif
-                    it->second->last_use.store(frame, std::memory_order_relaxed);
-                    return it->second.get();
+                      cached.size.height >= info.size.height)) && // NAT-113
+                    (!depth || it->second->write_version.load(std::memory_order_relaxed) >
+                                   depth->write_version.load(std::memory_order_relaxed))) {
+                    depth = it->second.get();
                 }
             }
+            if (depth) {
+#ifndef NDEBUG
+                ++stats.hits;
+#endif
+                depth->last_use.store(frame, std::memory_order_relaxed);
+                return depth;
+            }
         }
+        if (!render_target && !info.props.is_depth) {
+            // FIX-219: a colour texture that reads the first layers of a layered target of its own
+            // layout (size, mips, format, pitch, tiling): the target itself, viewed through those
+            // layers, as NAT-040 does for depth. GT7 draws every object's reflection probe into a
+            // 64x64 B10G11R11 target of 7 mips and 2048 layers, and the car shaders read it as
+            // 1464 layers: no target had that layout, the texture was uploaded from memory, which
+            // never holds what the GPU drew, and parts of the cars reflected black (blocks on
+            // the car in the race start's close-ups). RYGT_NATIVE_LAYER_VIEWS=1: on.
+            static const bool layer_views = [] {
+                const char* env = std::getenv("RYGT_NATIVE_LAYER_VIEWS");
+                return env && env[0] == '1'; // off unless asked: it did not fix what it was made for
+            }();
+            ImageEntry* layered = nullptr;
+            for (auto it = first; layer_views && it != last; ++it) {
+                const auto& c = it->second->info;
+                if (!it->second->from_cpu && it->second->image &&
+                    !it->second->reused.load(std::memory_order_relaxed) && !c.props.is_depth &&
+                    c.resources.layers > info.resources.layers &&
+                    c.resources.levels == info.resources.levels &&
+                    c.size.width == info.size.width && c.size.height == info.size.height &&
+                    c.size.depth == info.size.depth && c.pitch == info.pitch &&
+                    c.tile_mode == info.tile_mode && c.num_bits == info.num_bits &&
+                    c.num_samples == info.num_samples && c.pixel_format == info.pixel_format &&
+                    c.PackedOrdersCompatible(info) &&
+                    (!layered || it->second->write_version.load(std::memory_order_relaxed) >
+                                     layered->write_version.load(std::memory_order_relaxed))) {
+                    layered = it->second.get();
+                }
+            }
+            if (layered) {
+#ifndef NDEBUG
+                ++stats.hits;
+#endif
+                layered->last_use.store(frame, std::memory_order_relaxed);
+                return layered;
+            }
+        }
+#ifndef NDEBUG
+        if (!render_target && WatchedTexture(info.guest_address, info.guest_address + 1) &&
+            WatchSample()) {
+            // DIAG-221 (diagnosis, with RYGT_NATIVE_WATCH_TEXTURE): a texture lookup that found no
+            // target of its layout: the pictures at its address and how their layouts differ.
+            std::string others;
+            for (auto it = first; it != last; ++it) {
+                const auto& c = it->second->info;
+                others += fmt::format(" | {} {}x{} pitch {} tile {} bits {} fmt {} lv {} ly {}{}{}",
+                                      it->second->from_cpu ? "texture" : "target", c.size.width,
+                                      c.size.height, c.pitch, u32(c.tile_mode), c.num_bits,
+                                      u32(c.pixel_format), c.resources.levels, c.resources.layers,
+                                      it->second->reused.load() ? " reused" : "",
+                                      SameLayout(c, info) ? " same-layout" : "");
+            }
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-221: texture {:#x} {}x{} pitch {} tile {} bits {} fmt {}: no target; "
+                        "at the address:{}",
+                        info.guest_address, info.size.width, info.size.height, info.pitch,
+                        u32(info.tile_mode), info.num_bits, u32(info.pixel_format), others);
+        }
+#endif
         if (exact) {
 #ifndef NDEBUG
             ++stats.hits;
@@ -441,9 +529,14 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         entry->image = device.CreateImage(DescOf(info, render_target, false, false));
     }
     if (!entry->image) {
-        LOG_WARNING(Render_Vulkan, "NAT-020: no image for {:#x} ({}x{}, format {})",
-                    info.guest_address, info.size.width, info.size.height,
-                    vk::to_string(info.pixel_format));
+        // FIX-232: logged the first 8 times and then every 1000th (a tester's log grew to
+        // 484 MB in 22 minutes of one format the driver refused).
+        static std::atomic<u32> missing{};
+        if (const u32 n = ++missing; n <= 8 || n % 1000 == 0) {
+            LOG_WARNING(Render_Vulkan, "NAT-020: no image for {:#x} ({}x{}, format {}); {} so far",
+                        info.guest_address, info.size.width, info.size.height,
+                        vk::to_string(info.pixel_format), n);
+        }
         return nullptr;
     }
     entry->last_use.store(frame, std::memory_order_relaxed);
@@ -491,6 +584,35 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
     }
     fill_lock.unlock();
 #ifndef NDEBUG
+    if (!render_target && Vulkan::LiverpoolToVK::IsFormatDepthCompatible(info.pixel_format)) {
+        // DIAG-199 (diagnosis): a depth-like texture (R32/R16) made over a depth target's memory
+        // without being that target (NAT-040 reads only one at its address and size): its
+        // picture comes from memory, which never holds what the GPU drew (shadow maps).
+        static std::atomic<u32> logged{};
+        ForEachOverlapping(info.guest_address,
+                           info.guest_address + std::max<u64>(info.guest_size, 1),
+                           [&](ImageEntry& other) {
+                               if (other.from_cpu || !other.info.props.is_depth ||
+                                   logged.load(std::memory_order_relaxed) >= 40) {
+                                   return;
+                               }
+                               ++logged;
+                               LOG_WARNING(Render_Vulkan,
+                                           "DIAG-199: texture {:#x}+{:#x} {}x{} pitch {} {} "
+                                           "layers {} mips {} tile {} over depth target "
+                                           "{:#x}+{:#x} {}x{} pitch {} {} layers {} tile {}",
+                                           info.guest_address, info.guest_size, info.size.width,
+                                           info.size.height, info.pitch,
+                                           vk::to_string(info.pixel_format),
+                                           info.resources.layers, info.resources.levels,
+                                           u32(info.tile_mode), other.info.guest_address,
+                                           other.info.guest_size, other.info.size.width,
+                                           other.info.size.height, other.info.pitch,
+                                           vk::to_string(other.info.pixel_format),
+                                           other.info.resources.layers,
+                                           u32(other.info.tile_mode));
+                           });
+    }
     if (WatchedTexture(info.guest_address, info.guest_address + 1)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: made {} {:#x} {}x{} mips {} ({:#x} bytes); "
                     "memory {}", render_target ? "target" : "texture", info.guest_address,
@@ -507,7 +629,30 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         // that draws part of it leaves the rest as it was). GT Sport draws its 16x16 brightness
         // grid into a 64x16 target the CPU reads back for the exposure: the undrawn part went
         // back to memory as uninitialized video memory, and the picture came out too dark.
-        if (info.num_samples == 1 && !remembered) {
+        // (diagnosis) RYGT_NATIVE_ZERO_NEW_TARGETS=1: a new target starts as zeros instead.
+        // =<hex lo>-<hex hi>: only targets starting in that range.
+        static const std::pair<VAddr, VAddr> zero_range = [] {
+            const char* env = Common::DiagEnv("RYGT_NATIVE_ZERO_NEW_TARGETS");
+            if (!env || !*env) {
+                return std::pair<VAddr, VAddr>{};
+            }
+            if (env[0] == '1' && env[1] == '\0') {
+                return std::pair<VAddr, VAddr>{0, ~VAddr{0}};
+            }
+            char* end = nullptr;
+            const VAddr lo = std::strtoull(env, &end, 16);
+            const VAddr hi = end && *end == '-' ? std::strtoull(end + 1, nullptr, 16) : lo + 1;
+            return std::pair<VAddr, VAddr>{lo, hi};
+        }();
+        const bool zero_new = info.guest_address >= zero_range.first &&
+                              info.guest_address < zero_range.second;
+        // FIX-GT7-036: a target made just after a fill that covers it starts as that fill
+        // (remembered above, under recent_fills_mutex).
+        if (!remembered && zero_new && info.num_samples == 1) {
+            result->rewrite = ImageEntry::Rewrite::Clear;
+            result->rewrite_pattern = {0, 0};
+            result->rewrite_bytes = info.guest_size;
+        } else if (!remembered && info.num_samples == 1) {
             result->needs_upload.store(true, std::memory_order_relaxed);
             result->force_upload.store(true, std::memory_order_relaxed);
             std::scoped_lock lock{upload_mutex};
@@ -585,6 +730,40 @@ ImageEntry* ImageRegistry::FindExisting(VAddr address,
 }
 
 SourcePlace PlaceOf(const VideoCore::ImageInfo& target, const VideoCore::ImageInfo& texture) {
+    // FIX-GT7-127: a level of a block-compressed texture written by the GPU as one uncompressed
+    // texel per block. GT7's Scapes compress their HDR photo (6024x4016) to BC6H in a compute
+    // shader that binds each level as an R32G32B32A32Uint storage image over the level's padded
+    // area (2048x1024 for level 0, at the texture's address; 1024x512 for level 1, at its offset),
+    // and the scene samples the BC6H texture. Without a place the texture read guest memory,
+    // which only the GPU had written: zeros, a black background in the editor and in every photo.
+    // The copy then counts in source texels, one per block (Vulkan's rule between compressed and
+    // uncompressed formats). RYGT_NATIVE_BLOCK_TARGETS=0: as before.
+    if (texture.props.is_block && !target.props.is_block) {
+        static const bool block_targets = [] {
+            const char* env = std::getenv("RYGT_NATIVE_BLOCK_TARGETS");
+            return !(env && env[0] == '0');
+        }();
+        const s32 mip = block_targets ? texture.BlockLevelOf(target) : -1;
+        if (mip < 0) {
+            return {};
+        }
+        SourcePlace place{mip, 0, (std::max(texture.size.width >> mip, 1u) + 3) / 4,
+                          (std::max(texture.size.height >> mip, 1u) + 3) / 4};
+        place.blocks = true;
+#ifndef NDEBUG
+        static std::atomic<u32> logged{};
+        if (logged++ < 16) {
+            LOG_INFO(Render_Vulkan,
+                     "FIX-GT7-127: texture {:#x} {}x{} {} level {} made of target {:#x} {}x{} {} "
+                     "({}x{} blocks)",
+                     texture.guest_address, texture.size.width, texture.size.height,
+                     vk::to_string(texture.pixel_format), mip, target.guest_address,
+                     target.size.width, target.size.height, vk::to_string(target.pixel_format),
+                     place.width, place.height);
+        }
+#endif
+        return place;
+    }
     if (target.props.is_depth || texture.props.is_depth || target.props.is_block ||
         texture.props.is_block || !target.PackedOrdersCompatible(texture) ||
         target.num_bits != texture.num_bits ||
@@ -592,15 +771,23 @@ SourcePlace PlaceOf(const VideoCore::ImageInfo& target, const VideoCore::ImageIn
         return {};
     }
     // A crop: the texture is the corner of the target in the same layout (as IsSubrectOf, any
-    // colour format of the texel size).
+    // colour format of the texel size). FIX-195: of every layer too, as NAT-113 draws a smaller
+    // layered target into a larger one: GT7 writes its race sky cube (256x256, six layers, pitch
+    // 512) with one dispatch per face, those writes go into the 512x512 cube made earlier, and the
+    // sky shader's read of the 256x256 cube found nothing of its layout, read zeros and drew the
+    // sky black.
+    // FIX-GT7-058: of a target's first level too, as its other levels don't move that one. GT7's
+    // championship course maps resolve into the scratch pool's target at 0x100a0b0000, and when
+    // that was a 256x256 pyramid left by another pass, their 200x180 texture found no place and
+    // read guest memory: whatever colours it held, then a black square, with the map in the target.
+    // RYGT_NATIVE_CROP_OF_MIPS=0: as before.
     static const bool crop_of_mips = [] {
         const char* env = std::getenv("RYGT_NATIVE_CROP_OF_MIPS");
         return !(env && env[0] == '0');
     }();
     if (target.guest_address == texture.guest_address &&
-        (target.resources.levels == 1 || crop_of_mips) &&
-        target.resources.layers == 1 && texture.resources.levels == 1 &&
-        texture.resources.layers == 1 && target.pitch == texture.pitch &&
+        (target.resources.levels == 1 || crop_of_mips) && texture.resources.levels == 1 &&
+        texture.resources.layers <= target.resources.layers && target.pitch == texture.pitch &&
         target.tile_mode == texture.tile_mode && target.array_mode == texture.array_mode &&
         ((target.micro_tiled_mips ^ texture.micro_tiled_mips) & 1u) == 0 &&
         target.bank_swizzle == texture.bank_swizzle &&
@@ -611,15 +798,40 @@ SourcePlace PlaceOf(const VideoCore::ImageInfo& target, const VideoCore::ImageIn
         (texture.size.width < target.size.width || texture.size.height < target.size.height) &&
         target.size.depth == 1 && texture.size.depth == 1 &&
         target.type == AmdGpu::ImageType::Color2D && texture.type == target.type) {
+#ifndef NDEBUG
+        if (target.resources.levels != 1) {
+            static std::atomic<u32> logged{};
+            if (const u32 n = logged++; n < 8) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-GT7-058: texture {:#x} {}x{} {} is a corner of target {}x{} {}, "
+                            "{} levels",
+                            texture.guest_address, texture.size.width, texture.size.height,
+                            vk::to_string(texture.pixel_format), target.size.width,
+                            target.size.height, vk::to_string(target.pixel_format),
+                            target.resources.levels);
+            }
+        }
+#endif
         return {0, 0, texture.size.width, texture.size.height};
     }
     // A mip or layer of the texture drawn on its own.
-    if (const s32 mip = target.MipOf(texture); mip >= 0) {
-        const s32 layer = target.SliceOf(texture, mip);
+    // FIX-GT7-134: also a target a little larger than the mip, within its padded size. GT7's
+    // depth of field (Scapes' editor and photos, background blurring) builds an 8-level pyramid
+    // drawing each level as its own target sized to its extent (345x248, 172x124, ...) while the
+    // texture that samples the pyramid is 690x493, 690x479 or 690x496 (levels 345x246, 172x123,
+    // ...): no level was found, the blurred levels read guest memory (zeros) and the blurred
+    // background came out black. The copy is the mip's size. RYGT_NATIVE_PADDED_MIPS=0: as before.
+    static const bool padded_mips = [] {
+        const char* env = std::getenv("RYGT_NATIVE_PADDED_MIPS");
+        return !(env && env[0] == '0');
+    }();
+    if (const s32 mip = target.MipOf(texture, padded_mips); mip >= 0) {
+        const s32 layer = target.SliceOf(texture, mip, padded_mips);
         if (layer < 0 || u32(layer) >= std::max<u32>(texture.resources.layers, 1)) {
             return {};
         }
-        return {mip, layer, target.size.width, target.size.height};
+        return {mip, layer, std::min(target.size.width, std::max(texture.size.width >> mip, 1u)),
+                std::min(target.size.height, std::max(texture.size.height >> mip, 1u))};
     }
     // NAT-131: the texture is one layer (or mip) of the target: a face of a cube drawn as a
     // layered target, read on its own (GT Sport's environment cube, whose faces the cockpit's
@@ -632,6 +844,75 @@ SourcePlace PlaceOf(const VideoCore::ImageInfo& target, const VideoCore::ImageIn
         return {0, 0, texture.size.width, texture.size.height, src_mip, src_layer};
     }
     return {};
+}
+
+SourcePlace PartOf(const VideoCore::ImageInfo& part, const VideoCore::ImageInfo& whole) {
+    if (part.props.is_depth || whole.props.is_depth || part.props.is_block ||
+        whole.props.is_block || part.num_bits != whole.num_bits ||
+        !part.PackedOrdersCompatible(whole) ||
+        part.num_samples != whole.num_samples || part.resources.levels != 1 ||
+        (whole.resources.levels <= 1 && whole.resources.layers <= 1) ||
+        part.size.depth != 1 || whole.size.depth != 1) {
+        return {};
+    }
+    const s32 mip = part.MipOf(whole);
+    if (mip < 0) {
+        return {};
+    }
+    const s32 layer = part.SliceOf(whole, mip);
+    if (layer < 0 || u32(layer) >= std::max<u32>(whole.resources.layers, 1)) {
+        return {};
+    }
+    return {mip, layer, part.size.width, part.size.height};
+}
+
+bool ImageRegistry::SmallRewritesOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_NATIVE_SMALL_REWRITES");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+bool ImageRegistry::RewrittenSmall(ImageEntry& entry) {
+    // FIX-202: a storage buffer much larger than a texture is often a scratch pool written in
+    // part (NAT-129 ignores it: GT Sport's would upload every texture in it at each dispatch).
+    // A small texture in it is uploaded again at its next use after such a write, from the
+    // region the write went to: GT7 computes the driver's lighting into 4x4 RGBA16F textures
+    // with one dispatch over a larger buffer, and when the texture was first used before that
+    // dispatch it kept the garbage memory held then (Inf and NaN): the driver glowed in a random
+    // colour for the whole session, half the launches. RYGT_NATIVE_SMALL_REWRITES=0: ignored.
+    const u64 rewritten = entry.gpu_rewritten.load(std::memory_order_relaxed);
+    if (rewritten <= entry.rewrite_seen) {
+        return false;
+    }
+    entry.rewrite_seen = rewritten;
+    {
+        std::scoped_lock lock{entry.sources_mutex};
+        if (!entry.sources.empty()) {
+            return false; // made of targets: their pictures come in instead (NAT-104)
+        }
+    }
+    if (entry.info.num_samples != 1) {
+        return false;
+    }
+    MarkStale(entry, Stale::GpuWrite);
+    return true;
+}
+
+int ImageRegistry::LayersDifferingFromUpload(const ImageEntry& entry) const {
+    // FIX-GT7-027 (diagnosis): the upload's per-layer hashes live in entry.layer_hash
+    // (LayerHashState), which does not expose them: not known here.
+    (void)entry;
+    return -1;
+}
+
+bool TargetPartsOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_NATIVE_TARGET_PARTS");
+        return !(env && env[0] == '0');
+    }();
+    return on;
 }
 
 void ImageRegistry::IndexEntry(ImageEntry& entry) {
@@ -668,10 +949,90 @@ void ImageRegistry::LinkTarget(ImageEntry& target) {
     const VAddr end = begin + std::max<u64>(target.info.guest_size, 1);
     ForEachOverlapping(begin, end, [&](ImageEntry& entry) {
         if (!entry.from_cpu) {
+            // FIX-197: targets made of targets. GT7 lights its reflection probes in a 64x64
+            // cube target (seven mips), then writes mips 1-6 of each face as targets of their
+            // own at those mips' addresses (one 2D image per face and mip), and its convolution
+            // samples the cube at mips 1-6: they were never written in the cube's image, the
+            // probes' 32x32 lighting came out zero, and the pit crew and the crowd were drawn
+            // as black silhouettes. A target that is a mip or layers of another is its source
+            // from then on, as for textures (NAT-104/111): copied in before the other's next read.
+            if (&entry == &target || entry.reused.load(std::memory_order_relaxed) ||
+                !entry.image || !TargetPartsOn()) {
+                return;
+            }
+            ImageEntry* whole = &entry;
+            ImageEntry* part = &target;
+            auto place = PartOf(part->info, whole->info);
+            if (place.mip < 0) {
+                std::swap(whole, part);
+                place = PartOf(part->info, whole->info);
+            }
+#ifndef NDEBUG
+            if (WatchedTexture(begin, end)) {
+                LOG_WARNING(Render_Vulkan, "FIX-197 watch: new target {:#x} {}x{} mips {} layers {} "
+                            "and target {:#x} {}x{} mips {} layers {}: {}", begin,
+                            target.info.size.width, target.info.size.height,
+                            target.info.resources.levels, target.info.resources.layers,
+                            entry.info.guest_address, entry.info.size.width,
+                            entry.info.size.height, entry.info.resources.levels,
+                            entry.info.resources.layers,
+                            place.mip >= 0 ? fmt::format("part at mip {} layer {}", place.mip,
+                                                         place.layer)
+                                           : std::string{"no part"});
+            }
+#endif
+            if (place.mip < 0) {
+                return;
+            }
+            // (diagnosis) RYGT_NATIVE_TARGET_PARTS=2: only layered wholes; =3: only 2D ones.
+            static const char parts_mode = [] {
+                const char* env = std::getenv("RYGT_NATIVE_TARGET_PARTS");
+                return env && *env ? env[0] : '1';
+            }();
+            // (diagnosis) RYGT_NATIVE_TARGET_PARTS_ONLY=<hex address>: only that whole.
+            static const VAddr parts_only = [] {
+                const char* env = std::getenv("RYGT_NATIVE_TARGET_PARTS_ONLY");
+                return env && *env ? VAddr(std::strtoull(env, nullptr, 16)) : VAddr{0};
+            }();
+            if ((parts_mode == '2' && whole->info.resources.layers <= 1) ||
+                (parts_mode == '3' && whole->info.resources.layers > 1) ||
+                (parts_only != 0 && whole->info.guest_address != parts_only)) {
+                return;
+            }
+            {
+                std::scoped_lock sources_lock{whole->sources_mutex};
+                whole->sources.push_back({part, place});
+            }
+            whole->sources_dirty.store(true, std::memory_order_relaxed);
+            std::scoped_lock part_lock{part->sources_mutex};
+            part->dependents.push_back(whole);
+            if (++stats.target_parts <= 600) {
+                LOG_INFO(Render_Vulkan, "FIX-197: target {:#x} {}x{} (fmt {}) is mip {} layer {} "
+                         "of target {:#x} {}x{} mips {} layers {} (fmt {})",
+                         part->info.guest_address, part->info.size.width,
+                         part->info.size.height, vk::to_string(part->info.pixel_format),
+                         place.mip, place.layer, whole->info.guest_address,
+                         whole->info.size.width, whole->info.size.height,
+                         whole->info.resources.levels, whole->info.resources.layers,
+                         vk::to_string(whole->info.pixel_format));
+            }
             return;
         }
         const auto place = PlaceOf(target.info, entry.info);
 #ifndef NDEBUG
+        static const bool small_links = Common::DiagEnv("RYGT_DIAG_SMALL_LINKS") != nullptr;
+        static std::atomic<u32> small_logged{};
+        if (small_links && place.mip >= 0 && entry.info.size.width <= 8 &&
+            entry.info.size.height <= 8 && small_logged++ < 200) {
+            LOG_WARNING(Render_Vulkan, "DIAG-181: new target {:#x} {}x{} {} mips {} layers {} "
+                        "linked to texture {:#x} {}x{} {} at mip {} layer {} src mip {} layer {}",
+                        begin, target.info.size.width, target.info.size.height,
+                        vk::to_string(target.info.pixel_format), target.info.resources.levels,
+                        target.info.resources.layers, entry.info.guest_address,
+                        entry.info.size.width, entry.info.size.height,
+                        vk::to_string(entry.info.pixel_format), place.mip, place.layer,
+                        place.src_mip, place.src_layer);
+        }
         if (WatchedTexture(begin, end)) {
             LOG_WARNING(Render_Vulkan, "FIX-157 watch: new target {:#x} {}x{} layers {} over "
                         "texture {:#x} {}x{} layers {}: {}", begin, target.info.size.width,
@@ -716,6 +1077,22 @@ void ImageRegistry::LinkTexture(ImageEntry& texture) {
             }
 #endif
             if (place.mip >= 0) {
+#ifndef NDEBUG
+                // DIAG-181 (diagnosis, RYGT_DIAG_SMALL_LINKS=1): links of tiny textures.
+                static const bool small_links = Common::DiagEnv("RYGT_DIAG_SMALL_LINKS") != nullptr;
+                static std::atomic<u32> small_logged{};
+                if (small_links && texture.info.size.width <= 8 && texture.info.size.height <= 8 &&
+                    small_logged++ < 200) {
+                    LOG_WARNING(Render_Vulkan, "DIAG-181: new texture {:#x} {}x{} {} linked to "
+                                "target {:#x} {}x{} {} mips {} layers {} at mip {} layer {} src "
+                                "mip {} layer {}", begin, texture.info.size.width,
+                                texture.info.size.height, vk::to_string(texture.info.pixel_format),
+                                entry->info.guest_address, entry->info.size.width,
+                                entry->info.size.height, vk::to_string(entry->info.pixel_format),
+                                entry->info.resources.levels, entry->info.resources.layers,
+                                place.mip, place.layer, place.src_mip, place.src_layer);
+                }
+#endif
                 {
                     std::scoped_lock sources_lock{texture.sources_mutex};
                     texture.sources.push_back({&other, place});
@@ -921,6 +1298,7 @@ void ImageRegistry::MarkStale(ImageEntry& entry, Stale why) {
 #ifndef NDEBUG
     ++stats.stale[static_cast<u32>(why)];
 #endif
+    entry.last_stale = static_cast<u8>(why); // DIAG-197 (diagnosis)
 #ifndef NDEBUG
     if (WatchedTexture(entry.info.guest_address, entry.info.guest_address + 1)) {
         LOG_WARNING(Render_Vulkan, "FIX-153 watch: {:#x} stale ({}), pending before {}; memory {}",
@@ -993,6 +1371,14 @@ void ImageRegistry::ForgetFills(VAddr address, u64 size) {
     });
 }
 
+bool ImageRegistry::FilledWhole(VAddr address, u64 size) {
+    const VAddr end = address + std::max<u64>(size, 1);
+    std::scoped_lock lock{recent_fills_mutex};
+    return std::ranges::any_of(recent_fills.Ranges(), [&](const std::pair<VAddr, VAddr>& fill) {
+        return fill.first <= address && end <= fill.second;
+    });
+}
+
 std::vector<std::pair<VAddr, VAddr>> ImageRegistry::RecentFillRanges() {
     std::scoped_lock lock{recent_fills_mutex};
     return recent_fills.Ranges();
@@ -1032,11 +1418,16 @@ void ImageRegistry::Invalidate(VAddr address, u64 size, Stale why) {
     });
 }
 
-void ImageRegistry::InvalidateNewMapping(VAddr address, u64 size) {
-    ForgetFills(address, size);
-    ForEachOverlapping(address, address + size, [&](ImageEntry& entry) {
-        if (entry.from_cpu) MarkStale(entry, Stale::Unmap);
+u32 ImageRegistry::InvalidateNewMapping(VAddr address, u64 size) {
+    ForgetFills(address, size); // FIX-GT7-036
+    u32 count = 0;
+    ForEachOverlapping(address, address + std::max<u64>(size, 1), [&](ImageEntry& entry) {
+        if (entry.from_cpu) {
+            MarkStale(entry, Stale::Unmap); // FIX-GT7-077: forced, not skipped by NAT-109's hash
+            ++count;
+        }
     });
+    return count;
 }
 
 void ImageRegistry::MarkReused(ImageEntry& entry) {
@@ -1142,6 +1533,39 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
             // texture in it again at each dispatch (10-30 GB in 10 s): only buffers about the
             // texture's size count, as for targets below.
             if (!exact && size > 2 * std::max<u64>(entry.info.guest_size, 1)) {
+                // FIX-202: a small texture is uploaded again at its next use instead (see
+                // ImageRegistry::RewrittenSmall).
+                if (entry.info.guest_size <= SmallRewriteSize && SmallRewritesOn()) {
+                    u64 seen = entry.gpu_rewritten.load(std::memory_order_relaxed);
+                    while (seen < clock && !entry.gpu_rewritten.compare_exchange_weak(
+                                               seen, clock, std::memory_order_relaxed)) {
+                    }
+                }
+#ifndef NDEBUG
+                // DIAG-183 (diagnosis, RYGT_DIAG_IGNORED_WRITES=1): such writes over tiny textures;
+                // =<w>x<h>: over textures that size (GT7's 30x17 light grid, 136 KB).
+                static const std::array<u32, 3> diag = [] {
+                    std::array<u32, 3> d{};
+                    if (const char* env = Common::DiagEnv("RYGT_DIAG_IGNORED_WRITES")) {
+                        d[0] = 1;
+                        if (std::sscanf(env, "%ux%u", &d[1], &d[2]) != 2) {
+                            d[1] = d[2] = 0;
+                        }
+                    }
+                    return d;
+                }();
+                static std::atomic<u32> logged{};
+                const bool sized = diag[1] != 0 && entry.info.size.width == diag[1] &&
+                                   entry.info.size.height == diag[2];
+                if (diag[0] && (sized || (diag[1] == 0 && entry.info.guest_size <= 4096)) &&
+                    logged++ < 3000) {
+                    LOG_WARNING(Render_Vulkan, "DIAG-183: storage write {:#x}+{:#x} over texture "
+                                "{:#x} {}x{} {} ignored (clock {}, last use {})", address, size,
+                                entry.info.guest_address, entry.info.size.width,
+                                entry.info.size.height, vk::to_string(entry.info.pixel_format),
+                                clock, entry.last_use.load(std::memory_order_relaxed));
+                }
+#endif
                 return;
             }
             // Retain ownership even after clears/source links/force flags are consumed.
@@ -1168,19 +1592,54 @@ void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* 
                 entry.rewrite_pattern = *pattern;
                 entry.rewrite_bytes = entry.info.guest_size;
                 entry.rewrite_clock = clock;
-                // A later CPU write of the old bytes must upload them, rather
-                // than matching the hash from before this GPU fill.
+                // FIX-GT7-059: as FIX-209: kept, the same bytes written back by the CPU were taken
+                // for "unchanged" and never uploaded, and the texture kept the fill. GT7's main
+                // menu reads its sky tables from memory a race's fill covers: they stayed zero,
+                // and after a race the menu's ground and buildings were black until the game
+                // closed, whatever the time of day. RYGT_NATIVE_FILL_FORGETS_HASH=0: as before.
                 static const bool forget_hash = [] {
                     const char* env = std::getenv("RYGT_NATIVE_FILL_FORGETS_HASH");
                     return !(env && env[0] == '0');
                 }();
-                if (forget_hash) entry.content_hash = 0;
+                if (forget_hash) {
+                    entry.content_hash = 0;
+#ifndef NDEBUG
+                    static std::atomic<u32> logged{};
+                    if (const u32 n = logged++; n < 40 || n % 2000 == 0) {
+                        LOG_INFO(Render_Vulkan,
+                                 "FIX-GT7-059: texture {:#x} {}x{} filled by {:#x}+{:#x} with {:#x} "
+                                 "({} so far)",
+                                 entry.info.guest_address, entry.info.size.width,
+                                 entry.info.size.height, address, size, (*pattern)[0], n + 1);
+                    }
+#endif
+                }
                 return;
             }
             bool made_of_targets;
             {
                 std::scoped_lock lock{entry.sources_mutex};
                 made_of_targets = !entry.sources.empty();
+            }
+            // FIX-200: a texture made of targets whose memory a GPU buffer write rewrote whole
+            // holds what the write left, as the GPU's memory does: it is uploaded again, and the
+            // targets' pictures from before the write are no longer copied in (newer ones still
+            // are). GT7's compute shaders write pictures as buffers into the scratch pool other
+            // passes drew into before (0x100a0b0000), and the texture read there kept showing an
+            // older target's picture: the far scenery of the replay's depth-of-field shots was
+            // black. RYGT_NATIVE_REWRITE_MADE_OF_TARGETS=0: such writes are ignored, as before.
+            static const bool rewrite_made_of_targets = [] {
+                const char* env = std::getenv("RYGT_NATIVE_REWRITE_MADE_OF_TARGETS");
+                return !(env && env[0] == '0');
+            }();
+            const bool whole = address <= entry.info.guest_address &&
+                               address + size >= entry.info.guest_address + entry.info.guest_size;
+            if (made_of_targets && whole && rewrite_made_of_targets) {
+                u64 seen = entry.foreign_clock.load(std::memory_order_relaxed);
+                while (seen < clock && !entry.foreign_clock.compare_exchange_weak(
+                                           seen, clock, std::memory_order_relaxed)) {
+                }
+                made_of_targets = false;
             }
             if (!made_of_targets && entry.info.num_samples == 1) {
 #ifndef NDEBUG
@@ -1425,7 +1884,99 @@ Rhi::Buffer* ImageRegistry::AcquireUploadGatherScratch(Rhi::CommandList& list, u
     return upload_gather_scratch.get();
 }
 
-u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) {
+// FIX-204: whether a tiny half-float texture's memory holds no plausible values (NaN, infinity
+// or magnitudes from 2048 up) in the texels it has. GT7 samples two 4x4 RGBA16F textures for
+// the driver's lighting in its vertex shader that nothing in a session ever writes: on fresh
+// memory they hold zeros and the driver looks right, but the allocator often places them over
+// memory that held other data (compressed texture blocks, descriptor tables), and the driver
+// then lit up in a random colour with a glare over the whole picture, in most launches. Such
+// textures upload as zeros. RYGT_NATIVE_SANITIZE_TINY=0: as memory holds them.
+static bool ImplausibleTinyFloatTexture(const ImageEntry& entry) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_SANITIZE_TINY");
+        return !(env && env[0] == '0');
+    }();
+    const auto& info = entry.info;
+    if (!enabled || !entry.from_cpu || info.size.width > 4 || info.size.height > 4 ||
+        info.resources.levels != 1 || info.resources.layers != 1 || info.props.is_depth ||
+        info.props.is_block) {
+        return false;
+    }
+    u32 halves = 0;
+    switch (info.pixel_format) {
+    case vk::Format::eR16Sfloat:
+        halves = 1;
+        break;
+    case vk::Format::eR16G16Sfloat:
+        halves = 2;
+        break;
+    case vk::Format::eR16G16B16A16Sfloat:
+        halves = 4;
+        break;
+    default:
+        return false;
+    }
+    // Linear, or thin micro tiles (GT7's are Thin1DThin): within a micro tile, texels of a 4x4
+    // corner are in Morton order.
+    const bool linear = !info.props.is_tiled;
+    if (!linear && info.tile_mode != AmdGpu::TileMode::Thin1DThin) {
+        return false;
+    }
+    std::array<u16, 256> memory{};
+    const u64 bytes = std::min<u64>(info.guest_size, sizeof(memory));
+    if (!Core::RytyMemory::GuardedCopy(memory.data(),
+                                       reinterpret_cast<const void*>(info.guest_address), bytes)) {
+        return false;
+    }
+    const u64 pitch = std::max<u64>(info.pitch, info.size.width);
+    for (u32 y = 0; y < info.size.height; ++y) {
+        for (u32 x = 0; x < info.size.width; ++x) {
+            const u64 index = linear ? y * pitch + x
+                                     : (x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2);
+            if ((index + 1) * halves * 2 > bytes) {
+                return false;
+            }
+            for (u32 h = 0; h < halves; ++h) {
+                const u32 exponent = (memory[index * halves + h] >> 10) & 0x1f;
+                if (exponent >= 26) { // |x| >= 2048, infinity or NaN
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+void ImageRegistry::ReportUploadTally() {
+    std::vector<const UploadTally*> top;
+    u64 total_bytes = 0, total_uploads = 0;
+    for (const auto& [entry, tally] : upload_tally) {
+        top.push_back(&tally);
+        total_bytes += tally.bytes;
+        total_uploads += tally.uploads;
+    }
+    std::ranges::sort(top, [](const auto* a, const auto* b) { return a->bytes > b->bytes; });
+    LOG_INFO(Render_Vulkan, "DIAG-197: {} uploads ({:.1f} MB) of {} pictures since the last report",
+             total_uploads, total_bytes / 1048576.0, top.size());
+    for (size_t i = 0; i < std::min<size_t>(top.size(), 12); ++i) {
+        const auto& t = *top[i];
+        LOG_INFO(Render_Vulkan, "DIAG-197:   {:#x} {}x{} {} mips {}: {} uploads, {:.1f} MB, forced "
+                 "{}, after CPU write/unmap/GPU write/other {}/{}/{}/{}",
+                 t.address, t.width, t.height, vk::to_string(t.format), t.levels, t.uploads,
+                 t.bytes / 1048576.0, t.forced, t.why[0], t.why[1], t.why[2], t.why[3]);
+    }
+    upload_tally.clear();
+}
+
+bool ImageRegistry::LazyUploads() {
+    // PERF-109: textures marked stale are uploaded when work uses them (MarkStale defers every
+    // CPU texture; QueueUploadForUse or RecordUploads' `bound` admits them). Always on: eager
+    // queuing re-imported textures while an unmap waited (see MarkStale).
+    return true;
+}
+
+u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* const> bound,
+                                 bool trace_slow_calls) {
     SampleGuestHashCalls hash_sampling{trace_slow_calls};
     SlowCallTrace<16> trace{trace_slow_calls, "image-uploads",
         {"queue-lock", "validate", "watch-pages", "hash", "gpu-source", "cpu-allocate",
@@ -1435,6 +1986,12 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
     {
         std::scoped_lock lock{upload_mutex};
         pending.swap(pending_uploads);
+    }
+    // PERF-109: the stale textures the work uses (an entry listed twice is uploaded once).
+    for (ImageEntry* entry : bound) {
+        if (entry && entry->from_cpu && entry->needs_upload.load(std::memory_order_relaxed)) {
+            pending.push_back(entry);
+        }
     }
     // Duplicates may observe needs_upload becoming true again while an earlier
     // snapshot is copied. Consume each image only once, preserving that new dirty
@@ -1496,7 +2053,16 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
         constexpr u64 HashedSize = 4ull << 20;
         const bool forced = entry->force_upload.exchange(false);
         // FIX-157: render targets of any size (what their memory held when made).
-        if ((size <= HashedSize || !entry->from_cpu) && memory_clamp &&
+        // PERF-108: not a texture uploaded because GPU work wrote it: its picture comes from the
+        // region the GPU wrote, and its last hash still tells CPU writes apart. Hashing them
+        // all read ~3 GB a second of guest memory on the recorder in GT7's races (compute
+        // output sampled as textures, written several times a frame).
+        static const bool hash_forced = [] {
+            const char* env = std::getenv("RYGT_NATIVE_HASH_FORCED"); // PERF-108 off: =1
+            return env && env[0] == '1';
+        }();
+        const bool skip_hash = forced && entry->from_cpu && !hash_forced;
+        if ((size <= HashedSize || !entry->from_cpu) && !skip_hash && memory_clamp &&
             memory_clamp(info.guest_address, size) == size) {
             // FIX-160: a safe read (see MemoryUnchanged).
             const u64 hash = Core::HashGuestBytes(info.guest_address, size) | 1;
@@ -1514,15 +2080,81 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
             }
             entry->content_hash = hash;
         } else {
+            // FIX-209: a forced upload that skipped the hash (PERF-108) forgets the old one:
+            // kept, a later CPU write that put those older bytes back matched it, was taken
+            // for "unchanged" and never uploaded, and the texture kept the forced picture.
             entry->content_hash = 0;
+        }
+        // (diagnosis) RYGT_DIAG_ZERO_TEXTURES=<w>x<h>x<bits>: textures of that size upload zeros.
+        static const std::array<u32, 3> zero_size = [] {
+            std::array<u32, 3> parts{};
+            if (const char* env = Common::DiagEnv("RYGT_DIAG_ZERO_TEXTURES")) {
+                std::sscanf(env, "%ux%ux%u", &parts[0], &parts[1], &parts[2]);
+            }
+            return parts;
+        }();
+        bool zero_texture = entry->from_cpu && zero_size[0] != 0 &&
+                            info.size.width == zero_size[0] && info.size.height == zero_size[1] &&
+                            info.num_bits == zero_size[2];
+        if (!zero_texture && ImplausibleTinyFloatTexture(*entry)) {
+            zero_texture = true; // FIX-204
+            ++upload_stats.sanitized;
+            static std::atomic<u32> logged{};
+            if (logged++ < 16) {
+                LOG_INFO(Render_Vulkan, "FIX-204: texture {:#x} {}x{} {} holds no plausible "
+                         "values; uploaded as zeros", info.guest_address, info.size.width,
+                         info.size.height, vk::to_string(info.pixel_format));
+            }
         }
         // NAT-107: the bytes as the GPU sees guest memory, in GPU order (textures the game's
         // GPU work filled, in memory the CPU may not even read), else a copy the CPU makes now.
+        // (diagnosis) RYGT_DIAG_UPLOAD_CPU_SIZE=<w>x<h>: textures that size are copied from guest
+        // memory by the CPU, never from a region or an imported view.
+        static const std::array<u32, 2> cpu_size = [] {
+            std::array<u32, 2> parts{};
+            if (const char* env = Common::DiagEnv("RYGT_DIAG_UPLOAD_CPU_SIZE")) {
+                std::sscanf(env, "%ux%u", &parts[0], &parts[1]);
+            }
+            return parts;
+        }();
+        const bool cpu_only = cpu_size[0] != 0 && info.size.width == cpu_size[0] &&
+                              info.size.height == cpu_size[1];
         trace.Next(4);
         UploadSource gpu_source;
-        if (upload_source) {
+        if (upload_source && !zero_texture && !cpu_only) {
             gpu_source = upload_source(*entry, list);
         }
+#ifndef NDEBUG
+        // DIAG-200 (diagnosis, RYGT_DIAG_UPLOAD_SIZE=<w>x<h>): each upload of textures that size,
+        // where its bytes come from (1 region, 2 imported view, 3 gathered, 0 CPU copy) and a
+        // hash of guest memory at the time.
+        static const std::array<u32, 2> diag_size = [] {
+            std::array<u32, 2> parts{};
+            if (const char* env = Common::DiagEnv("RYGT_DIAG_UPLOAD_SIZE")) {
+                std::sscanf(env, "%ux%u", &parts[0], &parts[1]);
+            }
+            return parts;
+        }();
+        if (diag_size[0] != 0 && info.size.width == diag_size[0] &&
+            info.size.height == diag_size[1]) {
+            static std::atomic<u32> diag_logged{};
+            if (diag_logged++ < 100000) {
+                std::vector<u8> memory(size);
+                const bool read = Core::RytyMemory::GuardedCopy(
+                    memory.data(), reinterpret_cast<const void*>(info.guest_address), size);
+                u64 nonzero = 0;
+                for (const u8 byte : memory) {
+                    nonzero += byte != 0;
+                }
+                LOG_WARNING(Render_Vulkan, "DIAG-200: frame {} texture {:#x}+{:#x} {}x{} layers {} "
+                            "source {} forced {} stale {} memory {:016x} ({} nonzero bytes{})",
+                            entry->last_use.load(), info.guest_address, size, info.size.width,
+                            info.size.height, info.resources.layers, u32(gpu_source.kind), forced,
+                            u32(entry->last_stale), read ? XXH3_64bits(memory.data(), size) : 0,
+                            nonzero, read ? "" : ", unreadable");
+            }
+        }
+#endif
         if (entry->total_uploads.load(std::memory_order_relaxed) == 0) {
             entry->guest_writes_tracked = gpu_source.guest_writes_tracked;
         }
@@ -1549,29 +2181,31 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
             if (!source || !source->Mapped()) {
                 continue;
             }
-            // Only what is mapped is read (a T# can reach past the end of a mapping); the rest of
-            // the picture is zeros.
+            // A streamed texture can have unmapped leading mips and resident lower mips.
+            // A readable prefix is only the fast path, not the extent of its mapped data.
             trace.Next(6);
-            const u64 readable = memory_clamp ? memory_clamp(info.guest_address, size) : size;
-            if (readable < size) {
-                std::memset(source->Mapped() + readable, 0, size - readable);
+            const u64 readable =
+                zero_texture ? 0 : memory_clamp ? memory_clamp(info.guest_address, size) : size;
+            if (readable < size && !zero_texture) {
                 static std::atomic<u32> logged{};
                 if (logged++ < 16) {
                     LOG_WARNING(Render_Vulkan,
                                 "NAT-042: texture {:#x}+{:#x} ({}x{}, {} mips) is mapped for {:#x} "
-                                "bytes only; the rest uploads as zeros",
+                                "contiguous bytes; copying its sparse mapped pages",
                                 info.guest_address, size, info.size.width, info.size.height,
                                 info.resources.levels, readable);
                 }
             }
-            // FIX-160: the game can release part of it meanwhile; then zeros where nothing is
-            // mapped any more.
-            if (readable != 0 &&
-                !Core::RytyMemory::GuardedCopy(source->Mapped(),
-                                               reinterpret_cast<const void*>(info.guest_address),
-                                               readable)) {
+            if (zero_texture) {
+                std::memset(source->Mapped(), 0, size);
+            } else if (readable != size ||
+                       !Core::RytyMemory::GuardedCopy(source->Mapped(),
+                                                      reinterpret_cast<const void*>(info.guest_address),
+                                                      size)) {
+                // FIX-160: backing pages remain readable when the guest view has holes or is
+                // GPU-only. Copy the whole range; only genuinely unmapped pages become zeros.
                 Core::Memory::Instance()->CopySparseMemory(info.guest_address, source->Mapped(),
-                                                           readable);
+                                                           size);
             }
             bytes = source.get();
             bytes_offset = 0;
@@ -1651,7 +2285,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
         list.CopyBufferToImage(linear, entry->image.get(), copies);
         if (LayerSamplesEnabled() && entry->from_cpu && info.resources.layers >= 16 && size > HashedSize &&
             size % info.resources.layers == 0 &&
-            !entry->gpu_backing_written.load(std::memory_order_acquire) &&
+            !entry->gpu_backing_written.load(std::memory_order_acquire) && !zero_texture &&
             memory_clamp && memory_clamp(info.guest_address, size) == size &&
             (source || gpu_source.kind == 2 || gpu_source.kind == 3)) {
             const u64 layer_size = size / info.resources.layers;
@@ -1695,10 +2329,44 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, bool trace_slow_calls) 
             }
         }
 #endif
+        // FIX-218: an upload replaces what the texture's targets had copied in (NAT-104), but those
+        // were only copied again once a target was drawn anew (NAT-111). GT7's driver fill
+        // rewrites its scratch pool before each pass, and the textures over its post-processing
+        // pyramid and the car close-ups were uploaded from that (zero) memory and kept it: black
+        // blocks on the car during the race start. They take their targets' pictures again at
+        // their next use. RYGT_NATIVE_SOURCES_AFTER_UPLOAD=1: on.
+        static const bool sources_after_upload = [] {
+            const char* env = std::getenv("RYGT_NATIVE_SOURCES_AFTER_UPLOAD");
+            return env && env[0] == '1'; // off unless asked: it did not fix what it was made for
+        }();
+        if (sources_after_upload) {
+            bool has_sources;
+            {
+                std::scoped_lock lock{entry->sources_mutex};
+                has_sources = !entry->sources.empty();
+            }
+            if (has_sources) {
+                entry->sources_dirty.store(true, std::memory_order_relaxed);
+            }
+        }
         ++entry->total_uploads;
 #ifndef NDEBUG
         ++entry->upload_count;
+        {
+            // DIAG-197 (diagnosis)
+            auto& tally = upload_tally[entry];
+            tally.address = info.guest_address;
+            tally.width = info.size.width;
+            tally.height = info.size.height;
+            tally.levels = info.resources.levels;
+            tally.format = info.pixel_format;
+            ++tally.uploads;
+            tally.bytes += size;
+            tally.forced += forced ? 1 : 0;
+            ++tally.why[std::min<u32>(entry->last_stale, 3)];
+        }
 #endif
+        entry->last_stale = 255;
         ++uploaded;
     }
     trace.Next(14, 0, pending.size());

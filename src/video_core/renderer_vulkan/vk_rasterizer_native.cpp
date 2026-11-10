@@ -62,6 +62,7 @@
 // barrier, and around dispatches and copies. Later versions record the game's render jobs on its
 // own threads with this code (ryty_gpu/native/DESIGN.md, N4).
 
+#include "video_core/renderer_vulkan/build_queue.h"
 #include "video_core/renderer_vulkan/vk_rasterizer_native.h"
 #include "common/geometry_trace.h"
 #include "video_core/renderer_vulkan/pipeline_owner.h"
@@ -75,6 +76,7 @@
 #include "video_core/renderer_vulkan/upload_chunk_cache.h"
 #include "video_core/renderer_vulkan/native_ring_policy.h"
 #include "common/thread.h"
+#include "common/native_thread_priority.h"
 
 #include <fstream>
 #include <algorithm>
@@ -85,7 +87,12 @@
 #include <cstring>
 #include <immintrin.h>
 #include <map>
+#include <mutex>
 #include <optional>
+#include <set>
+#include <sstream>
+#include <string_view>
+#include <tuple>
 #include <unordered_map>
 
 #include <fmt/ranges.h>
@@ -98,15 +105,20 @@
 #include "ryty_gpu/ryty_upscaler_status.h"
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/diagnostics.h"
+#include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "common/elf_info.h"
 #include "video_core/renderer_vulkan/one_off_regs.h"
 #include "common/perf_monitor.h"
+#include "common/thread.h"
 #include "common/ryty_config.h"
 // (ryty_config.h brings in windows.h, whose `near` and `far` macros would rename variables here.)
 #undef near
 #undef far
+#include "core/debug_state.h"
+#include "video_core/renderdoc.h"
 #include "core/guest_hash.h"
 #include "core/memory.h"
 #include "ryty_gpu/native/image_registry.h"
@@ -117,7 +129,9 @@
 #include "ryty_gpu/native/rhi/rhi_vulkan.h"
 #include "ryty_gpu/ryty_ghost.h"
 #include "ryty_gpu/ryty_fsr3.h"
+#include "ryty_gpu/ryty_diag.h"
 #include "shader_recompiler/info.h"
+#include "video_core/amdgpu/draw_pipe.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/direct_memory.h"
 #include "video_core/renderer_vulkan/depth_attachment.h"
@@ -165,6 +179,9 @@ struct NativeRenderer::PendingLinearDownload {
     std::vector<VideoCore::DirectMemory::LeasedPart> imports;
     std::vector<Native::LinearDownloadCopy> copies;
 };
+void RytyWatchWrites(std::uint64_t address, std::uint32_t ms, std::string label); // DIAG-067
+void RytyWatchDump(std::string label);                                           // DIAG-193
+
 namespace {
 enum MirrorDiagnosticReason : u32 { MirrorCandidateNew,MirrorCandidateSameFrame,MirrorCandidateDynamic,
     MirrorCandidateQueued,MirrorPromotionRegion,MirrorPromotionDynamic,MirrorPromotionBudget,
@@ -1345,6 +1362,31 @@ bool MatchExperimentalCompositionTexture(AmdGpu::Image& sharp, const Shader::Inf
     return true;
 }
 
+std::pair<u32, u64> DiagnosticPassOptions(u64 frame) {
+    static const char* path = Common::DiagEnv("RYGT_DIAG_PASS_FILE");
+    static u64 last_frame = ~u64{0};
+    static unsigned flags = 0;
+    static unsigned long long skip = 0;
+    if (path && last_frame != frame) {
+        last_frame = frame;
+        if (auto* file = std::fopen(path, "r")) {
+            std::fscanf(file, "%u %llx", &flags, &skip);
+            std::fclose(file);
+        }
+    }
+    return {flags, skip};
+}
+
+/// DIAG-193 (diagnosis, RYGT_DIAG_HW_WATCH=<hex address>,<seconds>): a hardware write watch over
+/// that address from that many seconds on, dumped when DIAG-184 meets a texture there.
+u64 HwWatchAddress() {
+    static const u64 address = [] {
+        const char* env = Common::DiagEnv("RYGT_DIAG_HW_WATCH");
+        return env && *env ? u64(std::strtoull(env, nullptr, 16)) : u64{0};
+    }();
+    return address;
+}
+
 /// Logs the first few times and then every 1000th.
 bool Sample(std::atomic<u32>& counter) {
     const u32 n = ++counter;
@@ -1586,6 +1628,25 @@ struct RecordPartitionEndGuard {
 };
 #endif
 
+// DIAG-GT7-004: a piece of a dispatch's recorder time, on every dispatch (nothing when `total`
+// is null: the same code for a draw).
+struct PartClock {
+    u64* total;
+    std::chrono::steady_clock::time_point start{};
+    explicit PartClock(u64* total_) : total{total_} {
+        if (total) {
+            start = std::chrono::steady_clock::now();
+        }
+    }
+    ~PartClock() {
+        if (total) {
+            *total += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now() - start)
+                          .count();
+        }
+    }
+};
+
 u64 ChunkSize() {
     static const u64 size = NativeChunkBytes(std::getenv("RYGT_NATIVE_CHUNK_MB"));
     return size;
@@ -1606,11 +1667,50 @@ bool NativeModeRequested() {
     // NAT-160: the launcher's renderer choice (GPU.native_renderer in the game's settings, so
     // GTSport.exe started on its own follows it too); RYGT_NATIVE=1 or =0 overrides it.
     static const bool requested = [] {
+        // FIX-230: logged, with where the choice came from (GT7 does not boot without it).
         if (const char* env = std::getenv("RYGT_NATIVE"); env && *env) {
-            return env[0] == '1';
+            const bool on = env[0] == '1';
+            LOG_WARNING(Render_Vulkan, "FIX-230: native renderer {} (RYGT_NATIVE={})",
+                        on ? "on" : "off", env);
+            return on;
         }
         const auto value = Common::RytyGameConfigValue("native_renderer");
-        return value && *value == "true";
+#ifdef _WIN32
+        // FIX-231: GT7 does not run on the old renderer (a tester's launches without the setting
+        // hung or stopped at "protect region as write-only"), so GT7.exe always gets the native
+        // renderer unless RYGT_NATIVE=0 says otherwise.
+        wchar_t exe[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        const std::wstring name{exe};
+        const std::wstring file = name.substr(name.find_last_of(L"\\/") + 1);
+        if (Common::RytyGameConfigText().empty()) {
+            // FIX-231: the launcher's settings were not found where the renderer looks.
+            const std::wstring path = Common::RytyGameConfigPathW();
+            std::string narrow(path.size() * 3 + 1, ' ');
+            narrow.resize(std::max(0, WideCharToMultiByte(CP_UTF8, 0, path.c_str(),
+                                                          static_cast<int>(path.size()),
+                                                          narrow.data(),
+                                                          static_cast<int>(narrow.size()),
+                                                          nullptr, nullptr)));
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-231: the launcher's settings file was not found at {} (start GT7 "
+                        "with RyGT7.exe from its own folder); the game's defaults apply",
+                        narrow);
+        }
+        if (_wcsicmp(file.c_str(), L"GT7.exe") == 0) {
+            LOG_WARNING(Render_Vulkan, "FIX-231: native renderer on (GT7 always uses it; the "
+                                       "settings say {})",
+                        value ? *value : std::string{"nothing"});
+            return true;
+        }
+#endif
+        const bool on = value && *value == "true";
+        LOG_WARNING(Render_Vulkan, "FIX-230: native renderer {} ({})", on ? "on" : "off",
+                    value ? "native_renderer in user\\custom_configs\\CUSA03220.json"
+                    : Common::RytyGameConfigText().empty()
+                        ? "the launcher's settings file could not be read: default off"
+                        : "no native_renderer setting: default off");
+        return on;
     }();
     return requested;
 }
@@ -1633,6 +1733,127 @@ void NativeRenderer::DrawBindings::PrepareWriteGroups() {
     groups_ready = true;
 }
 
+namespace {
+// OPT-013..015 on (RYGT_NATIVE_REUSE=0 off; DIAG-GT7-003 switches it while the game runs).
+std::atomic<bool> g_reuse_on{[] {
+    const char* env = std::getenv("RYGT_NATIVE_REUSE");
+    return !(env && env[0] == '0');
+}()};
+// PERF-GT7-013..016 (RYGT_NATIVE_NEXT=1).
+std::atomic<bool> g_next_on{[] {
+    const char* env = std::getenv("RYGT_NATIVE_NEXT");
+    return env && env[0] == '1';
+}()};
+// PERF-GT7-018 (on; RYGT_NATIVE_RING=0 off; DIAG-GT7-003 switches it while the game runs).
+std::atomic<bool> g_ring_on{[] {
+    const char* env = std::getenv("RYGT_NATIVE_RING");
+    return !(env && env[0] == '0');
+}()};
+
+} // namespace
+
+bool NativeRenderer::NextOn() {
+    return g_next_on.load(std::memory_order_relaxed);
+}
+
+bool NativeRenderer::ReuseOn() {
+    return g_reuse_on.load(std::memory_order_relaxed);
+}
+
+bool NativeRenderer::RingOn() {
+    return g_ring_on.load(std::memory_order_relaxed);
+}
+
+bool NativeRenderer::PreparedOn() {
+    return PrepareEnabled();
+}
+
+// PERF-GT7-010 as shadGT adapted it (PERF-314): the native threads' priority is opt-in
+// (RYGT_NATIVE_GPU_PRIORITY=1), see Common::NativeCpuPriorityRequested.
+bool NativeRenderer::BoostOn() {
+    return Common::NativeCpuPriorityRequested();
+}
+
+
+
+bool NativeRenderer::AbOn() {
+    static const bool on = [] {
+        const char* env = Common::DiagEnv("RYGT_NATIVE_AB");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
+std::string NativeRenderer::DispatchPartsText() const {
+    // DIAG-GT7-004: us a dispatch by DIAG-188 part, its bindings and notes by piece, and the
+    // FIX-203 copies before the work.
+    const double count = double(std::max<u64>(stats.dispatches, 1));
+    const auto per = [&](u64 ns) { return ns / 1000.0 / count; };
+    u64 pieces = 0;
+    for (const u64 ns : stats.dispatch_bind_ns) {
+        pieces += ns;
+    }
+    const u64 bindings = stats.dispatch_part_ns[1];
+    const auto& part = stats.dispatch_part_ns;
+    const auto& bind = stats.dispatch_bind_ns;
+    return fmt::format(
+        "us in pipeline/bindings/images/barrier/record/notes {:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/"
+        "{:.2f}; bindings in begin/buffers/textures/copies before/fill/rest "
+        "{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f} (region refreshes {:.2f}); notes in "
+        "write-backs/GPU writes {:.2f}/{:.2f}; copies before {} ({:.1f} MB), buffers made {}, "
+        "reused {}; image slots {} ({} from the memo, {:.1f} views each)",
+        per(part[0]), per(part[1]), per(part[2]), per(part[3]), per(part[4]), per(part[5]),
+        per(bind[0]), per(bind[1]), per(bind[2]), per(bind[3]), per(bind[4]),
+        per(bindings > pieces ? bindings - pieces : 0), per(stats.dispatch_refresh_ns),
+        per(stats.dispatch_note_ns[0]), per(stats.dispatch_note_ns[1]), stats.writeback_befores,
+        stats.snapshot_bytes / 1048576.0, stats.snapshots_made, stats.snapshots_reused,
+        stats.compute_texture_lookups, stats.compute_texture_hits,
+        stats.compute_texture_lookups
+            ? double(stats.compute_texture_bindings) / double(stats.compute_texture_lookups)
+            : 0.0);
+}
+
+u32 NativeRenderer::AbMode() const {
+    // A the defaults without PERF-GT7-018, B with it.
+    return u32(ab_window % 2);
+}
+
+void NativeRenderer::ForgetBindings(Stream& s) {
+    s.memo_layout = vk::PipelineLayout{};
+    s.push_known = false;
+    for (auto& memo : s.set_memos) {
+        memo.valid = false;
+    }
+}
+
+u64 NativeRenderer::ReuseGeneration() const {
+    return registry->Generation() + unmap_generation.load(std::memory_order_relaxed) +
+           buffer_generation;
+}
+
+std::pair<vk::Buffer, u64> NativeRenderer::UploadBytes(u32 slot, const void* data, u32 size,
+                                                      u64 align) {
+    Stream& s = stream;
+    if (ReuseOn() && slot < s.upload_memos.size()) {
+        UploadMemo& memo = s.upload_memos[slot];
+        if (memo.list == s.serial && memo.bytes.size() == size &&
+            std::memcmp(memo.bytes.data(), data, size) == 0) {
+            ++stats.uploads_reused;
+            return {memo.buffer, memo.offset};
+        }
+        const auto [buffer, offset, mapped] = Allocate(size, align);
+        std::memcpy(mapped, data, size);
+        memo.list = s.serial;
+        memo.buffer = buffer;
+        memo.offset = offset;
+        memo.bytes.assign(static_cast<const u8*>(data), static_cast<const u8*>(data) + size);
+        return {buffer, offset};
+    }
+    const auto [buffer, offset, mapped] = Allocate(size, align);
+    std::memcpy(mapped, data, size);
+    return {buffer, offset};
+}
+
 void NativeRenderer::DrawBindings::Clear() {
     writes.clear();
     write_sets.clear();
@@ -1644,7 +1865,7 @@ void NativeRenderer::DrawBindings::Clear() {
     push = {};
     sampled.clear();
     stored.clear();
-    image_entries.clear();
+    image_entries.clear(); // FIX-GT7-080
     gpu_writes.clear();
     region_writeback.reset();
     fill_pattern.reset();
@@ -1653,6 +1874,7 @@ void NativeRenderer::DrawBindings::Clear() {
     fill_size = 0;
     writes_buffers = false;
     failed = false;
+    diag_records = 0;
 }
 
 struct NativeRenderer::FsrComposition {
@@ -2083,10 +2305,39 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
         if (temporary_gather) source.keep.push_back(std::move(temporary_gather));
         return source;
     });
+    {
+        // FIX-203: FIX-194's write-back of the words a draw or dispatch changed.
+        const std::array<Native::Rhi::BindingSlot, 3> slots{{
+            {0, Native::Rhi::BindingType::StorageBuffer, Native::Rhi::StageCompute},
+            {1, Native::Rhi::BindingType::StorageBuffer, Native::Rhi::StageCompute},
+            {2, Native::Rhi::BindingType::StorageBuffer, Native::Rhi::StageCompute},
+        }};
+        writeback_layout = device->CreatePipelineLayout({.bindings = slots,
+                                                         .push_constant_bytes = sizeof(u32),
+                                                         .push_constant_stages =
+                                                             Native::Rhi::StageCompute});
+        if (writeback_layout) {
+            writeback_pipeline = device->CreateComputePipeline({
+                .layout = writeback_layout.get(),
+                .shader = {Native::Rhi::ShaderStage::Compute, NATIVE_REGION_WRITEBACK_COMP},
+                .name = "native region write-back",
+            });
+        }
+    }
+    VideoCore::DirectMemory::HoldReleasesForSplice(); // FIX-205
     registry->SetUploadHook([this](Native::ImageEntry& entry) {
+        // PERF-GT7-052: small textures in GT7's per-frame memory are checked each frame instead
+        // (their pages hold the data the game rewrites every frame: watched, every one of those
+        // writes faulted, 170,000-257,000 times in 10 s of a race).
+        const u64 size = std::max<u64>(entry.info.guest_size, 1);
+        if (PolledFrameTexture(entry.info.guest_address, size)) {
+            std::scoped_lock lock{polled_mutex};
+            polled_textures.emplace_back(entry.info.guest_address, size);
+            return;
+        }
         // NAT-105: CPU writes to a texture's memory from now on fault once, and the texture
         // is uploaded again.
-        WatchPages(entry.info.guest_address, std::max<u64>(entry.info.guest_size, 1));
+        WatchPages(entry.info.guest_address, size);
     });
     gds = device->CreateBuffer({.size = 64_KB,
                                 .usage = Native::Rhi::BufferUsageStorage |
@@ -2151,6 +2402,16 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
             LOG_WARNING(Render_Vulkan, "One-off observation unavailable; existing wait policy remains active");
         }
     }
+    LoadOneOffKinds(); // PERF-GT7-023
+    if (const u64 address = HwWatchAddress(); address != 0) {
+        const char* env = Common::DiagEnv("RYGT_DIAG_HW_WATCH");
+        const char* comma = std::strchr(env, ',');
+        const u32 delay = comma ? u32(std::strtoul(comma + 1, nullptr, 10)) : 10;
+        std::thread([address, delay] {
+            std::this_thread::sleep_for(std::chrono::seconds(delay));
+            RytyWatchWrites(address, 1000 * 1000, "ring hw watch"); // DIAG-193
+        }).detach();
+    }
 }
 
 NativeRenderer::~NativeRenderer() {
@@ -2207,6 +2468,7 @@ NativeRenderer::~NativeRenderer() {
         stream.imported_view_leases.clear();
         direct->ReleaseHeldAfterGpuIdle();
     }
+    SaveOneOffKinds(true); // PERF-GT7-023
     const vk::Device vk_device = r.instance.GetDevice();
     for (const auto pool : free_pools) {
         vk_device.destroyDescriptorPool(pool);
@@ -2216,6 +2478,12 @@ NativeRenderer::~NativeRenderer() {
     }
     for (const auto pool : stream.pools) {
         vk_device.destroyDescriptorPool(pool);
+    }
+    for (const auto pool : gpu_timing_pools) { // DIAG-GT7-001
+        vk_device.destroyQueryPool(pool);
+    }
+    for (const auto& timing : gpu_timing_pending) {
+        vk_device.destroyQueryPool(timing->pool);
     }
     views.clear();
     samplers.clear();
@@ -2227,6 +2495,175 @@ static bool FaultAheadEnabled() {
         return env && env[0] == '1';
     }();
     return enabled;
+}
+
+// GT7-UW: the display buffers' addresses (the presenter notes them as the game registers them).
+namespace {
+std::array<std::atomic<VAddr>, 16> g_display_addresses{};
+} // namespace
+
+void NoteDisplayAddress(VAddr address) {
+    for (auto& slot : g_display_addresses) {
+        VAddr expected = 0;
+        if (slot.load(std::memory_order_relaxed) == address ||
+            slot.compare_exchange_strong(expected, address)) {
+            return;
+        }
+    }
+}
+
+static bool IsDisplayAddress(VAddr address) {
+    for (const auto& slot : g_display_addresses) {
+        const VAddr value = slot.load(std::memory_order_relaxed);
+        if (value == 0) {
+            return false;
+        }
+        if (value == address) {
+            return true;
+        }
+    }
+    return false;
+}
+
+float RytyDisplayAspect(); // ryty_game_patch.cpp (GTS-009)
+
+// Merge (shadGT): GT7-UW splits GT7's HUD only; GT Sport keeps its own WIDE HUD handling.
+static bool IsGt7Title() {
+    static const bool gt7 = [] {
+        const auto& elf = Common::ElfInfo::Instance();
+        const std::string_view id = elf.GameSerial();
+        const std::string_view name = elf.Title();
+        return id == "CUSA24767" || id == "CUSA24769" ||
+               (name.starts_with("Gran Turismo") && name.ends_with(" 7"));
+    }();
+    return gt7;
+}
+
+bool NativeRenderer::HudSplitOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_HUD_SPLIT");
+        return IsGt7Title() && RytyDisplayAspect() > 0.0f && !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+bool NativeRenderer::HudStreamOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_HUD_STREAM");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+// Called with the HUD list swapped in as the stream.
+void NativeRenderer::BeginHudStream() {
+    Stream& s = stream;
+    if (s.list) {
+        return;
+    }
+    AcquireList(s); // PERF-GT7-018
+    s.rendering = false;
+    s.dynamic.Invalidate();
+    s.pipelines.Invalidate();
+    s.so_known = false; // SO-010
+    s.vertex_state_known = false;
+    s.commands = 0;
+    s.run_program = 0; // PERF-GT7-043
+    s.run_texels.Clear(); // PERF-GT7-057
+    ++s.serial;        // OPT-015
+    ForgetBindings(s); // OPT-014
+    // It runs after the main list: what that list wrote is finished first.
+    const vk::MemoryBarrier2 barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+    };
+    s.cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
+                                              .pMemoryBarriers = &barrier});
+}
+
+// Runs the HUD list after the main one (in the same command buffer, at the same tick).
+void NativeRenderer::SpliceHudStream(u64 tick) {
+    Stream& s = hud_stream;
+    if (!s.list) {
+        return;
+    }
+    if (s.rendering) {
+        s.cmd.endRendering();
+        s.rendering = false;
+    }
+    s.list->End();
+    r.scheduler.CommandBuffer().executeCommands(s.cmd);
+    device->MarkExecuted(s.list, {timeline.get(), tick});
+    {
+        std::scoped_lock chunk_lock{chunk_mutex};
+        for (auto& chunk : s.chunks) {
+            chunk.retire_tick = tick;
+            retiring_chunks.push_back(std::move(chunk));
+        }
+        for (const auto pool : s.pools) {
+            retiring_pools.emplace_back(tick, pool);
+        }
+    }
+    s.chunks.clear();
+    s.chunk_used = 0;
+    s.pools.clear();
+    for (auto& snapshot : s.pooled_snapshots) { // PERF-GT7-007
+        if (!snapshot_pool.Retire(snapshot, tick)) s.keep.push_back(std::move(snapshot));
+    }
+    s.pooled_snapshots.clear();
+    s.keep.clear();
+    s.list = nullptr;
+    s.cmd = CmdBuf{};
+    ++s.serial;        // OPT-015: the list's upload memory retires with it
+    ForgetBindings(s); // OPT-014
+}
+
+Native::ImageEntry* NativeRenderer::MakeHudPicture(const Native::ImageEntry& like) {
+    auto* entry = new Native::ImageEntry{};
+    entry->info = like.info;
+    Native::MadeImage made = MakeImage(entry->info, true);
+    if (!made.image) {
+        delete entry;
+        return nullptr;
+    }
+    entry->image = std::move(made.image);
+    entry->backend_usage = made.usage;
+    entry->backend_features = made.features;
+    // New pictures start undefined; native mode keeps its pictures in the general layout.
+    Stream& s = Begin();
+    EndRendering();
+    const vk::ImageMemoryBarrier2 barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eNone,
+        .srcAccessMask = vk::AccessFlagBits2::eNone,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .oldLayout = vk::ImageLayout::eUndefined,
+        .newLayout = vk::ImageLayout::eGeneral,
+        .image = vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())},
+        .subresourceRange{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .baseMipLevel = 0,
+            .levelCount = VK_REMAINING_MIP_LEVELS,
+            .baseArrayLayer = 0,
+            .layerCount = VK_REMAINING_ARRAY_LAYERS,
+        },
+    };
+    s.cmd.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                              .pImageMemoryBarriers = &barrier});
+    LOG_INFO(Render_Vulkan, "GT7-UW: HUD picture for the display {:#x} ({}x{})",
+             like.info.guest_address, like.info.size.width, like.info.size.height);
+    return entry;
+}
+
+// Port of xacidr4inx's reflection fix (RyGT 0066): square colour images of six layers or more can
+// be viewed as cube arrays. Not depth images (GT7's shadow cascades). FIX-GT7-084: what View checks
+// before it makes a cube-array view.
+static bool CubeCompatible(const Instance& instance, u32 width, u32 height, u32 layers, u32 samples,
+                           bool volume, bool depth) {
+    return instance.IsImageCubeArraySupported() && !volume && !depth && width == height &&
+           layers >= 6 && samples == 1;
 }
 
 Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bool) {
@@ -2246,9 +2683,8 @@ Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bo
     const Instance& instance = r.instance;
     vk::ImageCreateFlags flags{vk::ImageCreateFlagBits::eMutableFormat |
                                vk::ImageCreateFlagBits::eExtendedUsage};
-    if (r.instance.IsImageCubeArraySupported() && !info.props.is_volume &&
-        info.size.width == info.size.height &&
-        info.resources.layers >= 6 && info.num_samples == 1) {
+    if (CubeCompatible(instance, info.size.width, info.size.height, info.resources.layers,
+                       info.num_samples, info.props.is_volume, info.props.is_depth)) {
         flags |= vk::ImageCreateFlagBits::eCubeCompatible;
     }
     if (info.props.is_volume) {
@@ -2262,33 +2698,52 @@ Native::MadeImage NativeRenderer::MakeImage(const VideoCore::ImageInfo& info, bo
     }
     vk::ImageUsageFlags usage = UsageOf(instance, info);
     vk::FormatFeatureFlags2 features = FeaturesOf(usage);
-    const vk::Format format = instance.GetSupportedFormat(info.pixel_format, features);
+    vk::Format format = instance.GetSupportedFormat(info.pixel_format, features);
     const vk::ImageType type = TypeOf(info.type);
-    vk::PhysicalDeviceImageFormatInfo2 format_info{
-        .format = format,
-        .type = type,
-        .tiling = vk::ImageTiling::eOptimal,
-        .usage = usage,
-        .flags = flags,
-    };
-    auto properties = instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
-    // Compressed textures are sampled directly. Storage is optional for compatible
-    // uncompressed views, and some drivers reject that combination for BC6H.
-    // Keep the original usage when accepted, including NVIDIA's extended-usage path.
-    if (properties.result == vk::Result::eErrorFormatNotSupported && info.props.is_block &&
+    auto properties =
+        instance.GetPhysicalDevice().getImageFormatProperties2(vk::PhysicalDeviceImageFormatInfo2{
+            .format = format,
+            .type = type,
+            .tiling = vk::ImageTiling::eOptimal,
+            .usage = usage,
+            .flags = flags,
+        });
+    // FIX-232: an AMD driver refused BC6H images with storage use (about two million lookups
+    // of a tester's session found no image: textures missing). Such an image is made without
+    // the storage use (and the block-texel-view flag that goes with it): it is still sampled
+    // and copied as the game does with it. RYGT_BLOCK_NO_STORAGE_FALLBACK=1 keeps the old way.
+    static const bool fallback = [] {
+        const char* env = std::getenv("RYGT_BLOCK_NO_STORAGE_FALLBACK");
+        return !(env && env[0] == '1');
+    }();
+    if (properties.result != vk::Result::eSuccess && fallback &&
         (usage & vk::ImageUsageFlagBits::eStorage)) {
-        format_info.usage &= ~vk::ImageUsageFlagBits::eStorage;
-        auto sampled = instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
-        if (sampled.result == vk::Result::eSuccess) {
-            usage = format_info.usage;
-            features = FeaturesOf(usage);
-            properties = std::move(sampled);
-            static std::atomic<u32> fallbacks{};
-            if (Sample(fallbacks)) {
-                LOG_INFO(Render_Vulkan,
-                         "NAT-100: compressed image {} uses sampled-only fallback at {:#x}",
-                         vk::to_string(format), info.guest_address);
+        const vk::ImageUsageFlags reduced = usage & ~vk::ImageUsageFlagBits::eStorage;
+        const vk::ImageCreateFlags reduced_flags =
+            flags & ~vk::ImageCreateFlagBits::eBlockTexelViewCompatible;
+        const vk::Format reduced_format =
+            instance.GetSupportedFormat(info.pixel_format, FeaturesOf(reduced));
+        auto retry = instance.GetPhysicalDevice().getImageFormatProperties2(
+            vk::PhysicalDeviceImageFormatInfo2{
+                .format = reduced_format,
+                .type = type,
+                .tiling = vk::ImageTiling::eOptimal,
+                .usage = reduced,
+                .flags = reduced_flags,
+            });
+        if (retry.result == vk::Result::eSuccess) {
+            static std::atomic<u32> logged{};
+            if (Sample(logged)) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-232: format {} ({}x{}) made without storage use (the driver "
+                            "refuses it with storage)",
+                            vk::to_string(format), info.size.width, info.size.height);
             }
+            usage = reduced;
+            flags = reduced_flags;
+            format = reduced_format;
+            features = FeaturesOf(reduced);
+            properties = retry;
         }
     }
     if (properties.result != vk::Result::eSuccess) {
@@ -2401,10 +2856,12 @@ vk::ImageView NativeRenderer::View(const Native::ImageEntry& entry,
     }
     vk::ImageViewType view_type = VideoCore::ConvertImageViewType(info.type);
     if (use == ViewUse::CubeSampled) {
+        // FIX-GT7-084: whole cubes of a picture made cube compatible (CubeCompatible: not depth),
+        // else the slot is bound empty.
         const auto whole_layers = Native::CubeViewLayers(r.instance.IsImageCubeArraySupported(),
             volume, image_desc.width, image_desc.height,
             image_desc.layers, image_desc.samples, info.range.extent.layers);
-        if (!whole_layers) return {};
+        if (!whole_layers || entry.info.props.is_depth) return {};
         info.range.extent.layers = whole_layers;
         view_type = vk::ImageViewType::eCubeArray;
     }
@@ -2470,6 +2927,9 @@ u64 MemoHash(const u64* words, size_t count, u64 seed) {
 vk::Sampler NativeRenderer::SamplerFor(const AmdGpu::Sampler& original,
                                        AmdGpu::BorderColorBuffer border, bool is_depth) {
     auto sharp = original;
+    if (is_depth && (DiagnosticPassOptions(frame).first & 1)) {
+        sharp.depth_compare_func.Assign(AmdGpu::DepthCompare::Always);
+    }
     // PERF-GT7-015 (C): the samplers this thread looked up last, by raw S#, without the lock and
     // the hash map (a draw binds ~4; samplers live as long as the renderer).
     struct CachedSampler {
@@ -2694,6 +3154,7 @@ void NativeRenderer::BeginAhead() {
 
 CmdBuf NativeRenderer::CmdOf(Native::Rhi::CommandList& list) const {
     if (stream.list == &list) return stream.cmd;
+    if (hud_stream.list == &list) return hud_stream.cmd; // GT7-UW
     ASSERT_MSG(list.NativeHandleSlot() == nullptr, "Deferred list is not the active stream");
     return CmdBuf{vk::CommandBuffer{Handle<VkCommandBuffer_T>(list.NativeHandle())}};
 }
@@ -2718,17 +3179,190 @@ NativeRenderer::Stream& NativeRenderer::Begin() {
     } else {
         AcquireList(s); // PERF-GT7-018
     }
+    if (!s.lds_readers.empty()) {
+        // PERF-GT7-060: a list ends through EndRendering, which records them; none may be left.
+        static std::atomic<u32> logged{};
+        if (Sample(logged)) {
+            LOG_ERROR(Render_Vulkan, "PERF-GT7-060: {} reader passes left from an ended list",
+                      s.lds_readers.size());
+        }
+        s.lds_readers.clear();
+        s.lds_bytes = 0;
+    }
     s.rendering = false;
     s.dynamic.Invalidate();
     s.pipelines.Invalidate();
     s.vertex_state_known = false; // OPT-005
     s.commands = 0;
-    s.run_program = 0;
-    s.run_texels.Clear();
+    s.run_program = 0; // PERF-GT7-043
+    s.run_texels.Clear(); // PERF-GT7-057
+    GpuTimeBegin(s); // DIAG-GT7-001: the first segment is the wait for earlier GPU work
+    ++s.serial;        // OPT-015
+    ForgetBindings(s); // OPT-014
     // What was recorded before this list (earlier lists, the presenter) is finished first.
     GlobalBarrier();
     MakePendingMirrors(); // NAT-150: behind the barrier the list starts with anyway
     return s;
+}
+
+bool NativeRenderer::GpuTimeOn() {
+    static const bool on = [] {
+        const char* env = Common::DiagEnv("RYGT_DIAG_GPU_TIME");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
+void NativeRenderer::GpuTimeBegin(Stream& s) {
+    if (!GpuTimeOn() || s.wrapped_list) {
+        return;
+    }
+    vk::QueryPool pool{};
+    if (!gpu_timing_pools.empty()) {
+        pool = gpu_timing_pools.back();
+        gpu_timing_pools.pop_back();
+    } else {
+        const auto [result, made] = r.instance.GetDevice().createQueryPool(vk::QueryPoolCreateInfo{
+            .queryType = vk::QueryType::eTimestamp,
+            .queryCount = GpuTimeQueries,
+        });
+        if (result != vk::Result::eSuccess) {
+            return;
+        }
+        pool = made;
+    }
+    auto timing = std::make_unique<GpuTiming>();
+    timing->pool = pool;
+    timing->frame = frame;
+    timing->cpu_s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - gpu_timing_start).count();
+    timing->segments.emplace_back();
+    const auto& registry_stats = registry->GetStats();
+    timing->uploads_at = registry_stats.uploads.load(std::memory_order_relaxed);
+    timing->upload_bytes_at = registry_stats.upload_bytes.load(std::memory_order_relaxed);
+    s.cmd.resetQueryPool(pool, 0, GpuTimeQueries);
+    s.cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, pool, timing->used++);
+    s.gpu_timing = std::move(timing);
+}
+
+void NativeRenderer::GpuTimeMark(Stream& s) {
+    GpuTiming* t = s.gpu_timing.get();
+    if (!t || t->used + 1 >= GpuTimeQueries) {
+        return; // (past the pool's size the rest of the list goes in its last segment)
+    }
+    const auto& registry_stats = registry->GetStats();
+    const u64 uploads = registry_stats.uploads.load(std::memory_order_relaxed);
+    const u64 upload_bytes = registry_stats.upload_bytes.load(std::memory_order_relaxed);
+    GpuSegment& seg = t->segments.back();
+    seg.uploads += u32(uploads - t->uploads_at);
+    seg.upload_bytes += upload_bytes - t->upload_bytes_at;
+    t->uploads_at = uploads;
+    t->upload_bytes_at = upload_bytes;
+    s.cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, t->pool, t->used++);
+    t->segments.emplace_back();
+}
+
+void NativeRenderer::GpuTimeEnd(Stream& s, u64 tick) {
+    GpuTiming* t = s.gpu_timing.get();
+    if (!t) {
+        return;
+    }
+    if (t->used + 1 < GpuTimeQueries) {
+        GpuTimeMark(s); // the end, with an empty segment after it
+        t->segments.pop_back();
+    }
+    t->tick = tick;
+    t->cpu_end_s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - gpu_timing_start).count();
+    gpu_timing_pending.push_back(std::move(s.gpu_timing));
+}
+
+void NativeRenderer::GpuTimeCollect() {
+    if (gpu_timing_pending.empty()) {
+        return;
+    }
+    const double period_ms = double(r.instance.GetImageLimits().timestampPeriod) / 1e6;
+    const vk::Device vk_device = r.instance.GetDevice();
+    static thread_local std::vector<u64> stamps;
+    while (!gpu_timing_pending.empty()) {
+        GpuTiming& t = *gpu_timing_pending.front();
+        // FIX-GT7-014: only once the list's submission is done. A pool used before can still
+        // report that use's results until the GPU runs this list's reset: eSuccess alone took
+        // them for this list's, and the pool went back to the free ones while the GPU had it.
+        if (!r.scheduler.IsFree(t.tick)) {
+            break; // later lists come after it
+        }
+        stamps.assign(t.used, 0);
+        const vk::Result result = vk_device.getQueryPoolResults(
+            t.pool, 0, t.used, stamps.size() * sizeof(u64), stamps.data(), sizeof(u64),
+            vk::QueryResultFlagBits::e64);
+        if (result == vk::Result::eNotReady) {
+            break; // the GPU has not run it yet (later lists come after it)
+        }
+        if (result == vk::Result::eSuccess && t.used >= 2) {
+            const double list_ms = double(stamps[t.used - 1] - stamps[0]) * period_ms;
+            const double gap_ms = gpu_timing_prev_end != 0 && stamps[0] > gpu_timing_prev_end
+                                      ? double(stamps[0] - gpu_timing_prev_end) * period_ms
+                                      : 0.0;
+            gpu_timing_prev_end = stamps[t.used - 1];
+            // On the CPU: from the previous list's end to this one's start (a GPU gap about as
+            // long means the GPU waited for the recorder; much longer, it ran other work).
+            const double cpu_gap_ms =
+                gpu_timing_prev_cpu_end != 0.0 ? (t.cpu_s - gpu_timing_prev_cpu_end) * 1000.0 : 0.0;
+            gpu_timing_prev_cpu_end = t.cpu_end_s;
+            auto& st = gpu_time_stats;
+            ++st.lists;
+            st.busy_ms += list_ms;
+            st.max_list_ms = std::max(st.max_list_ms, list_ms);
+            st.max_gap_ms = std::max(st.max_gap_ms, gap_ms);
+            // The slowest segments of a slow list (or after a long gap), with what they held.
+            std::vector<std::pair<double, u32>> segs;
+            for (u32 i = 0; i + 1 < t.used && i < t.segments.size(); ++i) {
+                segs.emplace_back(double(stamps[i + 1] - stamps[i]) * period_ms, i);
+            }
+            std::ranges::sort(segs, std::greater{});
+            const bool slow = list_ms >= 20.0 || gap_ms >= 20.0 ||
+                              (!segs.empty() && segs.front().first >= 10.0);
+            if (slow) {
+                ++st.slow;
+                std::string text;
+                for (size_t k = 0; k < std::min<size_t>(segs.size(), 4); ++k) {
+                    const auto [ms, i] = segs[k];
+                    const GpuSegment& g = t.segments[i];
+                    text += fmt::format(
+                        "; seg {}/{} {:.2f} ms: {} draws (max {} prims, ps {:#x}), {} dispatches "
+                        "(max {} groups, cs {:#x}), {} uploads ({} KB)",
+                        i, t.segments.size(), ms, g.draws, g.max_prims, g.max_prims_ps,
+                        g.dispatches, g.max_groups, g.max_groups_cs, g.uploads,
+                        g.upload_bytes / 1024);
+                }
+                u32 draws = 0, dispatches = 0;
+                for (const GpuSegment& g : t.segments) {
+                    draws += g.draws;
+                    dispatches += g.dispatches;
+                }
+                LOG_WARNING(Render_Vulkan,
+                            "DIAG-GT7-001: frame {} at {:.2f} s: list {:.2f} ms on the GPU "
+                            "({} draws, {} dispatches, {} segments, recorded in {:.2f} ms), "
+                            "started {:.2f} ms after the previous list ended on the GPU ({:.2f} "
+                            "ms on the CPU){}",
+                            t.frame, t.cpu_s, list_ms, draws, dispatches, t.segments.size(),
+                            (t.cpu_end_s - t.cpu_s) * 1000.0, gap_ms, cpu_gap_ms, text);
+            }
+        }
+        gpu_timing_pools.push_back(t.pool);
+        gpu_timing_pending.pop_front();
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - gpu_timing_report >= std::chrono::seconds{10}) {
+        auto& st = gpu_time_stats;
+        LOG_WARNING(Render_Vulkan,
+                    "DIAG-GT7-001 (10 s): {} lists, {:.0f} ms on the GPU in them, longest list "
+                    "{:.2f} ms, longest gap between lists {:.2f} ms, {} slow lists logged",
+                    st.lists, st.busy_ms, st.max_list_ms, st.max_gap_ms, st.slow);
+        st = {};
+        gpu_timing_report = now;
+    }
 }
 
 bool NativeRenderer::LdsBatchOn() {
@@ -3055,6 +3689,7 @@ void NativeRenderer::GlobalBarrier() {
         .memoryBarrierCount = 1,
         .pMemoryBarriers = &barrier,
     });
+    GpuTimeMark(s); // DIAG-GT7-001
     s.written.clear();
     s.buffers_written = false;
     s.attach_dirty.clear();
@@ -3117,6 +3752,14 @@ void NativeRenderer::QueueWriteback(const Native::ImageEntry* entry) {
 // game ordered them; written back at the frame's end, the picture would overwrite the newer bytes.
 // It goes at the next global barrier, before that work, and the bytes the work leaves stay right.
 void NativeRenderer::WritebacksBefore(VAddr address, u64 size) {
+    // FIX-GT7-040: a picture moved here when its frame ended counts too: unnoticed, it reached the
+    // region only at the region's next use, over what this work writes.
+    if (std::ranges::any_of(writebacks, [&](const Native::ImageEntry* entry) {
+            const VAddr begin = entry->info.guest_address;
+            return address + std::max<u64>(size, 1) > begin && begin + entry->info.guest_size > address;
+        })) {
+        writebacks_due = true;
+    }
     std::erase_if(frame_writebacks, [&](Native::ImageEntry* entry) {
         const VAddr begin = entry->info.guest_address;
         if (address + std::max<u64>(size, 1) <= begin || begin + entry->info.guest_size <= address) {
@@ -3186,6 +3829,15 @@ void NativeRenderer::WritebacksBefore(DrawBindings& b) {
     for (const auto& [address, size] : b.gpu_writes) {
         WritebacksBefore(address, size);
     }
+    // FIX-GT7-040: pictures going back first reach the regions the work writes first too.
+    if (!SendWritebacksDue()) {
+        return;
+    }
+    for (const auto& [address, size] : b.gpu_writes) {
+        if (Region* region = RegionOver(address, size)) {
+            RefreshRegion(*region, address, size);
+        }
+    }
 }
 
 static bool PlanDirectLinearDownload(const Native::ImageEntry& entry,
@@ -3227,10 +3879,73 @@ static bool PlanDirectLinearDownload(const Native::ImageEntry& entry,
     return Native::PlanLinearImageDownload(mips, parts, info.guest_size, info.num_bits / 8, copies);
 }
 
+// FIX-150: GT Sport's small buffers from 0xf000000000 up are ones the GPU writes for the CPU
+// to read back. RYGT_NATIVE_INPLACE_FROM=<hex address> moves the limit
+// (ffffffffffffffff: every written range gets a region, as before).
+static VAddr InplaceFrom() {
+    static const VAddr from = [] {
+        const char* env = std::getenv("RYGT_NATIVE_INPLACE_FROM");
+        return env ? static_cast<VAddr>(std::strtoull(env, nullptr, 16)) : VAddr{0xf000000000};
+    }();
+    return from;
+}
+
+// FIX-GT7-041: a picture larger than NAT-112's drawn in the memory the CPU reads goes back in this
+// submission, before the fence the CPU waits for. GT7 saves a car's thumbnail this way: it copies
+// the finished 1920x1080 picture into two 1920x540 targets there, waits for the GPU and encodes
+// them to PNG, so the saved thumbnail held what that memory held before: black. GT7 draws few such
+// pictures: ten in a session with one customization. RYGT_NATIVE_WRITEBACK_CPU=0: as before.
+void NativeRenderer::WritebackForCpu(const Native::ImageEntry* entry) {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_NATIVE_WRITEBACK_CPU");
+        return !(env && env[0] == '0');
+    }();
+    if (!on || entry->info.guest_address < InplaceFrom() ||
+        std::ranges::find(writebacks, entry) != writebacks.end()) {
+        return;
+    }
+    writebacks.push_back(const_cast<Native::ImageEntry*>(entry));
+    static std::atomic<u32> logged{};
+    if (const u32 n = logged++; n < 64) {
+        LOG_WARNING(Render_Vulkan, "FIX-GT7-041: picture {:#x} {}x{} goes back for the CPU ({} so far)",
+                    entry->info.guest_address, entry->info.size.width, entry->info.size.height,
+                    n + 1);
+    }
+}
+
+// FIX-GT7-040: what work writes in a region stays there, so a picture going back to guest memory
+// first must reach the region first too. Left for the region's next use, it was copied in over the
+// shader's bytes: GT7 fills its rain layer, whose memory also holds its reflection's small mips, and
+// with no rain to draw it samples the fill right away. Those mips showed as a 64 KB block of huge
+// values at every frame of a pre-race screen, under a large halo. A fill or a copy gets its region
+// after this; a draw or dispatch has it already, and refreshes it again when this returns true.
+// RYGT_NATIVE_WRITEBACK_REFRESH=0: as before.
+bool NativeRenderer::SendWritebacksDue() {
+    static const bool refresh = [] {
+        const char* env = std::getenv("RYGT_NATIVE_WRITEBACK_REFRESH");
+        return !(env && env[0] == '0');
+    }();
+    if (!refresh || !writebacks_due) {
+        return false;
+    }
+    GlobalBarrier(); // the pictures go back here
+    return true;
+}
+
 void NativeRenderer::FlushWritebacks() {
     if (writebacks.empty() || !stream.list) {
         return;
     }
+    AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::WriteBacks};
+    struct Timed {
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        u64& total;
+        ~Timed() {
+            total += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count();
+        }
+    } timed{.total = stats.writeback_ns}; // DIAG-188
     Stream& s = stream;
     auto* direct = r.buffer_cache.GetDirectMemory();
     const u64 alignment = r.instance.StorageMinAlignment();
@@ -3536,6 +4251,7 @@ void NativeRenderer::FlushWritebacks() {
     writebacks.clear();
     writebacks_due = false;
     s.pipelines.Invalidate(); // the re-tiling binds its own pipeline
+    ForgetBindings(s);            // OPT-014: and its own bindings
     // What reads guest memory next (shaders, the CPU after the GPU) sees the pictures.
     const vk::MemoryBarrier2 barrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -3549,12 +4265,17 @@ void NativeRenderer::FlushWritebacks() {
     });
 }
 
-void NativeRenderer::PrepareImages() {
+void NativeRenderer::PrepareImages(std::span<const Native::ImageEntry* const> bound) {
+    AmdGpu::RecorderParts::Scope part{AmdGpu::RecorderParts::Part::Uploads}; // DIAG-GT7-005
     Native::SlowCallTrace<6> trace{t_timed, "prepare-images",
         {"pending-init-lock", "pending-upload-lock", "end-rendering", "initialize", "global-barrier", "uploads"}};
     const bool init = device->PendingImageInit();
     trace.Next(1);
-    const bool uploads = registry->HasPendingUploads();
+    // PERF-109: the stale textures the work uses, with the uploads queued.
+    const bool bound_stale = std::ranges::any_of(bound, [](const Native::ImageEntry* entry) {
+        return entry && entry->from_cpu && entry->needs_upload.load(std::memory_order_relaxed);
+    });
+    const bool uploads = bound_stale || registry->HasPendingUploads();
     if (!init && !uploads) {
         return;
     }
@@ -3569,9 +4290,22 @@ void NativeRenderer::PrepareImages() {
         trace.Next(4);
         GlobalBarrier(); // NAT-107: uploads read guest memory as earlier GPU work left it
         trace.Next(5);
-        registry->RecordUploads(*s.list, t_timed);
+        registry->RecordUploads(
+            *s.list,
+            std::span<Native::ImageEntry* const>{
+                const_cast<Native::ImageEntry* const*>(bound.data()), bound.size()}, // PERF-109
+            t_timed);
         s.pipelines.Invalidate(); // the uploads bind their own pipelines
+        ForgetBindings(s);            // OPT-014: and their own bindings
     }
+}
+
+void NativeRenderer::PrepareImages(const DrawBindings& b) {
+    // PERF-109: the pictures the work samples and stores into.
+    boost::container::small_vector<const Native::ImageEntry*, 32> bound;
+    bound.insert(bound.end(), b.sampled.begin(), b.sampled.end());
+    bound.insert(bound.end(), b.stored.begin(), b.stored.end());
+    PrepareImages(std::span<const Native::ImageEntry* const>{bound.data(), bound.size()});
 }
 
 void NativeRenderer::ChunkFlushCheck() {
@@ -3857,7 +4591,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
         });
         if (action == Native::RegionMergeDisposition::Preserve) return nullptr;
     }
-    ++buffer_generation;
+    ++buffer_generation; // OPT-003: regions are taken in or made
     buffer_log.Note(begin, end); // OPT-010
     // GPU-only guest allocations need not have CPU-importable backing. They still need
     // storage for shader writes (including the terrain's persistent shadow map).
@@ -3928,6 +4662,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
     LOG_INFO(Render_Vulkan, "NAT-114: region {:#x}+{:#x} on the GPU ({} taken in)", begin,
              end - begin, merged.size());
 #endif
+    NoteHistory(begin, end - begin, 10, merged.size()); // DIAG-187 (diagnosis)
     std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
     auto [it, inserted] = regions.emplace(begin, std::move(region));
     return &it->second;
@@ -4412,6 +5147,7 @@ void NativeRenderer::MakePendingMirrors() {
         // CPU writes to it from now on are copied in before its next use.
         promotion_trace.Next(5);
         WatchPages(begin, end - begin);
+        NoteHistory(begin, end - begin, 12, 0); // DIAG-187 (diagnosis)
         mirror_bytes += end - begin;
         NATIVE_DIAGNOSTIC(++stats.mirrors_made);
         NATIVE_DIAGNOSTIC(stats.mirror_made_bytes += end - begin);
@@ -5008,6 +5744,882 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
 #endif
 }
 
+bool NativeRenderer::OneOffDiagOn() {
+    static const bool on = [] {
+        const char* env = Common::DiagEnv("RYGT_DIAG_ONE_OFF_REDRAW");
+        return (RyDiag::Enabled() && !(env && env[0] == '0')) || OneOffDiagAll();
+    }();
+    return on;
+}
+
+bool NativeRenderer::OneOffDiagAll() {
+    // RYGT_DIAG_ONE_OFF_REDRAW=1: also the draws that found their pipeline built (they would
+    // have waited for it), so any race start counts, not only one whose pipelines are new.
+    static const bool all = [] {
+        const char* env = Common::DiagEnv("RYGT_DIAG_ONE_OFF_REDRAW");
+        return env && env[0] == '1';
+    }();
+    return all;
+}
+
+bool NativeRenderer::OneOffLearnOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_ONE_OFF_LEARN");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+bool NativeRenderer::OneOffTrackOn() {
+    return OneOffLearnOn() || OneOffDiagOn();
+}
+
+namespace {
+// PERF-GT7-023: pictures of a kind redrawn after their wait before it stops waiting (the 128x128
+// colour and 256x128 depth pictures of GT7's races had 34 and 137 in five runs, none sampled
+// first).
+constexpr u32 OneOffSafeCount = 8;
+// At one address, 4 (the per-frame targets there come back at the same address run after run).
+constexpr u32 OneOffPlaceSafeCount = 4;
+
+bool OneOffKindExempt(u32 safe, u32 harmful) {
+    return harmful == 0 && safe >= OneOffSafeCount;
+}
+
+bool OneOffPlaceExempt(u32 safe, u32 harmful) {
+    return harmful == 0 && safe >= OneOffPlaceSafeCount;
+}
+
+// The family of a kind: its format and tiling, whatever its size.
+template <typename Kind>
+Kind FamilyOf(Kind kind) {
+    kind.pitch = kind.height = kind.slices = kind.samples = 0;
+    return kind;
+}
+
+std::filesystem::path OneOffKindsPath() {
+    const auto& serial = Common::Singleton<Common::ElfInfo>::Instance()->GameSerial();
+    return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+           fmt::format("{}.one_off_kinds.txt", serial);
+}
+} // namespace
+
+size_t NativeRenderer::OneOffKindHash::operator()(const OneOffKind& kind) const noexcept {
+    const std::array<u64, 4> words{u64(kind.depth) << 32 | kind.pitch,
+                                   u64(kind.height) << 32 | kind.slices,
+                                   u64(kind.samples) << 32 | kind.format,
+                                   u64(kind.number_format) << 32 | kind.tile};
+    return MemoHash(words.data(), words.size(), 0x198);
+}
+
+size_t NativeRenderer::OneOffPlaceHash::operator()(const OneOffPlace& place) const noexcept {
+    return OneOffKindHash{}(place.kind) ^ (u64(place.address) * 0x9E3779B97F4A7C15ULL);
+}
+
+NativeRenderer::OneOffKind NativeRenderer::KindOf(const OneOffHit& hit) {
+    return {.depth = hit.depth,
+            .pitch = hit.pitch,
+            .height = hit.height,
+            .slices = hit.slices,
+            .samples = hit.samples,
+            .format = hit.format,
+            .number_format = hit.number_format,
+            .tile = hit.tile};
+}
+
+bool NativeRenderer::OneOffExempt(const OneOffHit& hit) const {
+    if (!OneOffLearnOn()) {
+        return false;
+    }
+    const OneOffKind kind = KindOf(hit);
+    if (const auto it = one_off_kinds.find(kind);
+        it != one_off_kinds.end() && OneOffKindExempt(it->second.safe, it->second.harmful)) {
+        return true;
+    }
+    if (const auto it = one_off_places.find({hit.address, FamilyOf(kind)});
+        it != one_off_places.end() && OneOffKindExempt(it->second.safe, it->second.harmful)) {
+        return true;
+    }
+    const auto it = one_off_places.find({hit.address, kind});
+    return it != one_off_places.end() && OneOffPlaceExempt(it->second.safe, it->second.harmful);
+}
+
+bool NativeRenderer::OneOffKnownHarmful() const {
+    // FIX-GT7-121: a picture of a kind (or at a place) already seen sampled before its redraw
+    // (PERF-GT7-023's harmful count) is one the game draws once and keeps: skipped at FIX-GT7-102/
+    // 109's deadline, it stays wrong for good. GT7's car shadows (1024x1024 maps drawn once a
+    // race) showed as dark rectangles under every car after a cold race start: ~20 of their draws
+    // had given up at the 12 ms deadline. Such a draw waits for its pipeline whatever the budget;
+    // the compile pack and the pre-translation remove the wait. RYGT_ONE_OFF_HARMFUL_WAIT=0: the
+    // deadline for every kind, as before.
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_ONE_OFF_HARMFUL_WAIT");
+        return !(env && env[0] == '0');
+    }();
+    if (!enabled || !OneOffLearnOn()) {
+        return false;
+    }
+    for (const OneOffHit& hit : one_off_hits) {
+        const OneOffKind kind = KindOf(hit);
+        if (const auto it = one_off_kinds.find(kind);
+            it != one_off_kinds.end() && it->second.harmful != 0) {
+            return true;
+        }
+        if (const auto it = one_off_places.find({hit.address, kind});
+            it != one_off_places.end() && it->second.harmful != 0) {
+            return true;
+        }
+        if (const auto it = one_off_places.find({hit.address, FamilyOf(kind)});
+            it != one_off_places.end() && it->second.harmful != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void NativeRenderer::LoadOneOffKinds() {
+    if (!OneOffLearnOn()) {
+        return;
+    }
+    std::ifstream file{OneOffKindsPath()};
+    std::string line;
+    u32 exempt = 0;
+    u32 places_exempt = 0;
+    while (std::getline(file, line)) {
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        std::istringstream in{line};
+        std::string what;
+        VAddr address = 0;
+        if (!(in >> what)) {
+            continue;
+        }
+        if (what == "at") { // a place: "at <address> <kind ...>"
+            std::string where;
+            if (!(in >> where >> what)) {
+                continue;
+            }
+            address = std::strtoull(where.c_str(), nullptr, 16);
+        }
+        OneOffKind kind{};
+        OneOffKindStats seen{};
+        if (!(in >> kind.pitch >> kind.height >> kind.slices >> kind.samples >> kind.format >>
+              kind.number_format >> kind.tile >> seen.safe >> seen.harmful)) {
+            continue;
+        }
+        kind.depth = what == "depth";
+        if (address != 0) {
+            one_off_places[{address, kind}] = seen;
+            places_exempt += OneOffPlaceExempt(seen.safe, seen.harmful) ? 1 : 0;
+        } else {
+            one_off_kinds[kind] = seen;
+            exempt += OneOffKindExempt(seen.safe, seen.harmful) ? 1 : 0;
+        }
+    }
+    LOG_INFO(Render_Vulkan,
+             "PERF-GT7-023: {} kinds of one-off pictures known, {} of them no longer waited for; "
+             "{} places, {} of them no longer waited for",
+             one_off_kinds.size(), exempt, one_off_places.size(), places_exempt);
+}
+
+void NativeRenderer::SaveOneOffKinds(bool wait) {
+    if (!OneOffLearnOn() || !one_off_kinds_changed) {
+        return;
+    }
+    one_off_kinds_changed = false;
+    std::string text = "# PERF-GT7-023: FIX-198 picture kinds (kind pitch height slices samples "
+                       "format number_format tile safe harmful),\n# and places (at address kind "
+                       "... safe harmful)\n";
+    const auto kind_text = [](const OneOffKind& kind, const OneOffKindStats& seen) {
+        return fmt::format("{} {} {} {} {} {} {} {} {} {}\n", kind.depth ? "depth" : "color",
+                           kind.pitch, kind.height, kind.slices, kind.samples, kind.format,
+                           kind.number_format, kind.tile, seen.safe, seen.harmful);
+    };
+    for (const auto& [kind, seen] : one_off_kinds) {
+        text += kind_text(kind, seen);
+    }
+    for (const auto& [place, seen] : one_off_places) {
+        text += fmt::format("at {:#x} ", place.address) + kind_text(place.kind, seen);
+    }
+    auto write = [path = OneOffKindsPath(), text = std::move(text)] {
+        static std::mutex write_mutex;
+        std::scoped_lock lk{write_mutex};
+        auto temp = path;
+        temp += ".tmp";
+        {
+            std::ofstream out{temp, std::ios::binary | std::ios::trunc};
+            out << text;
+            if (!out) {
+                return;
+            }
+        }
+        std::error_code ec;
+        std::filesystem::rename(temp, path, ec);
+    };
+    if (wait) {
+        write();
+    } else {
+        std::thread(std::move(write)).detach(); // a cold file open costs the recorder ~5 ms
+    }
+}
+
+void NativeRenderer::WatchOneOffs(const AmdGpu::Regs& regs, bool skipped) {
+    if (!OneOffTrackOn()) {
+        return;
+    }
+    u64 ps_hash = 0;
+    if (regs.stage_enable.IsStageEnabled(u32(Shader::HwStage::Fragment))) {
+        if (const auto* pgm = regs.ProgramForStage(u32(Shader::HwStage::Fragment));
+            pgm && pgm->Address<u32*>()) {
+            ps_hash = AmdGpu::GetParams(*pgm).hash;
+        }
+    }
+    for (const OneOffHit& hit : one_off_hits) {
+        auto [it, first] = one_off_watch.try_emplace(hit.address);
+        if (first) {
+            if (one_off_watch.size() > 4096) {
+                one_off_watch.erase(it);
+                continue;
+            }
+            it->second.hit = hit;
+            it->second.frame = frame;
+            it->second.ps_hash = ps_hash;
+            it->second.skipped = skipped;
+        }
+        it->second.skipped &= skipped;
+        ++it->second.waits;
+        if (it->second.frame == frame) {
+            ++it->second.draws;
+        }
+    }
+    one_off_hits.clear();
+}
+
+void NativeRenderer::CheckOneOffs() {
+    if (!OneOffTrackOn() || one_off_watch.empty()) {
+        return;
+    }
+    std::erase_if(one_off_watch, [&](const auto& item) {
+        const auto& [address, watch] = item;
+        const Native::ImageEntry* entry = registry->FindExisting(
+            address, [](const Native::ImageEntry& e) { return !e.from_cpu && e.image != nullptr; });
+        const u64 written = entry ? entry->written_frame.load(std::memory_order_relaxed) : 0;
+        const u64 sampled = entry ? entry->sampled_frame.load(std::memory_order_relaxed) : 0;
+        size_t outcome;
+        if (written > watch.frame) {
+            const u64 after = written - watch.frame;
+            outcome = after <= 1 ? 0 : after <= 4 ? 1 : after <= 16 ? 2 : after <= 64 ? 3 : 4;
+        } else if (sampled > watch.frame) {
+            outcome = 5;
+        } else if (frame - watch.frame > 300) {
+            outcome = 6;
+        } else {
+            return false; // still watched
+        }
+        const auto& hit = watch.hit;
+        if (OneOffLearnOn()) {
+            // PERF-GT7-023: what its kind learns. A picture whose draws were all skipped proves
+            // nothing when redrawn (nothing waited), only when sampled first.
+            const bool was_exempt = OneOffExempt(hit);
+            auto& seen = one_off_kinds[KindOf(hit)];
+            auto& here = one_off_places[{address, KindOf(hit)}];
+            auto& family = one_off_places[{address, FamilyOf(KindOf(hit))}];
+            if (outcome <= 4 && !watch.skipped) {
+                ++seen.safe;
+                ++here.safe;
+                ++family.safe;
+                one_off_kinds_changed = true;
+            } else if (outcome == 5) {
+                ++seen.harmful;
+                ++here.harmful;
+                ++family.harmful;
+                if (was_exempt) {
+                    LOG_WARNING(Render_Vulkan,
+                                "PERF-GT7-023: picture {:#x} ({} {}x{} format {}/{}) sampled "
+                                "before its redraw{}: it waits again",
+                                address, hit.depth ? "depth" : "color", hit.pitch, hit.height,
+                                hit.format, hit.number_format,
+                                watch.skipped ? " after a skipped draw" : "");
+                }
+                one_off_kinds_changed = true;
+            }
+        }
+        if (!OneOffDiagOn()) {
+            return true;
+        }
+        const size_t why = hit.never ? 0 : 1;
+        ++one_off_stats.pictures[why][outcome];
+        one_off_stats.waits[why][outcome] += watch.waits;
+        static constexpr std::array<const char*, 7> Outcomes{
+            "redrawn", "redrawn", "redrawn", "redrawn", "redrawn", "sampled first", "neither"};
+        LOG_WARNING(Render_Vulkan,
+                    "DIAG-GT7-008 picture {:#x} {}{} {}x{} slices {} samples {} format {}/{} tile "
+                    "{} ps {:#x} {} first frame {} draws {} waits {}: {} after {} frames",
+                    address, hit.depth ? "depth" : "color", hit.depth ? "" : std::to_string(hit.cb),
+                    hit.pitch, hit.height, hit.slices, hit.samples, hit.format, hit.number_format,
+                    hit.tile, watch.ps_hash, hit.never ? "never" : "gap", watch.frame, watch.draws,
+                    watch.waits, Outcomes[outcome],
+                    outcome <= 4 ? written - watch.frame
+                                 : (outcome == 5 ? sampled - watch.frame : frame - watch.frame));
+        return true;
+    });
+}
+
+std::string NativeRenderer::OneOffText() {
+    u64 total = 0;
+    for (const auto& row : one_off_stats.pictures) {
+        for (const u64 n : row) {
+            total += n;
+        }
+    }
+    if (total == 0 && one_off_watch.empty()) {
+        return {};
+    }
+    const auto row = [&](size_t why) {
+        const auto& p = one_off_stats.pictures[why];
+        const auto& w = one_off_stats.waits[why];
+        return fmt::format("redrawn after 1 frame {} ({} waits), 2-4 {} ({}), 5-16 {} ({}), 17-64 {} "
+                           "({}), 65-300 {} ({}); sampled in a later frame before any redraw {} "
+                           "({}); neither in 300 frames {} ({})",
+                           p[0], w[0], p[1], w[1], p[2], w[2], p[3], w[3], p[4], w[4], p[5], w[5],
+                           p[6], w[6]);
+    };
+    std::string text = fmt::format("pictures FIX-198 waited for, never drawn: {}; not drawn for 64 "
+                                   "frames: {}; {} still watched",
+                                   row(0), row(1), one_off_watch.size());
+    one_off_stats = {};
+    return text;
+}
+
+// FIX-GT7-109: a frame's wait for one-off pipelines in play (0: as at loads).
+static u64 PlayBudgetNs() {
+    static const u64 ns = [] {
+        u64 ms = 12;
+        if (const char* env = std::getenv("RYGT_ONE_OFF_PLAY_BUDGET_MS"); env && *env) {
+            ms = std::strtoull(env, nullptr, 10);
+        }
+        return ms * 1000000ull;
+    }();
+    return ns;
+}
+
+bool NativeRenderer::OneOffBudgetLeft() {
+    // FIX-GT7-102: on a first GT7 race load (every shader new) one frame lasted 185 s: about
+    // 5,000 draws into ~20 new pictures waited for their pipelines (FIX-198), one after the
+    // other, as each draw's GPU work had to finish before the command stream went on. DIAG-GT7-008
+    // then saw nearly all of those pictures redrawn the very next frame (0 or 1 not redrawn within
+    // 300 frames, 3 or 4 sampled before their redraw). A frame now waits that long at most; its
+    // other one-off draws are skipped and show as their pipelines arrive, as in keep-going mode.
+    // In play the pipelines are usually known and the budget is not reached.
+    static const u64 budget_ns = [] {
+        u64 ms = 40; // FIX-GT7-109: 250 before, with waits as long as a compile
+        if (const char* env = std::getenv("RYGT_ONE_OFF_BUDGET_MS"); env && *env) {
+            ms = std::strtoull(env, nullptr, 10);
+        }
+        return ms * 1000000ull;
+    }();
+    if (budget_ns == 0) {
+        return true;
+    }
+    if (one_off_budget_frame != frame) {
+        one_off_budget_frame = frame;
+        one_off_wait_ns_frame = 0;
+        // FIX-GT7-109: in play (the game at 15 frames a second or more) a frame's one-off draws
+        // wait RYGT_ONE_OFF_PLAY_BUDGET_MS in all (12 by default), never for a whole compile:
+        // a new track's race start had frames of 400-940 ms (translations and pipelines of
+        // one-off pictures), races 60-120 ms ones. Loads (slow frames) keep the budget above.
+        // The game's own frame count, over half a second or more.
+        const auto now = std::chrono::steady_clock::now();
+        const u64 game_frames = Common::GetGameFrameTotals().frames;
+        if (one_off_rate_since == std::chrono::steady_clock::time_point{}) {
+            one_off_rate_since = now;
+            one_off_rate_frames = game_frames;
+        } else if (now - one_off_rate_since >= std::chrono::milliseconds{500}) {
+            const double seconds = std::chrono::duration<double>(now - one_off_rate_since).count();
+            // 15 frames a second, as FIX-GT7-109's race state: a slower PC races at 20-25.
+            one_off_interactive = double(game_frames - one_off_rate_frames) / seconds >= 15.0 ||
+                                  g_game_in_play.load(std::memory_order_relaxed);
+            one_off_rate_since = now;
+            one_off_rate_frames = game_frames;
+        }
+    }
+    return one_off_wait_ns_frame < (one_off_interactive ? PlayBudgetNs() : budget_ns);
+}
+
+std::chrono::steady_clock::time_point NativeRenderer::OneOffDeadline() {
+    // FIX-GT7-109: every wait ends at the frame's budget (in play or at a load), so no frame
+    // waits a whole compile (a race start had frames of 170-940 ms). RYGT_ONE_OFF_BUDGET_MS=0:
+    // unbounded at loads, as before FIX-GT7-102.
+    static const u64 load_ns = [] {
+        u64 ms = 40;
+        if (const char* env = std::getenv("RYGT_ONE_OFF_BUDGET_MS"); env && *env) {
+            ms = std::strtoull(env, nullptr, 10);
+        }
+        return ms * 1000000ull;
+    }();
+    const u64 budget = one_off_interactive ? PlayBudgetNs() : load_ns;
+    if (budget == 0) {
+        return std::chrono::steady_clock::time_point::max();
+    }
+    const u64 left = budget > one_off_wait_ns_frame ? budget - one_off_wait_ns_frame : 0;
+    return std::chrono::steady_clock::now() + std::chrono::nanoseconds{left};
+}
+
+// FIX-GT7-135: a texture (several levels) one of whose levels 1 and up is this target.
+std::pair<VAddr, s32> NativeRenderer::TextureLevelOf(const VideoCore::ImageInfo& target) {
+    std::pair<VAddr, s32> found{0, -1};
+    registry->ForEachOverlapping(target.guest_address, target.guest_address + 1,
+                                 [&](Native::ImageEntry& e) {
+                                     if (found.second >= 1 || e.image == nullptr ||
+                                         e.info.resources.levels <= 1) {
+                                         return;
+                                     }
+                                     const Native::SourcePlace place = Native::PlaceOf(target, e.info);
+                                     if (place.mip >= 1) {
+                                         found = {e.info.guest_address, place.mip};
+                                     }
+                                 });
+    return found;
+}
+
+bool NativeRenderer::DrawMustNotSkip(const AmdGpu::Regs& regs) {
+    // FIX-198: GPU.compile_mode 2 (keep going) skips a draw while its new pipeline builds, so
+    // the game never stops for a compile: what it draws shows a frame or so later, as it's drawn
+    // again every frame. A draw into a picture that isn't drawn every frame (one drawn once and
+    // kept: a texture the game renders for later frames, a cached shadow map, the first frame of
+    // a new picture) would leave it missing for good, so such a draw waits for its pipeline. A
+    // picture counts as drawn every frame when one of the last four frames drew into it.
+    // RYGT_NATIVE_WAIT_ONE_OFF=0 skips them too.
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_WAIT_ONE_OFF");
+        return !(env && env[0] == '0');
+    }();
+    if (!enabled) {
+        one_off_hits.clear();
+        return false;
+    }
+    // DIAG-220 (diagnosis, RYGT_DIAG_ONE_OFF=1): why targets count as one-off: never drawn
+    // into, or how many frames since they were last drawn into.
+    static const bool diag = [] {
+        const char* env = Common::DiagEnv("RYGT_DIAG_ONE_OFF");
+        return env && env[0] == '1';
+    }();
+    const auto note = [&](u64 gap) {
+        if (!diag) {
+            return;
+        }
+        static std::array<u32, 6> buckets{}; // never, 5-8, 9-16, 17-64, 65-600, more
+        static u64 report_frame = 0;
+        const size_t i = gap == 0 ? 0 : gap <= 8 ? 1 : gap <= 16 ? 2 : gap <= 64 ? 3 : gap <= 600 ? 4 : 5;
+        ++buckets[i];
+        if (frame >= report_frame + 300) {
+            report_frame = frame;
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-220: one-off targets in 300 frames: never drawn {}, last drawn 5-8 "
+                        "frames ago {}, 9-16 {}, 17-64 {}, 65-600 {}, more {}",
+                        buckets[0], buckets[1], buckets[2], buckets[3], buckets[4], buckets[5]);
+            buckets = {};
+        }
+    };
+    one_off_hits.clear(); // DIAG-GT7-008
+    one_off_texture_level = false; // FIX-GT7-135
+    OneOffHit described{};
+    // FIX-GT7-131: a colour target counts as drawn lately only through a picture of its own memory
+    // layout (pitch, texel size, tiling, samples). Another layout at the same address (GT7's scratch
+    // pool holds a 1920x2160 menu backdrop, a pitch of 2048, where Scapes put a photo's 1920x1080
+    // work picture, a pitch of 1920) made a draw into a layout never drawn skippable: at a photo's
+    // first frames the work picture's draw was skipped for its new pipeline, the frames' average
+    // read the pool's memory instead (small RGBA8 menu pictures read as RGBA16F: huge values, NaN)
+    // and kept them to the end: noise blocks in every first photo. RYGT_NATIVE_ONE_OFF_LAYOUT=0:
+    // any picture at the address, as before.
+    static const bool same_layout_on = [] {
+        const char* env = std::getenv("RYGT_NATIVE_ONE_OFF_LAYOUT");
+        return !(env && env[0] == '0');
+    }();
+    // Out of play only (FIX-GT7-109): in a Monza race the rule made draws into GT7's scratch pool
+    // (0x100a0b0000, other layouts drawn there every frame) wait for new pipelines: 40-60 ms
+    // frames, and a 1.36 s one where FIX-GT7-121 knew the kind as harmful and the wait had no
+    // bound. In play another layout at the address counts again, as before; a draw skipped into a
+    // layout no picture has still leaves its target empty (in Draw), which kept the photos clean.
+    const bool same_layout = same_layout_on && !g_game_in_play.load(std::memory_order_relaxed);
+    const VideoCore::ImageInfo* layout = nullptr;
+    // FIX-GT7-135: a colour target never drawn into that is a level (1 and up) of a texture the
+    // game samples is drawn once, when the game builds the texture's levels: skipped, the level
+    // stays empty for good, whatever PERF-GT7-023 learned of its kind. A Scapes location whose
+    // backdrop is a 6024x4016 RGBA16F texture of 5 levels (the salt flat) has its levels 1-4
+    // drawn at the load, each from the level above; on a PC whose races had taught that RGBA16F
+    // targets of 2048x1024, 1024x512 and 512x256 may be skipped (redrawn every frame there),
+    // levels 2-4 were skipped and stayed empty: the editor, which reads the smaller levels, showed
+    // the location at about an eighth of its brightness, the photo (level 0) did not. The harm
+    // was never learned: the texture reads its levels' memory, not those targets. Such a draw
+    // is not exempted by its kind and, out of play, waits whatever the budget; in play
+    // (FIX-GT7-109) it keeps the frame's budget. RYGT_NATIVE_TEXTURE_LEVEL_WAIT=0: as before.
+    static const bool texture_levels = [] {
+        const char* env = std::getenv("RYGT_NATIVE_TEXTURE_LEVEL_WAIT");
+        return !(env && env[0] == '0');
+    }();
+    s32 target_cb = -1; // FIX-GT7-135: the colour buffer drawn_lately looks at (-1: depth)
+    const auto drawn_lately = [&](VAddr address) {
+        const Native::ImageEntry* entry = registry->FindExisting(
+            address, [&](const Native::ImageEntry& e) {
+                return !e.from_cpu && e.image != nullptr &&
+                       (!layout || (e.info.pitch == layout->pitch &&
+                                    e.info.num_bits == layout->num_bits &&
+                                    e.info.tile_mode == layout->tile_mode &&
+                                    e.info.num_samples == layout->num_samples));
+            });
+        if (!entry && layout && registry->FindExisting(address, [](const Native::ImageEntry& e) {
+                return !e.from_cpu && e.image != nullptr;
+            })) {
+            static std::atomic<u32> layout_logged{};
+            if (const u32 n = layout_logged++; n < 64 || n % 500 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-GT7-131: a draw into {:#x} (pitch {}, {} bits, tile {}) waits for its "
+                            "pipeline: only other layouts were drawn there (frame {}, {} so far)",
+                            address, layout->pitch, layout->num_bits, u32(layout->tile_mode), frame,
+                            n + 1);
+            }
+        }
+        if (!entry) {
+            note(0);
+            if (OneOffTrackOn()) {
+                described.address = address;
+                described.never = true;
+                one_off_hits.push_back(described);
+            }
+            if (texture_levels && target_cb >= 0) {
+                // The target's description is made here only, for a target never drawn into
+                // (out of play FIX-GT7-131 made it already), not for every draw without its
+                // pipeline.
+                std::optional<VideoCore::ImageInfo> made;
+                if (!layout) {
+                    made.emplace(regs.color_buffers[target_cb],
+                                 r.liverpool->DrawCbExtent(u32(target_cb)));
+                }
+                const VideoCore::ImageInfo& target = layout ? *layout : *made;
+                if (const auto [texture, mip] = TextureLevelOf(target); mip >= 1) {
+                    one_off_texture_level = true;
+                    static std::atomic<u32> level_logged{};
+                    if (const u32 n = level_logged++; n < 64 || n % 500 == 0) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "FIX-GT7-135: a draw into {:#x} {}x{}, level {} of the texture "
+                                    "at {:#x}, never drawn, waits for its pipeline (frame {}, {} "
+                                    "so far)",
+                                    address, target.size.width, target.size.height, mip, texture,
+                                    frame, n + 1);
+                    }
+                    return false; // FIX-GT7-135: whatever its kind
+                }
+            }
+            return OneOffExempt(described); // never drawn into; PERF-GT7-023: unless its kind
+        }
+        // FIX-GT7-130: a picture a fill rewrote whole, with nothing drawn into it since: skipped,
+        // the draw would leave the fill (black), not the last frame's picture as a skip usually
+        // does. GT7's Scapes clear a work picture at a photo's last frame and draw the photo's
+        // result into it, once, before filtering it into the photo: with that draw's pipeline
+        // new, it was skipped and every first photo of a game came out black (the second, its
+        // pipeline built, did not). Such a draw waits as a one-off draw does, within its frame's
+        // budget (FIX-GT7-102/109). RYGT_NATIVE_WAIT_AFTER_FILL=0: as before.
+        static const bool after_fill = [] {
+            const char* env = std::getenv("RYGT_NATIVE_WAIT_AFTER_FILL");
+            return !(env && env[0] == '0');
+        }();
+        if (after_fill && registry->FilledWhole(address, entry->info.guest_size)) {
+            static std::atomic<u32> fill_logged{};
+            if (const u32 n = fill_logged++; n < 64 || n % 500 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "FIX-GT7-130: a draw into {:#x} {}x{}, filled whole and not drawn "
+                            "since, waits for its pipeline (frame {}, {} so far)",
+                            address, entry->info.size.width, entry->info.size.height, frame, n + 1);
+            }
+            return false;
+        }
+        const u64 last = entry->written_frame.load(std::memory_order_relaxed);
+        const u64 earlier =
+            last < frame ? last : entry->written_frame_before.load(std::memory_order_relaxed);
+        // PERF-165: a picture drawn into within the last 64 frames is redrawn regularly (GT7
+        // redraws some every 9-64 frames: DIAG-220 counted up to 983 such draws in 300 frames,
+        // and they waited for new pipelines as one-off pictures); a skipped draw shows at its next
+        // redraw. Never-drawn pictures still wait. RYGT_NATIVE_ONE_OFF_FRAMES=4: as before.
+        static const u64 window = [] {
+            const char* env = std::getenv("RYGT_NATIVE_ONE_OFF_FRAMES");
+            return env && *env ? std::strtoull(env, nullptr, 10) : u64{64};
+        }();
+        const bool lately = earlier != 0 && frame - earlier <= window;
+        if (!lately) {
+            note(earlier == 0 ? 0 : frame - earlier);
+            if (OneOffTrackOn()) {
+                described.address = address;
+                described.never = earlier == 0;
+                one_off_hits.push_back(described);
+            }
+        }
+        return lately || OneOffExempt(described); // PERF-GT7-023
+    };
+    if (regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Disable) {
+        for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+            const auto& col_buf = regs.color_buffers[cb];
+            if (OneOffTrackOn() && col_buf) {
+                described = {.depth = false,
+                             .cb = cb,
+                             .pitch = col_buf.Pitch(),
+                             .height = col_buf.Height(),
+                             .slices = col_buf.NumSlices(),
+                             .samples = col_buf.NumSamples(),
+                             .format = u32(col_buf.GetDataFmt()),
+                             .number_format = u32(col_buf.GetNumberFmt()),
+                             .tile = u32(col_buf.GetTileMode())};
+            }
+            if (col_buf && regs.color_target_mask.GetMask(cb) != 0) {
+                std::optional<VideoCore::ImageInfo> info;
+                if (same_layout) {
+                    info.emplace(col_buf, r.liverpool->DrawCbExtent(cb)); // FIX-GT7-131
+                }
+                layout = info ? &*info : nullptr;
+                target_cb = s32(cb); // FIX-GT7-135
+                const bool lately = drawn_lately(col_buf.Address());
+                layout = nullptr;
+                target_cb = -1;
+                if (!lately) {
+                    return true;
+                }
+            }
+        }
+    }
+    if (OneOffTrackOn() && regs.depth_buffer.DepthValid()) {
+        const auto& db = regs.depth_buffer;
+        described = {.depth = true,
+                     .pitch = db.Pitch(),
+                     .height = db.Height(),
+                     .slices = regs.depth_view.NumSlices(),
+                     .samples = db.NumSamples(),
+                     .format = u32(db.z_info.format),
+                     .tile = u32(db.GetTileMode())};
+    }
+    if (regs.depth_control.depth_enable && regs.depth_control.depth_write_enable &&
+        regs.depth_buffer.DepthValid() && !drawn_lately(regs.depth_buffer.DepthAddress())) {
+        return true;
+    }
+    return false;
+}
+
+static const std::vector<std::pair<VAddr, VAddr>>& InplaceRanges();
+static bool InPerFrameMemory(VAddr address, u64 size);
+
+/// PERF-GT7-052 (RYGT_POLL_FRAME_TEXTURES=0: watched as before): a texture of 256 KB or less in a
+/// listed in-place range (GT7's per-frame memory) is checked each frame, not write-watched.
+bool NativeRenderer::PolledFrameTexture(VAddr address, u64 size) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_POLL_FRAME_TEXTURES");
+        return !(env && env[0] == '0');
+    }();
+    if (!enabled || size > 256_KB) {
+        return false;
+    }
+    for (const auto& [begin, end] : InplaceRanges()) {
+        if (address >= begin && address + size <= end) {
+            return true;
+        }
+    }
+    return InPerFrameMemory(address, size); // FIX-GT7-122: up to its end as seen
+}
+
+/// FIX-194: written ranges up to this size have their recently CPU-written pages written back.
+constexpr u64 MaxRegionWriteback = 4_MB;
+
+/// FIX-GT7-122: where RYGT_NATIVE_INPLACE_EXTRA's ranges start in InplaceRanges().
+static size_t g_inplace_extra_from = ~size_t{0};
+
+/// FIX-172 (diagnosis, RYGT_NATIVE_INPLACE_RANGES=<hex address>+<hex size>,...): written ranges
+/// meeting one of these stay in guest memory too.
+static const std::vector<std::pair<VAddr, VAddr>>& InplaceRanges() {
+    static const std::vector<std::pair<VAddr, VAddr>> inplace_ranges = [] {
+        std::vector<std::pair<VAddr, VAddr>> list;
+        // FIX-GT7-029: GT7's per-frame memory ends at 0x208600000 or 0x208800000, past the range
+        // the launcher lists. A compute write there makes a small region; the unbounded reads,
+        // which all end at that limit, meet it and grow it over most of the per-frame memory
+        // (NAT-114): every CPU write then faults, ~100,000 protection calls in 2 s, and the frame
+        // rate drops for the rest of the session. With a list (GT7's launcher), the tail stays in
+        // guest memory too; RYGT_NATIVE_INPLACE_EXTRA, in the same form, replaces it (empty: none).
+        const char* const ranges = std::getenv("RYGT_NATIVE_INPLACE_RANGES");
+        const char* extra = std::getenv("RYGT_NATIVE_INPLACE_EXTRA");
+        if (!extra && ranges) {
+            extra = "208000000+800000";
+        }
+        for (const char* source : {ranges, extra}) {
+            if (source == extra) {
+                g_inplace_extra_from = list.size(); // FIX-GT7-122
+            }
+            for (const char* at = source; at && *at;) {
+                char* end = nullptr;
+                const VAddr begin = std::strtoull(at, &end, 16);
+                if (end == at || *end != '+') {
+                    break;
+                }
+                at = end + 1;
+                const u64 length = std::strtoull(at, &end, 16);
+                list.emplace_back(begin, begin + std::max<u64>(length, 1));
+                at = *end == ',' ? end + 1 : end;
+            }
+        }
+        return list;
+    }();
+    return inplace_ranges;
+}
+
+// FIX-GT7-122: GT7's per-frame memory as listed: FIX-GT7-029's tail (the first range of
+// RYGT_NATIVE_INPLACE_EXTRA) and the listed ranges it continues ({0, 0}: no tail, or
+// RYGT_NATIVE_PERFRAME_GUARD=0). Its end moves: past the tail, to 0x209800000, on 2026-11-08, and
+// FIX-GT7-029's sequence came back: a compute write past the tail made a region, the unbounded
+// reads grew it over the per-frame memory, the regions there were refreshed a hundred times more
+// (2.8-4 s of the recorder's time in 10 s) and the game ran at 25 FPS until it was closed.
+static std::pair<VAddr, VAddr> PerFrameListed() {
+    static const std::pair<VAddr, VAddr> listed = [] {
+        const char* env = std::getenv("RYGT_NATIVE_PERFRAME_GUARD");
+        const auto& ranges = InplaceRanges();
+        if ((env && env[0] == '0') || g_inplace_extra_from >= ranges.size()) {
+            return std::pair<VAddr, VAddr>{0, 0};
+        }
+        auto [begin, end] = ranges[g_inplace_extra_from];
+        for (bool grew = true; grew;) {
+            grew = false;
+            for (const auto& [listed_begin, listed_end] : ranges) {
+                if (listed_end == begin && listed_begin < begin) {
+                    begin = listed_begin;
+                    grew = true;
+                }
+            }
+        }
+        return std::pair{begin, end};
+    }();
+    return listed;
+}
+
+/// FIX-GT7-122: the end of GT7's per-frame memory as seen so far (0: the listed end).
+static std::atomic<VAddr> g_per_frame_end{0};
+
+static VAddr PerFrameEnd() {
+    const VAddr end = g_per_frame_end.load(std::memory_order_relaxed);
+    return end != 0 ? end : PerFrameListed().second;
+}
+
+/// FIX-GT7-122: whether [address, address + size) is inside GT7's per-frame memory as seen.
+static bool InPerFrameMemory(VAddr address, u64 size) {
+    const VAddr begin = PerFrameListed().first;
+    return begin != 0 && address >= begin && address + size <= PerFrameEnd();
+}
+
+/// FIX-GT7-122: whether [address, address + size) meets a listed range or the per-frame memory.
+static bool ListedInPlace(VAddr address, u64 size) {
+    if (std::ranges::any_of(InplaceRanges(), [&](const auto& range) {
+            return address < range.second && address + size > range.first;
+        })) {
+        return true;
+    }
+    const VAddr begin = PerFrameListed().first;
+    return begin != 0 && address < PerFrameEnd() && address + size > begin;
+}
+
+void NativeRenderer::NotePerFrameRange(VAddr address, u64 size) {
+    // The unbounded reads end where the per-frame memory does: one that starts in it and ends past
+    // its end shows how far it goes now.
+    const auto [begin, listed_end] = PerFrameListed();
+    const VAddr end = PerFrameEnd();
+    const VAddr range_end = address + size;
+    if (begin == 0 || address < begin || address >= end || range_end <= end) {
+        return;
+    }
+    if (range_end > listed_end + 64_MB || r.memory->MappedAreaEnd(address, range_end) < range_end) {
+        static std::atomic<u32> refused{};
+        if (refused.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-GT7-122: range {:#x}+{:#x} goes past GT7's per-frame memory "
+                        "({:#x}-{:#x}, listed to {:#x}) but is not taken as its end",
+                        address, size, begin, end, listed_end);
+        }
+        return;
+    }
+    g_per_frame_end.store(range_end, std::memory_order_relaxed);
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 20) {
+        LOG_WARNING(Render_Vulkan,
+                    "FIX-GT7-122: GT7's per-frame memory reaches {:#x} (listed to {:#x}): "
+                    "written ranges up to there stay in guest memory",
+                    range_end, listed_end);
+    }
+}
+
+void NativeRenderer::NotePerFrameRegion(const Region& region) {
+    // A region inside the per-frame memory (made before its end was known, or grown there from
+    // one made then) goes, with the other regions inside it: the ranges there are then bound in
+    // guest memory, as in listed ranges. Not while a draw or dispatch binds: an earlier binding
+    // of the same work would still name the dropped region's buffer and its writes would be lost
+    // (FIX-GT7-090's case); this one binds the region as before, and the regions go before the
+    // next work binds anything. A region reaching out of the per-frame memory stays (its bytes
+    // outside it exist only there).
+    const VAddr begin = PerFrameListed().first;
+    if (begin != 0 && region.begin >= begin && region.end <= PerFrameEnd()) {
+        per_frame_drop_due = true;
+    }
+}
+
+void NativeRenderer::DropDuePerFrameRegions() {
+    if (!per_frame_drop_due) {
+        return;
+    }
+    per_frame_drop_due = false;
+    const VAddr begin = PerFrameListed().first;
+    const VAddr end = PerFrameEnd();
+    // At most 32 drops a session (past that the regions stay, as before), one in 120 frames at
+    // most: a region made again at once (a write there that can't be bound in guest memory makes
+    // one) must not use them all up in a loop.
+    static u32 drops = 0; // the recorder, with `mutex` held
+    if (drops >= 32 || (drops != 0 && frame < per_frame_drop_frame + 120)) {
+        static bool logged_limit = false, logged_soon = false;
+        if (drops >= 32 && !logged_limit) {
+            logged_limit = true;
+            LOG_WARNING(Render_Vulkan, "FIX-GT7-122: regions in GT7's per-frame memory dropped 32 "
+                                       "times; they stay from now on");
+        } else if (drops < 32 && !logged_soon) {
+            logged_soon = true;
+            LOG_WARNING(Render_Vulkan, "FIX-GT7-122: a region in GT7's per-frame memory came back "
+                                       "within 120 frames of a drop; left until then");
+        }
+        return;
+    }
+    std::vector<std::pair<VAddr, VAddr>> inside;
+    for (const auto& [base, region] : regions) {
+        if (region.begin >= begin && region.end <= end) {
+            inside.emplace_back(region.begin, region.end);
+        }
+    }
+    if (inside.empty()) {
+        return;
+    }
+    ++drops;
+    per_frame_drop_frame = frame;
+    u32 dropped = 0;
+    for (const auto& [from, to] : inside) {
+        dropped += DropRegionsOver(from, to - from); // the region and the mirrors over it
+    }
+    ++buffer_generation;      // OPT-003
+    ++buffer_hard_generation; // PERF-GT7-047
+    LOG_WARNING(Render_Vulkan,
+                "FIX-GT7-122: {} regions in GT7's per-frame memory {:#x}-{:#x} dropped ({} with "
+                "the mirrors over them; one at {:#x}-{:#x}); {} times so far",
+                inside.size(), begin, end, dropped, inside.front().first, inside.front().second,
+                drops);
+}
+
+bool NativeRenderer::WritebackRaceDiag() {
+    static const bool on = [] {
+        const char* env = Common::DiagEnv("RYGT_DIAG_WRITEBACK_RACE");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
 u64 NativeRenderer::SnapshotBelow() {
     static const u64 below = [] {
         const char* env = std::getenv("RYGT_NATIVE_SNAPSHOT_BELOW");
@@ -5112,8 +6724,10 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
                                                                             bool write,
                                                                             bool mirror) {
     last_bound = Bound::Region;
+    NotePerFrameRange(address, size); // FIX-GT7-122
     // NAT-114: ranges in (or reaching into) a region use it.
     if (Region* region = RegionOver(address, size)) {
+        NotePerFrameRegion(*region); // FIX-GT7-122: dropped before the next work binds
         if (address < region->begin || address + size > region->end) {
             region = MakeRegion(address, size, write);
             if (!region && RegionOver(address, size)) {
@@ -5150,7 +6764,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     const auto& inplace_ranges = NativeInplaceRanges();
     const bool listed_in_place = std::ranges::any_of(inplace_ranges, [&](const auto& range) {
         return address < range.second && address + size > range.first;
-    });
+    }) || ListedInPlace(address, size); // FIX-GT7-122: per-frame memory too
     if (write && write_regions && size <= 256_MB && address < inplace_from && !listed_in_place) {
         if (Region* region = MakeRegion(address, size, true)) {
             NATIVE_DIAGNOSTIC(++stats.region_binds);
@@ -5192,6 +6806,18 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     }
     if (write) {
         if (Region* region = MakeRegion(address, size, true)) {
+            // FIX-GT7-122: a region in GT7's per-frame memory, where ranges should stay in guest
+            // memory (the next work drops it; other listed ranges get such regions at loads).
+            if (const VAddr pf = PerFrameListed().first;
+                pf != 0 && address < PerFrameEnd() && address + size > pf) {
+                static std::atomic<u32> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-GT7-122: written range {:#x}+{:#x} in GT7's per-frame memory "
+                                "is not in one imported view: a region holds it",
+                                address, size);
+                }
+            }
             NATIVE_DIAGNOSTIC(++stats.region_binds);
             return std::pair{vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
                              u64{address - region->begin}};
@@ -5662,6 +7288,7 @@ bool NativeRenderer::TargetsFromMemo(const AmdGpu::Regs& regs, const GraphicsPip
     if (auto* entry = const_cast<Native::ImageEntry*>(out.depth)) {
         entry->last_use.store(frame, std::memory_order_relaxed);
         ApplyRewrite(*entry); // NAT-120
+        SyncDepthTwin(*entry); // FIX-212
         bool meta_clear = false;
         if (m.htile != 0) {
             meta_clear = cleared_meta.erase(m.htile) != 0;
@@ -5742,6 +7369,10 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
 #endif
         out.colors[cb] = entry;
         out.color_formats[cb] = desc.view_info.format;
+        out.color_ranges[cb] = {.mip = desc.view_info.range.base.level,
+                                .mips = 1,
+                                .layer = desc.view_info.range.base.layer,
+                                .layers = desc.view_info.range.extent.layers}; // FIX-208
         // FIX-154: the draw covers the target it names, not the larger picture it may share
         // (a clear of the small one must leave the rest alone).
         const u32 mip = desc.view_info.range.base.level;
@@ -5777,6 +7408,7 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
             entry ? View(*entry, desc.view_info, ViewUse::Attachment) : vk::ImageView{};
         if (view) {
             ApplyRewrite(*entry); // NAT-120
+            SyncDepthTwin(*entry); // FIX-212
             if (regs.depth_buffer.StencilValid() && entry->info.props.has_stencil) {
                 auto& owners = stencil_owners[regs.depth_buffer.StencilAddress()];
                 if (std::ranges::find(owners, entry) == owners.end()) {
@@ -5785,6 +7417,7 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
             }
             bool meta_clear = false;
             bool fresh = false;
+            htile_meta = desc.info.meta_info.htile_addr != 0; // OPT-013
             if (htile != 0) {
                 known_meta.insert(htile);
                 meta_clear = cleared_meta.erase(htile) != 0;
@@ -5887,6 +7520,7 @@ bool NativeRenderer::ResolveTargets(const AmdGpu::Regs& regs, const GraphicsPipe
 
 void NativeRenderer::BindStagesStable(std::span<const Shader::Info* const> stages,
                                       const AmdGpu::Regs& regs, bool compute, DrawBindings& b) {
+    DropDuePerFrameRegions(); // FIX-GT7-122: before this work binds anything
     static const bool enabled = [] {
         const char* env = std::getenv("RYGT_NATIVE_STABLE_BINDINGS");
         return !env || env[0] != '0';
@@ -5910,6 +7544,8 @@ void NativeRenderer::BindStagesStable(std::span<const Shader::Info* const> stage
 
 void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
                                 const AmdGpu::Regs& regs, bool compute, DrawBindings& b) {
+    const u64 nulls_before = stats.null_images; // DIAG-170
+    const auto reasons_before = stats.null_reasons;
     size_t total = 0;
     for (const auto* stage : stages) {
         if (stage) {
@@ -5929,6 +7565,7 @@ void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
                                              Shader::Backend::StageStart(u32(stage->sw_stage)));
         auto buffer_binding = plans[i].buffers;
         PhaseClock clock{stats.phase_ns[2]};
+        PartClock part{compute ? &stats.dispatch_bind_ns[1] : nullptr}; // DIAG-GT7-004
         BindBuffers(*stage, regs, compute, buffer_binding, b);
         binding = plans[i].next;
     }
@@ -5936,8 +7573,1613 @@ void NativeRenderer::BindStages(std::span<const Shader::Info* const> stages,
         if (const auto* stage = stages[i]) {
             auto texture_binding = plans[i].textures;
             PhaseClock clock{stats.phase_ns[3]};
+            PartClock part{compute ? &stats.dispatch_bind_ns[2] : nullptr}; // DIAG-GT7-004
             BindTextures(*stage, regs, texture_binding, b);
         }
+    }
+    // DIAG-169 (diagnosis, RYGT_WATCH_DRAW_TEXTURE=<w>x<h>[,<w>x<h>...]): for draws sampling a
+    // picture of that size, what guest memory holds now under each buffer they read.
+    static const std::vector<std::pair<u32, u32>> watch_sizes = [] {
+        std::vector<std::pair<u32, u32>> list;
+        const char* env = Common::DiagEnv("RYGT_WATCH_DRAW_TEXTURE");
+        for (const char* at = env; at && *at;) {
+            char* end = nullptr;
+            const u32 w = u32(std::strtoul(at, &end, 10));
+            if (end == at || *end != 'x') {
+                break;
+            }
+            const u32 h = u32(std::strtoul(end + 1, &end, 10));
+            list.emplace_back(w, h);
+            at = *end == ',' ? end + 1 : end;
+        }
+        return list;
+    }();
+    probe_buffers.clear();
+    probe_bound_hashes.clear();
+    for (const auto* stage : stages) {
+        if (stage) {
+            history_program = stage->pgm_hash; // DIAG-187: the last stage's
+        }
+    }
+    for (const auto* stage : stages) {
+        if (stage && !compute) {
+            NoteProgramTextures(stage->pgm_hash, b); // DIAG-184 (diagnosis)
+        }
+    }
+    // DIAG-233 (diagnosis, RYGT_DIAG_STAGE_TEXTURES=<hex program hash>): every texture of the draws
+    // using that program, once a frame (400 lines at most).
+    static const u64 diag233_program = [] {
+        const char* env = Common::DiagEnv("RYGT_DIAG_STAGE_TEXTURES");
+        return env && *env ? u64(std::strtoull(env, nullptr, 16)) : u64{0};
+    }();
+    static u32 diag233_lines = 0;
+    static u64 diag233_frame = ~u64{0};
+    if (diag233_program != 0 && diag233_lines < 400 && diag233_frame != frame &&
+        std::ranges::any_of(stages, [](const auto* stage) {
+            return stage && stage->pgm_hash == diag233_program;
+        })) {
+        diag233_frame = frame;
+        for (const auto* sampled : b.sampled) {
+            if (!sampled || diag233_lines >= 400) {
+                continue;
+            }
+            ++diag233_lines;
+            LOG_WARNING(Render_Vulkan, "DIAG-233: frame {} {} {:#x}+{:#x} {}x{} mips {} layers {} {} "
+                        "made frame {}",
+                        frame, sampled->from_cpu ? "texture" : "target",
+                        sampled->info.guest_address, sampled->info.guest_size,
+                        sampled->info.size.width, sampled->info.size.height,
+                        sampled->info.resources.levels, sampled->info.resources.layers,
+                        vk::to_string(sampled->info.pixel_format), sampled->made_frame);
+            if (sampled->info.resources.levels > 1 && diag233_lines < 400) {
+                std::string mips;
+                for (u32 m = 0; m < sampled->info.resources.levels; ++m) {
+                    const auto& mip = sampled->info.mips_layout[m];
+                    mips += fmt::format(" {}:{:#x}+{:#x}p{}", m, mip.offset, mip.size, mip.pitch);
+                }
+                ++diag233_lines;
+                LOG_WARNING(Render_Vulkan, "DIAG-233: {:#x} tile {} array {} pitch {} micro mips {}:{}",
+                            sampled->info.guest_address, u32(sampled->info.tile_mode),
+                            u32(sampled->info.array_mode), sampled->info.pitch,
+                            sampled->info.micro_tiled_mips, mips);
+            }
+        }
+    }
+    if (!diag_program_textures.empty() && diag185_lines < 200) {
+        diag_what.clear(); // DIAG-185: the work's programs
+        for (const auto* stage : stages) {
+            if (stage) {
+                diag_what += fmt::format(" {:#x}", stage->pgm_hash);
+            }
+        }
+    }
+    if (DiagFrame()) {
+        // DIAG-178: this work's programs.
+        diag_what.clear();
+        for (const auto* stage : stages) {
+            if (stage) {
+                diag_what += fmt::format(" {:#x}", stage->pgm_hash);
+            }
+        }
+    }
+    if (strip_frame == frame) {
+        // DIAG-173: what this draw or dispatch is, for the strip's pixel history.
+        strip_what.clear();
+        for (const auto* stage : stages) {
+            if (stage) {
+                strip_what += fmt::format(" {:#x}", stage->pgm_hash);
+            }
+        }
+        strip_what += " |";
+        for (const auto* entry : b.sampled) {
+            strip_what += fmt::format(" {:#x}:{}x{}l{}{}", entry->info.guest_address,
+                                      entry->info.size.width, entry->info.size.height,
+                                      entry->info.resources.layers,
+                                      entry->from_cpu ? "t" : "");
+        }
+    }
+    // RYGT_PROBE_AFTER=<seconds>: DIAG-169/170 only from then on (the game runs at full speed
+    // until the scene to look at).
+    static const auto watch_from = [] {
+        const char* env = Common::DiagEnv("RYGT_PROBE_AFTER");
+        return std::chrono::steady_clock::now() +
+               std::chrono::seconds(env && *env ? std::atoi(env) : 0);
+    }();
+    if (!watch_sizes.empty() && !compute && std::chrono::steady_clock::now() >= watch_from) {
+        const Native::ImageEntry* hit = nullptr;
+        for (const auto* entry : b.sampled) {
+            for (const auto& [w, h] : watch_sizes) {
+                if (entry && entry->info.size.width == w && entry->info.size.height == h) {
+                    hit = entry;
+                }
+            }
+        }
+        if (hit) {
+            std::string text;
+            for (const auto* stage : stages) {
+                if (!stage) {
+                    continue;
+                }
+                u32 index = 0;
+                for (const auto& desc : stage->buffers) {
+                    const u32 buffer_index = index++;
+                    if (desc.IsSpecial()) {
+                        continue;
+                    }
+                    const auto vsharp = desc.GetSharp(*stage);
+                    const u64 size = std::min<u64>(vsharp.GetSize(), 512);
+                    std::array<u32, 128> words{};
+                    const bool read =
+                        size != 0 &&
+                        Core::RytyMemory::GuardedCopy(words.data(),
+                                                      reinterpret_cast<const void*>(
+                                                          VAddr(vsharp.base_address)),
+                                                      size);
+                    // The whole buffer's hash in guest memory, and whether a region (the GPU's
+                    // copy) holds it, so draws of different frames compare.
+                    const u64 whole = std::min<u64>(vsharp.GetSize(), 256_KB);
+                    std::vector<u8> all(whole);
+                    const bool read_all =
+                        whole != 0 && Core::RytyMemory::GuardedCopy(
+                                          all.data(),
+                                          reinterpret_cast<const void*>(VAddr(vsharp.base_address)),
+                                          whole);
+                    bool in_region = false;
+                    {
+                        std::shared_lock map_lock{buffer_map_mutex};
+                        in_region = RegionOver(VAddr(vsharp.base_address),
+                                               std::max<u64>(vsharp.GetSize(), 1)) != nullptr;
+                    }
+                    text += fmt::format(" | {:#x} b{} {:#x}+{:#x}{} h{:016x}:", stage->pgm_hash,
+                                        buffer_index, VAddr(vsharp.base_address),
+                                        vsharp.GetSize(), in_region ? " region" : "",
+                                        read_all ? XXH3_64bits(all.data(), whole) : 0);
+                    if (read && probe_buffers.size() < 2) {
+                        probe_buffers.emplace_back(VAddr(vsharp.base_address), size); // DIAG-170
+                        probe_bound_hashes += fmt::format(
+                            " {:016x}", XXH3_64bits(words.data(), size));
+                    }
+                    for (u64 w = 0; read && w < std::min<u64>(size, 64) / 4; ++w) {
+                        text += fmt::format(" {:08x}", words[w]);
+                    }
+                }
+            }
+            static const bool quiet = [] {
+                const char* env = Common::DiagEnv("RYGT_PROBE_AT");
+                return env && *env; // DIAG-170 says what it needs
+            }();
+            if (!quiet) {
+                std::string sampled_text;
+                for (const auto* entry : b.sampled) {
+                    if (entry) {
+                        sampled_text += fmt::format(" {:#x}{}", entry->info.guest_address,
+                                                    entry->from_cpu ? "t" : "");
+                    }
+                }
+                LOG_WARNING(Render_Vulkan, "DIAG-169: draw sampling {:#x} {}x{} (frame {}) images{}{}",
+                            hit->info.guest_address, hit->info.size.width,
+                            hit->info.size.height, frame, sampled_text, text);
+            }
+        }
+        probe_sampled = hit; // DIAG-170
+        if (hit) {
+            probe_bound = fmt::format("{} empty", stats.null_images - nulls_before);
+            for (size_t k = 0; k < stats.null_reasons.size(); ++k) {
+                if (stats.null_reasons[k] != reasons_before[k]) {
+                    probe_bound += fmt::format(" (reason {})", k);
+                }
+            }
+            for (const auto& image : b.images) {
+                probe_bound += fmt::format(" {:x}", u64(static_cast<VkImageView>(image.imageView)) & 0xffffff);
+            }
+            for (const auto* entry : b.sampled) {
+                probe_bound += fmt::format(" [{:#x} {}x{}{}]", entry->info.guest_address,
+                                           entry->info.size.width, entry->info.size.height,
+                                           entry->from_cpu ? " tex" : "");
+            }
+        }
+    }
+}
+
+void NativeRenderer::ProbeDraw(const Targets& targets, const AmdGpu::Regs& regs) {
+    // DIAG-170 (diagnosis, RYGT_PROBE_AT=<x>,<y>[,<y2>] with RYGT_WATCH_DRAW_TEXTURE): after
+    // each draw DIAG-169 matches, 16x16 blocks of its first colour target at (x, y) and, in
+    // targets that tall, (x, y2), read back from the GPU and logged with the frame (one line
+    // per frame says which display buffer it shows), to see which draw of a glitched frame
+    // went wrong.
+    static const std::array<u32, 3> at = [] {
+        std::array<u32, 3> a{};
+        if (const char* env = Common::DiagEnv("RYGT_PROBE_AT"); env && *env) {
+            std::sscanf(env, "%u,%u,%u", &a[0], &a[1], &a[2]);
+        }
+        return a;
+    }();
+    const Native::ImageEntry* sampled = std::exchange(probe_sampled, nullptr);
+    if (!sampled || (at[0] == 0 && at[1] == 0) || !targets.colors[0] ||
+        !targets.colors[0]->image || draw_probes.size() >= 4096) {
+        return;
+    }
+    const Native::ImageEntry& target = *targets.colors[0];
+    const auto& desc = target.image->Desc();
+    const u32 bits = target.info.num_bits;
+    {
+        // The state the draw was recorded with.
+        const auto& d = stream.dynamic;
+        probe_bound += fmt::format(" | pipe {:x}", u64(static_cast<VkPipeline>(stream.pipelines.handles[0])) & 0xffffff);
+        for (const auto& v : d.viewports) {
+            probe_bound += fmt::format(" vp {}/{} {}x{} {}..{}", v.x, v.y, v.width, v.height,
+                                       v.minDepth, v.maxDepth);
+        }
+        for (const auto& sc : d.scissors) {
+            probe_bound += fmt::format(" sc {}/{} {}x{}", sc.offset.x, sc.offset.y,
+                                       sc.extent.width, sc.extent.height);
+        }
+        probe_bound += fmt::format(" z {}{} st {} cull {} wm {:x} fb {} rd {} att {:x}/{} {}x{} cl {}",
+                                   d.depth_test_enabled, d.depth_write_enabled,
+                                   d.stencil_test_enabled, u32(d.cull_mode),
+                                   u32(d.color_write_masks[0]), u32(d.feedback_loop_enabled),
+                                   d.rasterizer_discard_enable,
+                                   u64(static_cast<VkImageView>(targets.state.color_attachments[0].image_view)) & 0xffffff,
+                                   targets.state.num_color_attachments, targets.state.width,
+                                   targets.state.height,
+                                   targets.state.color_attachments[0].is_clear);
+        // The depth test as the registers have it.
+        const auto& vp = regs.viewports[0];
+        probe_bound += fmt::format(
+            " | zfunc {} cmp {} zclip near/far off {}/{} clamp off {} zscale {} zoffset {} "
+            "zmin {} zmax {} depth att {:x}",
+            u32(regs.depth_control.depth_func), u32(stream.dynamic.depth_compare_op),
+            u32(regs.clipper_control.zclip_near_disable),
+            u32(regs.clipper_control.zclip_far_disable),
+            u32(regs.depth_render_override.disable_viewport_clamp), vp.zscale, vp.zoffset,
+            regs.viewport_depths[0].zmin, regs.viewport_depths[0].zmax,
+            u64(static_cast<VkImageView>(targets.state.depth_stencil_attachment.image_view)) &
+                0xffffff);
+    }
+    if ((bits != 32 && bits != 64) || desc.width < at[0] + 16) {
+        return;
+    }
+    if (probe_frame != frame) {
+        probe_frame = frame;
+        probe_draw = 0;
+    }
+    std::array<u32, 2> rows{at[1], at[2] != 0 && desc.height >= at[2] + 16 ? at[2] : at[1]};
+    if (desc.height < rows[0] + 16) {
+        return;
+    }
+    const u64 block = 16 * 16 * (bits / 8);
+    constexpr u64 Extra = 2 * 512 + 4096 + 2 * 512 + 1024; // buffers, sampled, vertices, depth
+    auto buffer = device->CreateBuffer({.size = block * 2 + Extra,
+                                        .usage = Native::Rhi::BufferUsageStorage |
+                                                 Native::Rhi::BufferUsageTransferDst,
+                                        .memory = Native::Rhi::MemoryKind::Readback,
+                                        .name = "draw probe"});
+    if (!buffer || !buffer->Mapped()) {
+        return;
+    }
+    Begin();
+    GlobalBarrier();
+    for (u32 i = 0; i < 2; ++i) {
+        stream.cmd.copyImageToBuffer(
+            vk::Image{Handle<VkImage_T>(target.image->NativeHandle())}, vk::ImageLayout::eGeneral,
+            vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
+            vk::BufferImageCopy{.bufferOffset = block * i,
+                                .imageSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                                  .mipLevel = 0,
+                                                  .baseArrayLayer = 0,
+                                                  .layerCount = 1},
+                                .imageOffset = {s32(at[0]), s32(rows[i]), 0},
+                                .imageExtent = {16, 16, 1}});
+    }
+    // What the draw's buffers held in guest memory when it ran (as reads in place see them),
+    // and a corner of what it sampled.
+    u32 extra = 0;
+    std::array<u32, 2> lengths{};
+    const u32 texture_bytes = sampled->info.props.is_block ? 256 : 16 * 16 * sampled->info.num_bits / 8;
+    if (auto* direct = r.buffer_cache.GetDirectMemory()) {
+        for (u32 i = 0; i < probe_buffers.size(); ++i) {
+            const auto [address, size] = probe_buffers[i];
+            if (direct->EnsureImported(address, size)) {
+                if (const auto found = direct->FindBuffer(address, size)) {
+                    stream.cmd.copyBuffer(found->first->Handle(),
+                                          vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
+                                          vk::BufferCopy{.srcOffset = found->second,
+                                                         .dstOffset = block * 2 + 512 * i,
+                                                         .size = std::min<u64>(size, 512)});
+                    extra |= 1u << i;
+                    lengths[i] = u32(std::min<u64>(size, 512));
+                }
+            }
+        }
+    }
+    if (sampled->image && sampled->image->Desc().width >= 16 &&
+        sampled->image->Desc().height >= 16 && texture_bytes <= 4096) {
+        stream.cmd.copyImageToBuffer(
+            vk::Image{Handle<VkImage_T>(sampled->image->NativeHandle())},
+            vk::ImageLayout::eGeneral, vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
+            vk::BufferImageCopy{.bufferOffset = block * 2 + 1024,
+                                .imageSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                                  .mipLevel = 0,
+                                                  .baseArrayLayer = 0,
+                                                  .layerCount = 1},
+                                .imageOffset = {s32(std::min<u32>(at[0] / 2, sampled->image->Desc().width - 16) & ~15u),
+                                                s32(std::min<u32>(at[1] / 2, sampled->image->Desc().height - 16) & ~15u), 0},
+                                .imageExtent = {16, 16, 1}});
+        extra |= 4;
+    }
+    std::array<u32, 2> vertex_lengths{};
+    std::string vertex_recorded;
+    for (u32 i = 0; i < probe_vertices.size(); ++i) {
+        const auto& pv = probe_vertices[i];
+        stream.cmd.copyBuffer(pv.buffer, vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
+                              vk::BufferCopy{.srcOffset = pv.offset,
+                                             .dstOffset = block * 2 + 1024 + 4096 + 512 * i,
+                                             .size = pv.size});
+        vertex_lengths[i] = u32(pv.size);
+        vertex_recorded += fmt::format(" v{:#x}+{:#x} how {} {:016x} [{:08x} {:08x} {:08x} {:08x}]",
+                                       pv.base, pv.size, pv.how, pv.hash, pv.head[0], pv.head[1],
+                                       pv.head[2], pv.head[3]);
+    }
+    probe_bound_hashes += vertex_recorded;
+    // Its depth buffer there (a 32-bit float depth aspect).
+    bool depth = false;
+    if (const auto* z = targets.depth; z && z->image && z->info.props.is_depth &&
+        z->info.num_bits == 32 && z->image->Desc().width >= at[0] + 16 &&
+        z->image->Desc().height >= rows[0] + 16) {
+        stream.cmd.copyImageToBuffer(
+            vk::Image{Handle<VkImage_T>(z->image->NativeHandle())}, vk::ImageLayout::eGeneral,
+            vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
+            vk::BufferImageCopy{.bufferOffset = block * 2 + 1024 + 4096 + 1024,
+                                .imageSubresource{.aspectMask = vk::ImageAspectFlagBits::eDepth,
+                                                  .mipLevel = 0,
+                                                  .baseArrayLayer = 0,
+                                                  .layerCount = 1},
+                                .imageOffset = {s32(at[0]), s32(rows[0]), 0},
+                                .imageExtent = {16, 16, 1}});
+        depth = true;
+    }
+    GlobalBarrier();
+    draw_probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, frame, probe_draw++,
+                           sampled->info.guest_address, sampled->info.size.width,
+                           sampled->info.size.height, target.info.guest_address,
+                           target.info.size.width, target.info.size.height, bits, rows,
+                           std::move(probe_bound), probe_bound_hashes, extra, lengths,
+                           texture_bytes, vertex_lengths, depth});
+}
+
+void NativeRenderer::StripDraw(const Targets& targets) {
+    if (strip_frame == frame && targets.colors[0]) {
+        StripImage(*targets.colors[0], false);
+    }
+}
+
+void NativeRenderer::StripDispatch(const DrawBindings& b) {
+    if (strip_frame != frame) {
+        return;
+    }
+    for (const auto* stored : b.stored) {
+        if (stored) {
+            StripImage(*stored, true);
+        }
+    }
+}
+
+void NativeRenderer::StripImage(const Native::ImageEntry& target, bool dispatch) {
+    // DIAG-173 (diagnosis, RYGT_PROBE_STRIP=<y> RYGT_PROBE_TARGET=<hex address>; armed for one
+    // frame by a file named probe.now next to the user folder): after every draw into that
+    // target (and dispatch storing to it), rows y..y+7 of it are read back, so each pixel of the
+    // strip has its history (which draw wrote it last, and what it wrote). Written with the
+    // frame's screenshot to user\log\strip_<frame>.bin/.txt. RYGT_PROBE_TARGET=1: every
+    // picture of at least 1280x720; =2: of at least 640x360 (y scaled to its height, as a
+    // 1080-line picture's).
+    static const u32 strip_y = [] {
+        const char* env = Common::DiagEnv("RYGT_PROBE_STRIP");
+        return env && *env ? u32(std::atoi(env)) : ~0u;
+    }();
+    static const VAddr strip_target = [] {
+        const char* env = Common::DiagEnv("RYGT_PROBE_TARGET");
+        return env && *env ? VAddr(std::strtoull(env, nullptr, 16)) : VAddr{0};
+    }();
+    if (strip_y == ~0u || strip_frame != frame || !target.image || target.info.props.is_depth) {
+        return;
+    }
+    const auto& desc = target.image->Desc();
+    // =3: every picture at least 8 rows tall.
+    const u32 min_width = strip_target == 1 ? 1280 : strip_target == 2 ? 640 : 1;
+    const u32 min_height = strip_target == 1 ? 720 : strip_target == 2 ? 360 : 8;
+    if (strip_target > 3 ? target.info.guest_address != strip_target
+                         : (desc.width < min_width || desc.height < min_height)) {
+        return;
+    }
+    const u32 bits = target.info.num_bits;
+    const u32 y = strip_target <= 3
+                      ? std::min<u32>(u32(u64(strip_y) * desc.height / 1080), desc.height - 8)
+                      : strip_y;
+    if (bits % 8 != 0 || bits == 0 || bits > 128 || target.info.props.is_block ||
+        desc.height < y + 8) {
+        return;
+    }
+    const u64 bytes = u64(desc.width) * 8 * (bits / 8);
+    auto buffer = device->CreateBuffer({.size = bytes,
+                                        .usage = Native::Rhi::BufferUsageStorage |
+                                                 Native::Rhi::BufferUsageTransferDst,
+                                        .memory = Native::Rhi::MemoryKind::Readback,
+                                        .name = "strip probe"});
+    if (!buffer || !buffer->Mapped()) {
+        return;
+    }
+    Begin();
+    GlobalBarrier();
+    stream.cmd.copyImageToBuffer(
+        vk::Image{Handle<VkImage_T>(target.image->NativeHandle())}, vk::ImageLayout::eGeneral,
+        vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
+        vk::BufferImageCopy{.bufferOffset = 0,
+                            .imageSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                              .mipLevel = 0,
+                                              .baseArrayLayer = 0,
+                                              .layerCount = 1},
+                            .imageOffset = {0, s32(y), 0},
+                            .imageExtent = {desc.width, 8, 1}});
+    GlobalBarrier();
+    strip_probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1,
+                            u32(strip_probes.size()),
+                            fmt::format(" @{:#x}:{}x{}b{}:{} y{}{}", target.info.guest_address,
+                                        desc.width, desc.height, bits,
+                                        vk::to_string(static_cast<vk::Format>(desc.format)), y,
+                                        dispatch ? " cs" : "") +
+                                strip_what});
+}
+
+void NativeRenderer::StripFrameEnd() {
+    // DIAG-173: arming (probe.now, checked every 30 flips) and writing out.
+    static u32 checks = 0;
+    if (strip_frame == ~u64{0} && ++checks % 30 == 0) {
+        std::error_code error;
+        const auto trigger =
+            Common::FS::GetUserPath(Common::FS::PathType::UserDir).parent_path() / "probe.now";
+        if (std::filesystem::remove(trigger, error)) {
+            strip_frame = frame; // the frame recorded from now on (FindDisplay counted it)
+            strip_screenshot = true;
+            LOG_WARNING(Render_Vulkan, "DIAG-173: strip of frame {}", strip_frame);
+        }
+        return;
+    }
+    if (strip_frame == ~u64{0}) {
+        return;
+    }
+    if (strip_screenshot && frame == strip_frame + 1) {
+        // This flip shows the frame the strips were taken of.
+        VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::GameOnly);
+        strip_screenshot = false;
+    }
+    const u64 done = r.scheduler.GetWorkSemaphore()->KnownGpuTick();
+    if (frame <= strip_frame + 1 || strip_probes.empty() || strip_probes.back().tick > done) {
+        if (frame > strip_frame + 600) {
+            strip_probes.clear(); // never finished
+            strip_frame = ~u64{0};
+        }
+        return;
+    }
+    const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir);
+    const auto base = fmt::format("strip_{}", strip_frame);
+    std::string index;
+    if (std::FILE* file = std::fopen((dir / (base + ".bin")).string().c_str(), "wb")) {
+        for (const auto& strip : strip_probes) {
+            std::fwrite(strip.buffer->Mapped(), 1, strip.buffer->Size(), file);
+            index += fmt::format("{}{}\n", strip.draw, strip.what);
+        }
+        std::fclose(file);
+    }
+    if (std::FILE* file = std::fopen((dir / (base + ".txt")).string().c_str(), "w")) {
+        std::fwrite(index.data(), 1, index.size(), file);
+        std::fclose(file);
+    }
+    LOG_WARNING(Render_Vulkan, "DIAG-173: {} strips of frame {} written to {}", strip_probes.size(),
+                strip_frame, (dir / base).string());
+    strip_probes.clear();
+    strip_frame = ~u64{0};
+}
+
+void NativeRenderer::ProbeDispatch(const Shader::Info& stage, const DrawBindings& b,
+                                   bool after) {
+    // DIAG-175 (diagnosis, RYGT_PROBE_DISPATCH=<hex program hash>|all,
+    // RYGT_PROBE_DISPATCH_TARGET=<hex address>): for those dispatches, texel (0,0) of the image
+    // it stores to before and after it (mip 0: every layer; mips 1-7: the first 8 layers), the
+    // center texel of the first 6 layers of every mip of the first 2 images it samples, and its
+    // flattened user data, logged once the GPU ran it.
+    static const char* program_env = Common::DiagEnv("RYGT_PROBE_DISPATCH");
+    static const bool any_program = program_env && std::string_view{program_env} == "all";
+    static const u64 program =
+        program_env && *program_env ? u64(std::strtoull(program_env, nullptr, 16)) : u64{0};
+    static const VAddr only = [] {
+        const char* env = Common::DiagEnv("RYGT_PROBE_DISPATCH_TARGET");
+        return env && *env ? VAddr(std::strtoull(env, nullptr, 16)) : VAddr{0};
+    }();
+    if ((!any_program && (program == 0 || stage.pgm_hash != program)) || b.stored.empty() ||
+        dispatch_probes.size() >= 64) {
+        return;
+    }
+    const auto* entry = b.stored[0];
+    if (!entry || !entry->image || entry->info.num_bits != 32 || entry->info.props.is_depth ||
+        (only && entry->info.guest_address != only)) {
+        return;
+    }
+    const u32 layers = std::max<u32>(entry->image->Desc().layers, 1);
+    const u32 mips = std::min<u32>(std::max<u32>(entry->image->Desc().mips, 1), 8);
+    const u32 few = std::min<u32>(layers, 8);
+    const u64 section = (u64(layers) + u64(mips - 1) * few) * 4;
+    const auto copy_texels = [&](const Native::ImageEntry& image, u64 offset, u32 mip,
+                                 u32 count, bool center) {
+        const auto& desc = image.image->Desc();
+        stream.cmd.copyImageToBuffer(
+            vk::Image{Handle<VkImage_T>(image.image->NativeHandle())}, vk::ImageLayout::eGeneral,
+            vk::Buffer{Handle<VkBuffer_T>(dispatch_probes.back().buffer->NativeHandle())},
+            vk::BufferImageCopy{
+                .bufferOffset = offset,
+                .imageSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                  .mipLevel = mip,
+                                  .baseArrayLayer = 0,
+                                  .layerCount = count},
+                .imageOffset = {center ? s32(std::max<u32>(desc.width >> mip, 1) / 2) : 0,
+                                center ? s32(std::max<u32>(desc.height >> mip, 1) / 2) : 0, 0},
+                .imageExtent = {1, 1, 1}});
+    };
+    if (!after) {
+        auto buffer = device->CreateBuffer({.size = section * 2 + 2 * 8 * 6 * 4,
+                                            .usage = Native::Rhi::BufferUsageStorage |
+                                                     Native::Rhi::BufferUsageTransferDst,
+                                            .memory = Native::Rhi::MemoryKind::Readback,
+                                            .name = "dispatch probe"});
+        if (!buffer || !buffer->Mapped()) {
+            return;
+        }
+        std::memset(buffer->Mapped(), 0xee, buffer->Size());
+        std::string what = fmt::format("program {:#x} dims {}x{}x{} flat",
+                                       stage.pgm_hash, r.liverpool->DrawCsRegs().dim_x,
+                                       r.liverpool->DrawCsRegs().dim_y,
+                                       r.liverpool->DrawCsRegs().dim_z);
+        for (size_t i = 0; i < stage.flattened_ud_buf.size() && i < 48; ++i) {
+            what += fmt::format(" {:x}", stage.flattened_ud_buf[i]);
+        }
+        dispatch_probes.push_back({std::move(buffer), 0, layers, mips,
+                                   entry->info.guest_address, std::move(what)});
+        GlobalBarrier();
+        auto& text = dispatch_probes.back().what;
+        text += " | sampled";
+        for (size_t i = 0; i < b.sampled.size() && i < 2; ++i) {
+            const auto* sampled = b.sampled[i];
+            if (!sampled || !sampled->image) {
+                text += " null";
+                continue;
+            }
+            const auto& desc = sampled->image->Desc();
+            text += fmt::format(" {:#x}:{}x{}l{}m{}b{}{}{} v{}", sampled->info.guest_address,
+                                desc.width, desc.height, desc.layers, desc.mips,
+                                sampled->info.num_bits, sampled->from_cpu ? "t" : "",
+                                sampled == entry ? "=stored" : "",
+                                sampled->write_version.load());
+            if (sampled->info.num_bits != 32 || sampled->info.props.is_depth) {
+                continue;
+            }
+            for (u32 mip = 0; mip < std::min<u32>(std::max<u32>(desc.mips, 1), 8); ++mip) {
+                copy_texels(*sampled, section * 2 + (i * 8 + mip) * 24, mip,
+                            std::min<u32>(std::max<u32>(desc.layers, 1), 6), true);
+            }
+        }
+    } else if (dispatch_probes.empty() || dispatch_probes.back().tick != 0 ||
+               dispatch_probes.back().address != entry->info.guest_address) {
+        return;
+    }
+    GlobalBarrier();
+    const u64 base = after ? section : 0;
+    copy_texels(*entry, base, 0, layers, false);
+    for (u32 mip = 1; mip < mips; ++mip) {
+        copy_texels(*entry, base + (u64(layers) + u64(mip - 1) * few) * 4, mip, few, false);
+    }
+    GlobalBarrier();
+    if (after) {
+        dispatch_probes.back().tick = r.scheduler.CurrentTick() + 1;
+    }
+}
+
+void NativeRenderer::ReadDispatchProbes() {
+    const u64 done = r.scheduler.GetWorkSemaphore()->KnownGpuTick();
+    for (auto it = dispatch_probes.begin(); it != dispatch_probes.end();) {
+        if (it->tick == 0 || it->tick > done) {
+            ++it;
+            continue;
+        }
+        it->buffer->Invalidate();
+        const u32* words = reinterpret_cast<const u32*>(it->buffer->Mapped());
+        const u32 few = std::min<u32>(it->layers, 8);
+        const u64 count_per = u64(it->layers) + u64(it->mips - 1) * few;
+        std::string changed, nonzero;
+        u32 total = 0;
+        for (u32 mip = 0; mip < it->mips; ++mip) {
+            const u32 n = mip == 0 ? it->layers : few;
+            const u64 at = mip == 0 ? 0 : u64(it->layers) + u64(mip - 1) * few;
+            u32 count = 0, nz = 0;
+            for (u32 l = 0; l < n; ++l) {
+                const u32 before = words[at + l];
+                const u32 now = words[count_per + at + l];
+                nz += now != 0;
+                if (before != now) {
+                    if (++total <= 10) {
+                        changed += fmt::format(" m{}l{}:{:x}->{:x}", mip, l, before, now);
+                    }
+                    ++count;
+                }
+            }
+            nonzero += fmt::format(" m{}:{}/{}{}", mip, nz, n,
+                                   count ? fmt::format("(+{})", count) : std::string{});
+        }
+        std::string sampled;
+        for (u32 i = 0; i < 2; ++i) {
+            sampled += " /";
+            for (u32 mip = 0; mip < 8; ++mip) {
+                const u32* texels = words + count_per * 2 + (i * 8 + mip) * 6;
+                if (texels[0] == 0xeeeeeeee) {
+                    break;
+                }
+                u32 nz = 0;
+                for (u32 l = 0; l < 6; ++l) {
+                    nz += texels[l] != 0 && texels[l] != 0xeeeeeeee;
+                }
+                sampled += fmt::format(" m{}:{}", mip, nz);
+            }
+        }
+        LOG_WARNING(Render_Vulkan, "DIAG-175: dispatch into {:#x} ({} layers, {} mips): {} "
+                    "changed{} | non-zero after{} | sampled non-zero{} | {}", it->address,
+                    it->layers, it->mips, total, changed, nonzero, sampled, it->what);
+        it = dispatch_probes.erase(it);
+    }
+}
+
+void NativeRenderer::ProbeRefresh(const Native::ImageEntry& texture, const std::string& what) {
+    static const std::pair<u32, u32> size = [] {
+        std::pair<u32, u32> wh{};
+        if (const char* env = Common::DiagEnv("RYGT_DIAG_REFRESH_READ"); env && *env) {
+            std::sscanf(env, "%ux%u", &wh.first, &wh.second);
+        }
+        return wh;
+    }();
+    if (size.first == 0 || texture.info.size.width != size.first ||
+        texture.info.size.height != size.second || texture.info.num_bits != 32 ||
+        refresh_probes.size() >= 64) {
+        return;
+    }
+    const u64 bytes = u64(size.first) * size.second * 4;
+    auto buffer = device->CreateBuffer({.size = bytes,
+                                        .usage = Native::Rhi::BufferUsageStorage |
+                                                 Native::Rhi::BufferUsageTransferDst,
+                                        .memory = Native::Rhi::MemoryKind::Readback,
+                                        .name = "refresh probe"});
+    if (!buffer || !buffer->Mapped()) {
+        return;
+    }
+    GlobalBarrier();
+    stream.cmd.copyImageToBuffer(
+        vk::Image{Handle<VkImage_T>(texture.image->NativeHandle())}, vk::ImageLayout::eGeneral,
+        vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
+        vk::BufferImageCopy{.bufferOffset = 0,
+                            .imageSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                              .mipLevel = 0,
+                                              .baseArrayLayer = 0,
+                                              .layerCount = 1},
+                            .imageOffset = {0, 0, 0},
+                            .imageExtent = {size.first, size.second, 1}});
+    GlobalBarrier();
+    refresh_probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, frame,
+                              fmt::format("{:#x} {}x{} {} <-{}", texture.info.guest_address,
+                                          size.first, size.second,
+                                          vk::to_string(texture.info.pixel_format), what)});
+}
+
+void NativeRenderer::CompareRegion(VAddr base, u64 size, u32 stride, vk::Buffer buffer,
+                                   u64 offset, u64 program, bool always) {
+    // DIAG-211 (diagnosis, RYGT_DIAG_REGION_COMPARE=1 with SHADGT_WATCH_SHADERS): each distinct
+    // region buffer a watched shader reads (up to 24 a frame), copied from the region right
+    // where the draw reads it, compared with guest memory as it was when the draw was recorded.
+    static const bool on = Common::DiagEnv("RYGT_DIAG_REGION_COMPARE") != nullptr;
+    // RYGT_DIAG_REGION_COMPARE=4: indirect arguments only (nothing else queued to crowd them out).
+    static const bool args_only = [] {
+        const char* env = Common::DiagEnv("RYGT_DIAG_REGION_COMPARE");
+        return env && env[0] == '4';
+    }();
+    if (!on || size == 0 || size > 512_KB || (args_only && !always) ||
+        region_compares.size() >= (always ? 2048u : 256u)) {
+        return;
+    }
+    static u64 seen_frame = ~u64{0};
+    static std::vector<VAddr> seen;
+    if (seen_frame != frame) {
+        seen_frame = frame;
+        seen.clear();
+    }
+    // RYGT_DIAG_REGION_COMPARE=3: every 10th frame, records of 144 bytes (GT7's crowd
+    // instances) are copied at every draw that reads them, each compared with the frame's first.
+    static const bool every_draw = [] {
+        const char* env = Common::DiagEnv("RYGT_DIAG_REGION_COMPARE");
+        return env && env[0] == '3';
+    }();
+    const bool every = every_draw && stride == 144 && frame % 10 == 0;
+    if (!always && !every &&
+        (seen.size() >= 24 || std::ranges::find(seen, base) != seen.end())) {
+        return;
+    }
+    if (!always && !every) {
+        seen.push_back(base);
+    }
+    std::vector<u8> cpu(size);
+    if (!Core::RytyMemory::GuardedCopy(cpu.data(), reinterpret_cast<const void*>(base), size)) {
+        return;
+    }
+    auto readback = device->CreateBuffer({.size = size,
+                                          .usage = Native::Rhi::BufferUsageStorage |
+                                                   Native::Rhi::BufferUsageTransferDst,
+                                          .memory = Native::Rhi::MemoryKind::Readback,
+                                          .name = "region compare"});
+    if (!readback || !readback->Mapped()) {
+        return;
+    }
+    Begin();
+    GlobalBarrier(); // the region's copy-ins are done
+    stream.cmd.copyBuffer(buffer, vk::Buffer{Handle<VkBuffer_T>(readback->NativeHandle())},
+                          vk::BufferCopy{.srcOffset = offset, .dstOffset = 0, .size = size});
+    GlobalBarrier();
+    // Per page: frames since the CPU last wrote it (FIX-194's cpu_pages), '-' if not known.
+    std::string pages;
+    if (Region* region = RegionOver(base, size)) {
+        for (VAddr page = Common::AlignDown(base, 4096); page < base + size; page += 4096) {
+            const auto it = region->cpu_pages->find(page);
+            pages += it == region->cpu_pages->end() ? std::string{" -"}
+                                                   : fmt::format(" {}", frame - it->second);
+        }
+    }
+    region_compares.push_back({std::move(readback), r.scheduler.CurrentTick() + 1, frame, base,
+                               size, std::max<u32>(stride, 16), std::move(cpu),
+                               fmt::format("program {:#x}, pages since CPU write:{}", program,
+                                           pages),
+                               always});
+}
+
+void NativeRenderer::CaptureImage(const Native::ImageEntry& entry, u64 at_frame,
+                                  const std::string& what) {
+    // DIAG-212 (diagnosis): mip 0 layer 0 of a 32-bit picture, copied where the work stands now.
+    if (!entry.image || entry.info.num_bits != 32 || captures.size() >= 12) {
+        return;
+    }
+    const auto& desc = entry.image->Desc();
+    const u64 bytes = u64(desc.width) * desc.height * 4;
+    auto buffer = device->CreateBuffer({.size = bytes,
+                                        .usage = Native::Rhi::BufferUsageStorage |
+                                                 Native::Rhi::BufferUsageTransferDst,
+                                        .memory = Native::Rhi::MemoryKind::Readback,
+                                        .name = "frame capture"});
+    if (!buffer || !buffer->Mapped()) {
+        return;
+    }
+    Begin();
+    GlobalBarrier();
+    stream.cmd.copyImageToBuffer(
+        vk::Image{Handle<VkImage_T>(entry.image->NativeHandle())}, vk::ImageLayout::eGeneral,
+        vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
+        vk::BufferImageCopy{.bufferOffset = 0,
+                            .imageSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                              .mipLevel = 0,
+                                              .baseArrayLayer = 0,
+                                              .layerCount = 1},
+                            .imageOffset = {0, 0, 0},
+                            .imageExtent = {desc.width, desc.height, 1}});
+    GlobalBarrier();
+    captures.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, at_frame, what,
+                        u32(desc.width), u32(desc.height), static_cast<u32>(desc.format)});
+}
+
+void NativeRenderer::WriteCaptures() {
+    const u64 done = r.scheduler.GetWorkSemaphore()->KnownGpuTick();
+    for (auto it = captures.begin(); it != captures.end();) {
+        if (it->tick > done) {
+            ++it;
+            continue;
+        }
+        it->buffer->Invalidate();
+        const auto path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) /
+                          fmt::format("cap_{}_{}_{}x{}_{}.bin", it->frame, it->what, it->width,
+                                      it->height,
+                                      vk::to_string(static_cast<vk::Format>(it->format)));
+        if (std::FILE* file = std::fopen(path.string().c_str(), "wb")) {
+            std::fwrite(it->buffer->Mapped(), 1, it->buffer->Size(), file);
+            std::fclose(file);
+        }
+        LOG_WARNING(Render_Vulkan, "DIAG-212: frame {} {} written to {}", it->frame, it->what,
+                    path.string());
+        it = captures.erase(it);
+    }
+}
+
+namespace {
+// DIAG-237 (diagnosis): flattened dwords of hull shaders as copied when the draw was recorded.
+struct StaleFlat {
+    u64 program;
+    u64 frame;
+    std::vector<std::pair<VAddr, u32>> words;
+};
+std::vector<StaleFlat> g_stale_flats;
+} // namespace
+
+void NativeRenderer::NoteStaleFlats(const Shader::Info& stage) {
+    // DIAG-237 (diagnosis, RYGT_DIAG_STALE_FLATS=1): at the end of the frame, whether guest memory
+    // still holds what hull shaders' flattened constants were copied from when recorded.
+    static const bool on = Common::DiagEnv("RYGT_DIAG_STALE_FLATS") != nullptr;
+    if (!on || stage.sw_stage != Shader::SwStage::TessellationControl || g_stale_flats.size() >= 64) {
+        return;
+    }
+    const auto& src = stage.flattened_ud_src;
+    const auto& flat = stage.flattened_ud_buf;
+    StaleFlat note{stage.pgm_hash, frame, {}};
+    for (size_t i = 0; i < src.size() && i < flat.size(); ++i) {
+        if (src[i] != 0) {
+            note.words.emplace_back(src[i], flat[i]);
+        }
+    }
+    g_stale_flats.push_back(std::move(note));
+}
+
+void NativeRenderer::CheckStaleFlats() {
+    static u32 logged = 0;
+    for (const auto& note : g_stale_flats) {
+        u32 changed = 0;
+        std::string first;
+        for (const auto& [address, value] : note.words) {
+            u32 now = 0;
+            if (Core::RytyMemory::GuardedCopy(&now, reinterpret_cast<const void*>(address), 4) &&
+                now != value) {
+                if (changed < 6) {
+                    first += fmt::format(" {:#x}:{:08x}->{:08x}", address, value, now);
+                }
+                ++changed;
+            }
+        }
+        if (logged < 300 && (changed != 0 || logged % 50 == 0)) {
+            ++logged;
+            LOG_WARNING(Render_Vulkan, "DIAG-237: frame {} hs {:#x}: {} of {} flattened dwords "
+                        "changed in memory since recorded{}",
+                        note.frame, note.program, changed, note.words.size(), first);
+        }
+    }
+    g_stale_flats.clear();
+}
+
+void NativeRenderer::CompareFlatSources(const Shader::Info& stage) {
+    // DIAG-211 (diagnosis, RYGT_DIAG_REGION_COMPARE=1 with SHADGT_WATCH_SHADERS): every 10th
+    // frame, each run of flattened dwords read from inside a region, as the region holds it right
+    // where the draw runs, against the dwords the CPU walk copied.
+    static const bool on = [] {
+        const char* env = Common::DiagEnv("RYGT_DIAG_REGION_COMPARE");
+        return env != nullptr && env[0] != '4';
+    }();
+    const auto& src = stage.flattened_ud_src;
+    const auto& flat = stage.flattened_ud_buf;
+    if (!on || frame % 10 != 0 || src.size() != flat.size()) {
+        return;
+    }
+    for (size_t i = 0; i < src.size() && region_compares.size() < 256;) {
+        size_t j = i + 1;
+        while (j < src.size() && src[j] != 0 && src[j] == src[j - 1] + 4) {
+            ++j;
+        }
+        const VAddr at = src[i];
+        const u64 bytes = u64(j - i) * 4;
+        Region* region = at != 0 ? RegionOver(at, bytes) : nullptr;
+        if (region && at >= region->begin && at + bytes <= region->end) {
+            auto readback = device->CreateBuffer({.size = bytes,
+                                                  .usage = Native::Rhi::BufferUsageStorage |
+                                                           Native::Rhi::BufferUsageTransferDst,
+                                                  .memory = Native::Rhi::MemoryKind::Readback,
+                                                  .name = "flat compare"});
+            if (readback && readback->Mapped()) {
+                Begin();
+                GlobalBarrier();
+                stream.cmd.copyBuffer(
+                    vk::Buffer{Handle<VkBuffer_T>(region->buffer->NativeHandle())},
+                    vk::Buffer{Handle<VkBuffer_T>(readback->NativeHandle())},
+                    vk::BufferCopy{.srcOffset = at - region->begin, .dstOffset = 0, .size = bytes});
+                GlobalBarrier();
+                std::vector<u8> walked(bytes);
+                std::memcpy(walked.data(), flat.data() + i, bytes);
+                region_compares.push_back(
+                    {std::move(readback), r.scheduler.CurrentTick() + 1, frame, at, bytes, 4,
+                     std::move(walked),
+                     fmt::format("flat dwords {}..{} of program {:#x} (walked, not memory)", i,
+                                 j - 1, stage.pgm_hash)});
+            }
+        }
+        i = j;
+    }
+}
+
+void NativeRenderer::ReadRegionCompares() {
+    const u64 done = r.scheduler.GetWorkSemaphore()->KnownGpuTick();
+    static u64 same = 0, differ = 0;
+    for (auto it = region_compares.begin(); it != region_compares.end();) {
+        if (it->tick > done) {
+            ++it;
+            continue;
+        }
+        it->buffer->Invalidate();
+        const u8* gpu = static_cast<const u8*>(it->buffer->Mapped());
+        const u64 records = it->size / it->stride;
+        u64 bad = 0;
+        s64 first = -1;
+        for (u64 i = 0; i < records; ++i) {
+            if (std::memcmp(gpu + i * it->stride, it->cpu.data() + i * it->stride, it->stride) != 0) {
+                bad += 1;
+                first = first < 0 ? s64(i) : first;
+            }
+        }
+        if (it->always) {
+            // Indirect arguments: each draw's (index count, instances, first index, base vertex,
+            // first instance) as the GPU read them, '*' where guest memory held other words.
+            std::string draws;
+            for (u64 i = 0; i < std::min<u64>(records, 16); ++i) {
+                std::array<u32, 5> g{}, c{};
+                const u64 at = i * it->stride;
+                const u64 n = std::min<u64>(20, it->size - at);
+                std::memcpy(g.data(), gpu + at, n);
+                std::memcpy(c.data(), it->cpu.data() + at, n);
+                draws += fmt::format(" [{} {} {} {} {}{}]", g[0], g[1], g[2], g[3], g[4],
+                                     g == c ? "" : "*");
+            }
+            LOG_WARNING(Render_Vulkan, "DIAG-211: frame {} arguments {:#x} ({} draws, {} differ "
+                        "from memory):{}; {}", it->frame, it->address, records, bad, draws,
+                        it->what);
+            it = region_compares.erase(it);
+            continue;
+        }
+        // RYGT_DIAG_REGION_COMPARE=3: each later read of the frame against its first one.
+        static const bool every_draw = [] {
+            const char* env = Common::DiagEnv("RYGT_DIAG_REGION_COMPARE");
+            return env && env[0] == '3';
+        }();
+        if (every_draw && it->stride == 144 && it->frame % 10 == 0) {
+            static std::map<std::pair<u64, VAddr>, std::pair<std::vector<u8>, u32>> firsts;
+            auto [first_read, inserted] =
+                firsts.try_emplace({it->frame, it->address}, std::vector<u8>{}, 0u);
+            ++first_read->second.second;
+            if (inserted) {
+                first_read->second.first.assign(gpu, gpu + it->size);
+            } else if (first_read->second.first.size() == it->size) {
+                const u8* base_bytes = first_read->second.first.data();
+                u64 moved = 0;
+                std::string text;
+                for (u64 i = 0; i < records; ++i) {
+                    if (std::memcmp(gpu + i * 144, base_bytes + i * 144, 144) == 0) {
+                        continue;
+                    }
+                    if (++moved <= 3) {
+                        text += fmt::format(" rec {}:", i);
+                        u32 listed = 0;
+                        for (u64 d = 0; d < 36 && listed < 6; ++d) {
+                            u32 now, then;
+                            std::memcpy(&now, gpu + i * 144 + d * 4, 4);
+                            std::memcpy(&then, base_bytes + i * 144 + d * 4, 4);
+                            if (now != then) {
+                                ++listed;
+                                text += fmt::format(" d{} {:08x}->{:08x}", d, then, now);
+                            }
+                        }
+                    }
+                }
+                if (moved != 0) {
+                    LOG_WARNING(Render_Vulkan, "DIAG-211: frame {} {:#x} read {} of the frame: {} of "
+                                "{} records differ from its first read:{}", it->frame,
+                                it->address, first_read->second.second, moved, records, text);
+                }
+            }
+            while (firsts.size() > 64) {
+                firsts.erase(firsts.begin());
+            }
+        }
+        // RYGT_DIAG_REGION_COMPARE=2: records of 144 bytes (GT7's crowd instances) as the GPU
+        // read them, every 10th frame: dwords 33 and 34 (the SH probe index) and a short hash.
+        static const bool dump_records = [] {
+            const char* env = Common::DiagEnv("RYGT_DIAG_REGION_COMPARE");
+            return env && env[0] == '2';
+        }();
+        if (dump_records && it->stride == 144 && it->frame % 10 == 0) {
+            std::string text;
+            for (u64 i = 0; i < records; ++i) {
+                u32 d33, d34;
+                std::memcpy(&d33, gpu + i * 144 + 33 * 4, 4);
+                std::memcpy(&d34, gpu + i * 144 + 34 * 4, 4);
+                text += fmt::format(" {:x},{:x},{:04x}", d33, d34,
+                                    u32(XXH3_64bits(gpu + i * 144, 128) & 0xffff));
+            }
+            LOG_WARNING(Render_Vulkan, "DIAG-211: frame {} records {:#x} ({}):{}", it->frame,
+                        it->address, records, text);
+        }
+        if (bad == 0) {
+            ++same;
+        } else {
+            ++differ;
+            // Which dwords of the first differing records differ, region against memory.
+            std::string dwords;
+            u32 shown = 0;
+            for (u64 i = u64(first); i < records && shown < 3; ++i) {
+                const u64 base_at = i * it->stride;
+                if (std::memcmp(gpu + base_at, it->cpu.data() + base_at, it->stride) == 0) {
+                    continue;
+                }
+                ++shown;
+                dwords += fmt::format(" rec {}:", i);
+                u32 listed = 0;
+                for (u64 d = 0; d < it->stride / 4 && listed < 8; ++d) {
+                    u32 g, c;
+                    std::memcpy(&g, gpu + base_at + d * 4, 4);
+                    std::memcpy(&c, it->cpu.data() + base_at + d * 4, 4);
+                    if (g != c) {
+                        ++listed;
+                        dwords += fmt::format(" d{} {:08x}/{:08x}", d, g, c);
+                    }
+                }
+            }
+            LOG_WARNING(Render_Vulkan, "DIAG-211: frame {} {:#x} differing dwords (region/memory):{}",
+                        it->frame, it->address, dwords);
+            const u64 at = u64(first) * it->stride;
+            const auto words = [&](const u8* bytes) {
+                std::array<u32, 4> w{};
+                std::memcpy(w.data(), bytes + at, std::min<u64>(16, it->size - at));
+                return fmt::format("{:08x} {:08x} {:08x} {:08x}", w[0], w[1], w[2], w[3]);
+            };
+            LOG_WARNING(Render_Vulkan, "DIAG-211: frame {} {:#x}+{:#x} stride {}: {} of {} records "
+                        "differ, first {} (region {} | memory {}); {}; so far {} buffers same, {} "
+                        "differ", it->frame, it->address, it->size, it->stride, bad, records,
+                        first, words(gpu), words(it->cpu.data()), it->what, same, differ);
+        }
+        it = region_compares.erase(it);
+    }
+}
+
+void NativeRenderer::ReadRefreshProbes() {
+    const u64 done = r.scheduler.GetWorkSemaphore()->KnownGpuTick();
+    for (auto it = refresh_probes.begin(); it != refresh_probes.end();) {
+        if (it->tick > done) {
+            ++it;
+            continue;
+        }
+        it->buffer->Invalidate();
+        const u64 count = it->buffer->Size() / 4;
+        const float* values = reinterpret_cast<const float*>(it->buffer->Mapped());
+        u64 non_finite = 0, huge = 0, zero = 0;
+        float lo = std::numeric_limits<float>::max(), hi = 0.0f;
+        for (u64 i = 0; i < count; ++i) {
+            const float v = values[i];
+            if (!std::isfinite(v)) {
+                ++non_finite;
+                continue;
+            }
+            huge += std::abs(v) > 1e6f;
+            zero += v == 0.0f;
+            lo = std::min(lo, v);
+            hi = std::max(hi, v);
+        }
+        if (it->what.starts_with("vertex floats")) {
+            // DIAG-208: as floats, 4 to a group.
+            std::string text;
+            for (u64 i = 0; i < std::min<u64>(count, 512); ++i) {
+                text += fmt::format("{}{:g}", i % 4 == 0 ? " |" : " ", values[i]);
+            }
+            LOG_WARNING(Render_Vulkan, "DIAG-208: frame {} {}:{}", it->frame, it->what, text);
+            it = refresh_probes.erase(it);
+            continue;
+        }
+        if (it->what.starts_with("region words")) {
+            const u32* words = reinterpret_cast<const u32*>(values);
+            std::string text;
+            for (u64 i = 0; i < std::min<u64>(it->buffer->Size() / 4, 8); ++i) {
+                text += fmt::format(" {:08x}", words[i]);
+            }
+            LOG_WARNING(Render_Vulkan, "DIAG-187: frame {} {}:{}", it->frame, it->what, text);
+            it = refresh_probes.erase(it);
+            continue;
+        }
+        if (it->what.starts_with("GPU picture")) {
+            const u16* halves = reinterpret_cast<const u16*>(values);
+            std::string text;
+            for (u64 i = 0; i < std::min<u64>(it->buffer->Size() / 2, 16); ++i) {
+                text += fmt::format(" {:04x}", halves[i]);
+            }
+            LOG_WARNING(Render_Vulkan, "DIAG-184: frame {} {}: halves{}", it->frame, it->what, text);
+            it = refresh_probes.erase(it);
+            continue;
+        }
+        static u32 logged = 0;
+        if (++logged <= 400 || huge != 0 || non_finite != 0) {
+            LOG_WARNING(Render_Vulkan, "DIAG-179: frame {} {}: min {} max {}, {} huge, {} Inf/NaN, "
+                        "{} zero of {}; first {:08x} {:08x} {:08x} {:08x}", it->frame, it->what, lo,
+                        hi, huge, non_finite, zero, count,
+                        reinterpret_cast<const u32*>(values)[0],
+                        reinterpret_cast<const u32*>(values)[1],
+                        reinterpret_cast<const u32*>(values)[2],
+                        reinterpret_cast<const u32*>(values)[3]);
+        }
+        it = refresh_probes.erase(it);
+    }
+}
+
+void NativeRenderer::ProbeVolume() {
+    static const VAddr address = [] {
+        const char* env = Common::DiagEnv("RYGT_DIAG_VOLUME");
+        return env && *env ? VAddr(std::strtoull(env, nullptr, 16)) : VAddr{0};
+    }();
+    if (address == 0) {
+        return;
+    }
+    if (volume_probe && volume_tick != 0 &&
+        volume_tick <= r.scheduler.GetWorkSemaphore()->KnownGpuTick()) {
+        volume_probe->Invalidate();
+        const u16* halves = reinterpret_cast<const u16*>(volume_probe->Mapped());
+        const auto to_float = [](u16 h) {
+            const u32 e = (h >> 10) & 0x1f, m = h & 0x3ff;
+            const float v = e == 0 ? std::ldexp(float(m), -24)
+                                   : std::ldexp(1.0f + float(m) / 1024.0f, int(e) - 15);
+            return (h & 0x8000) ? -v : v;
+        };
+        std::string text;
+        u64 bad_total = 0;
+        for (u32 z = 0; z < volume_depth; ++z) {
+            u32 bad = 0, zero = 0;
+            float hi = 0.0f;
+            for (u32 i = 0; i < volume_width * volume_height; ++i) {
+                const u16* texel = halves + (u64(z) * volume_width * volume_height + i) * 4;
+                bool texel_bad = false, texel_zero = true;
+                for (u32 c = 0; c < 3; ++c) {
+                    const u16 h = texel[c];
+                    if (((h >> 10) & 0x1f) == 31) {
+                        texel_bad = true;
+                        continue;
+                    }
+                    const float v = std::abs(to_float(h));
+                    texel_bad |= v > 64.0f;
+                    texel_zero &= v == 0.0f;
+                    hi = std::max(hi, v);
+                }
+                bad += texel_bad;
+                zero += texel_zero;
+            }
+            bad_total += bad;
+            if (bad != 0 || z % 16 == 0 || z == volume_depth - 1) {
+                text += fmt::format(" z{}:{}bad/{}zero/max{:.2f}", z, bad, zero, hi);
+            }
+        }
+        LOG_WARNING(Render_Vulkan, "DIAG-180: frame {} volume {:#x} {}x{}x{}: {} bad texels;{}",
+                    frame, address, volume_width, volume_height, volume_depth, bad_total, text);
+        // The whole volume, once, to compare runs (user\log\volume_<frame>.bin).
+        static bool written = false;
+        if (!written && frame >= 2000) {
+            written = true;
+            const auto path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) /
+                              fmt::format("volume_{}.bin", frame);
+            if (std::FILE* file = std::fopen(path.string().c_str(), "wb")) {
+                std::fwrite(halves, 1, u64(volume_width) * volume_height * volume_depth * 8, file);
+                std::fclose(file);
+            }
+        }
+        volume_tick = 0;
+    }
+    if (frame % 300 != 0 || volume_tick != 0) {
+        return;
+    }
+    Native::ImageEntry* entry = registry->FindExisting(
+        address, [](const Native::ImageEntry& e) { return !e.from_cpu && e.image != nullptr; });
+    if (!entry || entry->info.num_bits != 64) {
+        return;
+    }
+    const auto& desc = entry->image->Desc();
+    volume_width = desc.width;
+    volume_height = desc.height;
+    volume_depth = std::max<u32>(desc.depth, 1);
+    const u64 bytes = u64(volume_width) * volume_height * volume_depth * 8;
+    if (!volume_probe || volume_probe->Size() < bytes) {
+        volume_probe = device->CreateBuffer({.size = bytes,
+                                             .usage = Native::Rhi::BufferUsageStorage |
+                                                      Native::Rhi::BufferUsageTransferDst,
+                                             .memory = Native::Rhi::MemoryKind::Readback,
+                                             .name = "volume probe"});
+    }
+    if (!volume_probe || !volume_probe->Mapped()) {
+        return;
+    }
+    Begin();
+    GlobalBarrier();
+    stream.cmd.copyImageToBuffer(
+        vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())}, vk::ImageLayout::eGeneral,
+        vk::Buffer{Handle<VkBuffer_T>(volume_probe->NativeHandle())},
+        vk::BufferImageCopy{.bufferOffset = 0,
+                            .imageSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                              .mipLevel = 0,
+                                              .baseArrayLayer = 0,
+                                              .layerCount = 1},
+                            .imageOffset = {0, 0, 0},
+                            .imageExtent = {volume_width, volume_height, volume_depth}});
+    GlobalBarrier();
+    volume_tick = r.scheduler.CurrentTick() + 1;
+}
+
+void NativeRenderer::NoteProgramTextures(u64 program, const DrawBindings& b) {
+    static const u64 watched = [] {
+        const char* env = Common::DiagEnv("RYGT_DIAG_PROGRAM_TEXTURES");
+        return env && *env ? u64(std::strtoull(env, nullptr, 16)) : u64{0};
+    }();
+    if (watched == 0 || program != watched) {
+        return;
+    }
+    for (const auto* sampled : b.sampled) {
+        if (sampled && sampled->info.guest_size <= 4096 &&
+            std::ranges::find(diag_program_textures, sampled) == diag_program_textures.end() &&
+            diag_program_textures.size() < 16) {
+            diag_program_textures.push_back(const_cast<Native::ImageEntry*>(sampled));
+            PrintHistory(sampled->info.guest_address,
+                         std::max<u64>(sampled->info.guest_size, 1)); // DIAG-187
+            if (const u64 watched_at = HwWatchAddress();
+                watched_at >= sampled->info.guest_address &&
+                watched_at < sampled->info.guest_address + sampled->info.guest_size) {
+                RytyWatchDump(fmt::format("texture {:#x} (frame {})", sampled->info.guest_address,
+                                          frame)); // DIAG-193
+            }
+            // DIAG-195 (diagnosis): the other pictures over its memory, and when they were used.
+            registry->ForEachOverlapping(
+                sampled->info.guest_address,
+                sampled->info.guest_address + std::max<u64>(sampled->info.guest_size, 1),
+                [&](Native::ImageEntry& other) {
+                    if (&other == sampled) {
+                        return;
+                    }
+                    LOG_WARNING(Render_Vulkan, "DIAG-195: {:#x} 4x4 lies in {} {:#x}+{:#x} {}x{} {} "
+                                "mips {} layers {}, made frame {}, last used frame {}",
+                                sampled->info.guest_address, other.from_cpu ? "texture" : "target",
+                                other.info.guest_address, other.info.guest_size,
+                                other.info.size.width, other.info.size.height,
+                                vk::to_string(other.info.pixel_format), other.info.resources.levels,
+                                other.info.resources.layers, other.made_frame,
+                                other.last_use.load());
+                });
+            LOG_WARNING(Render_Vulkan, "DIAG-192: {:#x}: tile mode {} array mode {} pitch {} "
+                        "tiled {} guest size {:#x} mips {} alt tile {}",
+                        sampled->info.guest_address, u32(sampled->info.tile_mode),
+                        u32(sampled->info.array_mode), sampled->info.pitch,
+                        u32(sampled->info.props.is_tiled), sampled->info.guest_size,
+                        sampled->info.resources.levels, u32(sampled->info.alt_tile));
+            // DIAG-192 (diagnosis): all of its memory, as halves, 32 bytes a line.
+            std::array<u16, 16> line{};
+            for (u64 at = 0; at < std::min<u64>(sampled->info.guest_size, 1024); at += 32) {
+                if (!Core::RytyMemory::GuardedCopy(
+                        line.data(),
+                        reinterpret_cast<const void*>(sampled->info.guest_address + at), 32)) {
+                    break;
+                }
+                std::string text;
+                for (const u16 half : line) {
+                    text += fmt::format(" {:04x}", half);
+                }
+                LOG_WARNING(Render_Vulkan, "DIAG-192: {:#x}+{:03x}:{}", sampled->info.guest_address,
+                            at, text);
+            }
+            LOG_WARNING(Render_Vulkan, "DIAG-184: frame {} program {:#x} samples {} {:#x} {}x{} "
+                        "{}; memory {}", frame, program, sampled->from_cpu ? "texture" : "target",
+                        sampled->info.guest_address, sampled->info.size.width,
+                        sampled->info.size.height, vk::to_string(sampled->info.pixel_format),
+                        Native::WatchedBytes(sampled->info.guest_address));
+        }
+    }
+}
+
+static bool WriteHistoryOn() {
+    static const bool on = Common::DiagEnv("RYGT_DIAG_WRITE_HISTORY") != nullptr;
+    return on;
+}
+
+void NativeRenderer::NoteHistory(VAddr begin, u64 size, u32 kind, u64 program) {
+    if (!WriteHistoryOn()) {
+        return;
+    }
+    constexpr u64 Capacity = 1ull << 22;
+    // RYGT_DIAG_HISTORY_RANGES=<hex address>+<hex size>,...: notes over these are kept from the
+    // start too (the ring holds the last few hundred frames).
+    const auto& kept_ranges = HistoryRanges();
+    std::scoped_lock lock{write_history_mutex};
+    if (write_history.empty()) {
+        write_history.resize(Capacity);
+    }
+    write_history[write_history_count++ % Capacity] = {begin, size, frame, program, kind};
+    for (const auto& [from, to] : kept_ranges) {
+        if (begin < to && begin + std::max<u64>(size, 1) > from && kept_history.size() < 100000) {
+            kept_history.push_back({begin, size, frame, program, kind});
+            break;
+        }
+    }
+}
+
+const std::vector<std::pair<VAddr, VAddr>>& NativeRenderer::HistoryRanges() {
+    static const std::vector<std::pair<VAddr, VAddr>> kept_ranges = [] {
+        std::vector<std::pair<VAddr, VAddr>> list;
+        const char* env = Common::DiagEnv("RYGT_DIAG_HISTORY_RANGES");
+        for (const char* at = env; at && *at;) {
+            char* end = nullptr;
+            const VAddr from = std::strtoull(at, &end, 16);
+            if (end == at || *end != '+') {
+                break;
+            }
+            at = end + 1;
+            const u64 length = std::strtoull(at, &end, 16);
+            list.emplace_back(from, from + std::max<u64>(length, 1));
+            at = *end == ',' ? end + 1 : end;
+        }
+        return list;
+    }();
+    return kept_ranges;
+}
+
+void NativeRenderer::WatchHistoryRanges() {
+    // DIAG-187: the kept ranges' pages are watched every frame, so every CPU write there faults
+    // (and is noted, with where it wrote) from the start.
+    if (!WriteHistoryOn()) {
+        return;
+    }
+    for (const auto& [from, to] : HistoryRanges()) {
+        if (r.IsMapped(from, to - from)) {
+            WatchPages(from, to - from);
+        }
+    }
+    // DIAG-214 (diagnosis): a frame dump also prints the kept ranges' histories.
+    static u64 printed_at = 0;
+    if (r.FrameDumpCollecting() && frame > printed_at + 30) {
+        printed_at = frame;
+        for (const auto& [from, to] : HistoryRanges()) {
+            PrintHistory(from, to - from);
+        }
+    }
+}
+
+void NativeRenderer::PrintHistory(VAddr begin, u64 size) {
+    if (!WriteHistoryOn()) {
+        return;
+    }
+    static constexpr std::array<const char*, 15> kinds{
+        "draw into target", "depth target",     "image store",         "storage buffer",
+        "fill",             "copy",             "inline write",        "CPU write fault",
+        "target written back", "region written back", "region made",   "region dropped",
+        "mirror made",      "draw came in for target", "draw came in for depth"};
+    std::scoped_lock lock{write_history_mutex};
+    u32 kept_lines = 0;
+    for (const WriteNote& n : kept_history) {
+        if (n.begin < begin + size && n.begin + std::max<u64>(n.size, 1) > begin &&
+            kept_lines++ < 200) {
+            LOG_WARNING(Render_Vulkan, "DIAG-187:   (from the start) frame {} {} {:#x}+{:#x} "
+                        "program {:#x}", n.frame, n.kind < kinds.size() ? kinds[n.kind] : "?",
+                        n.begin, n.size, n.program);
+        }
+    }
+    const u64 capacity = write_history.size();
+    const u64 kept = std::min<u64>(write_history_count, capacity);
+    std::vector<const WriteNote*> hits; // newest first
+    for (u64 i = 0; i < kept; ++i) {
+        const WriteNote& note = write_history[(write_history_count - 1 - i) % capacity];
+        if (note.begin < begin + size && note.begin + std::max<u64>(note.size, 1) > begin) {
+            hits.push_back(&note);
+        }
+    }
+    LOG_WARNING(Render_Vulkan, "DIAG-187: frame {} {:#x}+{:#x}: {} of the last {} noted writes "
+                "over it (since frame {})", frame, begin, size, hits.size(), kept,
+                kept ? write_history[(write_history_count - kept) % capacity].frame : 0);
+    for (u64 i = 0; i < hits.size(); ++i) {
+        if (i >= 40 && i + 20 < hits.size()) {
+            continue; // the newest 40 and the oldest 20
+        }
+        const WriteNote& n = *hits[i];
+        LOG_WARNING(Render_Vulkan, "DIAG-187:   frame {} {} {:#x}+{:#x} program {:#x}", n.frame,
+                    n.kind < kinds.size() ? kinds[n.kind] : "?", n.begin, n.size, n.program);
+    }
+}
+
+void NativeRenderer::NoteProgramTextureWrite(VAddr address, u64 size, const char* kind) {
+    if (diag_program_textures.empty() || diag185_lines >= 200) {
+        return;
+    }
+    for (const auto* entry : diag_program_textures) {
+        const VAddr begin = entry->info.guest_address;
+        const VAddr end = begin + std::max<u64>(entry->info.guest_size, 1);
+        if (address < end && address + size > begin) {
+            ++diag185_lines;
+            LOG_WARNING(Render_Vulkan, "DIAG-185: frame {} {} {:#x}+{:#x} over texture {:#x} "
+                        "{}x{} ({}); memory {}", frame, kind, address, size, begin,
+                        entry->info.size.width, entry->info.size.height, diag_what,
+                        Native::WatchedBytes(begin));
+            return;
+        }
+    }
+}
+
+void NativeRenderer::NoteProgramTextureWrites(const Targets* targets, const DrawBindings& b) {
+    if (diag_program_textures.empty()) {
+        return;
+    }
+    if (targets) {
+        for (const auto* color : targets->colors) {
+            if (color) {
+                NoteProgramTextureWrite(color->info.guest_address,
+                                        std::max<u64>(color->info.guest_size, 1),
+                                        "draw into target");
+            }
+        }
+        if (targets->depth) {
+            NoteProgramTextureWrite(targets->depth->info.guest_address,
+                                    std::max<u64>(targets->depth->info.guest_size, 1),
+                                    "depth target");
+        }
+    }
+    for (const auto* stored : b.stored) {
+        if (stored) {
+            NoteProgramTextureWrite(stored->info.guest_address,
+                                    std::max<u64>(stored->info.guest_size, 1), "image store");
+        }
+    }
+    for (const auto& [address, size] : b.gpu_writes) {
+        NoteProgramTextureWrite(address, size, "storage buffer");
+    }
+}
+
+void NativeRenderer::ReportProgramTextures() {
+    if (diag_program_textures.empty() || frame % 120 != 0) {
+        return;
+    }
+    for (auto* entry : diag_program_textures) {
+        // The picture on the GPU too (DIAG-179's read-back, logged with its words).
+        if (entry->image && entry->info.num_bits == 64 && refresh_probes.size() < 64) {
+            const auto& desc = entry->image->Desc();
+            const u64 bytes = u64(desc.width) * desc.height * 8;
+            auto buffer = device->CreateBuffer({.size = bytes,
+                                                .usage = Native::Rhi::BufferUsageStorage |
+                                                         Native::Rhi::BufferUsageTransferDst,
+                                                .memory = Native::Rhi::MemoryKind::Readback,
+                                                .name = "program texture probe"});
+            if (buffer && buffer->Mapped()) {
+                Begin();
+                GlobalBarrier();
+                stream.cmd.copyImageToBuffer(
+                    vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())},
+                    vk::ImageLayout::eGeneral,
+                    vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
+                    vk::BufferImageCopy{
+                        .bufferOffset = 0,
+                        .imageSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                          .mipLevel = 0,
+                                          .baseArrayLayer = 0,
+                                          .layerCount = 1},
+                        .imageOffset = {0, 0, 0},
+                        .imageExtent = {desc.width, desc.height, 1}});
+                GlobalBarrier();
+                refresh_probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, frame,
+                                          fmt::format("GPU picture of {:#x} {}x{}",
+                                                      entry->info.guest_address, desc.width,
+                                                      desc.height)});
+            }
+        }
+        LOG_WARNING(Render_Vulkan, "DIAG-184: frame {} {:#x} {}x{}: memory {}, uploads {}, kind {}, "
+                    "needs upload {}, memory as uploaded {}, version {}, last use {}", frame,
+                    entry->info.guest_address, entry->info.size.width, entry->info.size.height,
+                    Native::WatchedBytes(entry->info.guest_address), entry->total_uploads.load(),
+                    entry->upload_kind, entry->needs_upload.load(),
+                    entry->content_hash != 0 ? (registry->MemoryUnchanged(*entry) ? "yes" : "NO")
+                                             : "no hash",
+                    entry->write_version.load(), entry->last_use.load());
+    }
+}
+
+void NativeRenderer::CheckSmallTextures() {
+    static const bool enabled = Common::DiagEnv("RYGT_DIAG_STALE_SMALL") != nullptr;
+    if (!enabled || frame % 120 != 0) {
+        return;
+    }
+    u32 checked = 0, stale = 0;
+    static u32 logged = 0;
+    registry->ForEachOverlapping(0, ~VAddr{0}, [&](Native::ImageEntry& entry) {
+        if (!entry.from_cpu || entry.info.guest_size > 64_KB || entry.content_hash == 0 ||
+            entry.needs_upload.load(std::memory_order_relaxed) ||
+            entry.last_use.load(std::memory_order_relaxed) + 2 < frame) {
+            return;
+        }
+        ++checked;
+        if (registry->MemoryUnchanged(entry)) {
+            return;
+        }
+        ++stale;
+        if (logged++ < 60) {
+            LOG_WARNING(Render_Vulkan, "DIAG-182: frame {} texture {:#x} {}x{} {} ({:#x} bytes) "
+                        "differs from its upload, not marked; memory {}", frame,
+                        entry.info.guest_address, entry.info.size.width, entry.info.size.height,
+                        vk::to_string(entry.info.pixel_format), entry.info.guest_size,
+                        Native::WatchedBytes(entry.info.guest_address));
+        }
+    });
+    LOG_INFO(Render_Vulkan, "DIAG-182: frame {}: {} small textures in use checked, {} differ from "
+             "their upload unmarked", frame, checked, stale);
+}
+
+void NativeRenderer::ReadDrawProbes() {
+    const u64 done = r.scheduler.GetWorkSemaphore()->KnownGpuTick();
+    for (auto it = draw_probes.begin(); it != draw_probes.end();) {
+        if (it->tick > done) {
+            ++it;
+            continue;
+        }
+        const u8* bytes = it->buffer->Mapped();
+        std::string text;
+        for (u32 i = 0; i < 2; ++i) {
+            std::array<double, 4> sum{};
+            for (u32 t = 0; t < 256; ++t) {
+                if (it->bits == 32) {
+                    u32 word;
+                    std::memcpy(&word, bytes + (i * 256 + t) * 4, 4);
+                    sum[0] += (word & 1023) / 1023.0;
+                    sum[1] += ((word >> 10) & 1023) / 1023.0;
+                    sum[2] += ((word >> 20) & 1023) / 1023.0;
+                    sum[3] += (word >> 30) / 3.0;
+                } else {
+                    std::array<u16, 4> half;
+                    std::memcpy(half.data(), bytes + (i * 256 + t) * 8, 8);
+                    for (u32 c = 0; c < 4; ++c) {
+                        const u32 e = (half[c] >> 10) & 31, m = half[c] & 1023;
+                        const float v = e == 0    ? std::ldexp(float(m), -24)
+                                        : e == 31 ? 0.0f
+                                                  : std::ldexp(float(m | 1024), int(e) - 25);
+                        sum[c] += (half[c] & 0x8000) ? -v : v;
+                    }
+                }
+            }
+            u32 first_word = 0;
+            std::memcpy(&first_word, bytes + i * 256 * (it->bits / 8), 4);
+            text += fmt::format(" y{}: {:.3f} {:.3f} {:.3f} a {:.3f} [{:08x}]", it->y[i],
+                                sum[0] / 256, sum[1] / 256, sum[2] / 256, sum[3] / 256,
+                                first_word);
+            if (it->y[1] == it->y[0]) {
+                break;
+            }
+        }
+        const u64 block = 16 * 16 * (it->bits / 8);
+        std::string ran;
+        for (u32 i = 0; i < 2; ++i) {
+            if (it->extra & (1u << i)) {
+                ran += fmt::format(" {:016x}", XXH3_64bits(bytes + block * 2 + 512 * i,
+                                                            it->lengths[i]));
+            }
+        }
+        if (it->extra & 4) {
+            ran += fmt::format(" tex {:016x}", XXH3_64bits(bytes + block * 2 + 1024,
+                                                            it->texture_bytes));
+        }
+        for (u32 i = 0; i < 2; ++i) {
+            if (it->vertex_lengths[i] != 0) {
+                const u8* at = bytes + block * 2 + 1024 + 4096 + 512 * i;
+                std::array<u32, 4> head{};
+                std::memcpy(head.data(), at, std::min<u32>(it->vertex_lengths[i], 16));
+                ran += fmt::format(" v {:016x} [{:08x} {:08x} {:08x} {:08x}]",
+                                   XXH3_64bits(at, it->vertex_lengths[i]), head[0], head[1],
+                                   head[2], head[3]);
+            }
+        }
+        if (it->depth) {
+            std::array<float, 256> z;
+            std::memcpy(z.data(), bytes + block * 2 + 1024 + 4096 + 1024, sizeof(z));
+            const auto [lo, hi] = std::ranges::minmax(z);
+            ran += fmt::format(" depth {} ({}..{})", z[0], lo, hi);
+        }
+        LOG_WARNING(Render_Vulkan, "DIAG-170: frame {} draw {} sampling {:#x} {}x{} into {:#x} "
+                    "{}x{}:{} | {} | recorded{} ran{}", it->frame, it->draw, it->sampled,
+                    it->sampled_width, it->sampled_height, it->target, it->width, it->height,
+                    text, it->bound, it->recorded, ran);
+        it = draw_probes.erase(it);
     }
 }
 
@@ -5960,11 +9202,14 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
     if (Rasterizer::ExposureLogOn()) {
         r.ExposureLogShader(stage, "native"); // FIX-153 (diagnosis)
     }
-    static const bool watching = std::getenv("SHADGT_WATCH_SHADERS") != nullptr;
+    static const bool watching = Common::DiagEnv("SHADGT_WATCH_SHADERS") != nullptr;
     const bool watched = watching && IsWatchedShader(stage.pgm_hash);
     static std::atomic<u64> watched_binds{};
     const u64 watched_bind = watched ? ++watched_binds : 0;
-    const bool log_watched = watched && (watched_bind <= 8 || watched_bind % 300 == 0);
+    // SHADGT_WATCH_SHADERS_ALL=1: every bind of the watched shaders, not a sample.
+    static const bool log_all = Common::DiagEnv("SHADGT_WATCH_SHADERS_ALL") != nullptr;
+    const bool log_watched =
+        watched && (log_all || watched_bind <= 8 || watched_bind % 300 == 0);
     if (log_watched) {
         std::string flat;
         for (size_t i = 0; i < std::min<size_t>(stage.flattened_ud_buf.size(), 192); ++i) {
@@ -5989,6 +9234,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                     stage.pgm_hash, watched_bind, sources);
     }
 #else
+    constexpr bool watched = false;
     constexpr bool log_watched = false;
 #endif
     // AMD defaults to the validated descriptor-backed buffer path
@@ -6020,6 +9266,8 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
 #else
     constexpr bool force_descriptor = false;
 #endif
+    // OPT-015: the stage set's upload memos (flattened user data, clip planes, D3 table).
+    const u32 upload_slot = Shader::Backend::StageSet(u32(stage.sw_stage)) * 3;
     auto* direct = stage.uses_direct && !descriptor_composition && !force_descriptor
         ? r.buffer_cache.GetDirectMemory() : nullptr;
     // D3's table: page table L1 and zero page, then base, size and valid of each buffer read
@@ -6046,6 +9294,10 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                     }
                     info = {buffer, offset, size};
                 }
+                if (watched) {
+                    CompareFlatSources(stage); // DIAG-211 (diagnosis)
+                }
+                NoteStaleFlats(stage); // DIAG-237 (diagnosis)
                 break;
             }
             case Shader::BufferType::ClipPlanes:
@@ -6058,16 +9310,16 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                         planes[i * 4 + 2] = std::bit_cast<float>(plane.data_z);
                         planes[i * 4 + 3] = std::bit_cast<float>(plane.data_w);
                     }
-                    const auto [buffer, offset, data] = Allocate(sizeof(planes), alignment);
-                    std::memcpy(data, planes.data(), sizeof(planes));
+                    const auto [buffer, offset] = UploadBytes(upload_slot + 1, planes.data(),
+                                                              sizeof(planes), alignment); // OPT-015
                     info = {buffer, offset, sizeof(planes)};
                 }
                 break;
             case Shader::BufferType::DirectTable: {
                 const u32 words = static_cast<u32>(4 + stage.buffers.size() * 4);
-                const auto [buffer, offset, data] = Allocate(words * sizeof(u32), alignment);
-                auto* table = reinterpret_cast<u32*>(data);
-                std::memset(table, 0, words * sizeof(u32));
+                static thread_local std::vector<u32> table_words;
+                table_words.assign(words, 0);
+                u32* const table = table_words.data();
                 if (auto* memory = r.buffer_cache.GetDirectMemory()) {
                     const u64 l1 = memory->L1Address();
                     const u64 zero = memory->ZeroPageAddress();
@@ -6079,6 +9331,8 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                         std::memcpy(&table[4 + i * 4], direct_entries[i].data(), 16);
                     }
                 }
+                const auto [buffer, offset] = UploadBytes(upload_slot + 2, table,
+                                                          words * sizeof(u32), alignment); // OPT-015
                 info = {buffer, offset, words * sizeof(u32)};
                 break;
             }
@@ -6164,7 +9418,7 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                 // FIX-174 (diagnosis, RYGT_NATIVE_WATCH_BUFFER=<hex address>+<hex size>): the
                 // shaders that bind a buffer over that range (the first ones, then now and then).
                 static const std::pair<VAddr, VAddr> watch_buffer = [] {
-                    const char* env = std::getenv("RYGT_NATIVE_WATCH_BUFFER");
+                    const char* env = Common::DiagEnv("RYGT_NATIVE_WATCH_BUFFER");
                     if (!env || !*env) {
                         return std::pair<VAddr, VAddr>{};
                     }
@@ -6186,6 +9440,9 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                     }
                 }
 #endif
+                if (vsharp.GetStride() == 144 && !desc.is_written) {
+                    b.diag_records = base; // DIAG-214 (diagnosis)
+                }
 #if !defined(NDEBUG)
                 const auto log_buffer = [&](const char* how) {
                     if (!log_watched) {
@@ -6196,9 +9453,9 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                                                         reinterpret_cast<const void*>(base),
                                                         std::min<u64>(size, sizeof(head)));
                     LOG_WARNING(Render_Vulkan,
-                                "DIAG-150: native shader {:#x} use {} buffer {} {} {:#x}+{:#x} "
-                                "stride {} records {:#x}: {}; memory {}",
-                                stage.pgm_hash, watched_bind, buffer_index,
+                                "DIAG-150: frame {} native shader {:#x} use {} buffer {} {} "
+                                "{:#x}+{:#x} stride {} records {:#x}: {}; memory {}",
+                                frame, stage.pgm_hash, watched_bind, buffer_index,
                                 desc.is_written ? "write" : "read", base, size, vsharp.GetStride(),
                                 vsharp.num_records, how,
                                 read ? fmt::format("{:08x} {:08x} {:08x} {:08x}", head[0], head[1],
@@ -6319,6 +9576,10 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                                 break;
                             }
                         }
+                    }
+                    if (watched && last_bound == Bound::Region && !desc.is_written) {
+                        CompareRegion(base, size, vsharp.GetStride(), found->first, found->second,
+                                      stage.pgm_hash); // DIAG-211 (diagnosis)
                     }
                     const u64 aligned = Common::AlignDown(found->second, alignment);
                     const u64 adjust = found->second - aligned;
@@ -6448,14 +9709,78 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
 #endif
         auto tsharp = image_desc.GetSharp(stage);
         MatchExperimentalCompositionTexture(tsharp, stage, image_desc, *registry);
+        {
+            // DIAG-186 (diagnosis, with RYGT_DIAG_PROGRAM_TEXTURES=<hash>): where that program's
+            // small textures' descriptors were read (guest address of the T#'s first dword), and
+            // whether GPU work writes there (a region), every 120 frames.
+            static const u64 watched = [] {
+                const char* env = Common::DiagEnv("RYGT_DIAG_PROGRAM_TEXTURES");
+                return env && *env ? u64(std::strtoull(env, nullptr, 16)) : u64{0};
+            }();
+            if (watched != 0 && stage.pgm_hash == watched && frame % 120 == 0 &&
+                u64(tsharp.width + 1) * (tsharp.height + 1) <= 64) {
+                const u32 at = image_desc.sharp_fetch.offsets[0];
+                const u64 src = at < stage.flattened_ud_src.size() ? stage.flattened_ud_src[at] : 0;
+                const bool region = src != 0 && RegionOver(src, 32) != nullptr;
+                LOG_WARNING(Render_Vulkan, "DIAG-186: frame {} program {:#x} T# {:#x} {}x{} from "
+                            "flat dword {} read at {:#x} ({}); T# {:08x} {:08x} {:08x} {:08x}",
+                            frame, stage.pgm_hash, tsharp.Address(), tsharp.width + 1,
+                            tsharp.height + 1, at, src,
+                            src == 0 ? "user data" : region ? "in a GPU-written region" : "guest memory",
+                            reinterpret_cast<const u32*>(&tsharp)[0],
+                            reinterpret_cast<const u32*>(&tsharp)[1],
+                            reinterpret_cast<const u32*>(&tsharp)[2],
+                            reinterpret_cast<const u32*>(&tsharp)[3]);
+                // DIAG-187: what wrote the descriptor there, and what the GPU holds there.
+                static u32 histories = 0;
+                if (src != 0 && histories < 4) {
+                    ++histories;
+                    PrintHistory(src, 32);
+                    Region* over = RegionOver(src, 32);
+                    if (over && src >= over->begin && src + 32 <= over->end &&
+                        refresh_probes.size() < 64) {
+                        auto buffer = device->CreateBuffer(
+                            {.size = 32,
+                             .usage = Native::Rhi::BufferUsageStorage |
+                                      Native::Rhi::BufferUsageTransferDst,
+                             .memory = Native::Rhi::MemoryKind::Readback,
+                             .name = "descriptor probe"});
+                        if (buffer && buffer->Mapped()) {
+                            Begin();
+                            GlobalBarrier();
+                            stream.cmd.copyBuffer(
+                                vk::Buffer{Handle<VkBuffer_T>(over->buffer->NativeHandle())},
+                                vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
+                                vk::BufferCopy{.srcOffset = src - over->begin,
+                                               .dstOffset = 0,
+                                               .size = 32});
+                            GlobalBarrier();
+                            refresh_probes.push_back(
+                                {std::move(buffer), r.scheduler.CurrentTick() + 1, frame,
+                                 fmt::format("region words of the T# read at {:#x}", src)});
+                        }
+                    }
+                }
+            }
+        }
         const bool cube_sampling = image_desc.post_op == Shader::SharpFetchPostOp::NativeCubeSampling;
         const u32 num_bindings = image_desc.NumBindings(stage);
         const u32 first = static_cast<u32>(b.images.size());
         const bool storage = image_desc.is_written;
+        const bool compute_stage = stage.sw_stage == Shader::SwStage::Compute; // PERF-GT7-009
+        if (compute_stage) {
+            ++stats.compute_texture_lookups;
+            stats.compute_texture_bindings += num_bindings;
+        }
+        // FIX-GT7-080: which descriptor of a compute stage each picture is bound to (SameTexelKey).
         const auto note_entry = [&](const Native::ImageEntry* entry) {
-            if (stage.sw_stage != Shader::SwStage::Compute) return;
+            if (!compute_stage) {
+                return;
+            }
             const size_t index = size_t(&image_desc - stage.images.data());
-            if (b.image_entries.size() <= index) b.image_entries.resize(index + 1, nullptr);
+            if (b.image_entries.size() <= index) {
+                b.image_entries.resize(index + 1, nullptr);
+            }
             b.image_entries[index] = entry;
         };
         const auto add_write = [&] {
@@ -6471,13 +9796,41 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             });
             binding.unified += num_bindings;
         };
+        // DIAG-213 (diagnosis, SHADGT_WATCH_SHADERS with RYGT_DIAG_IMAGE_SLOTS=1): every 30th
+        // frame, each image slot of a watched shader: its T# and what it was bound to.
+        static const bool slot_log = Common::DiagEnv("RYGT_DIAG_IMAGE_SLOTS") != nullptr &&
+                                     Common::DiagEnv("SHADGT_WATCH_SHADERS") != nullptr;
+        const bool log_slot = slot_log && frame % 30 == 0 && IsWatchedShader(stage.pgm_hash);
+        // PERF-GT7-006: the slot's text is only made when it is logged (A, the reference, still
+        // makes it for every slot, as before).
+        const bool make_text = log_slot || !ReuseOn();
+        const auto slot_text = [&](const auto& make_bound) {
+            if (!make_text) {
+                return;
+            }
+            const std::string bound = make_bound();
+            if (log_slot) {
+                LOG_WARNING(Render_Vulkan, "DIAG-213: frame {} program {:#x} slot {} T# {:#x} {}x{} "
+                            "fmt {}/{} type {} levels {}-{} layers {}-{}{} -> {}", frame,
+                            stage.pgm_hash, first, tsharp.Address(), tsharp.width + 1,
+                            tsharp.height + 1, u32(tsharp.GetDataFmt()), u32(tsharp.GetNumberFmt()),
+                            u32(tsharp.GetType()), u32(tsharp.base_level), u32(tsharp.last_level),
+                            u32(tsharp.base_array), u32(tsharp.last_array),
+                            image_desc.is_written ? " (store)" : "", bound);
+            }
+        };
         const auto bind_null = [&](u32 reason) {
             if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-null-image id={} stage={} program={:#x} binding={} reason={} address={:#x}",SceneTrace::Id(),u32(stage.sw_stage),stage.pgm_hash,binding.unified,reason,tsharp.Address()));
+            const vk::ImageView stand_in =
+                image_desc.is_depth && !storage && num_bindings == 1 && !cube_sampling
+                    ? DepthStandIn(image_desc.is_array, true) // FIX-GT7-133
+                    : vk::ImageView{};
             for (u32 i = 0; i < num_bindings; ++i) {
-                b.images.push_back({VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral});
+                b.images.push_back({VK_NULL_HANDLE, stand_in, vk::ImageLayout::eGeneral});
             }
             NATIVE_DIAGNOSTIC(++stats.null_images);
             NATIVE_DIAGNOSTIC(++stats.null_reasons[reason]);
+            slot_text([&] { return fmt::format("NULL (reason {})", reason); }); // DIAG-213
             add_write();
         };
 #if !defined(NDEBUG)
@@ -6491,6 +9844,16 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             continue;
         }
 #endif
+        // PERF-GT7-006: an empty T# (no address or format: ~0.8 a draw in GT7) is bound empty
+        // before the memo is hashed; the memo never holds one.
+        if (ReuseOn() && (tsharp.Address() == 0 ||
+                          tsharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid ||
+                          !magic_enum::enum_contains(tsharp.GetDataFmt()) ||
+                          !magic_enum::enum_contains(tsharp.GetNumberFmt()))) {
+            NATIVE_DIAGNOSTIC(++stats.texture_lookups);
+            bind_null(0);
+            continue;
+        }
         // OPT-002: the picture and views this T# resolved to last time.
         NATIVE_DIAGNOSTIC(++stats.texture_lookups);
         TextureMemo* memo = nullptr;
@@ -6532,10 +9895,20 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                     WatchBind(*entry, tsharp, storage, true, stage.pgm_hash); // FIX-157
                 }
 #endif
+                SeqBind(*entry, tsharp, storage, stage.pgm_hash); // DIAG-208 (diagnosis)
                 if (!storage && entry->from_cpu) registry->LayersRewritten(*entry, frame);
                 ApplyRewrite(*entry); // NAT-120
-                if (!storage && entry->from_cpu) {
-                    RefreshSources(*entry); // NAT-104
+                SyncDepthTwin(*entry); // FIX-212
+                if (!storage) {
+                    if (entry->from_cpu && registry->RewrittenSmall(*entry)) {
+                        ++stats.small_rewrites; // FIX-202
+                    }
+                    if (entry->from_cpu) {
+                        registry->LayersRewritten(*entry, frame); // FIX-221
+                    }
+                    RefreshSources(*entry); // NAT-104 (FIX-197: targets too)
+                } else if (PartSyncOn()) {
+                    RefreshSources(*entry); // FIX-210: a store counts as writing all of it
                 }
                 for (u32 i = 0; i < num_bindings; ++i) {
                     b.images.push_back({VK_NULL_HANDLE, memo->views[i], vk::ImageLayout::eGeneral});
@@ -6543,8 +9916,15 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                 (storage ? b.stored : b.sampled).push_back(entry);
                 if (!storage && one_off_observer) one_off_observer->Sampled(entry->info.guest_address);
                 note_entry(entry);
+                slot_text([&] {
+                    return fmt::format("{} {:#x} {}x{} v{} (memo)",
+                                       entry->from_cpu ? "texture" : "target",
+                                       entry->info.guest_address, entry->info.size.width,
+                                       entry->info.size.height, entry->write_version.load());
+                }); // DIAG-213
                 add_write();
                 NATIVE_DIAGNOSTIC(++stats.texture_memo_hits);
+                NATIVE_DIAGNOSTIC(stats.compute_texture_hits += compute_stage ? 1 : 0);
                 continue;
             }
         }
@@ -6683,12 +10063,14 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             WatchBind(*entry, tsharp, storage, false, stage.pgm_hash); // FIX-157 (diagnosis)
         }
 #endif
+        SeqBind(*entry, tsharp, storage, stage.pgm_hash); // DIAG-208 (diagnosis)
         if (!storage && entry->from_cpu) registry->LayersRewritten(*entry, frame);
         ApplyRewrite(*entry); // NAT-120 (NAT-133: textures too)
+        SyncDepthTwin(*entry); // FIX-212
         if (!storage && r.FrameDumpCollecting()) {
             // FIX-152 (diagnosis): RYGT_FRAME_DUMP_ALL_TEXTURES=1 dumps uploaded ones too.
             static const bool dump_all = [] {
-                const char* env = std::getenv("RYGT_FRAME_DUMP_ALL_TEXTURES");
+                const char* env = Common::DiagEnv("RYGT_FRAME_DUMP_ALL_TEXTURES");
                 return env && env[0] == '1';
             }();
             if (dump_all || !entry->from_cpu || SceneTrace::Id()) {
@@ -6699,10 +10081,18 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
                 }
             }
         }
-        if (!storage && entry->from_cpu) {
+        if (!storage) {
+            if (entry->from_cpu && registry->RewrittenSmall(*entry)) {
+                ++stats.small_rewrites; // FIX-202
+            }
+            if (entry->from_cpu) {
+                registry->LayersRewritten(*entry, frame); // FIX-221
+            }
             // (part of the textures' time; reported apart; OPT-001: on timed draws only)
             PhaseClock sources_clock{stats.phase_ns[4]};
-            RefreshSources(*entry); // NAT-104
+            RefreshSources(*entry); // NAT-104 (FIX-197: targets too)
+        } else if (PartSyncOn()) {
+            RefreshSources(*entry); // FIX-210: a store counts as writing all of it
         }
         const auto fallback = image_desc.mip_fallback_mode;
         for (u32 i = 0; i < num_bindings; ++i) {
@@ -6748,6 +10138,7 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             memo->registry_generation = registry->Generation();
             memo->unmap_generation = unmap_generation.load(std::memory_order_acquire);
             memo->generation = memo->registry_generation + memo->unmap_generation;
+            // PERF-GT7-047: what Find looked at, and the picture it answered with.
             memo->range_begin = std::min(desc.info.guest_address, entry->info.guest_address);
             memo->range_end =
                 std::max(desc.info.guest_address + std::max<u64>(desc.info.guest_size, 1),
@@ -6756,6 +10147,11 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
         (storage ? b.stored : b.sampled).push_back(entry);
         if (!storage && one_off_observer) one_off_observer->Sampled(entry->info.guest_address);
         note_entry(entry);
+        slot_text([&] {
+            return fmt::format("{} {:#x} {}x{} v{}", entry->from_cpu ? "texture" : "target",
+                               entry->info.guest_address, entry->info.size.width,
+                               entry->info.size.height, entry->write_version.load());
+        }); // DIAG-213
         add_write();
     }
     for (const auto& sampler : stage.samplers) {
@@ -6765,6 +10161,18 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             ssharp = AmdGpu::Sampler{};
         }
         if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-sampler id={} stage={} program={:#x} binding={} comparison={} compare_op={} min_lod={} max_lod={} original_bias={} sanitized_bias={} effective_bias={} effective_max_lod={} mip_filter={} min_filter={} mag_filter={} anisotropy={} clamp={}/{}/{} border={}",SceneTrace::Id(),u32(stage.sw_stage),stage.pgm_hash,binding.unified,sampler.is_depth,u32(ssharp.depth_compare_func.Value()),ssharp.MinLod(),ssharp.MaxLod(),sampler.GetSharp(stage).LodBias(),ssharp.LodBias(),std::min(ssharp.LodBias(),r.instance.MaxSamplerLodBias()),std::max(ssharp.MinLod(),ssharp.MaxLod()),u32(ssharp.mip_filter.Value()),u32(ssharp.xy_min_filter.Value()),u32(ssharp.xy_mag_filter.Value()),ssharp.MaxAniso(),u32(ssharp.clamp_x.Value()),u32(ssharp.clamp_y.Value()),u32(ssharp.clamp_z.Value()),u32(ssharp.border_color_type.Value())));
+        // DIAG-235 (diagnosis, RYGT_DIAG_HS_SAMPLERS=1): hull shader samplers, 40 at most.
+        static const bool diag235 = Common::DiagEnv("RYGT_DIAG_HS_SAMPLERS") != nullptr;
+        static u32 diag235_lines = 0;
+        if (diag235 && stage.sw_stage == Shader::SwStage::TessellationControl && diag235_lines < 40) {
+            ++diag235_lines;
+            LOG_WARNING(Render_Vulkan, "DIAG-235: hs {:#x} S# unnorm {} mip_filter {} xy_min {} "
+                        "xy_mag {} min_lod {} max_lod {} lod_bias {}",
+                        stage.pgm_hash, u32(ssharp.force_unnormalized.Value()),
+                        u32(ssharp.mip_filter.Value()), u32(ssharp.xy_min_filter.Value()),
+                        u32(ssharp.xy_mag_filter.Value()), ssharp.MinLod(), ssharp.MaxLod(),
+                        u32(ssharp.lod_bias.Value()));
+        }
         b.images.push_back({SamplerFor(ssharp, regs.ta_bc_base, sampler.is_depth), VK_NULL_HANDLE,
                             vk::ImageLayout::eGeneral});
         b.write_sets.push_back(u8(Shader::Backend::StageSet(u32(stage.sw_stage)))); // SHD-002
@@ -6777,6 +10185,81 @@ void NativeRenderer::BindTextures(const Shader::Info& stage, const AmdGpu::Regs&
             .pImageInfo = &b.images.back(),
         });
     }
+}
+
+// FIX-GT7-133: an empty T# (address 0) sampled with a depth comparison was bound as a null
+// descriptor, which reads 0 whatever the sampler says, so every comparison failed: "in shadow".
+// On the console the texture unit still applies the sampler's addressing, and outside [0, 1] a
+// border-clamped sampler returns its border colour. GT7's Scapes backdrop shades the ground the
+// car's cascade doesn't cover with a fallback shadow map that is such an empty 1x1 T#, its matrix
+// putting every point far outside, under a white-bordered, less-equal sampler: lit on the console,
+// in full shadow here. All the ground around the car was about six times too dark (a pale
+// rectangle where the car's cascade lit it, a dark band where the ground ended). A 1x1 depth image
+// at the far depth (1.0: nothing in front, as an absent shadow map means) now stands in for such
+// T#s; at 0, the strip of ground the matrix puts inside [0, 1] stayed a thin dark line across the
+// road. RYGT_NATIVE_DEPTH_STAND_IN=0: null descriptors, as before.
+bool NativeRenderer::DepthStandInOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_NATIVE_DEPTH_STAND_IN");
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+vk::ImageView NativeRenderer::DepthStandIn(bool array, bool may_create) {
+    if (!DepthStandInOn()) {
+        return {};
+    }
+    const u32 i = array ? 1 : 0;
+    if (const VkImageView ready = depth_stand_in_handles[i].load(std::memory_order_acquire)) {
+        return vk::ImageView{ready};
+    }
+    if (!may_create) {
+        return {};
+    }
+    if (!depth_stand_in) {
+        depth_stand_in = device->CreateImage({
+            .dim = Native::Rhi::ImageDim::D2,
+            .format = Native::Rhi::FormatFromVk(VK_FORMAT_D32_SFLOAT),
+            .width = 1,
+            .height = 1,
+            .layers = 1,
+            .mips = 1,
+            .usage = Native::Rhi::ImageUsageSampled | Native::Rhi::ImageUsageTransferDst,
+            .name = "native depth stand-in",
+        });
+        if (!depth_stand_in) {
+            return {};
+        }
+        Stream& s = Begin();
+        EndRendering();
+        device->RecordPendingImageInit(*s.list);
+        s.cmd.clearDepthStencilImage(
+            vk::Image{Handle<VkImage_T>(depth_stand_in->NativeHandle())}, vk::ImageLayout::eGeneral,
+            vk::ClearDepthStencilValue{1.0f, 0},
+            vk::ImageSubresourceRange{.aspectMask = vk::ImageAspectFlagBits::eDepth,
+                                      .baseMipLevel = 0,
+                                      .levelCount = 1,
+                                      .baseArrayLayer = 0,
+                                      .layerCount = 1});
+        GlobalBarrier();
+        LOG_WARNING(Render_Vulkan, "FIX-GT7-133: a 1x1 depth image at 1.0 stands in for empty T#s "
+                    "sampled with a depth comparison (frame {})", frame);
+    }
+    auto& view = depth_stand_in_views[i];
+    if (!view) {
+        view = device->CreateImageView(
+            depth_stand_in.get(),
+            Native::Rhi::ImageViewDesc{.dim = array ? Native::Rhi::ViewDim::D2Array
+                                                    : Native::Rhi::ViewDim::D2,
+                                       .aspect = Native::Rhi::AspectDepth});
+        if (!view) {
+            return {};
+        }
+    }
+    const VkImageView handle = Handle<VkImageView_T>(view->NativeHandle());
+    depth_stand_in_handles[i].store(handle, std::memory_order_release);
+    return vk::ImageView{handle};
 }
 
 void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoint bind_point,
@@ -7054,6 +10537,11 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
     Mirror* near = nullptr;
     u64 near_generation = 0;
     const bool sampled = InPlaceSampled();
+    static const bool probing = [] {
+        const char* env = Common::DiagEnv("RYGT_PROBE_AT");
+        return env && *env; // DIAG-170
+    }();
+    probe_vertices.clear();
     for (u32 index = 0; index < guest_buffers.size(); ++index) {
         const auto& guest = guest_buffers[index];
         std::optional<std::pair<vk::Buffer, u64>> found;
@@ -7076,9 +10564,11 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
             Native::CpuStackRegistry::Lease lease{Native::CpuStacks()};
             return lease.Allowed(near->begin, near->end);
         }();
+        bool via_near = false; // DIAG-170
         if (near_on && near_allowed && !sampled && base != 0 && sharp_size > 0 &&
             near_generation == buffer_generation && base >= near->begin &&
             base + sharp_size <= near->end && near->dirty_pages.empty()) {
+            via_near = true;
             size = sharp_size;
             found = std::pair{vk::Buffer{Handle<VkBuffer_T>(near->buffer->NativeHandle())},
                               u64{base - near->begin}};
@@ -7106,6 +10596,52 @@ void NativeRenderer::ResolveVertexBuffers(const GraphicsPipeline& pipeline,
                 index, found ? size : 0, frame, r.scheduler.CurrentTick());
         }
 #endif
+        {
+            // DIAG-211 (diagnosis, RYGT_DIAG_REGION_COMPARE with SHADGT_WATCH_SHADERS): a watched
+            // shader's vertex buffers, how they are bound, every 10th frame.
+            static const bool on = [] {
+                const char* env = Common::DiagEnv("RYGT_DIAG_REGION_COMPARE");
+                return env != nullptr && env[0] != '4' &&
+                       Common::DiagEnv("SHADGT_WATCH_SHADERS") != nullptr;
+            }();
+            if (on && frame % 10 == 0) {
+                bool watched = false;
+                for (const auto* stage : pipeline.GetStages()) {
+                    watched |= stage && IsWatchedShader(stage->pgm_hash);
+                }
+                if (watched) {
+                    std::array<u32, 4> head{};
+                    Core::RytyMemory::GuardedCopy(head.data(), reinterpret_cast<const void*>(base),
+                                                  std::min<u64>(sharp_size, sizeof(head)));
+                    LOG_WARNING(Render_Vulkan, "DIAG-211: frame {} vertex binding {} {:#x}+{:#x} "
+                                "stride {} bound {} (offset {:#x}); memory {:08x} {:08x} {:08x} "
+                                "{:08x}", frame, index, base, sharp_size, guest.GetStride(),
+                                !found                        ? "nowhere"
+                                : via_near                    ? "near mirror"
+                                : last_bound == Bound::Region ? "region"
+                                : last_bound == Bound::Mirror ? "mirror"
+                                                              : "in place",
+                                found ? found->second : 0, head[0], head[1], head[2], head[3]);
+                    if (found && size <= 512_KB) {
+                        CompareRegion(base, size, std::max<u32>(guest.GetStride(), 4u),
+                                      found->first, found->second, 0, false); // GPU vs memory
+                    }
+                }
+            }
+        }
+        if (probing && found && probe_vertices.size() < 2) {
+            std::array<u8, 512> bytes{};
+            const u64 length = std::min<u64>(size, 512);
+            if (Core::RytyMemory::GuardedCopy(bytes.data(), reinterpret_cast<const void*>(base),
+                                              length)) {
+                std::array<u32, 4> head{};
+                std::memcpy(head.data(), bytes.data(), std::min<u64>(length, 16));
+                probe_vertices.push_back({base, length, found->first, found->second,
+                                          XXH3_64bits(bytes.data(), length),
+                                          via_near ? 9u : u32(last_bound),
+                                          head});
+            }
+        }
         Mirror* bound_mirror = found && near && base >= near->begin &&
                                        base + std::max<u64>(size, 1) <= near->end
                                    ? near
@@ -7588,6 +11124,37 @@ bool NativeRenderer::NeedsBarrierFor(const DrawBindings& b) const {
 }
 
 void NativeRenderer::Written(const Native::ImageEntry* entry, u64 at) {
+    WrittenSubresources(entry, at, nullptr);
+}
+
+void NativeRenderer::WrittenRange(const Native::ImageEntry* entry, const DrawnRange& range) {
+    WrittenSubresources(entry, 0, &range);
+}
+
+bool NativeRenderer::SubVersionsOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_NATIVE_SUB_VERSIONS"); // FIX-208 off: =0
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+u64 NativeRenderer::SubVersion(Native::ImageEntry& entry, u32 mip, u32 layer) {
+    const u64 whole = entry.write_version.load(std::memory_order_relaxed);
+    if (!SubVersionsOn()) {
+        return whole;
+    }
+    std::scoped_lock lock{entry.sources_mutex};
+    const u32 layers = std::max<u32>(entry.info.resources.layers, 1);
+    const size_t at = size_t(mip) * layers + layer;
+    if (entry.sub_versions.empty() || layer >= layers || at >= entry.sub_versions.size()) {
+        return whole;
+    }
+    return entry.sub_versions[at];
+}
+
+void NativeRenderer::WrittenSubresources(const Native::ImageEntry* entry, u64 at,
+                                         const DrawnRange* range) {
     if (!entry) {
         return;
     }
@@ -7597,14 +11164,21 @@ void NativeRenderer::Written(const Native::ImageEntry* entry, u64 at) {
                                                 entry->info.guest_address + 1);
     const bool first_write = watched && written->write_version.load(std::memory_order_relaxed) == 0;
 #endif
-    written->write_version.store(at != 0 ? at : ++write_clock, std::memory_order_relaxed);
+    const u64 previous = written->write_version.load(std::memory_order_relaxed);
+    const u64 version = at != 0 ? at : ++write_clock;
+    written->write_version.store(version, std::memory_order_relaxed);
+    // FIX-198: the frames it was drawn in.
+    if (const u64 last = written->written_frame.load(std::memory_order_relaxed); last != frame) {
+        written->written_frame_before.store(last, std::memory_order_relaxed);
+        written->written_frame.store(frame, std::memory_order_relaxed);
+    }
 #if !defined(NDEBUG)
     if (watched) {
         // FIX-159 (diagnosis, RYGT_FRAME_DUMP_ON_STORE=<seconds>): from that long after start,
         // the first write of a watched picture starts a frame dump there (the frames a
         // time-triggered dump never lands on).
         static const double on_store = [] {
-            const char* env = std::getenv("RYGT_FRAME_DUMP_ON_STORE");
+            const char* env = Common::DiagEnv("RYGT_FRAME_DUMP_ON_STORE");
             return env && *env ? std::atof(env) : -1.0;
         }();
         static const auto started = std::chrono::steady_clock::now();
@@ -7625,16 +11199,120 @@ void NativeRenderer::Written(const Native::ImageEntry* entry, u64 at) {
     }
 #endif
     // NAT-111: the textures made of it copy its picture in before their next read.
-    std::scoped_lock lock{written->sources_mutex};
-    for (auto* texture : written->dependents) {
-        texture->sources_dirty.store(true, std::memory_order_relaxed);
+    boost::container::small_vector<Native::ImageEntry*, 4> dependents;
+    {
+        std::scoped_lock lock{written->sources_mutex};
+        // FIX-208: which subresources hold this picture now. GT7 draws each reflection probe's
+        // mips into 18-layer targets six layers (one probe's faces) at a time, and its compute
+        // passes write other probes' layers of the cube array those targets are mips of: copied
+        // in whole, a target's never-drawn layers (zeros) went over the compute output, and the
+        // cockpit and the crowd lit by those probes were black two frames in three.
+        const u32 mips = std::max<u32>(written->info.resources.levels, 1);
+        const u32 layers = std::max<u32>(written->info.resources.layers, 1);
+        auto& subs = written->sub_versions;
+        const bool eligible = SubVersionsOn() && mips <= 16 && layers <= 64 &&
+                              written->info.type != AmdGpu::ImageType::Color3D;
+        const bool partial = range && range->mips != 0 &&
+                             (range->mip != 0 || range->mips < mips || range->layer != 0 ||
+                              range->layers < layers);
+        if (eligible && partial) {
+            if (subs.empty()) {
+                subs.assign(size_t(mips) * layers, previous);
+            }
+            for (u32 m = range->mip; m < std::min<u32>(u32(range->mip) + range->mips, mips); ++m) {
+                const u32 last = std::min<u32>(u32(range->layer) + std::max<u32>(range->layers, 1),
+                                               layers);
+                for (u32 l = range->layer; l < last; ++l) {
+                    subs[size_t(m) * layers + l] = version;
+                }
+            }
+        } else if (!subs.empty()) {
+            std::fill(subs.begin(), subs.end(), version);
+        }
+        for (auto* texture : written->dependents) {
+            texture->sources_dirty.store(true, std::memory_order_relaxed);
+            dependents.push_back(texture);
+        }
     }
+    // FIX-207: and the textures made of those (see RefreshSources).
+    if (WholeSourcesOn()) {
+        for (auto* whole : dependents) {
+            std::scoped_lock lock{whole->sources_mutex};
+            for (auto* texture : whole->dependents) {
+                texture->sources_dirty.store(true, std::memory_order_relaxed);
+            }
+        }
+    }
+}
+
+bool NativeRenderer::WholeSourcesOn() {
+    // Off unless RYGT_NATIVE_WHOLE_SOURCES=1: it did not change the black-cockpit rate it was
+    // written for (64% of frames with and without), and a whole's version counted as its parts'
+    // could pick its older mip 0 over a fresher plain target of the same memory.
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_NATIVE_WHOLE_SOURCES");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
+u64 NativeRenderer::WholeVersion(Native::ImageEntry& source) {
+    // FIX-207: a target made of targets (its mips drawn as targets of their own) holds a picture
+    // as new as the newest of them.
+    u64 version = source.write_version.load(std::memory_order_relaxed);
+    if (!WholeSourcesOn()) {
+        return version;
+    }
+    std::scoped_lock lock{source.sources_mutex};
+    for (const auto& link : source.sources) {
+        if (link.source->image && !link.source->reused.load(std::memory_order_relaxed)) {
+            version = std::max(version, link.source->write_version.load(std::memory_order_relaxed));
+        }
+    }
+    return version;
 }
 
 void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
     // NAT-111: only when one of its targets was drawn since the last time.
+    const bool traced = Rasterizer::Traced(texture.info.guest_address, texture.info.guest_size);
     if (!texture.sources_dirty.exchange(false, std::memory_order_relaxed)) {
+        if (traced) {
+            LOG_WARNING(Render_Vulkan, "DIAG-165: texture {:#x} {}x{} not dirty (frame {})",
+                        texture.info.guest_address, texture.info.size.width,
+                        texture.info.size.height, DebugState.GetFrameNum());
+        }
         return;
+    }
+    // FIX-207: textures made of a target that is itself made of targets. GT7 draws each
+    // reflection probe into a 128x128 cube target and its mips 1-7 as targets of their own
+    // (FIX-197 copies those into the cube target), and the lighting samples the probe through a
+    // texture of another layout over the same memory, made of the cube target only: just the
+    // target's mip 0 was copied in, the texture's other mips stayed empty, and the cockpit and
+    // the crowd lit by them were black in most frames. Such a whole is brought up to date first,
+    // and all its mips are copied. RYGT_NATIVE_WHOLE_SOURCES=0 turns it off.
+    static thread_local u32 refresh_depth = 0;
+    if (WholeSourcesOn() && refresh_depth == 0) {
+        boost::container::small_vector<Native::ImageEntry*, 8> links;
+        {
+            std::scoped_lock lock{texture.sources_mutex};
+            for (const auto& link : texture.sources) {
+                if (link.source != &texture) {
+                    links.push_back(link.source);
+                }
+            }
+        }
+        ++refresh_depth;
+        for (auto* source : links) {
+            bool whole;
+            {
+                std::scoped_lock lock{source->sources_mutex};
+                whole = !source->sources.empty();
+            }
+            if (whole) {
+                RefreshSources(*source);
+            }
+        }
+        --refresh_depth;
     }
     static thread_local std::vector<Native::SourceLink> sources;
     {
@@ -7650,43 +11328,129 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
         Native::ImageEntry* source;
         Native::SourcePlace place;
         u64 version;
+        u32 run_layers = 0; ///< FIX-208: layers of a per-layer run (0: as many as fit)
     };
     boost::container::small_vector<Pick, 16> picks;
     auto& held = held_versions[&texture];
-    const u64 own = texture.write_version.load(std::memory_order_relaxed);
-    for (const auto& [source, place] : sources) {
-        const u64 version = source->write_version.load(std::memory_order_relaxed);
-        if (version == 0 || !source->image || source->reused.load(std::memory_order_relaxed)) {
-            continue; // FIX-157: a reused one is stale
+    // FIX-200: a texture's memory rewritten by a GPU buffer write counts as its own picture then.
+    const u64 foreign =
+        texture.from_cpu ? texture.foreign_clock.load(std::memory_order_relaxed) : u64{0};
+    const u64 own = std::max(texture.write_version.load(std::memory_order_relaxed), foreign);
+    const auto pick_whole = [&](Native::ImageEntry* source, const Native::SourcePlace& place) {
+        const u64 version = WholeVersion(*source); // FIX-207
+        const u32 key = (u32(place.mip) << 16) | u32(place.layer);
+        if (version <= std::max(held[key], own)) {
+            return;
         }
-        const u32 source_layers = std::max(source->image->Desc().layers, 1u);
-        if (place.src_layer < 0 || place.layer < 0 ||
-            u32(place.src_layer) >= source_layers ||
-            u32(place.layer) >= std::max(texture.image->Desc().layers, 1u)) {
-            continue;
+        const auto same = std::ranges::find_if(picks, [&](const Pick& pick) {
+            return pick.run_layers == 0 && pick.place.mip == place.mip &&
+                   pick.place.layer == place.layer;
+        });
+        if (same == picks.end()) {
+            picks.push_back({source, place, version});
+        } else if (version > same->version) {
+            *same = {source, place, version};
         }
-        const u32 layers = std::min(source_layers - u32(place.src_layer),
-                                    std::max(texture.image->Desc().layers, 1u) - u32(place.layer));
-        // A layered target and individual faces can overlap. Choose and remember the newest
-        // source for each face; choosing only the first face lets an older array overwrite a
-        // newer face later in the copy list (or after that face was already copied).
-        for (u32 layer = 0; layer < layers; ++layer) {
-            auto face = place;
-            face.layer += s32(layer);
-            face.src_layer += s32(layer);
-            const u32 key = (u32(face.mip) << 16) | u32(face.layer);
-            if (version <= std::max(held[key], own)) {
+    };
+    if (!SubVersionsOn()) {
+        for (const auto& [source, place] : sources) {
+            if (WholeVersion(*source) == 0 || !source->image ||
+                source->reused.load(std::memory_order_relaxed)) {
+                continue; // FIX-157: a reused one is stale
+            }
+            pick_whole(source, place);
+        }
+    } else {
+        // FIX-208: per layer of the texture, the newest picture any source drew there, against
+        // what the texture holds in that layer; then runs of layers one source drew at once.
+        struct LayerPick {
+            u32 key;
+            Native::ImageEntry* source;
+            Native::SourcePlace place;
+            u32 offset;
+            u64 version;
+        };
+        boost::container::small_vector<LayerPick, 64> best;
+        std::vector<u64> source_subs;
+        for (const auto& [source, place] : sources) {
+            if (WholeVersion(*source) == 0 || !source->image ||
+                source->reused.load(std::memory_order_relaxed)) {
+                continue; // FIX-157: a reused one is stale
+            }
+            const u32 src_layers = std::max<u32>(source->image->Desc().layers, 1u);
+            const u32 dst_layers = std::max<u32>(texture.image->Desc().layers, 1u);
+            const u32 count = std::max<u32>(
+                1u, std::min<u32>(src_layers - std::min<u32>(u32(place.src_layer), src_layers),
+                                  dst_layers - std::min<u32>(u32(place.layer), dst_layers)));
+            if (count > 64 || src_layers > 64 || dst_layers > 64) {
+                pick_whole(source, place); // big arrays: one version for all, as before
                 continue;
             }
-            const auto same = std::ranges::find_if(picks, [&](const Pick& pick) {
-                return pick.place.mip == face.mip && pick.place.layer == face.layer;
-            });
-            if (same == picks.end()) {
-                picks.push_back({source, face, version});
-            } else if (version > same->version) {
-                *same = {source, face, version};
+            {
+                std::scoped_lock lock{source->sources_mutex};
+                source_subs = source->sub_versions;
+            }
+            const u64 source_version = source->write_version.load(std::memory_order_relaxed);
+            for (u32 offset = 0; offset < count; ++offset) {
+                const u32 src_layer = u32(place.src_layer) + offset;
+                const size_t at = size_t(place.src_mip) * src_layers + src_layer;
+                const u64 version = at < source_subs.size() ? source_subs[at] : source_version;
+                if (version == 0) {
+                    continue; // never drawn there
+                }
+                const u32 layer = u32(place.layer) + offset;
+                const u32 key = (u32(place.mip) << 16) | layer;
+                const u64 holds =
+                    std::max({held[key], SubVersion(texture, u32(place.mip), layer), foreign});
+                if (version <= holds) {
+                    continue;
+                }
+                const auto same = std::ranges::find_if(
+                    best, [&](const LayerPick& pick) { return pick.key == key; });
+                if (same == best.end()) {
+                    best.push_back({key, source, place, offset, version});
+                } else if (version > same->version) {
+                    *same = {key, source, place, offset, version};
+                }
             }
         }
+        std::ranges::sort(best, [](const LayerPick& a, const LayerPick& b) {
+            return std::tie(a.source, a.place.mip, a.place.src_mip, a.place.layer, a.offset) <
+                   std::tie(b.source, b.place.mip, b.place.src_mip, b.place.layer, b.offset);
+        });
+        for (size_t i = 0; i < best.size();) {
+            size_t j = i + 1;
+            while (j < best.size() && best[j].source == best[i].source &&
+                   best[j].place.mip == best[i].place.mip &&
+                   best[j].place.src_mip == best[i].place.src_mip &&
+                   best[j].place.layer == best[i].place.layer &&
+                   best[j].place.src_layer == best[i].place.src_layer &&
+                   best[j].offset == best[j - 1].offset + 1 &&
+                   best[j].version == best[i].version) {
+                ++j;
+            }
+            Native::SourcePlace place = best[i].place;
+            place.layer += s32(best[i].offset);
+            place.src_layer += s32(best[i].offset);
+            picks.push_back({best[i].source, place, best[i].version, u32(j - i)});
+            i = j;
+        }
+    }
+    if (traced) {
+        // DIAG-165: each source's version against what the texture holds.
+        std::string text;
+        for (const auto& [source, place] : sources) {
+            text += fmt::format(" {}x{}p{}:{}@{}{}", source->info.size.width,
+                                source->info.size.height, source->info.pitch,
+                                vk::to_string(source->info.pixel_format),
+                                source->write_version.load(std::memory_order_relaxed),
+                                source->reused.load(std::memory_order_relaxed) ? "(reused)" : "");
+        }
+        LOG_WARNING(Render_Vulkan, "DIAG-165: texture {:#x} {}x{}p{}:{} own {} held {} picks {}:{} "
+                    "(frame {})", texture.info.guest_address, texture.info.size.width,
+                    texture.info.size.height, texture.info.pitch,
+                    vk::to_string(texture.info.pixel_format), own, held[0], picks.size(), text,
+                    DebugState.GetFrameNum());
     }
     if (picks.empty()) {
         return;
@@ -7695,35 +11459,35 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
     for (const auto& pick : picks) {
         ApplyRewrite(*pick.source); // NAT-122
     }
-    PrepareImages();  // the texture's own upload goes first
+    const Native::ImageEntry* const self = &texture;
+    // The texture's own upload goes first (PERF-109: it too).
+    PrepareImages(std::span<const Native::ImageEntry* const>{&self, 1});
     GlobalBarrier();  // the sources' pictures are written
     const vk::Image dst{Handle<VkImage_T>(texture.image->NativeHandle())};
-    std::ranges::sort(picks, {}, [](const Pick& pick) {
-        return std::pair{pick.place.mip, pick.place.layer};
-    });
-    for (size_t index = 0; index < picks.size();) {
-        const auto& pick = picks[index];
+    for (const auto& pick : picks) {
         const auto& place = pick.place;
+        // FIX-GT7-127: into a block-compressed texture from a target of one texel per block, the
+        // extent counts the source's texels (Vulkan's rule between compressed and uncompressed
+        // formats): the level's blocks.
+        const u32 block_dim = place.blocks ? 4u : 1u;
         const u32 width = std::min(
-            {place.width, std::max(texture.info.size.width >> place.mip, 1u),
+            {place.width,
+             (std::max(texture.info.size.width >> place.mip, 1u) + block_dim - 1) / block_dim,
              std::max(pick.source->info.size.width >> place.src_mip, 1u)});
         const u32 height = std::min(
-            {place.height, std::max(texture.info.size.height >> place.mip, 1u),
+            {place.height,
+             (std::max(texture.info.size.height >> place.mip, 1u) + block_dim - 1) / block_dim,
              std::max(pick.source->info.size.height >> place.src_mip, 1u)});
-        // Keep contiguous faces from the same source in one GPU copy, without crossing a
-        // face selected from a newer source.
-        u32 layers = 1;
-        while (index + layers < picks.size()) {
-            const auto& next = picks[index + layers];
-            if (next.source != pick.source || next.version != pick.version ||
-                next.place.mip != place.mip || next.place.src_mip != place.src_mip ||
-                next.place.layer != place.layer + s32(layers) ||
-                next.place.src_layer != place.src_layer + s32(layers) ||
-                next.place.width != place.width || next.place.height != place.height) {
-                break;
-            }
-            ++layers;
-        }
+        // NAT-125: a layered target (a cube's faces drawn in one pass, the layer from the
+        // vertex shader) gives all its layers; NAT-131: from the layer the texture starts at.
+        const u32 layers =
+            pick.run_layers != 0
+                ? pick.run_layers // FIX-208: the layers this source drew last
+                : std::max<u32>(
+                      1u, std::min<u32>(std::max<u32>(pick.source->image->Desc().layers, 1u) -
+                                            u32(place.src_layer),
+                                        std::max<u32>(texture.image->Desc().layers, 1u) -
+                                            u32(place.layer)));
         const vk::ImageCopy region{
             .srcSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
                             .mipLevel = u32(place.src_mip),
@@ -7739,6 +11503,31 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
         };
         CmdBuf{s.cmd}.copyImage(vk::Image{Handle<VkImage_T>(pick.source->image->NativeHandle())},
                                 vk::ImageLayout::eGeneral, dst, vk::ImageLayout::eGeneral, region);
+        // FIX-207: a whole made of targets gives its other mips too (brought up to date above).
+        bool whole = false;
+        if (WholeSourcesOn()) {
+            std::scoped_lock lock{pick.source->sources_mutex};
+            whole = !pick.source->sources.empty();
+        }
+        const u32 src_mips = std::max<u32>(pick.source->image->Desc().mips, 1u);
+        const u32 dst_mips = std::max<u32>(texture.image->Desc().mips, 1u);
+        // Not for FIX-GT7-127's blocks: each level has its own target.
+        for (u32 m = 1; whole && !place.blocks && u32(place.src_mip) + m < src_mips &&
+                        u32(place.mip) + m < dst_mips;
+             ++m) {
+            vk::ImageCopy mip = region;
+            mip.srcSubresource.mipLevel = u32(place.src_mip) + m;
+            mip.dstSubresource.mipLevel = u32(place.mip) + m;
+            mip.extent.width = std::max(std::min(texture.info.size.width >> (place.mip + m),
+                                                 pick.source->info.size.width >> (place.src_mip + m)),
+                                        1u);
+            mip.extent.height = std::max(std::min(texture.info.size.height >> (place.mip + m),
+                                                  pick.source->info.size.height >> (place.src_mip + m)),
+                                         1u);
+            CmdBuf{s.cmd}.copyImage(
+                vk::Image{Handle<VkImage_T>(pick.source->image->NativeHandle())},
+                vk::ImageLayout::eGeneral, dst, vk::ImageLayout::eGeneral, mip);
+        }
         if (Rasterizer::Traced(texture.info.guest_address, texture.info.guest_size)) {
             LOG_WARNING(Render_Vulkan,
                         "NAT-130: texture {:#x} {}x{} mips {} layers {} <- target {:#x} {}x{} "
@@ -7750,20 +11539,431 @@ void NativeRenderer::RefreshSources(Native::ImageEntry& texture) {
                         pick.source->info.resources.layers, place.mip, place.layer, layers,
                         pick.version);
         }
-        for (u32 layer = 0; layer < layers; ++layer) {
-            held[(u32(place.mip) << 16) | (u32(place.layer) + layer)] = pick.version;
+        if (SeqTraced(&texture) || SeqTraced(pick.source)) {
+            LOG_WARNING(Render_Vulkan, "DIAG-208: frame {} copy {:#x} mip {} layer {} -> {:#x} "
+                        "mip {} layer {} x{} ({}x{}) v{} (own {}, run {})", frame,
+                        pick.source->info.guest_address, place.src_mip, place.src_layer,
+                        texture.info.guest_address, place.mip, place.layer, layers, width,
+                        height, pick.version, own, pick.run_layers); // DIAG-208 (diagnosis)
         }
-        index += layers;
+        if (pick.run_layers != 0) {
+            for (u32 i = 0; i < pick.run_layers; ++i) {
+                held[(u32(place.mip) << 16) | (u32(place.layer) + i)] = pick.version; // FIX-208
+            }
+        } else {
+            held[(u32(place.mip) << 16) | u32(place.layer)] = pick.version;
+        }
+        // DIAG-181 (diagnosis): copies into tiny textures.
+        static const bool small_links = Common::DiagEnv("RYGT_DIAG_SMALL_LINKS") != nullptr;
+        static u32 small_logged = 0;
+        if (small_links && texture.info.size.width <= 8 && texture.info.size.height <= 8 &&
+            small_logged++ < 300) {
+            LOG_WARNING(Render_Vulkan, "DIAG-181: frame {} texture {:#x} {}x{} {} <- target {:#x} "
+                        "{}x{} {} (version {}, own {}) at mip {} layer {}", frame,
+                        texture.info.guest_address, texture.info.size.width,
+                        texture.info.size.height, vk::to_string(texture.info.pixel_format),
+                        pick.source->info.guest_address, pick.source->info.size.width,
+                        pick.source->info.size.height,
+                        vk::to_string(pick.source->info.pixel_format), pick.version, own,
+                        place.mip, place.layer);
+        }
     }
     s.written.push_back(&texture); // read after the next barrier
+    if (traced) {
+        std::string what;
+        for (const auto& pick : picks) {
+            what += fmt::format(" {:#x} {}x{} {} v{}", pick.source->info.guest_address,
+                                pick.source->info.size.width, pick.source->info.size.height,
+                                vk::to_string(pick.source->info.pixel_format), pick.version);
+        }
+        ProbeRefresh(texture, what); // DIAG-179 (diagnosis)
+    }
     NATIVE_DIAGNOSTIC(stats.source_copies += picks.size());
     ++s.commands;
 }
 
+
+void NativeRenderer::SyncDepthTwin(Native::ImageEntry& entry) {
+    // FIX-212: on the PS4 a depth buffer and a colour picture of its layout at its address are
+    // the same memory. GT7 double-buffers its 5120x5120 static shadow map (D16 at 0x2900000000
+    // and 0x2920000000): each frame a compute pass reprojects the last map into the other
+    // through an R16 storage image, then draws a few tiles into it as a depth buffer and samples
+    // it the next frame. The stores went into an R16 image of their own; the depth buffer, made
+    // from memory (which never holds what the GPU wrote), stayed zero, so one map in two put the
+    // whole scene in shadow: the flickering dark band at Alsace. Vulkan copies no colour image
+    // into a depth one, so the picture goes through a buffer.
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_NATIVE_DEPTH_TWINS");
+        return !(env && env[0] == '0');
+    }();
+    const auto& info = entry.info;
+    if (!on || entry.from_cpu || !entry.image || info.num_samples != 1 ||
+        info.props.has_stencil ||
+        (!info.props.is_depth && !LiverpoolToVK::IsFormatDepthCompatible(info.pixel_format))) {
+        return;
+    }
+    Native::ImageEntry* twin =
+        registry->FindExisting(info.guest_address, [&](const Native::ImageEntry& other) {
+            const auto& o = other.info;
+            return &other != &entry && !other.from_cpu && other.image &&
+                   o.props.is_depth != info.props.is_depth && !o.props.has_stencil &&
+                   o.num_samples == 1 && o.num_bits == info.num_bits &&
+                   o.size.width == info.size.width && o.size.height == info.size.height &&
+                   o.resources.levels == info.resources.levels &&
+                   o.resources.layers == info.resources.layers && o.type == info.type &&
+                   (o.props.is_depth || LiverpoolToVK::IsFormatDepthCompatible(o.pixel_format));
+        });
+    if (!twin) {
+        return;
+    }
+    const u64 version = twin->write_version.load(std::memory_order_relaxed);
+    if (version == 0 || version <= entry.write_version.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const u32 texel = std::max<u32>(info.num_bits / 8, 1);
+    const u32 mips = std::max<u32>(info.resources.levels, 1);
+    const u32 layers = std::max<u32>(info.resources.layers, 1);
+    const auto aspect = [](const Native::ImageEntry& e) {
+        return e.info.props.is_depth ? vk::ImageAspectFlagBits::eDepth
+                                     : vk::ImageAspectFlagBits::eColor;
+    };
+    boost::container::small_vector<vk::BufferImageCopy, 16> from, into;
+    u64 offset = 0;
+    for (u32 m = 0; m < mips; ++m) {
+        const u32 width = std::max(info.size.width >> m, 1u);
+        const u32 height = std::max(info.size.height >> m, 1u);
+        vk::BufferImageCopy copy{
+            .bufferOffset = offset,
+            .imageSubresource{.mipLevel = m, .baseArrayLayer = 0, .layerCount = layers},
+            .imageExtent = {width, height, 1},
+        };
+        copy.imageSubresource.aspectMask = aspect(*twin);
+        from.push_back(copy);
+        copy.imageSubresource.aspectMask = aspect(entry);
+        into.push_back(copy);
+        offset += u64(width) * height * layers * texel;
+    }
+    auto staging = device->CreateBuffer({.size = offset,
+                                         .usage = Native::Rhi::BufferUsageTransferSrc |
+                                                  Native::Rhi::BufferUsageTransferDst,
+                                         .memory = Native::Rhi::MemoryKind::DeviceLocal,
+                                         .name = "native depth twin copy"});
+    if (!staging) {
+        return;
+    }
+    Stream& s = Begin();
+    ApplyRewrite(*twin);
+    ApplyRewrite(entry);
+    // Their own uploads first (a new target starts with what memory holds, NAT-127).
+    const std::array<const Native::ImageEntry*, 2> both{&entry, twin};
+    PrepareImages(std::span<const Native::ImageEntry* const>{both});
+    GlobalBarrier(); // the twin's picture is written
+    const vk::Buffer buffer{Handle<VkBuffer_T>(staging->NativeHandle())};
+    s.cmd.copyImageToBuffer(vk::Image{Handle<VkImage_T>(twin->image->NativeHandle())},
+                            vk::ImageLayout::eGeneral, buffer, from);
+    GlobalBarrier();
+    s.cmd.copyBufferToImage(buffer, vk::Image{Handle<VkImage_T>(entry.image->NativeHandle())},
+                            vk::ImageLayout::eGeneral, into);
+    s.keep.push_back(std::move(staging)); // freed once the GPU ran this list
+    s.written.push_back(&entry);          // read after the next barrier
+    ++s.commands;
+    WrittenSubresources(&entry, version, nullptr);
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 40) {
+        LOG_INFO(Render_Vulkan, "FIX-212: {} {:#x} {}x{} {} <- {} {} (version {}, frame {})",
+                 info.props.is_depth ? "depth" : "colour", info.guest_address, info.size.width,
+                 info.size.height, vk::to_string(info.pixel_format),
+                 twin->info.props.is_depth ? "depth" : "colour",
+                 vk::to_string(twin->info.pixel_format), version, frame);
+    }
+}
+
+bool NativeRenderer::PartSyncOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_NATIVE_PART_SYNC"); // FIX-210 off: =0
+        return !(env && env[0] == '0');
+    }();
+    return on;
+}
+
+void NativeRenderer::SyncPartFromWholes(Native::ImageEntry& part, const DrawnRange& range) {
+    // FIX-210: on the PS4 a target that is mips or layers of a larger one (FIX-197) is the same
+    // memory, and what other work wrote into the larger one is in the part when the part is
+    // drawn into. GT7 draws its reflection probes' mips 1-8 into 18-layer targets through a
+    // 12-layer view, the six layers it draws picked by the vertex data; the other six belong to
+    // a probe its compute filter writes in the cube array. Copied back as the view drawn
+    // (FIX-208), those never-drawn layers blanked that probe's mips 1-8, and the cockpit and the
+    // crowd it lights were black two frames in three. The subresources of the view that the
+    // larger target holds newer pictures for are copied into the part first.
+    const auto eligible = [](const Native::ImageEntry& e) {
+        return e.image && std::max<u32>(e.info.resources.levels, 1) <= 16 &&
+               std::max<u32>(e.info.resources.layers, 1) <= 64 &&
+               e.info.type != AmdGpu::ImageType::Color3D;
+    };
+    if (!PartSyncOn() || !SubVersionsOn() || part.from_cpu || range.mips == 0 ||
+        !eligible(part)) {
+        return;
+    }
+    struct Whole {
+        Native::ImageEntry* entry;
+        Native::SourcePlace place;
+    };
+    boost::container::small_vector<Whole, 2> wholes;
+    {
+        boost::container::small_vector<Native::ImageEntry*, 4> dependents;
+        {
+            std::scoped_lock lock{part.sources_mutex};
+            dependents.assign(part.dependents.begin(), part.dependents.end());
+        }
+        for (auto* dependent : dependents) {
+            if (dependent->from_cpu || dependent->reused.load(std::memory_order_relaxed) ||
+                !eligible(*dependent)) {
+                continue;
+            }
+            std::scoped_lock lock{dependent->sources_mutex};
+            for (const auto& link : dependent->sources) {
+                if (link.source == &part) {
+                    wholes.push_back({dependent, link.place});
+                    break;
+                }
+            }
+        }
+    }
+    for (const auto& [whole, place] : wholes) {
+        if (range.mip < u32(place.src_mip)) {
+            continue;
+        }
+        const u32 whole_mip = u32(place.mip) + (range.mip - u32(place.src_mip));
+        if (whole_mip >= std::min<u32>(std::max<u32>(whole->info.resources.levels, 1),
+                                       std::max<u32>(whole->image->Desc().mips, 1u))) {
+            continue;
+        }
+        RefreshSources(*whole); // its other parts' newer pictures first
+        auto& held = held_versions[whole];
+        const u32 part_layers = std::min<u32>(std::max<u32>(part.info.resources.layers, 1),
+                                              std::max<u32>(part.image->Desc().layers, 1u));
+        const u32 whole_layers = std::min<u32>(std::max<u32>(whole->info.resources.layers, 1),
+                                               std::max<u32>(whole->image->Desc().layers, 1u));
+        struct Run {
+            u32 part_layer;
+            u32 whole_layer;
+            u32 count;
+        };
+        boost::container::small_vector<Run, 4> runs;
+        boost::container::small_vector<std::pair<u32, u64>, 32> taken; // part layer, version
+        const u32 last = std::min<u32>(u32(range.layer) + std::max<u32>(range.layers, 1),
+                                       part_layers);
+        for (u32 layer = range.layer; layer < last; ++layer) {
+            if (layer < u32(place.src_layer)) {
+                continue;
+            }
+            const u32 whole_layer = u32(place.layer) + (layer - u32(place.src_layer));
+            if (whole_layer >= whole_layers) {
+                break;
+            }
+            // What the whole holds there: its own drawing, or the newest part copied in.
+            const auto copied = held.find((whole_mip << 16) | whole_layer);
+            const u64 version = std::max(SubVersion(*whole, whole_mip, whole_layer),
+                                         copied != held.end() ? copied->second : u64{0});
+            if (version <= SubVersion(part, range.mip, layer)) {
+                continue;
+            }
+            if (!runs.empty() && runs.back().part_layer + runs.back().count == layer &&
+                runs.back().whole_layer + runs.back().count == whole_layer) {
+                ++runs.back().count;
+            } else {
+                runs.push_back({layer, whole_layer, 1});
+            }
+            taken.emplace_back(layer, version);
+        }
+        if (runs.empty()) {
+            continue;
+        }
+        Stream& s = Begin();
+        GlobalBarrier(); // the whole's pictures are written
+        const u32 width = std::min(std::max(part.info.size.width >> range.mip, 1u),
+                                   std::max(whole->info.size.width >> whole_mip, 1u));
+        const u32 height = std::min(std::max(part.info.size.height >> range.mip, 1u),
+                                    std::max(whole->info.size.height >> whole_mip, 1u));
+        for (const auto& run : runs) {
+            const vk::ImageCopy region{
+                .srcSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                .mipLevel = whole_mip,
+                                .baseArrayLayer = run.whole_layer,
+                                .layerCount = run.count},
+                .srcOffset = {0, 0, 0},
+                .dstSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                .mipLevel = range.mip,
+                                .baseArrayLayer = run.part_layer,
+                                .layerCount = run.count},
+                .dstOffset = {0, 0, 0},
+                .extent = {width, height, 1},
+            };
+            CmdBuf{s.cmd}.copyImage(vk::Image{Handle<VkImage_T>(whole->image->NativeHandle())},
+                                    vk::ImageLayout::eGeneral,
+                                    vk::Image{Handle<VkImage_T>(part.image->NativeHandle())},
+                                    vk::ImageLayout::eGeneral, region);
+        }
+        GlobalBarrier(); // before the draw writes the part
+        {
+            // The part holds those pictures now, as new as the whole's: copied back only once
+            // drawn again.
+            std::scoped_lock lock{part.sources_mutex};
+            const u32 mips = std::max<u32>(part.info.resources.levels, 1);
+            const u32 layers = std::max<u32>(part.info.resources.layers, 1);
+            auto& subs = part.sub_versions;
+            if (subs.empty()) {
+                subs.assign(size_t(mips) * layers,
+                            part.write_version.load(std::memory_order_relaxed));
+            }
+            for (const auto& [layer, version] : taken) {
+                const size_t at = size_t(range.mip) * layers + layer;
+                if (at < subs.size()) {
+                    subs[at] = version;
+                }
+            }
+        }
+        stats.source_copies += runs.size();
+        ++s.commands;
+        static std::atomic<u32> logged{};
+        if (logged++ < 8 || SeqTraced(&part)) {
+            LOG_INFO(Render_Vulkan, "FIX-210: target {:#x} {}x{} mip {} layers {}+{} takes {} "
+                     "layers of target {:#x} mip {} first (frame {})", part.info.guest_address,
+                     part.info.size.width, part.info.size.height, range.mip, range.layer,
+                     range.layers, taken.size(), whole->info.guest_address, whole_mip, frame);
+        }
+    }
+}
+
+VAddr NativeRenderer::DiagWritesAt() {
+    static const VAddr at = [] {
+        const char* env = Common::DiagEnv("RYGT_DIAG_WRITES_AT");
+        return env && *env ? VAddr(std::strtoull(env, nullptr, 16)) : VAddr{0};
+    }();
+    return at;
+}
+
+bool NativeRenderer::DiagFrame() const {
+    // DIAG-178 (RYGT_DIAG_WRITES_AT=<hex address>, RYGT_DIAG_WRITES_FRAME=<frame>, 2500 if not
+    // given): one frame's work touching the address, in order, up to 300 lines.
+    static const u64 at_frame = [] {
+        const char* env = Common::DiagEnv("RYGT_DIAG_WRITES_FRAME");
+        return env && *env ? u64(std::strtoull(env, nullptr, 0)) : u64{2500};
+    }();
+    return DiagWritesAt() != 0 && frame >= at_frame && diag_lines < 300;
+}
+
+void NativeRenderer::DiagWrites(const Targets* targets, const DrawBindings& b) {
+    if (!DiagFrame()) {
+        return;
+    }
+    const VAddr at = DiagWritesAt();
+    // RYGT_DIAG_PROGRAM=<hex hash>: that program's work too, wherever it draws.
+    static const std::string program = [] {
+        const char* env = Common::DiagEnv("RYGT_DIAG_PROGRAM");
+        return env && *env ? std::string{env} : std::string{};
+    }();
+    const bool by_program = !program.empty() && diag_what.find(program) != std::string::npos;
+    const auto covers = [&](const Native::ImageEntry* e) {
+        return e && (by_program || (e->info.guest_address <= at &&
+                                    at < e->info.guest_address +
+                                             std::max<u64>(e->info.guest_size, 1)));
+    };
+    const auto describe = [](const Native::ImageEntry* e) {
+        return fmt::format("{:#x} {}x{}p{} {} mips {} layers {}{}", e->info.guest_address,
+                           e->info.size.width, e->info.size.height, e->info.pitch,
+                           vk::to_string(e->info.pixel_format), e->info.resources.levels,
+                           e->info.resources.layers, e->from_cpu ? " (texture)" : "");
+    };
+    std::string text;
+    if (targets) {
+        for (const auto* color : targets->colors) {
+            if (covers(color)) {
+                text += " draws into " + describe(color) +
+                        fmt::format(" (version {})", color->write_version.load());
+            }
+        }
+        if (covers(targets->depth)) {
+            text += " depth " + describe(targets->depth);
+        }
+    }
+    for (const auto* stored : b.stored) {
+        if (covers(stored)) {
+            text += " stores " + describe(stored);
+        }
+    }
+    for (const auto& [address, size] : b.gpu_writes) {
+        if (address <= at && at < address + size) {
+            text += fmt::format(" writes buffer {:#x}+{:#x}", address, size);
+        }
+    }
+    const bool writes = !text.empty();
+    for (const auto* sampled : b.sampled) {
+        if (covers(sampled)) {
+            text += " samples " + describe(sampled);
+        }
+    }
+    // Reads alone: the first 20 lines only.
+    static u32 read_lines = 0;
+    if (!writes && !text.empty() && ++read_lines > 20) {
+        return;
+    }
+    if (!text.empty()) {
+        ++diag_lines;
+        if (targets) {
+            // How it draws: primitive, count, blend of MRT0, viewport, scissor.
+            const auto& regs = r.liverpool->DrawRegs();
+            const auto& blend = regs.blend_control[0];
+            const auto& vp = regs.viewports[0];
+            text += fmt::format(" | prim {} count {} blend {} src {} func {} dst {} mask {:#x} "
+                                "vp {}x{} at {},{} scissor {},{}-{},{}",
+                                u32(regs.primitive_type), regs.num_indices, u32(blend.enable),
+                                u32(blend.color_src_factor), u32(blend.color_func),
+                                u32(blend.color_dst_factor), regs.color_target_mask.raw,
+                                vp.xscale * 2, -vp.yscale * 2, vp.xoffset - vp.xscale,
+                                vp.yoffset + vp.yscale, regs.screen_scissor.top_left_x,
+                                regs.screen_scissor.top_left_y, regs.screen_scissor.bottom_right_x,
+                                regs.screen_scissor.bottom_right_y);
+        }
+        LOG_WARNING(Render_Vulkan, "DIAG-178: frame {} {} {}:{}", frame,
+                    targets ? "draw" : "dispatch", diag_what, text);
+    }
+}
+
 void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
+    DiagWrites(targets, b);               // DIAG-178 (diagnosis)
+    NoteProgramTextureWrites(targets, b); // DIAG-185 (diagnosis)
+    if (WriteHistoryOn()) {
+        // DIAG-187 (diagnosis)
+        if (targets) {
+            for (const auto* color : targets->colors) {
+                if (color) {
+                    NoteHistory(color->info.guest_address, color->info.guest_size, 0,
+                                history_program);
+                }
+            }
+            if (targets->depth) {
+                NoteHistory(targets->depth->info.guest_address, targets->depth->info.guest_size,
+                            1, history_program);
+            }
+        }
+        for (const auto* stored : b.stored) {
+            if (stored) {
+                NoteHistory(stored->info.guest_address, stored->info.guest_size, 2,
+                            history_program);
+            }
+        }
+        for (const auto& [address, size] : b.gpu_writes) {
+            NoteHistory(address, size, 3, history_program);
+        }
+    }
     Stream& s = stream;
-    const auto note = [&](const Native::ImageEntry* entry) {
-        Written(entry);
+    const auto note = [&](const Native::ImageEntry* entry, const DrawnRange* range = nullptr) {
+        if (range && range->mips != 0) {
+            WrittenRange(entry, *range); // FIX-208: only the mips and layers drawn
+        } else {
+            Written(entry);
+        }
         if (entry && r.FrameDumpCollecting() &&
             std::ranges::find(dump_entries, entry) == dump_entries.end()) {
             dump_entries.push_back(entry); // NAT-116
@@ -7805,8 +12005,9 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
             attached(entry);
         }
         attached(targets->depth);
-        for (const auto* entry : targets->colors) {
-            note(entry);
+        for (size_t cb = 0; cb < targets->colors.size(); ++cb) {
+            const auto* entry = targets->colors[cb];
+            note(entry, &targets->color_ranges[cb]);
             if (entry && entry->info.num_samples == 1) {
                 const u64 size = entry->info.guest_size;
                 const auto initial = Native::ClassifyHighCpuWriteback(entry->info.guest_address,
@@ -7874,6 +12075,7 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
     if (b.region_writeback) RecordRegionWriteback(b.region_writeback);
     // NAT-119: images the shader overwrote in memory are uploaded again (after this work, in
     // GPU order: the next PrepareImages records the uploads behind a barrier).
+    PartClock part{targets ? nullptr : &stats.dispatch_note_ns[1]}; // DIAG-GT7-004
     for (const auto& [address, size] : b.gpu_writes) {
         if (b.fill_pattern && address == b.fill_address) {
             GpuWrote(address, std::min(size, b.fill_size), &*b.fill_pattern, true); // NAT-120
@@ -7883,19 +12085,7 @@ void NativeRenderer::NoteWrites(const Targets* targets, const DrawBindings& b) {
     }
 }
 
-// DIAG-208: purple pixels of the garage cockpit view, and what each draw left there.
-namespace {
-constexpr VAddr TracedTarget = 0x1005000000;
-constexpr std::array<std::pair<s32, s32>, 4> TracedPixels{
-    {{266, 190}, {538, 306}, {273, 195}, {571, 322}}};
-constexpr u64 PixelTraceDraws = 8192;
-struct PixelTrace {
-    std::unique_ptr<Native::Rhi::Buffer> buffer;
-    std::vector<std::pair<u64, u64>> hashes;
-} g_pixel_trace;
-} // namespace
-
-void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
+void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect) {
     std::scoped_lock lock{mutex};
     struct StreamUnwindGuard {
         NativeRenderer& renderer;
@@ -8001,6 +12191,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             parallel_sidecars_generation.fetch_add(1,std::memory_order_release);
         } catch(const std::exception&) {parallel_sidecar_init_failed.store(true,std::memory_order_relaxed);LOG_WARNING(Render_Vulkan,"PARALLEL-RECORD: initialization failed, using serial recorder");}
     }
+    AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::Draws}; // DIAG-GT7-005
 #if !defined(NDEBUG)
     const auto start = std::chrono::steady_clock::now();
     t_timed = r.FrameDumpCollecting() || (++timing_tick & 15) == 0; // F8: every draw
@@ -8059,7 +12250,33 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
 
 #endif
     r.scheduler.PopPendingOperations();
+    // NAT-161: an indirect draw that returns before its draw command is counted as skipped.
+    struct IndirectSkip {
+        u64* skipped;
+        ~IndirectSkip() {
+            if (skipped) {
+                ++*skipped;
+            }
+        }
+    } indirect_skip{indirect ? &stats.indirect_skipped : nullptr};
     const auto& regs = r.liverpool->DrawRegs();
+    if (WriteHistoryOn()) {
+        // DIAG-189 (diagnosis): every draw's targets as it comes in, drawn or skipped later
+        // (the filter in the program field: 0 draw, 1 fast clear eliminate, 2 FMASK decompress,
+        // 3 resolve, 4 no primitive, 5 depth copy).
+        const u64 filter = u64(Classify(regs));
+        for (u32 i = 0; i < AmdGpu::NUM_COLOR_BUFFERS; ++i) {
+            const auto& col_buf = regs.color_buffers[i];
+            if (col_buf && col_buf.Address() != 0) {
+                NoteHistory(col_buf.Address(), u64(col_buf.GetColorSliceSize()) * col_buf.NumSlices(),
+                            13, filter | (u64(i) << 8));
+            }
+        }
+        if (regs.depth_buffer.DepthValid() && regs.depth_buffer.DepthWriteAddress() != 0) {
+            NoteHistory(regs.depth_buffer.DepthWriteAddress(),
+                        regs.depth_buffer.GetDepthSliceSize(), 14, filter);
+        }
+    }
     switch (Classify(regs)) {
     case Filter::EliminateFastClear: {
         // Fast-cleared tiles get the clear colour now when nothing drew into the target since
@@ -8114,12 +12331,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     }
 
     const bool quad_list = regs.primitive_type == AmdGpu::PrimitiveType::QuadList;
-    bool quad_triangles = quad_list && Common::PerfFeatureEnabled(28) &&
+    // NAT-161: an indirect draw's vertex count is in GPU memory, so its quads are drawn through
+    // the tessellation helpers (as the old path's DrawIndirect does).
+    bool quad_triangles = quad_list && !indirect && Common::PerfFeatureEnabled(28) &&
                           u64(regs.num_indices) / 4 * 6 * sizeof(u32) <= MaxQuadIndexBytes;
-    // OPT-010: the draw a game job thread prepared, if any.
+    // OPT-010: the draw a game job thread prepared, if any (job threads prepare direct draws).
     static const bool prepare = PrepareEnabled();
     PreparedDraw* prepared = nullptr;
-    if (prepare && !r.FrameDumpCollecting() && RytyGtsInRace()) {
+    if (prepare && !indirect && !r.FrameDumpCollecting() && RytyGtsInRace()) { // NAT-161: direct draws only
         prepared = TakePrepared(Rasterizer::t_draw_packet);
         NATIVE_DIAGNOSTIC(stats.prepared_missing += prepared ? 0 : 1);
     }
@@ -8136,6 +12355,21 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     // thread's selection is installed and trusted.
     bool trusted = false;
     std::shared_ptr<const void> pipeline_owner;
+    // NAT-161: as the old path's DrawIndirect: the vertex shader reads the base vertex and
+    // first instance the CP would write into its user data SGPRs from the BaseVertex and
+    // BaseInstance built-ins, i.e. from the draw's arguments.
+    const DrawIndirectParams params =
+        indirect ? DrawIndirectParams{
+                       .vertex_sgpr_offset = indirect->vertex_sgpr_offset,
+                       .instance_sgpr_offset = indirect->instance_sgpr_offset,
+                       .tessellate_quads = true,
+                       .is_indirect = true, // FIX-192
+                   }
+                 : DrawIndirectParams{
+                       .vertex_sgpr_offset = 0,
+                       .instance_sgpr_offset = 0,
+                       .tessellate_quads = quad_list && !quad_triangles,
+                   };
     const GraphicsPipeline* pipeline = [&]() -> const GraphicsPipeline* {
         PhaseClock clock{stats.phase_ns[0]};
         if (prepared && !quad_list && r.selected_pipeline == nullptr && prepared->pipeline &&
@@ -8146,14 +12380,45 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                 return installed;
             }
         }
-        return r.AcquireGraphicsPipeline(
-            {
-                .vertex_sgpr_offset = 0,
-                .instance_sgpr_offset = 0,
-                .tessellate_quads = quad_list && !quad_triangles,
-            },
-            !quad_list, &pipeline_owner);
+        return r.AcquireGraphicsPipeline(params, !indirect && !quad_list, &pipeline_owner);
     }();
+    const bool must_wait = !pipeline && DrawMustNotSkip(regs);
+    // FIX-GT7-121: a picture known to be sampled before any redraw waits whatever the budget.
+    // FIX-GT7-135: so does a never-drawn level of a texture, out of play.
+    const bool harmful_wait =
+        must_wait && (OneOffKnownHarmful() ||
+                      (one_off_texture_level && !g_game_in_play.load(std::memory_order_relaxed)));
+    if (must_wait && (harmful_wait || OneOffBudgetLeft())) {
+        // FIX-198: drawn once its pipeline is built (see DrawMustNotSkip).
+        PhaseClock clock{stats.phase_ns[0]};
+        const auto wait_start = std::chrono::steady_clock::now();
+        pipeline = r.AcquireGraphicsPipelineWaiting(
+            params, harmful_wait ? std::chrono::steady_clock::time_point::max()
+                                 : OneOffDeadline()); // FIX-GT7-109, FIX-GT7-121
+        one_off_wait_ns_frame += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - wait_start)
+                                         .count()); // FIX-GT7-102
+        if (pipeline) {
+            ++stats.one_off_waits;
+            stats.one_off_harmful_waits += harmful_wait ? 1 : 0;
+            WatchOneOffs(regs, false); // DIAG-GT7-008, PERF-GT7-023
+        } else {
+            ++stats.one_off_budget_skips; // FIX-GT7-109: not ready within the play budget
+            WatchOneOffs(regs, true);
+        }
+    } else if (must_wait) {
+        // FIX-GT7-102: this frame already waited its budget for one-off pipelines: skipped as
+        // other draws are, and watched as a skip (it never makes its kind safe).
+        ++stats.one_off_budget_skips;
+        WatchOneOffs(regs, true);
+    } else if (!pipeline && !one_off_hits.empty()) {
+        // PERF-GT7-023: one-off pictures of kinds that no longer wait only: skipped as other
+        // draws are, and still watched (one sampled before its redraw makes its kind wait again).
+        ++stats.one_off_exempt;
+        WatchOneOffs(regs, true);
+    } else if (pipeline && OneOffDiagAll() && DrawMustNotSkip(regs)) {
+        WatchOneOffs(regs, false); // DIAG-GT7-008: it would have waited
+    }
     if (!pipeline) {
         if (one_off_observer) {
             const auto outputs = GetOneOffOutputs(regs);
@@ -8164,6 +12429,51 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         if (GeometryTrace::current)
             GeometryTrace::Record("draw_no_pipeline", GeometryTrace::current);
 #endif
+        // FIX-GT7-131: a draw into a colour layout no picture has, skipped all the same (its
+        // pipeline not ready within the frame's budget), leaves its target empty rather than
+        // missing: a later read of that layout would otherwise read guest memory. At a Scapes
+        // photo's first frames that was the scratch pool's other pictures (RGBA8 menu pictures read
+        // as RGBA16F: huge values, NaN) and the photo's average kept them to the end.
+        static const bool empty_target = [] {
+            const char* env = std::getenv("RYGT_NATIVE_ONE_OFF_LAYOUT");
+            return !(env && env[0] == '0');
+        }();
+        if (empty_target && regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Disable) {
+            for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+                const auto& col_buf = regs.color_buffers[cb];
+                if (!col_buf || regs.color_target_mask.GetMask(cb) == 0) {
+                    continue;
+                }
+                const VideoCore::TextureCache::ImageDesc desc{col_buf,
+                                                              r.liverpool->DrawCbExtent(cb)};
+                const auto& info = desc.info;
+                if (info.num_samples != 1 ||
+                    registry->FindExisting(col_buf.Address(), [&](const Native::ImageEntry& e) {
+                        return !e.from_cpu && e.image != nullptr && e.info.pitch == info.pitch &&
+                               e.info.num_bits == info.num_bits &&
+                               e.info.tile_mode == info.tile_mode &&
+                               e.info.num_samples == info.num_samples;
+                    })) {
+                    continue;
+                }
+                Native::ImageEntry* const made = registry->Find(info, true, frame);
+                if (!made || made->write_version.load(std::memory_order_relaxed) != 0) {
+                    continue;
+                }
+                made->needs_upload.store(false, std::memory_order_relaxed);
+                made->force_upload.store(false, std::memory_order_relaxed);
+                made->rewrite = Native::ImageEntry::Rewrite::Clear;
+                made->rewrite_pattern = {0, 0};
+                made->rewrite_bytes = made->info.guest_size;
+                static std::atomic<u32> empty_logged{};
+                if (const u32 n = empty_logged++; n < 64 || n % 500 == 0) {
+                    LOG_WARNING(Render_Vulkan,
+                                "FIX-GT7-131: a draw into {:#x} {}x{} skipped without its pipeline: "
+                                "its target starts empty (frame {}, {} so far)",
+                                col_buf.Address(), info.size.width, info.size.height, frame, n + 1);
+                }
+            }
+        }
         return;
     }
     ASSERT_MSG(PipelineOwnerMatches(pipeline, pipeline_owner), "Graphics pipeline owner mismatch");
@@ -8186,10 +12496,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         }
         return hashes;
     }();
-    if (!skip_ps.empty()) {
+    const u64 diagnostic_skip = DiagnosticPassOptions(frame).second;
+    if (!skip_ps.empty() || diagnostic_skip) {
         const auto& stages = pipeline->GetStages();
         const Shader::Info* fs = stages[u32(Shader::SwStage::Fragment)];
-        if (fs && std::ranges::find(skip_ps, fs->pgm_hash) != skip_ps.end()) {
+        if (fs && (fs->pgm_hash == diagnostic_skip ||
+                   std::ranges::find(skip_ps, fs->pgm_hash) != skip_ps.end())) {
             NATIVE_DIAGNOSTIC(++stats.skipped);
             static std::atomic<u32> logged{};
             if (logged++ < 32) {
@@ -8207,7 +12519,55 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                  appearance.rim_brightness);
     }
     SyncUiReads(pipeline->GetStages());
+    if (indirect) {
+        // DIAG-162: the first kinds of indirect draws, by shaders and argument layout.
+        static std::mutex seen_mutex;
+        static std::set<std::tuple<u64, u64, bool, u32, bool, u32>> seen;
+        const auto& stages = pipeline->GetStages();
+        const Shader::Info* vs = stages[u32(Shader::SwStage::Vertex)];
+        const Shader::Info* fs = stages[u32(Shader::SwStage::Fragment)];
+        const auto key = std::make_tuple(vs ? vs->pgm_hash : 0, fs ? fs->pgm_hash : 0, is_indexed,
+                                         indirect->max_count, indirect->count_address != 0,
+                                         indirect->stride);
+        std::scoped_lock lock{seen_mutex};
+        if (seen.size() < 64 && seen.insert(key).second) {
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-162: indirect draw vs {:#x} ps {:#x} {} max_count {} count {:#x} "
+                        "stride {} args {:#x} sgprs {}/{}",
+                        std::get<0>(key), std::get<1>(key), is_indexed ? "indexed" : "arrays",
+                        indirect->max_count, indirect->count_address, indirect->stride,
+                        indirect->address, indirect->vertex_sgpr_offset,
+                        indirect->instance_sgpr_offset);
+        }
+    }
     Stream& s = Begin();
+    // NAT-161: the arguments are looked up before the draw's other buffers, as DispatchIndirect
+    // does: a region a later lookup makes takes theirs in and leaves it as it was, holding what
+    // the GPU wrote there; made last, their region could take in one this draw binds for
+    // writing, whose writes would then go to the buffer left behind.
+    std::optional<IndirectBuffers> arguments;
+    if (indirect) {
+        arguments = ResolveIndirect(*indirect, is_indexed);
+        if (!arguments) {
+            ++stats.skipped;
+            return;
+        }
+        // DIAG-211 (diagnosis): a watched shader's arguments as the GPU reads them.
+        static const bool watching = Common::DiagEnv("SHADGT_WATCH_SHADERS") != nullptr;
+        if (watching && frame % 10 == 0) {
+            for (const auto* stage : pipeline->GetStages()) {
+                if (stage && IsWatchedShader(stage->pgm_hash)) {
+                    const u32 command = is_indexed ? 20u : 16u;
+                    const u64 bytes =
+                        u64(std::max(indirect->stride, command)) * (arguments->max_count - 1) +
+                        command;
+                    CompareRegion(indirect->address, bytes, std::max(indirect->stride, command),
+                                  arguments->args, arguments->args_offset, stage->pgm_hash, true);
+                    break;
+                }
+            }
+        }
+    }
     Targets targets;
     {
         PhaseClock clock{stats.phase_ns[1]};
@@ -8247,7 +12607,55 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         }
     }
 
+    // GT7-UW: the frame's first draw into a display buffer is the scene; later ones the HUD,
+    // drawn into the display's black and white HUD pictures instead.
+    std::optional<RenderState> hud_black_state;
+    std::optional<RenderState> hud_white_state;
+    HudLayer* hud_layer = nullptr;
+    // (Multisampled, as a race's track and course maps are; a menu's small pictures drawn with
+    // depth, like the World Map's 256x256 probe, are not.)
+    if (HudSplitOn() && targets.colors[0] && targets.depth &&
+        targets.colors[0]->info.num_samples > 1 &&
+        targets.colors[0]->info.size.width <= 1024 && targets.colors[0]->info.size.height <= 600) {
+        hud_depth_drawn[targets.colors[0]->info.guest_address] = frame;
+    }
+    if (HudSplitOn() && targets.colors[0] && targets.state.num_color_attachments == 1 &&
+        IsDisplayAddress(targets.colors[0]->info.guest_address)) {
+        HudLayer& layer = hud_layers[targets.colors[0]->info.guest_address];
+        if (layer.composite_frame != frame) {
+            layer.composite_frame = frame;
+            layer.clear_pending = true;
+            if (!layer.black) {
+                layer.black = MakeHudPicture(*targets.colors[0]);
+                layer.white = MakeHudPicture(*targets.colors[0]);
+            }
+        } else if (layer.black && layer.white) {
+            const VideoCore::TextureCache::ImageDesc desc{regs.color_buffers[0],
+                                                          r.liverpool->DrawCbExtent(0)};
+            const vk::ImageView black = View(*layer.black, desc.view_info, ViewUse::Attachment);
+            const vk::ImageView white = View(*layer.white, desc.view_info, ViewUse::Attachment);
+            if (black && white) {
+                hud_black_state = targets.state;
+                hud_white_state = targets.state;
+                auto& b0 = hud_black_state->color_attachments[0];
+                auto& w0 = hud_white_state->color_attachments[0];
+                b0.image_view = black;
+                w0.image_view = white;
+                b0.is_clear = w0.is_clear = layer.clear_pending ? 1u : 0u;
+                b0.clear_value = {};
+                const u32 one = std::bit_cast<u32>(1.0f);
+                w0.clear_value = layer.clear_pending ? std::array<u32, 4>{one, one, one, one}
+                                                     : std::array<u32, 4>{};
+                layer.clear_pending = false;
+                layer.hud_frame = frame;
+                hud_layer = &layer;
+            }
+        }
+    }
     if (r.FrameDumpActive() || Rasterizer::ExposureLogOn()) {
+        if (r.FrameDumpCollecting()) {
+            SnapPass(targets); // DIAG-226 (diagnosis)
+        }
         r.FrameDumpPass(regs, targets.state, pipeline); // NAT-117
     }
     // WIDE-031: the menus' 3D scenes (Home, the livery editor's car, helmet and suit) shot wide.
@@ -8330,6 +12738,19 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         }
     }
     DrawBindings& b = from_prepared ? prepared->bindings : bindings;
+    // GT7-UW: a HUD draw showing a small picture drawn with depth this frame (the race's maps).
+    const auto note_race_hud = [&] {
+        if (!hud_layer || hud_layer->race_frame == frame) {
+            return;
+        }
+        for (const auto* sampled : b.sampled) {
+            const auto it = hud_depth_drawn.find(sampled->info.guest_address);
+            if (it != hud_depth_drawn.end() && it->second == frame) {
+                hud_layer->race_frame = frame;
+                return;
+            }
+        }
+    };
     if (!from_prepared) {
         b.Clear();
         b.push = UserData(regs);
@@ -8349,16 +12770,40 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         } else {
             vertex_index = {};
             ResolveVertexBuffers(*pipeline, regs, vertex_index);
+            // NAT-161: an indexed indirect draw's indices start at the index base; num_indices
+            // is then the index buffer's size (INDEX_BUFFER_SIZE), as the old path binds it.
             if (!ResolveIndices(regs, is_indexed, index_offset, quad_triangles, vertex_index)) {
+                if (indirect && is_indexed) {
+                    static const bool logged = [&] {
+                        LOG_WARNING(Render_Vulkan,
+                                    "NAT-161: indexed indirect draw skipped: its {} indices at "
+                                    "{:#x} can't be bound",
+                                    regs.num_indices, regs.index_base_address.Address());
+                        return true;
+                    }();
+                }
                 NATIVE_DIAGNOSTIC(++stats.skipped);
                 return;
             }
-            CheckVertexReach(*pipeline, regs, is_indexed, index_offset); // FIX-181 (diagnosis)
+            if (indirect && is_indexed && regs.index_offset != 0) {
+                // The GPU adds VGT_INDX_OFFSET to every index it fetches; the arguments have
+                // their own base vertex, and nothing adds this one (as in the old path).
+                static const bool logged = [&] {
+                    LOG_WARNING(Render_Vulkan,
+                                "NAT-161: indexed indirect draw with VGT_INDX_OFFSET {} drawn "
+                                "without it",
+                                regs.index_offset);
+                    return true;
+                }();
+            }
+            if (!indirect) { // NAT-161: an indirect draw's counts are in GPU memory
+                CheckVertexReach(*pipeline, regs, is_indexed, index_offset); // FIX-181 (diagnosis)
+            }
         }
     }
     {
         PhaseClock clock{stats.phase_ns[6]};
-        PrepareImages();
+        PrepareImages(b); // PERF-109
     }
     const bool native_fsr_composition = BeginNativeFsr(*pipeline, targets, b);
     if (native_fsr_composition) scale_composition = false;
@@ -8567,6 +13012,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         }
         b.key_layout = nullptr; // attachment layout changes descriptor image layouts
     }
+    SnapProgramMips(pipeline->GetStages(), b); // DIAG-234 (diagnosis)
     PhaseClock record_clock{stats.phase_ns[7]};
     {
         PhaseClock part{stats.record_ns[0]}; // OPT-011
@@ -8577,7 +13023,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             const char* env = std::getenv("RYGT_NATIVE_PASS_BARRIERS");
             return !(env && env[0] == '0');
         }();
-        const bool pass_change = !s.rendering || !(s.render == targets.state);
+        const bool pass_change =
+            !s.rendering || !(s.render == (hud_black_state ? *hud_black_state : targets.state));
         // FIX-183 (diagnosis, RYGT_NATIVE_DRAW_BARRIER=1): a full barrier before every draw.
         static const bool draw_barrier = [] {
             const char* env = std::getenv("RYGT_NATIVE_DRAW_BARRIER");
@@ -8597,16 +13044,35 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             }
             return targets.depth && std::ranges::find(list, targets.depth) != list.end();
         };
+        // NAT-161: an indirect draw reads its arguments (and count) at the draw-indirect stage.
+        // Buffers written since the last global barrier (by the dispatch that wrote them) get
+        // one now, whose second scope (all commands, all memory reads) takes in indirect command
+        // reads; NeedsBarrierFor asks for it too, but the arguments keep it whatever that checks.
+        const bool reads_arguments = indirect && s.buffers_written;
         if (!pass_barriers) {
-            if (pass_change || NeedsBarrierFor(b)) {
+            if (pass_change || NeedsBarrierFor(b) || reads_arguments) {
                 GlobalBarrier();
             }
-        } else if (NeedsBarrierFor(b) || (pass_change && targets_in(s.read))) {
+        } else if (NeedsBarrierFor(b) || reads_arguments || (pass_change && targets_in(s.read))) {
             GlobalBarrier();
         } else if (pass_change && targets_in(s.attach_dirty)) {
             PassBarrier();
         } else if (pass_change) {
             NATIVE_DIAGNOSTIC(++stats.passes_unblocked);
+        }
+    }
+    // FIX-210: a target's pending pictures (from the targets it is made of, and from the larger
+    // target it is a part of) go in before the draw, which counts as drawing its whole view.
+    if (PartSyncOn()) {
+        const u64 copies_before = stats.source_copies;
+        for (size_t cb = 0; cb < targets.colors.size(); ++cb) {
+            if (auto* color = const_cast<Native::ImageEntry*>(targets.colors[cb])) {
+                RefreshSources(*color);
+                SyncPartFromWholes(*color, targets.color_ranges[cb]);
+            }
+        }
+        if (stats.source_copies != copies_before) {
+            GlobalBarrier(); // the copies are done before the draw writes the targets
         }
     }
     auto* parallel=FindParallelRuntime(this);
@@ -8684,7 +13150,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         parallel_bindings.ordinary_buffers=worker_result->ordinary_buffers;
         parallel_bindings.ordinary_images=worker_result->ordinary_images;
     };
-    if(parallel && !parallel->closing && parallel->applied_mode.Enabled()) {
+    // NAT-161 indirect draws and GT7-UW HUD draws stay on the serial recorder.
+    if(parallel && !parallel->closing && parallel->applied_mode.Enabled() && !indirect && !hud_black_state) {
 #if !defined(NDEBUG)
         static const bool whole_enabled=[] {const char* p=std::getenv("RYGT_PARALLEL_WHOLE_PREFLIGHT");return p && p[0]=='1' && p[1]=='\0';}();
         const bool whole_sample=whole_enabled && ((++parallel->whole_seq & 127u)==0);
@@ -9691,7 +14158,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     const bool lds_owned_buffers = !pipeline->LdsEmulation() ||
         (std::ranges::all_of(b.buffers, [&](const auto& descriptor) { return lds_owned_buffer(descriptor.buffer); }) &&
          std::ranges::all_of(vi->buffers, lds_owned_buffer) && lds_owned_buffer(vi->index_buffer));
-    const bool lds_safe_draw = pipeline->LdsEmulation() &&
+    const bool lds_safe_draw = pipeline->LdsEmulation() && !indirect && // NAT-161: direct draws only
         TessLdsSafeShape(regs.num_instances.NumInstances(), quad_triangles, lds_readonly_stages && lds_owned_buffers,
                          !b.stored.empty() || !b.gpu_writes.empty() || b.writes_buffers,
                          regs.reg_array[0xa30e] == ~0u && regs.reg_array[0xa30f] == ~0u) && !has_feedback &&
@@ -9703,8 +14170,114 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     if (!s.lds_readers.empty() && (!lds_batch_candidate || s.lds_readers.size() >= 1024 ||
         s.lds_bytes + lds_proposed_size->size > (32ull << 20))) FlushLdsReaders(0);
     {
+        // DIAG-214 (diagnosis, RYGT_DIAG_RECORD_DRAWS=1): every 30th frame, each draw reading a
+        // 144-byte-stride buffer (GT7's crowd records): its programs, records, depth test, targets.
+        static const bool record_draws = Common::DiagEnv("RYGT_DIAG_RECORD_DRAWS") != nullptr;
+        if (record_draws && b.diag_records != 0 && frame % 30 == 0) {
+            std::string programs;
+            for (const auto* stage : pipeline->GetStages()) {
+                if (stage) {
+                    programs += fmt::format(" {:#x}", stage->pgm_hash);
+                }
+            }
+            const auto& dc = regs.depth_control;
+            const auto& dsa = targets.state.depth_stencil_attachment;
+            LOG_WARNING(Render_Vulkan, "DIAG-214: frame {} draw{} records {:#x} | depth {:#x} test {} "
+                        "write {} func {} | entry {} {} {}x{} v{} clear {} view {} | c0 {:#x} mask "
+                        "{:#x} | indirect {} n {} inst {}", frame,
+                        programs, b.diag_records,
+                        targets.depth ? targets.depth->info.guest_address : 0, u32(dc.depth_enable),
+                        u32(dc.depth_write_enable), u32(dc.depth_func),
+                        static_cast<const void*>(targets.depth),
+                        targets.depth ? vk::to_string(targets.depth->info.pixel_format) : "-",
+                        targets.depth ? targets.depth->info.size.width : 0,
+                        targets.depth ? targets.depth->info.size.height : 0,
+                        targets.depth ? targets.depth->write_version.load() : 0, dsa.depth_clear,
+                        static_cast<const void*>(static_cast<VkImageView>(dsa.image_view)),
+                        targets.colors[0] ? targets.colors[0]->info.guest_address : 0,
+                        regs.color_target_mask.raw, indirect != nullptr, regs.num_indices,
+                        regs.num_instances.NumInstances());
+        }
+    }
+    {
+        // DIAG-212 (diagnosis, RYGT_DIAG_CAPTURE=<hex program>,<every n frames>): every n-th
+        // frame, the color target the program's first draw writes, right before that draw, and
+        // (in FindDisplay) the display picture the frame ends with.
+        // Several programs: <hex>+<hex>+...,<n>; each one's first draw in the frame is captured.
+        struct CaptureConfig {
+            std::vector<u64> programs;
+            u64 every = 30;
+        };
+        static const CaptureConfig capture = [] {
+            CaptureConfig c;
+            if (const char* env = Common::DiagEnv("RYGT_DIAG_CAPTURE"); env && *env) {
+                const char* at = env;
+                char* end = nullptr;
+                while (true) {
+                    c.programs.push_back(std::strtoull(at, &end, 16));
+                    if (!end || *end != '+') {
+                        break;
+                    }
+                    at = end + 1;
+                }
+                c.every = end && *end == ',' ? std::max<u64>(std::strtoull(end + 1, nullptr, 10), 1)
+                                             : 30;
+            }
+            return c;
+        }();
+        static u64 captured_frame = ~u64{0};
+        static std::vector<u64> captured;
+        if (!capture.programs.empty() && frame % capture.every == 0 && targets.colors[0]) {
+            if (captured_frame != frame) {
+                captured_frame = frame;
+                captured.clear();
+            }
+            for (const auto* stage : pipeline->GetStages()) {
+                if (stage && std::ranges::find(capture.programs, stage->pgm_hash) !=
+                                 capture.programs.end() &&
+                    std::ranges::find(captured, stage->pgm_hash) == captured.end()) {
+                    captured.push_back(stage->pgm_hash);
+                    capture_frame = frame;
+                    CaptureImage(*targets.colors[0], frame,
+                                 fmt::format("before_{:x}", stage->pgm_hash));
+                    break;
+                }
+            }
+        }
+    }
+    // DIAG-208 (diagnosis): the vertex data of a logged draw as the GPU reads it (GT7's probe
+    // passes take each triangle's layer, LOD and scale from it).
+    if (std::ranges::any_of(targets.colors, [&](const auto* color) { return SeqTraced(color); })) {
+        for (size_t i = 0; i < vi->buffers.size() && i < 2 && refresh_probes.size() < 64; ++i) {
+            const u64 bytes = std::min<u64>(vi->sizes[i], 2048);
+            if (bytes == 0 || !vi->buffers[i]) {
+                continue;
+            }
+            auto buffer = device->CreateBuffer({.size = bytes,
+                                                .usage = Native::Rhi::BufferUsageStorage |
+                                                         Native::Rhi::BufferUsageTransferDst,
+                                                .memory = Native::Rhi::MemoryKind::Readback,
+                                                .name = "vertex probe"});
+            if (!buffer || !buffer->Mapped()) {
+                continue;
+            }
+            GlobalBarrier();
+            stream.cmd.copyBuffer(vi->buffers[i],
+                                  vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
+                                  vk::BufferCopy{.srcOffset = vi->offsets[i], .dstOffset = 0,
+                                                 .size = bytes});
+            GlobalBarrier();
+            const auto* color = *std::ranges::find_if(
+                targets.colors, [&](const auto* c) { return SeqTraced(c); });
+            refresh_probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, frame,
+                                      fmt::format("vertex floats of binding {} (stride {}) of a "
+                                                  "draw into {:#x}",
+                                                  i, vi->strides[i], color->info.guest_address)});
+        }
+    }
+    {
         PhaseClock part{stats.record_ns[1]};
-        if(!parallel_draw) BeginRendering(targets.state);
+        if(!parallel_draw) BeginRendering(hud_black_state ? *hud_black_state : targets.state); // GT7-UW
     }
 
     // The renderer's dynamic state code, filling this list's state.
@@ -9870,6 +14443,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             for (size_t i = 0; i < outputs.count; ++i) one_off_observer->Redrawn(outputs.keys[i]);
         }
     }
+    note_race_hud(); // GT7-UW
     {
         PhaseClock part{stats.record_ns[6]};
         const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
@@ -9952,6 +14526,17 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
                                                vs_hash, fs_hash, count);
             });
         }
+        // DIAG-243: the draws recorded last, for the report of a lost device.
+        static const bool note_draws = [] {
+            const char* env = std::getenv("RYGT_DEVICE_FAULT");
+            return env && env[0] == '1';
+        }();
+        if (note_draws) {
+            const auto& key = pipeline->GetGraphicsKey();
+            NoteDrawForFault(XXH3_64bits(&key, sizeof(key)),
+                             (pipeline->LdsEmulation() & 0xff) |
+                                 (u32(regs.stage_enable.hs_en != 0) << 8));
+        }
         // WIDE-008/031/060: the draw is split from its preparation, so the 32:9 paths can
         // issue it with their own viewports and scissors (several times for a split HUD element).
         const auto prepare_draw = [&] {
@@ -9964,6 +14549,11 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
         }
         };
         const auto issue = [&] {
+        const CmdBuf cmdbuf{stream.cmd}; // GT7-UW: the HUD list's when it is swapped in
+        if (indirect) {
+            RecordIndirect(*indirect, *arguments, is_indexed); // NAT-161
+            return;
+        }
         if (quad_triangles) {
             if (index_count != 0) {
                 cmdbuf.drawIndexed(index_count, instances, 0, s32(vertex_offset),
@@ -10345,6 +14935,33 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
             s.cmd.pushConstants(pipeline->GetLayout(), AllGraphicsStageBits,
                 u32(offsetof(Shader::PushData, quad_sample_mask)), 8u, b.push.quad_sample_mask.data());
         }
+        if (hud_white_state && HudStreamOn() && !stream.wrapped_list) {
+            // GT7-UW: the same draw over white, in the HUD list (its state recorded there too).
+            std::swap(stream, hud_stream);
+            BeginHudStream();
+            BeginRendering(*hud_white_state);
+            {
+                DynamicState* const saved = Rasterizer::t_dynamic_state;
+                Rasterizer::t_dynamic_state = &s.dynamic;
+                r.UpdateViewportScissorState();
+                r.UpdateDepthStencilState();
+                r.UpdatePrimitiveState(is_indexed, quad_triangles);
+                r.UpdateRasterizationState();
+                r.UpdateColorBlendingState(pipeline);
+                s.dynamic.Commit(r.instance, CmdBuf{s.cmd});
+                Rasterizer::t_dynamic_state = saved;
+            }
+            RecordVertexIndex(*vi);
+            BindGraphics(s, *pipeline, pipeline_owner);
+            PushBindings(*pipeline, vk::PipelineBindPoint::eGraphics, b);
+            issue();
+            std::swap(stream, hud_stream);
+        } else if (hud_white_state) {
+            // GT7-UW: the same draw again over white (the pipeline, bindings and dynamic state
+            // stay bound across the change of attachment).
+            BeginRendering(*hud_white_state);
+            issue();
+        }
         SceneTrace::GpuEnd(s.cmd);
         }
     }
@@ -10352,6 +14969,30 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     {
         PhaseClock part{stats.record_ns[7]};
         NoteWrites(&targets, b);
+    }
+    for (size_t cb = 0; cb < targets.colors.size(); ++cb) {
+        const auto* color = targets.colors[cb];
+        if (!SeqTraced(color)) {
+            continue;
+        }
+        // DIAG-208 (diagnosis): the draw, the subresources it was noted as drawing.
+        const auto& range = targets.color_ranges[cb];
+        LOG_WARNING(Render_Vulkan, "DIAG-208: frame {} draw into {:#x} {}x{}: mip {} layers {}+{}{} -> v{}",
+                    frame, color->info.guest_address, color->info.size.width,
+                    color->info.size.height, range.mip, range.layer, range.layers,
+                    targets.state.color_attachments[cb].is_clear ? " CLEAR" : "",
+                    color->write_version.load());
+    }
+    ProbeDraw(targets, regs); // DIAG-170 (diagnosis)
+    StripDraw(targets);       // DIAG-173 (diagnosis)
+    if (GpuSegment* seg = GpuSeg()) { // DIAG-GT7-001
+        ++seg->draws;
+        const u64 prims = u64(regs.num_indices) * std::max<u32>(regs.num_instances.NumInstances(), 1);
+        if (prims > seg->max_prims) {
+            const Shader::Info* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+            seg->max_prims = prims;
+            seg->max_prims_ps = ps ? ps->pgm_hash : 0;
+        }
     }
     RecordPartitionClock tail_partition{parallel?&parallel->record_partition[partition_mode][1]:nullptr};
     if (!feedback.empty()) {
@@ -10452,10 +15093,145 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset) {
     }
 
     NATIVE_DIAGNOSTIC(++stats.draws);
+    if (indirect) {
+        indirect_skip.skipped = nullptr; // NAT-161
+        ++stats.indirect_draws;
+    }
     ++s.commands;
     tail_partition.Finish();
     {RecordPartitionClock chunk_partition{parallel?&parallel->record_partition[partition_mode][2]:nullptr};ChunkFlushCheck();}
     {RecordPartitionClock report_partition{parallel?&parallel->record_partition[partition_mode][3]:nullptr};Report();}
+}
+
+std::optional<NativeRenderer::IndirectBuffers> NativeRenderer::ResolveIndirect(
+    const IndirectDraw& indirect, bool is_indexed) {
+    // What Vulkan can't draw as the GPU would is skipped, rather than drawn wrong.
+    const u32 command_size =
+        is_indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);
+    if (indirect.max_count == 0) {
+        return std::nullopt; // no draws (none on the GPU either)
+    }
+    if (!r.instance.IsDrawIndirectFirstInstanceSupported()) {
+        // The shaders read the first instance from the arguments (BaseInstance), which Vulkan
+        // leaves undefined there without the feature unless it is 0.
+        static const bool logged = [] {
+            LOG_WARNING(Render_Vulkan, "NAT-161: indirect draws skipped: the device can't start "
+                                       "them at an instance other than 0 "
+                                       "(drawIndirectFirstInstance)");
+            return true;
+        }();
+        return std::nullopt;
+    }
+    if (indirect.count_address != 0 && (!r.instance.IsDrawIndirectCountSupported() ||
+                                        indirect.max_count > r.instance.MaxDrawIndirectCount())) {
+        static const bool logged = [&] {
+            LOG_WARNING(
+                Render_Vulkan,
+                "NAT-161: indirect draw of up to {} draws counted at {:#x} skipped: the "
+                "device can't take that many draws from a count in memory "
+                "(drawIndirectCount, at most {})",
+                indirect.max_count, indirect.count_address,
+                r.instance.IsDrawIndirectCountSupported() ? r.instance.MaxDrawIndirectCount() : 0u);
+            return true;
+        }();
+        return std::nullopt;
+    }
+    // Several draws step through the arguments by the stride, which Vulkan wants 4-byte aligned
+    // and no shorter than one draw's arguments (one draw's stride is ignored).
+    if ((indirect.max_count > 1 || indirect.count_address != 0) &&
+        (indirect.stride % 4 != 0 || indirect.stride < command_size)) {
+        static const bool logged = [&] {
+            LOG_WARNING(Render_Vulkan,
+                        "NAT-161: indirect draw of up to {} draws with arguments {} bytes apart "
+                        "skipped (Vulkan needs a multiple of 4, at least {})",
+                        indirect.max_count, indirect.stride, command_size);
+            return true;
+        }();
+        return std::nullopt;
+    }
+    // With a count in memory, max_count is only an upper bound (the GPU reads min(count,
+    // max_count) draws), so the arguments looked up end where the mapping does, and at most
+    // MaxCountArgs in: a huge bound would otherwise make GuestBuffer merge and drop regions for
+    // a range that cannot exist.
+    constexpr u64 MaxCountArgs = 16_MB;
+    u32 max_count = indirect.max_count;
+    u64 size = u64(indirect.stride) * (max_count - 1) + command_size;
+    if (indirect.count_address != 0) {
+        const u64 reach = std::min(r.memory->ClampRangeSize(indirect.address, size), MaxCountArgs);
+        if (reach < command_size) {
+            static const bool logged = [&] {
+                LOG_WARNING(Render_Vulkan,
+                            "NAT-161: indirect draw skipped: its arguments at {:#x} are not mapped",
+                            indirect.address);
+                return true;
+            }();
+            return std::nullopt;
+        }
+        if (reach < size) {
+            max_count = static_cast<u32>((reach - command_size) / indirect.stride + 1);
+            size = u64(indirect.stride) * (max_count - 1) + command_size;
+        }
+    }
+    // The arguments where the GPU has them: in their region when shaders wrote them (NAT-114;
+    // GT7's come from compute shader 850c97f9), else guest memory read in place.
+    const auto args = GuestBuffer(indirect.address, size, false);
+    if (!args || args->second % 4 != 0) {
+        static const bool logged = [&] {
+            LOG_WARNING(Render_Vulkan,
+                        "NAT-161: indirect draw skipped: its arguments at {:#x}+{:#x} are {}",
+                        indirect.address, size,
+                        args ? "not 4-byte aligned" : "not readable by the GPU");
+            return true;
+        }();
+        return std::nullopt;
+    }
+    IndirectBuffers buffers{.args = args->first, .args_offset = args->second, .max_count = max_count};
+    if (indirect.count_address != 0) {
+        const auto count = GuestBuffer(indirect.count_address, sizeof(u32), false);
+        if (!count || count->second % 4 != 0) {
+            static const bool logged = [&] {
+                LOG_WARNING(Render_Vulkan,
+                            "NAT-161: indirect draw skipped: its draw count at {:#x} is {}",
+                            indirect.count_address,
+                            count ? "not 4-byte aligned" : "not readable by the GPU");
+                return true;
+            }();
+            return std::nullopt;
+        }
+        buffers.count = count->first;
+        buffers.count_offset = count->second;
+    }
+    return buffers;
+}
+
+void NativeRenderer::RecordIndirect(const IndirectDraw& indirect, const IndirectBuffers& buffers,
+                                    bool is_indexed) {
+    // The guest's argument structures are Vulkan's (pm4_cmds.h): index or vertex count,
+    // instance count, first index or vertex, (base vertex,) first instance.
+    const CmdBuf cmdbuf{stream.cmd};
+    if (buffers.count) {
+        if (is_indexed) {
+            cmdbuf.drawIndexedIndirectCount(buffers.args, buffers.args_offset, buffers.count,
+                                            buffers.count_offset, buffers.max_count,
+                                            indirect.stride);
+        } else {
+            cmdbuf.drawIndirectCount(buffers.args, buffers.args_offset, buffers.count,
+                                     buffers.count_offset, buffers.max_count, indirect.stride);
+        }
+        return;
+    }
+    // A command makes at most maxDrawIndirectCount draws (1 without multiDrawIndirect).
+    const u32 per_command = std::max(r.instance.MaxDrawIndirectCount(), 1u);
+    for (u32 first = 0; first < buffers.max_count;) {
+        const u32 count = std::min(per_command, buffers.max_count - first);
+        const u64 offset = buffers.args_offset + u64(first) * indirect.stride;
+        if (is_indexed) {
+            cmdbuf.drawIndexedIndirect(buffers.args, offset, count, indirect.stride);
+        } else {
+            cmdbuf.drawIndirect(buffers.args, offset, count, indirect.stride);
+        }
+        first += count;
+    }
 }
 
 bool NativeRenderer::PrepareEnabled() {
@@ -11312,12 +16088,22 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
             });
             binding.unified += num_bindings;
         };
+        // false: the draw goes to the recorder (FIX-GT7-133's stand-in not made yet).
         const auto bind_null = [&] {
+            const bool wants_stand_in =
+                image_desc.is_depth && !storage && num_bindings == 1 && !cube_sampling;
+            const vk::ImageView stand_in = wants_stand_in
+                                               ? DepthStandIn(image_desc.is_array, false)
+                                               : vk::ImageView{};
+            if (wants_stand_in && !stand_in && DepthStandInOn()) {
+                return false; // FIX-GT7-133: made and cleared on the recorder, which binds it
+            }
             for (u32 i = 0; i < num_bindings; ++i) {
-                b.images.push_back({VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral});
+                b.images.push_back({VK_NULL_HANDLE, stand_in, vk::ImageLayout::eGeneral});
             }
             ++p.null_images;
             add_write();
+            return true;
         };
         std::array<u64, 4> raw_sharp{};
         static_assert(sizeof(tsharp) == sizeof(raw_sharp));
@@ -11331,7 +16117,7 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
             return false; // the recorder (FIX-081's grass shader, long arrays)
         }
         const u64 memo_generation = p.image_generation + p.unmap_gen;
-        TextureMemo& memo = memos[XXH3_64bits_withSeed(raw_sharp.data(), sizeof(raw_sharp),
+        JobTextureMemo& memo = memos[XXH3_64bits_withSeed(raw_sharp.data(), sizeof(raw_sharp),
                                                        memo_flags) &
                                   (memos.size() - 1)];
         auto* proof_memo=proof_enabled && proof_memos ? &(*proof_memos)[static_cast<std::size_t>(&memo-memos.data()) & (proof_memos->size()-1)] : nullptr;
@@ -11382,7 +16168,9 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
             LiverpoolToVK::TrySurfaceFormat(data_fmt, num_fmt) == vk::Format::eUndefined ||
             VideoCore::CheckImageDescriptorGeometry(tsharp, r.instance.GetImageLimits()) !=
                 VideoCore::ImageDescriptorGeometryError::None) {
-            bind_null();
+            if (!bind_null()) {
+                return false;
+            }
             continue;
         }
         VideoCore::TextureCache::ImageDesc desc{tsharp, image_desc};
@@ -11416,7 +16204,9 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
         }
 
         if (!r.IsMappedStart(desc.info.guest_address)) {
-            bind_null();
+            if (!bind_null()) {
+                return false;
+            }
             continue;
         }
         Native::ImageEntry* entry = registry->Find(desc.info, storage, now_frame, false);
@@ -11777,15 +16567,18 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
         auto& entry = *const_cast<Native::ImageEntry*>(stored);
         entry.last_use.store(frame, std::memory_order_relaxed);
         ApplyRewrite(entry); // NAT-120
+        SyncDepthTwin(entry); // FIX-212
     }
     for (const auto* sampled : p.bindings.sampled) {
         auto& entry = *const_cast<Native::ImageEntry*>(sampled);
         entry.last_use.store(frame, std::memory_order_relaxed);
         if (entry.from_cpu) registry->LayersRewritten(entry, frame);
         ApplyRewrite(entry); // NAT-120, NAT-133
-        if (entry.from_cpu) {
-            RefreshSources(entry); // NAT-104
+        SyncDepthTwin(entry); // FIX-212
+        if (entry.from_cpu && registry->RewrittenSmall(entry)) {
+            ++stats.small_rewrites; // FIX-202
         }
+        RefreshSources(entry); // NAT-104 (FIX-197: targets too)
     }
     // RefreshRegion can process CPU writes again after the first freshness
     // check and retire a prepared mirror. Settle any new stream/promotion,
@@ -11855,37 +16648,34 @@ void NativeRenderer::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>*
     }
 }
 
-void NativeRenderer::TrimFillPatterns(u64 current_key) {
-    // Fill values can change throughout a race. Cache recent patterns within a bounded
-    // budget; unlike rendered images, these buffers can always be regenerated.
-    constexpr u64 PatternBudget = 64ull << 20;
-    u64 total = 0;
-    for (const auto& [key, pattern] : fill_patterns) {
-        total += pattern.buffer->Size();
-    }
-    while (total > PatternBudget && fill_patterns.size() > 1) {
-        auto oldest = fill_patterns.end();
-        for (auto it = fill_patterns.begin(); it != fill_patterns.end(); ++it) {
-            if (it->first != current_key &&
-                (oldest == fill_patterns.end() || it->second.last_use < oldest->second.last_use)) {
-                oldest = it;
-            }
-        }
-        if (oldest == fill_patterns.end()) break;
-        total -= oldest->second.buffer->Size();
-        // RHI destruction retires the buffer after recorded GPU work completes.
-        fill_patterns.erase(oldest);
-    }
-}
-
 const Native::Rhi::Buffer* NativeRenderer::PatternBuffer(u32 lo, u32 hi, u64 bytes) {
     // NAT-134: a device buffer holding lo, hi, lo, hi... for fills, made once per pattern and
     // grown when a bigger picture needs it (only ever read afterwards).
+    // FIX-GT7-123: every pattern kept its buffer, the size of the largest picture filled with it,
+    // and a grown buffer's old one was never freed: in two races on 2026-11-08, 146 patterns held
+    // 298 buffers, 1,487 MB of video memory (146 of 8 MB, 147 of 2 MB), never given back. The most
+    // recently used patterns are kept, up to RYGT_NATIVE_FILL_PATTERNS (64; 0: every pattern keeps
+    // its buffer) and 256 MB; the others, and grown buffers' old ones (with 0 too), go once the
+    // GPU ran the list that last could read them.
+    static const u64 keep_count = [] {
+        const char* env = std::getenv("RYGT_NATIVE_FILL_PATTERNS");
+        return env && *env ? u64{std::strtoull(env, nullptr, 10)} : u64{64};
+    }();
+    constexpr u64 KeepBytes = 256_MB;
     const u64 key = u64(lo) | (u64(hi) << 32);
-    const auto found = fill_patterns.find(key);
-    if (found != fill_patterns.end() && found->second.buffer->Size() >= bytes) {
-        found->second.last_use = ++fill_pattern_clock;
-        return found->second.buffer.get();
+    FillPattern& slot = fill_patterns[key];
+    slot.used = ++pattern_clock;
+    if (slot.buffer && slot.buffer->Size() >= bytes) {
+        return slot.buffer.get();
+    }
+    // FIX-GT7-123: patterns let go lately, to count those made again soon after (more patterns in
+    // use than are kept: each fill then makes its buffer again).
+    static std::array<u64, 256> let_go{};
+    static size_t let_go_count = 0; // entries written (the ring holds the last 256)
+    static u64 made_again = 0;
+    if (const auto known = let_go.begin() + std::min(let_go_count, let_go.size());
+        !slot.buffer && std::find(let_go.begin(), known, key) != known) {
+        ++made_again;
     }
     const u64 size = std::max<u64>(Common::AlignUp(bytes, 64_KB), 1_MB);
     auto buffer = device->CreateBuffer({.size = size,
@@ -11894,7 +16684,11 @@ const Native::Rhi::Buffer* NativeRenderer::PatternBuffer(u32 lo, u32 hi, u64 byt
                                         .memory = Native::Rhi::MemoryKind::DeviceLocal,
                                         .name = "native fill pattern"});
     if (!buffer) {
-        return found != fill_patterns.end() ? found->second.buffer.get() : nullptr;
+        if (!slot.buffer) {
+            fill_patterns.erase(key); // FIX-GT7-123: no empty slot left behind
+            return nullptr;
+        }
+        return slot.buffer.get();
     }
     Stream& s = Begin();
     EndRendering();
@@ -11929,11 +16723,39 @@ const Native::Rhi::Buffer* NativeRenderer::PatternBuffer(u32 lo, u32 hi, u64 byt
     }
     transfer_barrier();
     ++s.commands;
-    auto& slot = fill_patterns[key];
-    // Replaced buffers follow the same fence retirement as evicted cache entries.
+    if (slot.buffer) {
+        // Copies recorded before may still read it: freed once this list ran (FIX-GT7-123).
+        pattern_bytes -= std::min(pattern_bytes, slot.buffer->Size());
+        s.keep.push_back(std::move(slot.buffer));
+    }
+    pattern_bytes += buffer->Size();
     slot.buffer = std::move(buffer);
-    slot.last_use = ++fill_pattern_clock;
-    TrimFillPatterns(key);
+    // FIX-GT7-123: the least recently used other patterns go past the count or the bytes.
+    static u64 dropped = 0;
+    while (keep_count != 0 && (fill_patterns.size() > keep_count || pattern_bytes > KeepBytes)) {
+        auto oldest = fill_patterns.end();
+        for (auto it = fill_patterns.begin(); it != fill_patterns.end(); ++it) {
+            if (it->first != key &&
+                (oldest == fill_patterns.end() || it->second.used < oldest->second.used)) {
+                oldest = it;
+            }
+        }
+        if (oldest == fill_patterns.end()) {
+            break;
+        }
+        if (oldest->second.buffer) {
+            pattern_bytes -= std::min(pattern_bytes, oldest->second.buffer->Size());
+            s.keep.push_back(std::move(oldest->second.buffer));
+        }
+        let_go[let_go_count++ % let_go.size()] = oldest->first;
+        fill_patterns.erase(oldest);
+        if (++dropped == 1 || dropped % 500 == 0) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-GT7-123: {} fill patterns let go so far ({} kept, {:.0f} MB; {} made "
+                        "again within 256 let go)",
+                        dropped, fill_patterns.size(), pattern_bytes / 1048576.0, made_again);
+        }
+    }
     return slot.buffer.get();
 }
 
@@ -11941,7 +16763,8 @@ bool NativeRenderer::FillImage(Native::ImageEntry& entry, u32 lo, u32 hi, u32 ro
                                u32 first_layers) {
     // NAT-132/134: a picture filled with the pattern (two dwords, repeated), as memory holds it
     // after a fill: copied in from a buffer holding it (any format: every texel is the pattern's
-    // bytes). `rows` != 0: only those rows of the first mip and layer (NAT-124).
+    // bytes). `rows` != 0: only those rows of the first mip and layer (NAT-124), or of its first
+    // layers with `first_layers` (FIX-GT7-031).
     const auto& info = entry.info;
     const u32 texel = info.props.is_depth
                           ? (info.pixel_format == vk::Format::eD16Unorm ||
@@ -12027,6 +16850,16 @@ void NativeRenderer::ApplyRewrite(Native::ImageEntry& entry) {
                     info.guest_size, entry.rewrite_pattern[0], entry.rewrite_pattern[1]);
     }
 #endif
+    if (SeqTraced(&entry)) {
+        LOG_WARNING(Render_Vulkan, "DIAG-208: frame {} rewrite {} {:#x} ({:#x} bytes of {:#x}, "
+                    "pattern {:#x} {:#x}, clock {}) @{}", frame,
+                    entry.rewrite == Rewrite::Clear    ? "clear"
+                    : entry.rewrite == Rewrite::Upload ? "upload"
+                                                       : "stencil clear",
+                    info.guest_address, entry.rewrite_bytes, info.guest_size,
+                    entry.rewrite_pattern[0], entry.rewrite_pattern[1], entry.rewrite_clock,
+                    static_cast<const void*>(&entry)); // DIAG-208 (diagnosis)
+    }
     const Rewrite rewrite = std::exchange(entry.rewrite, Rewrite::None);
     const bool stencil = std::exchange(entry.stencil_clear_pending, false) &&
                          info.props.has_stencil && entry.image;
@@ -12132,7 +16965,17 @@ void NativeRenderer::ReadFillShader(const Shader::Info& cs, DrawBindings& b) {
     // lo, hi... (count dwords) to its second: a memset of depth buffers, stencil planes and
     // pictures.
     constexpr u64 FillShader = 0x8aa6e00c;
-    if (cs.pgm_hash != FillShader || cs.buffers.size() < 2) {
+    // FIX-GT7-031: GT7's is the same shader. Without it, its fills of targets were lost: the
+    // headlight shadow maps were never cleared and kept the nearest depth of every frame since
+    // the race began, so the lights lit only what no object ever covered (the middle of the road).
+    // RYGT_NATIVE_GT7_FILLS=0: as before.
+    constexpr u64 FillShaderGt7 = 0xabe484108a360b66;
+    static const bool gt7_fills = [] {
+        const char* env = std::getenv("RYGT_NATIVE_GT7_FILLS");
+        return !(env && env[0] == '0');
+    }();
+    if ((cs.pgm_hash != FillShader && !(gt7_fills && cs.pgm_hash == FillShaderGt7)) ||
+        cs.buffers.size() < 2) {
         return;
     }
     const Shader::BufferResource* args = nullptr;
@@ -12198,6 +17041,7 @@ bool NativeRenderer::MetaClearDispatch(const Shader::Info& cs) {
 
 void NativeRenderer::DispatchDirect() {
     std::scoped_lock lock{mutex};
+    AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::Dispatches};
 #if !defined(NDEBUG)
     const auto start = std::chrono::steady_clock::now();
     struct Timed {
@@ -12560,11 +17404,39 @@ void NativeRenderer::DispatchDirect() {
                 Native::GpuCheckpoints::Record(static_cast<VkCommandBuffer>(cmd), 2, captured_frame, hash, x, yz);
             });
         }
+        ProbeDispatch(pipeline->GetStage(Shader::SwStage::Compute), b, false); // DIAG-175
         cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+        if (GpuSegment* seg = GpuSeg()) { // DIAG-GT7-001
+            ++seg->dispatches;
+            const u64 groups = u64(cs_program.dim_x) * cs_program.dim_y * cs_program.dim_z;
+            if (groups > seg->max_groups) {
+                seg->max_groups = groups;
+                seg->max_groups_cs = pipeline->GetStage(Shader::SwStage::Compute).pgm_hash;
+            }
+        }
+        ProbeDispatch(pipeline->GetStage(Shader::SwStage::Compute), b, true); // DIAG-175
     }
     SceneTrace::GpuEnd(s.cmd);
     if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-compute-path id={} transfer_rewrite={}",SceneTrace::Id(),transferred));
     NoteWrites(nullptr, b);
+    for (const auto* stored : b.stored) {
+        if (SeqTraced(stored)) {
+            // DIAG-208 (diagnosis): with the flattened user data the shader reads its cube and
+            // mip from (GT7's probe filter: dwords 8, 194 and 195).
+            const auto& flat = pipeline->GetStage(Shader::SwStage::Compute).flattened_ud_buf;
+            std::string words;
+            for (const size_t at : {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 192, 193, 194, 195, 196, 197}) {
+                words += at < flat.size() ? fmt::format(" [{}]{:08x}", at, flat[at])
+                                          : std::string{};
+            }
+            LOG_WARNING(Render_Vulkan, "DIAG-208: frame {} dispatch cs {:#x} {}x{}x{} stored {:#x} "
+                        "-> v{} @{} | flat{}", frame,
+                        pipeline->GetStage(Shader::SwStage::Compute).pgm_hash, cs_program.dim_x,
+                        cs_program.dim_y, cs_program.dim_z, stored->info.guest_address,
+                        stored->write_version.load(), static_cast<const void*>(stored), words);
+        }
+    }
+    StripDispatch(b); // DIAG-173 (diagnosis)
 #if !defined(NDEBUG)
     if (Native::g_dump_request.exchange(false)) {
         r.StartFrameDumpNow(); // FIX-156 (diagnosis): a watched fill
@@ -12586,6 +17458,7 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     SceneTrace::CpuScope scene_trace{r.FrameDumpCollecting(),frame,"dispatch-indirect"};
 #endif
     if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-pass id={} kind=dispatch-indirect arguments={:#x}+{} bytes={}",SceneTrace::Id(),address,offset,size));
+    AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::Dispatches};
 #if !defined(NDEBUG)
     t_timed = false; // OPT-001
 #endif
@@ -12669,8 +17542,12 @@ void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     }else if(SceneTrace::Id())r.FrameDumpEvent(fmt::format("scene-indirect-snapshot id={} skipped=capacity",SceneTrace::Id()));
     SceneTrace::GpuBegin(s.cmd);
     cmdbuf.dispatchIndirect(args->first, args->second);
+    if (GpuSegment* seg = GpuSeg()) { // DIAG-GT7-001 (groups unknown here)
+        ++seg->dispatches;
+    }
     SceneTrace::GpuEnd(s.cmd);
     NoteWrites(nullptr, b);
+    StripDispatch(b); // DIAG-173 (diagnosis)
     s.buffers_written = true;
     NATIVE_DIAGNOSTIC(++stats.dispatches);
     ++s.commands;
@@ -12691,6 +17568,14 @@ void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
         registry->Find(dst_desc.info, true, frame, true, src_desc.info.num_samples > 1);
     if (!src || !dst) {
         return;
+    }
+    // GT7-UW: a resolve of a picture drawn with depth this frame (a race's minimaps are drawn
+    // with MSAA and resolved before the HUD shows them) passes that on to its result.
+    if (HudSplitOn()) {
+        const auto it = hud_depth_drawn.find(src->info.guest_address);
+        if (it != hud_depth_drawn.end() && it->second == frame) {
+            hud_depth_drawn[dst->info.guest_address] = frame;
+        }
     }
     Stream& s = Begin();
     // NAT-122: a fill before the resolve is applied before it (left pending, it cleared the
@@ -12731,6 +17616,65 @@ void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
     };
     const vk::Image src_image{Handle<VkImage_T>(src->image->NativeHandle())};
     const vk::Image dst_image{Handle<VkImage_T>(dst->image->NativeHandle())};
+    // FIX-GT7-044: the scratch pool's targets keep the format they were made with, whatever is drawn
+    // into them later (NAT-113). vkCmdResolveImage wants one format on both sides: GT7's menu course
+    // map, drawn in R8G8B8A8, came out converted to 10-bit fields once a 512x512 A2B10G10R10 target
+    // was left at 0x100a0b0000 (the rewards screen draws one), and the map's texture read those bits
+    // as R8G8B8A8: an orange line and a rainbow shadow instead of white and grey. A view of the
+    // source's format writes the bits a guest resolve would. RYGT_NATIVE_RESOLVE_VIEW=0: as before.
+    static const bool resolve_view = [] {
+        const char* env = std::getenv("RYGT_NATIVE_RESOLVE_VIEW");
+        return !(env && env[0] == '0');
+    }();
+    const auto src_format = src->image->Desc().format;
+    if (resolve_view && layers == 1 && src->image->Desc().samples > 1 &&
+        dst->image->Desc().samples == 1 && src_format != dst->image->Desc().format &&
+        src->info.num_bits == dst->info.num_bits) {
+        static std::atomic<u32> logged{};
+        if (const u32 n = logged++; n < 8) {
+            LOG_WARNING(Render_Vulkan,
+                        "FIX-GT7-044: resolve {:#x} {} into {:#x}, a {} target, the guest's {}",
+                        src->info.guest_address, vk::to_string(src->info.pixel_format),
+                        dst->info.guest_address, vk::to_string(dst->info.pixel_format),
+                        vk::to_string(dst_desc.info.pixel_format));
+        }
+        // Views made for attachments: ImageEntry::View's are for sampling or storage only. The mode
+        // follows the views' format, which can differ from the one the guest names.
+        const vk::Format view_format = static_cast<vk::Format>(src_format);
+        const auto attachment_view = [&](const Native::ImageEntry& entry, u32 layer) {
+            VideoCore::ImageViewInfo view_info{};
+            view_info.format = view_format;
+            view_info.range.base.layer = u16(layer);
+            return View(entry, view_info, ViewUse::Attachment);
+        };
+        const vk::ImageView src_view = attachment_view(*src, region.srcSubresource.baseArrayLayer);
+        const vk::ImageView dst_view = attachment_view(*dst, region.dstSubresource.baseArrayLayer);
+        if (src_view && dst_view) {
+            const std::string_view numeric = vk::componentNumericFormat(view_format, 0);
+            const vk::RenderingAttachmentInfo attachment{
+                .imageView = src_view,
+                .imageLayout = vk::ImageLayout::eGeneral,
+                .resolveMode = numeric == "UINT" || numeric == "SINT"
+                                   ? vk::ResolveModeFlagBits::eSampleZero
+                                   : vk::ResolveModeFlagBits::eAverage,
+                .resolveImageView = dst_view,
+                .resolveImageLayout = vk::ImageLayout::eGeneral,
+                .loadOp = vk::AttachmentLoadOp::eLoad,
+                .storeOp = vk::AttachmentStoreOp::eStore,
+            };
+            s.cmd.beginRendering(vk::RenderingInfo{
+                .renderArea{.extent = {region.extent.width, region.extent.height}},
+                .layerCount = 1,
+                .colorAttachmentCount = 1,
+                .pColorAttachments = &attachment,
+            });
+            s.cmd.endRendering();
+            Written(dst);
+            s.buffers_written = true;
+            ++s.commands;
+            return;
+        }
+    }
     if (src->image->Desc().samples > 1 && dst->image->Desc().samples == 1) {
         const auto src_format = src->image->Desc().format;
         if (src_format != dst->image->Desc().format) {
@@ -12828,6 +17772,16 @@ void NativeRenderer::ResolveDraw(const AmdGpu::Regs& regs) {
 }
 
 void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
+    if (!is_gds) {
+        NoteProgramTextureWrite(address, num_bytes, "fill"); // DIAG-185 (diagnosis)
+        NoteHistory(address, num_bytes, 4, value);           // DIAG-187 (diagnosis)
+    }
+    if (DiagFrame() && !is_gds && address <= DiagWritesAt() &&
+        DiagWritesAt() < address + num_bytes) {
+        ++diag_lines;
+        LOG_WARNING(Render_Vulkan, "DIAG-178: frame {} fill {:#x}+{:#x} with {:#x}", frame,
+                    address, num_bytes, value);
+    }
     if (num_bytes == 0) {
         return;
     }
@@ -12851,6 +17805,7 @@ void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is
     }
     NATIVE_DIAGNOSTIC(++stats.fills);
     WritebacksBefore(address, num_bytes);
+    SendWritebacksDue();                  // FIX-GT7-040
     const auto found = GuestBuffer(address, num_bytes, true);
     WritebackPlan candidate;
     const std::pair<VAddr, u64> written{address, num_bytes};
@@ -12889,6 +17844,15 @@ void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is
 }
 
 void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    if (!dst_gds) {
+        NoteProgramTextureWrite(dst, num_bytes, "copy"); // DIAG-185 (diagnosis)
+        NoteHistory(dst, num_bytes, 5, src_gds ? 0 : src); // DIAG-187 (diagnosis)
+    }
+    if (DiagFrame() && !dst_gds && dst <= DiagWritesAt() && DiagWritesAt() < dst + num_bytes) {
+        ++diag_lines;
+        LOG_WARNING(Render_Vulkan, "DIAG-178: frame {} copy {:#x}+{:#x} from {:#x}", frame, dst,
+                    num_bytes, src);
+    }
     if (num_bytes == 0) {
         return;
     }
@@ -12906,8 +17870,14 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
                                      dst_gds ? " (GDS)" : "", src, src_gds ? " (GDS)" : "",
                                      num_bytes)); // NAT-117
     }
-    if (!src_gds) WritebacksBefore(src, num_bytes);
-    if (!dst_gds) WritebacksBefore(dst, num_bytes);
+    // PERF-GT7-044: what it reads as well as what it overwrites.
+    if (!src_gds) {
+        WritebacksBefore(src, num_bytes);
+    }
+    if (!dst_gds) {
+        WritebacksBefore(dst, num_bytes);
+    }
+    SendWritebacksDue(); // FIX-GT7-040
     const vk::Buffer gds_buffer{Handle<VkBuffer_T>(gds->NativeHandle())};
     auto source = src_gds ? std::optional{std::pair{gds_buffer, u64(src)}}
                                 : GuestBuffer(src, num_bytes, false);
@@ -12962,6 +17932,7 @@ bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
     if (data.empty() || data.size() % 4 != 0 || data.size() > 65536 || address % 4 != 0) {
         return false;
     }
+    NoteHistory(address, data.size(), 6, 0); // DIAG-187 (diagnosis)
     std::scoped_lock lock{mutex};
     auto* direct = r.buffer_cache.GetDirectMemory();
     if (!direct || !direct->EnsureImported(address, data.size())) {
@@ -12972,10 +17943,10 @@ bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
         return false;
     }
     Stream& s = Begin();
-    WritebacksBefore(address, data.size());
+    WritebacksBefore(address, data.size()); // PERF-GT7-044
     GlobalBarrier();
     CmdBuf{s.cmd}.updateBuffer(found->first->Handle(), found->second, data.size(), data.data());
-    registry->ForgetFills(address, data.size());
+    registry->ForgetFills(address, data.size()); // FIX-GT7-036: the bytes are no longer the fill
     // NAT-146: a region over the range holds what the GPU reads there: it gets the bytes too.
     for (auto& [base, region] : regions) {
         const VAddr begin = std::max<VAddr>(address, region.begin);
@@ -13051,27 +18022,40 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
                      VideoCore::PageManager::GetNextPageAddr(address + size - 1));
     }
     registry->Invalidate(address, size, Native::ImageRegistry::Stale::Unmap);
-    // NAT-146: regions over unmapped memory go (the device frees their buffers once the GPU is
-    // done with them).
     std::scoped_lock lock{mutex};
     CancelLinearDownloads(address, size);
     if (FaultAheadEnabled() && size != 0) {
         page_watches.ClearExclusions(VideoCore::PageManager::GetPageAddr(address),
                                     VideoCore::PageManager::GetNextPageAddr(address + size - 1));
     }
+    DropRegionsOver(address, size, MirrorUnmapDrop);
+    ++buffer_generation;        // OPT-003
+    ++buffer_hard_generation;   // PERF-GT7-047: invalidates even disjoint memos
+    ++unmap_generation;         // OPT-002
+}
+
+u32 NativeRenderer::DropRegionsOver(VAddr address, u64 size, u32 mirror_reason) {
+    // NAT-146, FIX-GT7-086: regions over the range go (the device frees their buffers once the
+    // GPU is done with them), and the mirrors over it. With `mutex` held. Returns how many.
+    u32 dropped = 0;
     {
         std::unique_lock map_lock{buffer_map_mutex}; // OPT-010
         for (auto it = regions.begin(); it != regions.end();) {
             if (it->second.begin < address + size && it->second.end > address) {
                 buffer_log.Note(it->second.begin, it->second.end);
                 retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
+                NoteHistory(it->second.begin, it->second.end - it->second.begin, 11,
+                            0); // DIAG-187 (diagnosis)
                 it = regions.erase(it);
+                ++dropped;
             } else {
                 ++it;
             }
         }
     }
-    DropMirrors(address, size, MirrorUnmapDrop); // NAT-150
+    const size_t mirrors_before = mirrors.size();
+    DropMirrors(address, size, mirror_reason); // NAT-150
+    dropped += u32(mirrors_before - mirrors.size());
     {
         std::scoped_lock pending_lock{region_dirty_mutex}; // FIX-173
         std::erase_if(page_snapshots, [&](const auto& snapshot) {
@@ -13093,9 +18077,7 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
             return entry.first < address + size && entry.first + 4096 > address;
         });
     }
-    ++buffer_generation;        // OPT-003
-    ++buffer_hard_generation;   // PERF-GT7-047: invalidates even disjoint memos
-    ++unmap_generation;         // OPT-002
+    return dropped;
 }
 
 void NativeRenderer::OnNewMapping(VAddr address, u64 size) {
@@ -13172,7 +18154,86 @@ void NativeRenderer::WatchBind(const Native::ImageEntry& entry, const AmdGpu::Im
                 memo ? " (memo)" : "", program, entry.from_cpu ? "texture" : "target",
                 entry.info.size.width, entry.info.size.height, entry.info.resources.layers,
                 entry.write_version.load(), sources, frame);
+    if (entry.from_cpu) {
+        // DIAG-223 (diagnosis): whether the texture's memory still holds what was uploaded, and
+        // which of its layers differ (CPU writes the page watch missed show here).
+        const bool unchanged = registry->MemoryUnchanged(const_cast<Native::ImageEntry&>(entry));
+        std::string layers;
+        const u64 layer_size = entry.info.resources.layers > 1
+                                   ? entry.info.guest_size / entry.info.resources.layers
+                                   : 0;
+        if (!unchanged && layer_size >= 4096) {
+            static std::unordered_map<VAddr, std::vector<u64>> seen;
+            auto& hashes = seen[entry.info.guest_address];
+            hashes.resize(entry.info.resources.layers);
+            u32 changed = 0;
+            for (u32 l = 0; l < entry.info.resources.layers; ++l) {
+                const u64 h = Core::HashGuestBytes(entry.info.guest_address + l * layer_size,
+                                                   layer_size);
+                if (hashes[l] != 0 && hashes[l] != h && changed++ < 12) {
+                    layers += fmt::format(" {}", l);
+                }
+                hashes[l] = h;
+            }
+            layers += fmt::format(" ({} layers changed since the last bind)", changed);
+        }
+        LOG_WARNING(Render_Vulkan, "DIAG-223: texture {:#x} memory {} the upload (uploads {}){}",
+                    entry.info.guest_address, unchanged ? "matches" : "DIFFERS FROM",
+                    u32(entry.total_uploads), layers);
+    }
 #endif
+}
+
+bool NativeRenderer::SeqTraced(const Native::ImageEntry* entry) const {
+    // DIAG-208 (diagnosis, RYGT_DIAG_SEQ=<hex lo>-<hex hi>[,<every>[,<count>]]): in <count>
+    // frames of every <every> (4 of 600 if not given), each bind, draw, dispatch, rewrite and
+    // copy-in of the pictures starting in that range, with the mips and layers it covers.
+    struct Config {
+        VAddr lo = 0;
+        VAddr hi = 0;
+        u64 every = 600;
+        u64 count = 4;
+    };
+    static const Config config = [] {
+        Config c;
+        const char* env = Common::DiagEnv("RYGT_DIAG_SEQ");
+        if (!env || !*env) {
+            return c;
+        }
+        char* end = nullptr;
+        c.lo = std::strtoull(env, &end, 16);
+        c.hi = end && *end == '-' ? std::strtoull(end + 1, &end, 16) : c.lo + 1;
+        if (end && *end == ',') {
+            c.every = std::max<u64>(std::strtoull(end + 1, &end, 10), 1);
+        }
+        if (end && *end == ',') {
+            c.count = std::strtoull(end + 1, &end, 10);
+        }
+        return c;
+    }();
+    return entry && config.lo < config.hi && entry->info.guest_address >= config.lo &&
+           entry->info.guest_address < config.hi && frame % config.every < config.count;
+}
+
+void NativeRenderer::SeqBind(const Native::ImageEntry& entry, const AmdGpu::Image& tsharp,
+                             bool storage, u64 program) {
+    if (!storage && !entry.from_cpu && OneOffTrackOn()) {
+        // DIAG-GT7-008, PERF-GT7-023: a picture the GPU drew, sampled.
+        const_cast<Native::ImageEntry&>(entry).sampled_frame.store(frame,
+                                                                   std::memory_order_relaxed);
+    }
+    if (!SeqTraced(&entry)) {
+        return;
+    }
+    LOG_WARNING(Render_Vulkan, "DIAG-208: frame {} {} T# {:#x} {}x{} mips {}-{} layers {}-{} "
+                "(program {:#x}) -> {} {:#x} {}x{} mips {} layers {} v{} @{}", frame,
+                storage ? "store" : "sample", tsharp.Address(), tsharp.width + 1,
+                tsharp.height + 1, u32(tsharp.base_level), u32(tsharp.last_level),
+                u32(tsharp.base_array), u32(tsharp.last_array), program,
+                entry.from_cpu ? "texture" : "target", entry.info.guest_address,
+                entry.info.size.width, entry.info.size.height, entry.info.resources.levels,
+                entry.info.resources.layers, entry.write_version.load(),
+                static_cast<const void*>(&entry));
 }
 
 void NativeRenderer::ProbeWatchedPictures() {
@@ -13225,18 +18286,27 @@ void NativeRenderer::ProbeWatchedPictures() {
             for (u32 mip = 0; mip < it->mips; ++mip) {
                 const u64 w = std::max(it->width >> mip, 1u), h = std::max(it->height >> mip, 1u);
                 text += fmt::format(" m{}:", mip);
+                u64 non_finite = 0; // DIAG-177: texels with an Inf/NaN channel (exponent 31)
+                float largest = 0.0f;
                 for (u32 layer = 0; layer < it->layers; ++layer) {
                     double layer_sum = 0;
                     for (u64 i = 0; i < w * h && (at + i + 1) * 4 <= it->size; ++i) {
                         u32 word;
                         std::memcpy(&word, bytes + (at + i) * 4, 4);
-                        layer_sum += (small_float(word & 0x7ff, 6) +
-                                      small_float((word >> 11) & 0x7ff, 6) +
-                                      small_float(word >> 22, 5)) / 3.0f;
+                        if (((word >> 6) & 0x1f) == 31 || ((word >> 17) & 0x1f) == 31 ||
+                            ((word >> 27) & 0x1f) == 31) {
+                            ++non_finite;
+                        }
+                        const float value = (small_float(word & 0x7ff, 6) +
+                                             small_float((word >> 11) & 0x7ff, 6) +
+                                             small_float(word >> 22, 5)) / 3.0f;
+                        largest = std::max(largest, value);
+                        layer_sum += value;
                     }
                     at += w * h;
                     text += fmt::format(" {:.3f}", layer_sum / double(w * h));
                 }
+                text += fmt::format(" (max {:.1f}, {} Inf/NaN)", largest, non_finite);
             }
             if (it->layers == 1 && it->height >= 3) {
                 // A plain picture (the frame's main view): its top, middle and bottom thirds.
@@ -13271,7 +18341,7 @@ void NativeRenderer::ProbeWatchedPictures() {
     }
     // FIX-171 (diagnosis, RYGT_NATIVE_WATCH_EVERY=<frames>): how often (every 30 frames).
     static const u64 every = [] {
-        const char* env = std::getenv("RYGT_NATIVE_WATCH_EVERY");
+        const char* env = Common::DiagEnv("RYGT_NATIVE_WATCH_EVERY");
         return env && *env ? std::max<u64>(std::strtoull(env, nullptr, 0), 1) : u64{30};
     }();
     if (frame % every != 0 || probes.size() >= (every >= 30 ? 1u : 16u)) {
@@ -13289,7 +18359,7 @@ void NativeRenderer::ProbeWatchedPictures() {
             // FIX-171 (RYGT_NATIVE_WATCH_RECT=x,y,w,h): of a plain picture only that rectangle.
             static const std::array<u32, 4> rect = [] {
                 std::array<u32, 4> r{};
-                if (const char* env = std::getenv("RYGT_NATIVE_WATCH_RECT"); env && *env) {
+                if (const char* env = Common::DiagEnv("RYGT_NATIVE_WATCH_RECT"); env && *env) {
                     std::sscanf(env, "%u,%u,%u,%u", &r[0], &r[1], &r[2], &r[3]);
                 }
                 return r;
@@ -13364,6 +18434,8 @@ void NativeRenderer::ProbeWatchedPictures() {
                 stream.list->CopyImageToBuffer(entry.image.get(), buffer.get(), copies);
                 stream.list->Barrier(Native::Rhi::ScopeTransfer, Native::Rhi::ScopeHost);
                 stream.pipelines.Invalidate();
+                stream.so_known = false; // SO-010
+                ForgetBindings(stream); // OPT-014
                 probes.push_back({std::move(buffer), r.scheduler.CurrentTick() + 1, size, frame,
                                   entry.write_version.load(), entry.info.size.width,
                                   entry.info.size.height, !entry.from_cpu, watched, false});
@@ -13377,6 +18449,19 @@ void NativeRenderer::EvictImages() {
     Native::SlowCallTrace<3> trace{true, "frame-retirement",
         {"completed-views", "cold-mirrors", "cold-images"}};
     ProbeWatchedPictures(); // FIX-156 (diagnosis)
+    {
+        // PERF-GT7-052: each frame, the per-frame textures uploaded since are looked at again:
+        // stale, the next use uploads them, and NAT-109 skips the copy when their bytes are
+        // unchanged.
+        std::vector<std::pair<VAddr, u64>> polled;
+        {
+            std::scoped_lock lock{polled_mutex};
+            polled.swap(polled_textures);
+        }
+        for (const auto& [address, size] : polled) {
+            registry->Invalidate(address, size, Native::ImageRegistry::Stale::CpuWrite);
+        }
+    }
     // NAT-108: images not used for two seconds go (GT Sport's scratch pool holds render
     // targets of ever-changing sizes: the UI's blur panels, effects).
     constexpr u64 KeepFrames = 120;
@@ -13729,7 +18814,30 @@ void NativeRenderer::FaultAhead(VAddr begin, VAddr end) {
     }
 }
 
+// DIAG-194: where a CPU write fault's time goes (snapshot, unwatch, registry, the rest).
+static std::array<std::atomic<u64>, 5> g_fault_part_ns{};
+static std::atomic<u64> g_fault_count{};
+
 void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
+    // DIAG-194 (diagnosis, RYGT_DIAG_FAULT_COST=1)
+    static const bool timed = [] {
+        const char* env = Common::DiagEnv("RYGT_DIAG_FAULT_COST");
+        return env && env[0] == '1';
+    }();
+    auto lap = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto split = [&](u32 part) {
+        if (!timed) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        g_fault_part_ns[part].fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - lap).count(),
+            std::memory_order_relaxed);
+        lap = now;
+    };
+    if (timed) {
+        g_fault_count.fetch_add(1, std::memory_order_relaxed);
+    }
     // The written pages stop being watched (so they open up and the write goes on), and the
     // textures over them are uploaded again when next used (which watches them again).
     const VAddr begin = VideoCore::PageManager::GetPageAddr(address);
@@ -13740,6 +18848,10 @@ void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
                     "memory {}", address, size, exact, Native::WatchedBytes(address));
     }
 #endif
+    NoteHistory(begin, end - begin, 7, exact != 0 ? address + exact : 0); // DIAG-187 (diagnosis)
+    if (RyDiag::Enabled()) {
+        NoteFaultPages(begin, end); // DIAG-GT7-010
+    }
     // FIX-173: a region page holds what the GPU wrote there, which guest memory never got; a
     // CPU write to the page copies in only the bytes the CPU changed (RefreshRegion compares
     // with this copy of the page from before the write), not the whole page from guest memory.
@@ -13747,22 +18859,63 @@ void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
     // cockpit's light from its interior capture into 64 bytes at 0x1000e317c0 every third
     // frame, and the CPU writes other data in that page every frame, so the cockpit was lit in
     // one frame of three and dark in the other two.
+    // PERF-107: each page's copy is taken before any lock is held (the page can't change: it is
+    // still protected, and other threads writing it fault and wait in here too), and kept under
+    // the lock before the page opens: once it is open, another thread's copy of it may hold a
+    // write already, and the copy kept must predate them all. (Kept after the page opened, a
+    // fault racing on the same page lost the other thread's write: stale data in regions, and
+    // the GPU faulted - device lost - in most races.) Taken under the region lock, each fault
+    // waited ~2.5 us for the recorder.
+    split(0);
+    bool region_fault = false; // PERF-GT7-030
     if (end - begin <= 64_KB) {
-        std::shared_lock map_lock{buffer_map_mutex};
-        if (RegionOver(begin, end - begin)) {
-            std::scoped_lock pending_lock{region_dirty_mutex};
+        bool in_region = false;
+        {
+            std::shared_lock map_lock{buffer_map_mutex};
+            in_region = RegionOver(begin, end - begin) != nullptr;
+        }
+        region_fault = in_region;
+        if (in_region) {
+            boost::container::small_vector<
+                std::pair<VAddr, std::unique_ptr<std::array<u8, 4096>>>, 2>
+                copies;
             for (VAddr page = begin; page < end; page += 4096) {
-                auto& slot = page_snapshots[page];
-                if (slot) {
-                    continue; // the first write since the page was copied in counts
-                }
                 auto copy = std::make_unique<std::array<u8, 4096>>();
                 if (Core::RytyMemory::GuardedCopy(copy->data(),
                                                   reinterpret_cast<const void*>(page), 4096)) {
-                    slot = std::move(copy);
-                } else {
-                    page_snapshots.erase(page);
+                    copies.emplace_back(page, std::move(copy));
                 }
+            }
+            std::scoped_lock pending_lock{region_dirty_mutex};
+            for (auto& [page, copy] : copies) {
+                auto& slot = page_snapshots[page];
+                if (!slot) {
+                    slot = std::move(copy); // the first write since the page was copied in counts
+                }
+            }
+        }
+    }
+    if (WritebackRaceDiag()) {
+        // DIAG-176: a CPU write into guest memory a FIX-194 write-back will still copy over (the
+        // GPU hasn't run it yet): what the CPU writes there now may be lost.
+        const u64 known = r.scheduler.GetWorkSemaphore()->KnownGpuTick();
+        std::scoped_lock race_lock{writeback_race_mutex};
+        while (!pending_writebacks.empty() && pending_writebacks.front().tick <= known) {
+            pending_writebacks.pop_front();
+        }
+        ++writeback_race_faults;
+        for (const auto& pending : pending_writebacks) {
+            if (pending.begin < end && pending.end > begin && pending.tick > known) {
+                const u64 hits = ++writeback_race_hits;
+                if (hits <= 40 || hits % 1000 == 0) {
+                    LOG_WARNING(Render_Vulkan,
+                                "DIAG-176: CPU write {:#x}+{:#x} (frame {}) into a write-back "
+                                "{:#x}..{:#x} of frame {} the GPU hasn't run (tick {}, GPU at {}); "
+                                "{} such writes so far",
+                                address, size, frame, pending.begin, pending.end, pending.frame,
+                                pending.tick, known, hits);
+                }
+                break;
             }
         }
     }
@@ -13783,6 +18936,86 @@ void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
     FaultAhead(begin, end);
 }
 
+void NativeRenderer::NoteFaultPages(VAddr begin, VAddr end) {
+    const u64 now = shared_frame.load(std::memory_order_relaxed);
+    std::scoped_lock lock{fault_pages_mutex};
+    for (VAddr page = begin; page < end; page += 4096) {
+        if (fault_pages.size() >= 65536 && !fault_pages.contains(page)) {
+            return;
+        }
+        FaultPage& p = fault_pages[page];
+        const u64 gap = now - p.last_frame;
+        if (p.faults == 0 || gap >= 32) {
+            p.frames = 1;
+        } else if (gap != 0) {
+            p.frames = (p.frames << gap) | 1u;
+        }
+        p.last_frame = now;
+        ++p.faults;
+    }
+}
+
+std::string NativeRenderer::FaultPagesText() {
+    std::unordered_map<VAddr, FaultPage> pages;
+    {
+        std::scoped_lock lock{fault_pages_mutex};
+        pages.swap(fault_pages);
+    }
+    if (pages.empty()) {
+        return {};
+    }
+    const u64 now = shared_frame.load(std::memory_order_relaxed);
+    u64 faults = 0;
+    u32 hot = 0;
+    std::array<u32, 4> by_class{}; // region, texture up to 4 MB (hashed), larger texture, neither
+    std::map<VAddr, std::pair<u32, std::string>> chunks; // 64 KB: hot pages, what one holds
+    for (const auto& [page, p] : pages) {
+        faults += p.faults;
+        // Hot: written in 6 or more of the 8 frames up to its last write, and lately.
+        if (now - p.last_frame > 8 || std::popcount(p.frames & 0xffu) < 6) {
+            continue;
+        }
+        ++hot;
+        bool region = false;
+        {
+            std::shared_lock map_lock{buffer_map_mutex};
+            region = RegionOver(page, 4096) != nullptr;
+        }
+        u64 biggest = 0;
+        std::string what;
+        registry->ForEachOverlapping(page, page + 4096, [&](Native::ImageEntry& entry) {
+            if (entry.from_cpu && entry.info.guest_size > biggest) {
+                biggest = entry.info.guest_size;
+                what = fmt::format("texture {:#x} {}x{} {} ({} KB)", entry.info.guest_address,
+                                   entry.info.size.width, entry.info.size.height,
+                                   vk::to_string(entry.info.pixel_format),
+                                   entry.info.guest_size >> 10);
+            }
+        });
+        const size_t cls = region ? 0 : biggest == 0 ? 3 : biggest <= 4_MB ? 1 : 2;
+        ++by_class[cls];
+        auto& chunk = chunks[page & ~VAddr{0xFFFF}];
+        ++chunk.first;
+        if (chunk.second.empty()) {
+            chunk.second = region ? std::string{"region"} : biggest ? what : std::string{"neither"};
+        }
+    }
+    std::vector<std::pair<u32, VAddr>> busiest;
+    for (const auto& [chunk, info] : chunks) {
+        busiest.emplace_back(info.first, chunk);
+    }
+    std::ranges::sort(busiest, std::greater{});
+    std::string top;
+    for (size_t i = 0; i < std::min<size_t>(busiest.size(), 6); ++i) {
+        top += fmt::format("; {:#x} {} hot pages: {}", busiest[i].second, busiest[i].first,
+                           chunks[busiest[i].second].second);
+    }
+    return fmt::format("{} CPU write faults on {} pages; {} pages written in 6+ of 8 frames: {} in "
+                       "regions, {} in textures up to 4 MB, {} in larger textures, {} neither{}",
+                       faults, pages.size(), hot, by_class[0], by_class[1], by_class[2],
+                       by_class[3], top);
+}
+
 u32 NativeRenderer::ReadGds(u32 gds_offset) {
     u32 value = 0;
     if (gds_offset + sizeof(u32) <= gds->Size()) {
@@ -13793,6 +19026,7 @@ u32 NativeRenderer::ReadGds(u32 gds_offset) {
 
 void NativeRenderer::Splice() {
     std::scoped_lock lock{mutex};
+    AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::Splices};
     Stream& s = stream;
     if (!s.list) {
         return;
@@ -13804,6 +19038,7 @@ void NativeRenderer::Splice() {
         GlobalBarrier(); // NAT-112: written back in this submission
     }
     const bool wrapped = s.wrapped_list != nullptr; // FIX-188: Intel Arc (#65)
+    GpuTimeEnd(s, r.scheduler.CurrentTick()); // DIAG-GT7-001
     if (!wrapped) {
         s.list->End();
     }
@@ -13837,6 +19072,8 @@ void NativeRenderer::Splice() {
         r.scheduler.CommandBuffer().executeCommands(s.cmd);
     }
     const u64 tick = r.scheduler.CurrentTick();
+    GpuTimeCollect(); // DIAG-GT7-001: lists the GPU finished
+    SpliceHudStream(tick); // GT7-UW
     if (!s.remembered_fill_receipts.empty()) {
         // Keep the stream owners until queueing succeeds: allocation failure in
         // the scheduler must not retire a receipt for work already enqueued.
@@ -13896,6 +19133,8 @@ void NativeRenderer::Splice() {
     s.list = nullptr;
     s.cmd = CmdBuf{};
     s.rendering = false;
+    ++s.serial;        // OPT-015: the list's upload memory retires with it
+    ForgetBindings(s); // OPT-014
 #if !defined(NDEBUG)
     if(auto* sidecar=FindParallelRuntime(this);sidecar && sidecar->transfer_mode_controller && !sidecar->closing) {
         const auto changed=sidecar->transfer_applied_mode.Apply(sidecar->transfer_mode_controller->Requested(),true);
@@ -14044,6 +19283,7 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         }
         ++in_place.frames;
     }
+    // PERF-GT7-044: this frame's pictures go back after the next global barrier.
     for (auto* entry : frame_writebacks) {
         if (std::ranges::find(writebacks, entry) == writebacks.end()) {
             writebacks.push_back(entry);
@@ -14065,6 +19305,14 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         registry->ExpireRecentFills(frame);
     }
     shared_frame.store(frame, std::memory_order_relaxed); // OPT-010
+    if (RyDiag::Enabled() && !AbOn()) {
+        // DIAG-GT7-011: the recorder's stack samples of heavy frames (over 3,300 draws, as GT7's
+        // pause menu) go to their own tag in recorder_profile.txt (2; the others 0).
+        const u64 drawn = stats.draws >= draws_at_frame ? stats.draws - draws_at_frame : stats.draws;
+        draws_at_frame = stats.draws;
+        RyDiag::SetProfileTag(drawn > 3300 ? 2 : 0);
+    }
+    CheckOneOffs(); // DIAG-GT7-008
     // The game's render target there (its layout from the CB registers may differ in details
     // from the video out description), else an image of the display layout.
     Native::ImageEntry* entry =
@@ -14108,6 +19356,48 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
         PrepareImages();
     }
     ProbeDisplay(*source); // FIX-175 (diagnosis)
+    if (capture_frame != ~u64{0} && capture_frame + 1 == frame) {
+        CaptureImage(*source, capture_frame, "display"); // DIAG-212 (diagnosis)
+    }
+    WriteCaptures();      // DIAG-212 (diagnosis)
+    StripFrameEnd();      // DIAG-173 (diagnosis)
+    ReadDispatchProbes(); // DIAG-175 (diagnosis)
+    ReadRefreshProbes();  // DIAG-179 (diagnosis)
+    ReadRegionCompares(); // DIAG-211 (diagnosis)
+    CheckStaleFlats();    // DIAG-237 (diagnosis)
+    ProbeVolume();        // DIAG-180 (diagnosis)
+    CheckSmallTextures(); // DIAG-182 (diagnosis)
+    ReportProgramTextures(); // DIAG-184 (diagnosis)
+    WatchHistoryRanges();    // DIAG-187 (diagnosis)
+    // DIAG-174 (diagnosis, RYGT_NATIVE_REUPLOAD=1): every texture the last frames used, not
+    // made of targets, is uploaded from guest memory again before its next use (=2: only those
+    // from 0x200000000 to 0x208000000, GT7's per-frame memory).
+    static const int reupload = [] {
+        const char* env = std::getenv("RYGT_NATIVE_REUPLOAD");
+        return env && *env ? std::atoi(env) : 0;
+    }();
+    if (reupload) {
+        const VAddr lo = reupload == 2 ? 0x200000000 : 0;
+        const VAddr hi = reupload == 2 ? 0x208000000 : ~VAddr{0};
+        registry->ForEachOverlapping(lo, hi, [&](Native::ImageEntry& texture) {
+            if (!texture.from_cpu || texture.info.guest_address < lo ||
+                texture.last_use.load(std::memory_order_relaxed) + 2 < frame) {
+                return;
+            }
+            {
+                std::scoped_lock lock{texture.sources_mutex};
+                if (!texture.sources.empty()) {
+                    return;
+                }
+            }
+            registry->RequestUpload(texture);
+        });
+    }
+    if (!draw_probes.empty() || probe_frame != 0) {
+        LOG_WARNING(Render_Vulkan, "DIAG-170: frame {} shows {:#x}", frame - 1,
+                    info.guest_address);
+        ReadDrawProbes();
+    }
     Splice();
     Display display{vk::Image{Handle<VkImage_T>(source->image->NativeHandle())}, view,
                     source->info.size.width, source->info.size.height};
@@ -14136,6 +19426,18 @@ std::optional<NativeRenderer::Display> NativeRenderer::FindDisplay(const VideoCo
     }
     if (fsr_display_frame + 1 == frame && fsr_display_address == entry->info.guest_address)
         display.upscaler = fsr_display_backend;
+    // GT7-UW: the HUD drawn into this display in the frame just finished (frame counted it).
+    if (HudSplitOn()) {
+        const auto it = hud_layers.find(info.guest_address);
+        if (it != hud_layers.end() && it->second.black && it->second.white &&
+            it->second.hud_frame + 1 == frame) {
+            VideoCore::ImageViewInfo hud_view{};
+            hud_view.format = view_format;
+            display.hud_black = View(*it->second.black, hud_view, ViewUse::Sampled);
+            display.hud_white = View(*it->second.white, hud_view, ViewUse::Sampled);
+            display.hud_race = it->second.race_frame + 1 == frame;
+        }
+    }
     VerifyMirrors(); // FIX-176 (diagnosis)
     EvictImages(); // (the display picture was just used: it stays)
     ReleaseUnusedWatches();
@@ -14253,7 +19555,7 @@ void NativeRenderer::ProbeDisplay(const Native::ImageEntry& entry) {
     // already have cleared them when a probe runs).
     static const std::array<u32, 4> rect = [] {
         std::array<u32, 4> r{};
-        if (const char* env = std::getenv("RYGT_NATIVE_WATCH_DISPLAY"); env && *env) {
+        if (const char* env = Common::DiagEnv("RYGT_NATIVE_WATCH_DISPLAY"); env && *env) {
             std::sscanf(env, "%u,%u,%u,%u", &r[0], &r[1], &r[2], &r[3]);
         }
         return r;
@@ -14340,6 +19642,136 @@ void NativeRenderer::ProbeDisplay(const Native::ImageEntry& entry) {
 #endif
 }
 
+void NativeRenderer::SnapPass(const Targets& targets) {
+    // DIAG-226 (diagnosis, RYGT_DUMP_PASS_SNAPS=<hex address>[,<hex address>...]): in a dumped frame,
+    // each time a pass starts that draws into one of those colour targets, a copy of the targets as
+    // they are then (what the passes before left), written with the dump as
+    // snap_<n>_<address>_<w>x<h>_<format>.bin.
+    static const std::vector<VAddr> watched = [] {
+        std::vector<VAddr> list;
+        const char* env = Common::DiagEnv("RYGT_DUMP_PASS_SNAPS");
+        for (const char* at = env; at && *at;) {
+            char* end = nullptr;
+            const VAddr address = std::strtoull(at, &end, 16);
+            if (end == at) {
+                break;
+            }
+            list.push_back(address);
+            at = *end == ',' ? end + 1 : end;
+        }
+        return list;
+    }();
+    if (watched.empty() || pass_snaps.size() >= 160) {
+        return;
+    }
+    const std::array<const Native::ImageEntry*, 3> key{targets.colors[0], targets.colors[1],
+                                                       targets.depth};
+    if (key == last_snap_key) {
+        return;
+    }
+    last_snap_key = key;
+    const u32 index = pass_snap_index++;
+    for (u32 cb = 0; cb < 2; ++cb) {
+        const auto* entry = targets.colors[cb];
+        if (!entry || !entry->image ||
+            std::find(watched.begin(), watched.end(), entry->info.guest_address) ==
+                watched.end()) {
+            continue;
+        }
+        const auto& desc = entry->image->Desc();
+        const u32 texel = std::max(entry->info.num_bits / 8, 1u);
+        const u64 size = u64(desc.width) * desc.height * texel;
+        auto buffer = device->CreateBuffer({.size = size,
+                                            .usage = Native::Rhi::BufferUsageStorage |
+                                                     Native::Rhi::BufferUsageTransferDst,
+                                            .memory = Native::Rhi::MemoryKind::Readback,
+                                            .name = "pass snapshot"});
+        if (!buffer || !buffer->Mapped()) {
+            continue;
+        }
+        Stream& s = Begin();
+        if (s.rendering) {
+            EndRendering();
+        }
+        GlobalBarrier();
+        s.cmd.copyImageToBuffer(
+            vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())}, vk::ImageLayout::eGeneral,
+            vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
+            vk::BufferImageCopy{.bufferOffset = 0,
+                                .imageSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                                  .mipLevel = 0,
+                                                  .baseArrayLayer = 0,
+                                                  .layerCount = 1},
+                                .imageOffset = {0, 0, 0},
+                                .imageExtent = {desc.width, desc.height, 1}});
+        GlobalBarrier();
+        pass_snaps.push_back({std::move(buffer),
+                              fmt::format("snap_{:03}_{:x}_{}x{}_{}.bin", index,
+                                          entry->info.guest_address, desc.width, desc.height,
+                                          u32(desc.format))});
+    }
+}
+
+void NativeRenderer::SnapProgramMips(std::span<const Shader::Info* const> stages,
+                                     const DrawBindings& b) {
+    // DIAG-234 (diagnosis): in a dumped frame, every mip of the mipmapped textures in GT7's
+    // per-frame memory that draws with RYGT_DIAG_STAGE_TEXTURES's program sample, as uploaded
+    // for them (snap_pyr_<address>_m<mip>_<w>x<h>.bin), once each.
+    static const u64 program = [] {
+        const char* env = Common::DiagEnv("RYGT_DIAG_STAGE_TEXTURES");
+        return env && *env ? u64(std::strtoull(env, nullptr, 16)) : u64{0};
+    }();
+    if (program == 0 || !r.FrameDumpCollecting() || pass_snaps.size() >= 160 ||
+        !std::ranges::any_of(stages, [](const Shader::Info* stage) {
+            return stage && stage->pgm_hash == program;
+        })) {
+        return;
+    }
+    for (const auto* entry : b.sampled) {
+        if (!entry || !entry->image || entry->info.resources.levels < 2 ||
+            entry->info.guest_address < 0x200000000 || entry->info.guest_address >= 0x208000000 ||
+            std::ranges::any_of(pass_snaps, [&](const PassSnap& snap) {
+                return snap.name.starts_with(
+                    fmt::format("snap_pyr_{:x}_", entry->info.guest_address));
+            })) {
+            continue;
+        }
+        const auto& desc = entry->image->Desc();
+        const u32 texel = std::max(entry->info.num_bits / 8, 1u);
+        Stream& s = Begin();
+        if (s.rendering) {
+            EndRendering();
+        }
+        GlobalBarrier();
+        for (u32 mip = 0; mip < entry->info.resources.levels; ++mip) {
+            const u32 w = std::max(desc.width >> mip, 1u);
+            const u32 h = std::max(desc.height >> mip, 1u);
+            auto buffer = device->CreateBuffer({.size = u64(w) * h * texel,
+                                                .usage = Native::Rhi::BufferUsageStorage |
+                                                         Native::Rhi::BufferUsageTransferDst,
+                                                .memory = Native::Rhi::MemoryKind::Readback,
+                                                .name = "pyramid snapshot"});
+            if (!buffer || !buffer->Mapped()) {
+                continue;
+            }
+            s.cmd.copyImageToBuffer(
+                vk::Image{Handle<VkImage_T>(entry->image->NativeHandle())},
+                vk::ImageLayout::eGeneral, vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())},
+                vk::BufferImageCopy{.bufferOffset = 0,
+                                    .imageSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                                      .mipLevel = mip,
+                                                      .baseArrayLayer = 0,
+                                                      .layerCount = 1},
+                                    .imageOffset = {0, 0, 0},
+                                    .imageExtent = {w, h, 1}});
+            pass_snaps.push_back({std::move(buffer),
+                                  fmt::format("snap_pyr_{:x}_m{}_{}x{}.bin",
+                                              entry->info.guest_address, mip, w, h)});
+        }
+        GlobalBarrier();
+    }
+}
+
 void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
 #if !defined(NDEBUG)
     std::scoped_lock lock{mutex};
@@ -14351,6 +19783,8 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
         u32 mip;
     };
     std::vector<Readback> readbacks;
+    std::vector<std::unique_ptr<Native::Rhi::Image>> resolved_images;
+    std::vector<std::unique_ptr<Native::Rhi::ImageView>> resolved_views;
     Stream& s = Begin();
     GlobalBarrier();
     // NAT-123: the sampled GPU-written textures follow the targets (named tex_<key>).
@@ -14393,7 +19827,7 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
             list += fmt::format("{} -> {} {:#x} {}x{} mips {} layers {} {}, {} sources, "
                                 "version {}{}; memory {}; {}; uploads {}, stale {}; "
                                 "total uploads {} kind {}, tiled {} mode {} bits {} size {:#x}; "
-                                "hash now {:016x} uploaded {:016x}{}\n",
+                                "hash now {:016x} uploaded {:016x}{}{}\n",
                                 key, entry->from_cpu ? "texture" : "target", info.guest_address,
                                 info.size.width, info.size.height, info.resources.levels,
                                 info.resources.layers, vk::to_string(info.pixel_format), sources,
@@ -14411,7 +19845,16 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
                                 hash_now, entry->content_hash,
                                 hash_now && entry->content_hash && hash_now != entry->content_hash
                                     ? " CHANGED"
-                                    : "");
+                                    : "",
+                                [&] { // FIX-GT7-027
+                                    const int differing =
+                                        registry->LayersDifferingFromUpload(*entry);
+                                    return differing < 0
+                                               ? std::string{}
+                                               : fmt::format("; layers differing from their "
+                                                             "upload {} of {}",
+                                                             differing, info.resources.layers);
+                                }());
             jobs.emplace_back(entry, fmt::format("tex_{}{}.bin", key,
                                                  info.props.is_depth ? "_depth" : ""));
         }
@@ -14593,6 +20036,18 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
             std::fclose(file);
         }
     }
+    for (const auto& snap : pass_snaps) { // DIAG-226
+        if (std::FILE* file = std::fopen((dir / snap.name).string().c_str(), "wb")) {
+            std::fwrite(snap.buffer->Mapped(), 1, snap.buffer->Size(), file);
+            std::fclose(file);
+        }
+    }
+    if (!pass_snaps.empty()) {
+        LOG_WARNING(Render_Vulkan, "DIAG-226: {} pass snapshots dumped", pass_snaps.size());
+    }
+    pass_snaps.clear();
+    last_snap_key = {};
+    pass_snap_index = 0;
     LOG_WARNING(Render_Vulkan, "NAT-116: {} render targets and textures of the frame dumped to {}",
                 readbacks.size(), dir.string());
     if(scene_indirect_buffer){
@@ -14617,6 +20072,25 @@ void NativeRenderer::Report() {
     }
     const double seconds = std::chrono::duration<double>(now - last_report).count();
     last_report = now;
+    // DIAG-GT7-005: the recorder's time in the window by part, in ms a second.
+    const std::string recorder_parts = [&] {
+        if (!AmdGpu::RecorderParts::On()) {
+            return std::string{};
+        }
+        const auto ns = AmdGpu::RecorderParts::Take();
+        u64 busy = 0;
+        std::string text;
+        for (u32 i = 0; i < ns.size(); ++i) {
+            busy += ns[i];
+            text += fmt::format("{}{:.1f}", i == 0 ? "" : "/", ns[i] / 1e6 / seconds);
+        }
+        return fmt::format("jobs/draw jobs/draws/dispatches/labels/DMAs/splices/submits/uploads/"
+                           "write-backs/GPU waits/lists ahead {}, busy {:.1f}",
+                           text, busy / 1e6 / seconds);
+    }();
+    if (!recorder_parts.empty()) {
+        LOG_INFO(Render_Vulkan, "DIAG-GT7-005 (10 s): recorder ms a second in {}", recorder_parts);
+    }
     const auto& registry_stats = registry->GetStats();
     const u64 uploads = registry_stats.uploads.load();
     const u64 upload_bytes = registry_stats.upload_bytes.load();
@@ -14643,21 +20117,40 @@ void NativeRenderer::Report() {
     std::string crowded;
     for (const auto& [address, count] : registry->Crowded(4)) {
         crowded += fmt::format(" {:#x} x{};", address, count);
+        if (crowded.size() < 40) {
+            // PERF-GT7-011: what the busiest address holds (textures, of them idle and made of
+            // targets).
+            u32 textures = 0, idle = 0, made_of_targets = 0;
+            registry->ForEachOverlapping(address, address + 1, [&](Native::ImageEntry& entry) {
+                if (entry.info.guest_address != address || !entry.from_cpu) {
+                    return;
+                }
+                ++textures;
+                idle += entry.last_use.load(std::memory_order_relaxed) + 120 < frame ? 1 : 0;
+                std::scoped_lock lock{entry.sources_mutex};
+                made_of_targets += entry.sources.empty() ? 0 : 1;
+            });
+            crowded.pop_back();
+            crowded += fmt::format(" ({} textures, {} idle, {} made of targets);", textures, idle,
+                                   made_of_targets);
+        }
     }
     LOG_INFO(Render_Vulkan,
              "NAT-108 images (10 s): {} uploads ({:.1f} MB), {} skipped as unchanged (NAT-109), "
              "textures made stale by CPU writes {}, unmaps {}, GPU writes {} ({} targets so far, "
-             "NAT-119); {} evicted, {} live, most at one address:{}; uploaded most:{}",
+             "NAT-119); {} targets parts of others so far (FIX-197); {} evicted, {} live, most at "
+             "one address:{}; uploaded most:{}",
              uploads - report_base.uploads, (upload_bytes - report_base.upload_bytes) / 1048576.0,
              registry->GetUploadStats().unchanged.exchange(0),
              stale[0] - report_base.stale[0], stale[1] - report_base.stale[1],
              stale[2] - report_base.stale[2], registry_stats.targets_rewritten.load(),
-             evicted - report_base.evicted, registry->Count(),
+             registry_stats.target_parts.load(), evicted - report_base.evicted, registry->Count(),
              crowded,
              busiest.empty() ? std::string{" none"} : busiest);
     report_base = {uploads, upload_bytes, evicted, stale};
     LOG_INFO(Render_Vulkan,
-             "NAT-100 native (10 s): {} draws, {} dispatches, {} skipped, {} without pipeline; "
+             "NAT-100 native (10 s): {} draws, {} dispatches, {} skipped, {} without pipeline, "
+             "{} indirect draws ({} not drawn, NAT-161); "
              "{} passes, {} barriers ({} pass barriers, {} passes unblocked, NAT-140), {} lists "
              "run; {} reads copied ({:.1f} MB), {} ranges bound "
              "empty, {} images bound empty; {} fills, {} copies, {} meta clears, {} inline "
@@ -14681,7 +20174,8 @@ void NativeRenderer::Report() {
              "{:.2f} us a draw, {:.2f} us a dispatch on the recorder; images bound empty by "
              "reason (none/unmapped/format/geometry/outside/FIX-081/no image) {}; us per draw in "
              "pipeline/targets/buffers/textures(sources)/vertices/prepare/record {}",
-             stats.draws, stats.dispatches, stats.skipped, stats.no_pipeline, stats.passes,
+             stats.draws, stats.dispatches, stats.skipped, stats.no_pipeline,
+             stats.indirect_draws, stats.indirect_skipped, stats.passes,
              stats.barriers, stats.pass_barriers, stats.passes_unblocked, stats.splices,
              stats.copied_reads, stats.copied_bytes / 1048576.0,
              stats.unbound, stats.null_images, stats.fills, stats.copies, stats.meta_clears,
@@ -14974,7 +20468,97 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
              descriptor_hash_reused, descriptor_hash_refreshed);
     descriptor_hash_reused = descriptor_hash_refreshed = 0;
     const u64 cpu_writes = stats.cpu_writes.load();
+    registry->ReportUploadTally(); // DIAG-197 (diagnosis)
+    if (const u64 faults = g_fault_count.exchange(0); faults != 0) {
+        const auto per = [&](u32 part) {
+            return g_fault_part_ns[part].exchange(0) / 1000.0 / double(faults);
+        };
+        LOG_INFO(Render_Vulkan, "DIAG-194: {} CPU write faults, us each in start/snapshot/unwatch/"
+                 "registry/rest {:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}", faults, per(0), per(1), per(2),
+                 per(3), per(4));
+    }
+    if (stats.dispatches != 0) {
+        const auto per = [&](u64 ns) { return ns / 1000.0 / double(stats.dispatches); };
+        LOG_INFO(Render_Vulkan, "DIAG-188: us a dispatch in pipeline/bindings/images/barrier/"
+                 "record/notes {:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}; write-backs {:.1f} ms",
+                 per(stats.dispatch_part_ns[0]), per(stats.dispatch_part_ns[1]),
+                 per(stats.dispatch_part_ns[2]), per(stats.dispatch_part_ns[3]),
+                 per(stats.dispatch_part_ns[4]), per(stats.dispatch_part_ns[5]),
+                 stats.writeback_ns / 1e6);
+        LOG_INFO(Render_Vulkan, "DIAG-GT7-004 (10 s): {} dispatches: {}", stats.dispatches,
+                 DispatchPartsText());
+    }
+    stats.dispatch_part_ns = {};
+    stats.writeback_ns = 0;
+    stats.dispatch_bind_ns = {};
+    stats.dispatch_note_ns = {};
+    stats.dispatch_refresh_ns = 0;
+    stats.snapshot_bytes = stats.snapshots_made = stats.snapshots_reused = 0;
+    stats.compute_texture_lookups = stats.compute_texture_hits = 0;
+    stats.compute_texture_bindings = 0;
+    if (stats.writeback_befores != 0 || stats.precise_writebacks != 0) {
+        LOG_INFO(Render_Vulkan, "FIX-203: {} written ranges copied before the work, {} page runs "
+                 "written back by compare", std::exchange(stats.writeback_befores, 0),
+                 std::exchange(stats.precise_writebacks, 0));
+    }
+    if (stats.small_rewrites != 0) {
+        LOG_INFO(Render_Vulkan, "FIX-202: {} small textures uploaded again after larger storage "
+                 "writes over them", std::exchange(stats.small_rewrites, 0));
+    }
+    if (stats.one_off_waits != 0) {
+        LOG_INFO(Render_Vulkan, "FIX-198: {} draws into pictures not drawn lately waited for their "
+                 "new pipeline", std::exchange(stats.one_off_waits, 0));
+    }
+    if (const u64 opened = fault_ahead_pages.exchange(0); opened != 0) {
+        LOG_INFO(Render_Vulkan, "PERF-GT7-030: {} write faults in region chunks written lately "
+                 "opened {} more pages with them; FIX-GT7-018: {} left shut under a picture",
+                 fault_ahead_faults.exchange(0), opened, fault_ahead_pictures.exchange(0));
+    }
+    if (downloaded_with_copy != 0) {
+        LOG_INFO(Render_Vulkan, "FIX-GT7-020: {} region pages a picture's download wrote had a "
+                 "copy from before ({} opened by PERF-GT7-030): copied in whole",
+                 std::exchange(downloaded_with_copy, 0), std::exchange(downloaded_ahead, 0));
+    }
+    if (RyDiag::Enabled()) {
+        if (std::string text = FaultPagesText(); !text.empty()) {
+            LOG_WARNING(Render_Vulkan, "DIAG-GT7-010 (10 s): {}", text);
+        }
+    }
+    if (stats.one_off_exempt != 0) {
+        LOG_INFO(Render_Vulkan, "PERF-GT7-023: {} draws into one-off pictures of kinds always "
+                 "redrawn skipped instead of waiting", std::exchange(stats.one_off_exempt, 0));
+    }
+    if (stats.one_off_budget_skips != 0) {
+        LOG_INFO(Render_Vulkan, "FIX-GT7-102: {} draws into pictures not drawn lately skipped "
+                 "once their frame had waited its budget for one-off pipelines",
+                 std::exchange(stats.one_off_budget_skips, 0));
+    }
+    if (stats.one_off_harmful_waits != 0) {
+        LOG_INFO(Render_Vulkan, "FIX-GT7-121: {} draws into pictures of kinds seen sampled before "
+                 "their redraw waited for their pipeline whatever the budget",
+                 std::exchange(stats.one_off_harmful_waits, 0));
+    }
+    SaveOneOffKinds(false); // PERF-GT7-023
+    if (OneOffDiagOn()) {
+        if (std::string text = OneOffText(); !text.empty()) {
+            LOG_WARNING(Render_Vulkan, "DIAG-GT7-008 (10 s): {}", text);
+        }
+    }
+    if (WritebackRaceDiag()) {
+        LOG_INFO(Render_Vulkan, "DIAG-176: {} CPU write faults, {} into pending write-backs so far",
+                 writeback_race_faults.exchange(0), writeback_race_hits.load());
+    }
+    if (stats.region_whole_pages || stats.region_writebacks || stats.region_pages_forgotten) {
+        LOG_INFO(Render_Vulkan,
+                 "FIX-194: region pages copied in whole {}, write-backs {} ({:.1f} MB), pages "
+                 "left to the next CPU write {}",
+                 stats.region_whole_pages, stats.region_writebacks,
+                 stats.region_writeback_bytes / 1048576.0, stats.region_pages_forgotten);
+    }
+    stats.region_whole_pages = stats.region_writebacks = 0;
+    stats.region_writeback_bytes = stats.region_pages_forgotten = 0;
     stats.draws = stats.dispatches = stats.skipped = stats.no_pipeline = stats.passes = 0;
+    stats.indirect_draws = stats.indirect_skipped = 0;
     stats.barriers = stats.splices = stats.copied_reads = stats.copied_bytes = stats.unbound = 0;
     stats.null_images = stats.fills = stats.copies = stats.meta_clears = stats.inline_writes = 0;
     stats.source_copies = stats.draw_ns = stats.dispatch_ns = 0;

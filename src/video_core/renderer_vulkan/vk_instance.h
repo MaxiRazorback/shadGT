@@ -32,6 +32,8 @@ struct SharedShaderObjects {
             if (shader) VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyShaderEXT(device, shader, nullptr);
     }
 };
+/// DIAG-243 (RYGT_DEVICE_FAULT=1): the renderer's recent draws, logged when the device is lost.
+void NoteDrawForFault(u64 pipeline_hash, u32 info);
 
 class Instance {
 public:
@@ -46,6 +48,9 @@ public:
     const vk::PhysicalDeviceShaderObjectPropertiesEXT& ShaderObjectProperties() const {
         return shader_object_properties;
     }
+    /// DIAG-243: once, after a lost device: VK_EXT_device_fault's report (with
+    /// RYGT_DEVICE_FAULT=1) and the last draws the renderer recorded.
+    void ReportDeviceLost() const;
 
     /// Returns a formatted string for the driver version
     std::string GetDriverVersionName();
@@ -153,15 +158,18 @@ public:
         return vk12_features.shaderInt8;
     }
 
-    /// Returns true if VK_KHR_maintenance8 is supported
+    /// PERF-210: the frame index of a new frame's input stage, 0 without Anti-Lag.
     u64 AntiLagInput() const;
+    /// PERF-210: closes the frame of that index; 0 sends nothing.
+    void AntiLagPresent(u64 frame) const;
+
 
     /// BIN-001: VK_KHR_pipeline_binary is enabled.
     bool IsPipelineBinarySupported() const {
         return pipeline_binary;
     }
-    void AntiLagPresent(u64 frame) const;
 
+    /// Returns true if VK_KHR_maintenance8 is supported
     bool IsMaintenance8Supported() const {
         return maintenance_8;
     }
@@ -345,6 +353,21 @@ public:
         return features.tessellationShader;
     }
 
+    /// NAT-161: indirect draws may take their count from a buffer.
+    bool IsDrawIndirectCountSupported() const {
+        return vk12_features.drawIndirectCount;
+    }
+
+    /// NAT-161: indirect draws may start at an instance other than 0.
+    bool IsDrawIndirectFirstInstanceSupported() const {
+        return features.drawIndirectFirstInstance;
+    }
+
+    /// NAT-161: the most draws one indirect draw command makes (1 without multiDrawIndirect).
+    u32 MaxDrawIndirectCount() const {
+        return features.multiDrawIndirect ? properties.limits.maxDrawIndirectCount : 1u;
+    }
+
     /// Returns true when the shaderSubgroupClock feature of
     /// VK_KHR_shader_clock is supported.
     bool IsShaderSubgroupClockSupported() const {
@@ -356,6 +379,12 @@ public:
     bool IsAmdLegacyShaderCompiler() const {
         return driver_id == vk::DriverId::eAmdProprietary &&
                driver_info.find("LLPC") == std::string::npos;
+    }
+
+    /// AMD-313: a Radeon RX 7000 on AMD's driver.
+    bool IsAmdRx7000() const {
+        return driver_id == vk::DriverId::eAmdProprietary &&
+               GetModelName().find("Radeon RX 7") != std::string_view::npos;
     }
 
     /// AMD-306: pixel shaders can ask for whole quads and maximal reconvergence
@@ -554,7 +583,7 @@ public:
         return supports_block_texel_view;
     }
 
-    /// Returns whether VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT is supported on 3D images
+
     bool Is2dViewOf3dSupported() const {
         return image_2d_view_of_3d && image_2d_view_of_3d_features.image2DViewOf3D &&
                image_2d_view_of_3d_features.sampler2DViewOf3D;
@@ -583,6 +612,9 @@ public:
         return total_memory_budget;
     }
 
+    /// NAT-VRAM-001: the launcher's video memory setting in bytes, 0 for Auto.
+    [[nodiscard]] static u64 VideoMemorySettingBytes();
+
     /// Determines if a format is supported for a set of feature flags.
     [[nodiscard]] bool IsFormatSupported(vk::Format format, vk::FormatFeatureFlags2 flags) const;
 
@@ -596,6 +628,7 @@ private:
     /// Collects various information from the device.
     void CollectDeviceParameters();
     void CollectPhysicalMemoryInfo();
+    void ApplyVideoMemorySetting(); ///< NAT-VRAM-001
     void CollectImageFormatInfo();
     void CollectToolingInfo() const;
 

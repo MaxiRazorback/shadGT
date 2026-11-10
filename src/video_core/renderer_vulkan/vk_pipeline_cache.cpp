@@ -392,10 +392,23 @@ public:
     }
 
     void Queue(std::shared_ptr<TranslateJob> job) {
+        // PERF-GT7-114: a hull shader's draw always waits for its translation (its tessellation
+        // factor writes keep it from being skipped, SHD-005), so it goes before the others, in
+        // order, and is never dropped as too old: on a cold Monza race start 211 draws waited
+        // 1.5 s for hull shaders queued behind ~2,500 newer jobs, one wait after another.
+        // RYGT_TRANSLATE_URGENT_HS=0: in the common queue, as before.
+        static const bool urgent_hs = [] {
+            const char* env = std::getenv("RYGT_TRANSLATE_URGENT_HS");
+            return !(env && env[0] == '0');
+        }();
         {
             std::scoped_lock lk{mutex};
             job->queued_at = std::chrono::steady_clock::now();
-            EnqueueTranslation(queue, std::move(job), MaxAge().count() > 0);
+            if (urgent_hs && job->sw_stage == Shader::SwStage::TessellationControl) {
+                urgent.push_back(std::move(job));
+            } else {
+                EnqueueTranslation(queue, std::move(job), MaxAge().count() > 0);
+            }
         }
         cv.notify_one();
     }
@@ -419,11 +432,15 @@ private:
             bool expired = false;
             {
                 std::unique_lock lk{mutex};
-                cv.wait(lk, stop, [this] { return !queue.empty(); });
-                if (queue.empty()) {
+                cv.wait(lk, stop, [this] { return !queue.empty() || !urgent.empty(); });
+                if (!urgent.empty()) {
+                    job = std::move(urgent.front()); // PERF-GT7-114
+                    urgent.pop_front();
+                } else if (queue.empty()) {
                     continue;
+                } else {
+                    std::tie(job, expired) = TakeTranslation(queue, std::chrono::steady_clock::now(), MaxAge());
                 }
-                std::tie(job, expired) = TakeTranslation(queue, std::chrono::steady_clock::now(), MaxAge());
             }
             if (expired) continue;
             const bool want_low = Common::CompileThreadsLow();
@@ -493,6 +510,7 @@ private:
     std::mutex mutex;
     std::condition_variable_any cv;
     std::deque<std::shared_ptr<TranslateJob>> queue;
+    std::deque<std::shared_ptr<TranslateJob>> urgent; // PERF-GT7-114: hull shaders, first in order
     std::vector<std::jthread> threads;
 };
 
@@ -886,6 +904,31 @@ static Shader::PsColorBuffer TranslationColorBuffer(const Shader::PsColorBuffer&
     return out;
 }
 
+bool PipelineCache::ReadsVertexValues(const AmdGpu::ShaderProgram& program) {
+    // shadgt7 FIX-217: whether a pixel shader has a V_INTERP_MOV_F32 selecting P10 or P20 (a
+    // vertex's own attribute value; P0 is the provoking vertex, which flat inputs give anyway).
+    // VINTRP is 0b110010 in bits 31:26, the opcode in 17:16 (2: MOV) and the selector in 7:0.
+    // Each program's answer is kept by its code address (job threads look keys up too).
+    const VAddr address = program.Address<VAddr>();
+    {
+        std::scoped_lock lk{vertex_value_mutex};
+        if (const auto it = vertex_value_programs.find(address); it != vertex_value_programs.end()) {
+            return it->second;
+        }
+    }
+    const auto params = AmdGpu::GetParams(program);
+    bool found = false;
+    for (const u32 word : params.code) {
+        if ((word >> 26) == 0b110010 && ((word >> 16) & 3) == 2 && (word & 0xff) < 2) {
+            found = true;
+            break;
+        }
+    }
+    std::scoped_lock lk{vertex_value_mutex};
+    vertex_value_programs.emplace(address, found);
+    return found;
+}
+
 const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStage l_stage) {
     auto& info = S().runtime_infos[u32(l_stage)];
     const auto& regs = Regs();
@@ -973,9 +1016,20 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
             const char* value = std::getenv("RYGT_AMD_SINGLE_SAMPLE_BARYCENTRIC");
             return !value || std::strcmp(value, "0") != 0;
         }();
-        info.hw.fs.single_sample_barycentric = UseSingleSampleBarycentric(
+        // shadgt7 FIX-217: only for the fragment shaders 217d4011 is about (a V_INTERP_MOV reading
+        // a vertex's own value, P10 or P20); every other shader keeps the hardware interpolation
+        // and its translation and cache entries. On for all fragment shaders, it made AMD
+        // retranslate and recompile everything with heavier shaders.
+        // RYGT_AMD_BARYCENTRIC_ALL=1: all, as before.
+        static const bool all_shaders = [] {
+            const char* env = std::getenv("RYGT_AMD_BARYCENTRIC_ALL");
+            return env && env[0] == '1';
+        }();
+        const bool candidate = UseSingleSampleBarycentric(
             instance.GetVendorID(), profile.supports_fragment_shader_barycentric,
             S().graphics_key.num_samples, direct_barycentric_requested);
+        info.hw.fs.single_sample_barycentric =
+            candidate && (all_shaders || ReadsVertexValues(regs.ps_program));
         info.hw.fs.front_face_all_bits = regs.barycentric_control.front_face_all_bits;
         info.hw.fs.quad_sample_mask =
             regs.reg_array[0xa30e] != ~0u || regs.reg_array[0xa30f] != ~0u;
@@ -1182,6 +1236,13 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                     return env[0] != '0';
                 }
                 return GetStoreGpuFamily() != StoreGpuFamily::AmdRdna3;
+            }(),
+        // FIX-GT7-138: RYGT_MED3_NAN=0 turns the rule off. Shaders already in the store keep the
+        // rule they were translated with: compare in a store of their own (RYGT_SHADER_STORE_TAG).
+        .med3_nan_rule =
+            [] {
+                const char* env = std::getenv("RYGT_MED3_NAN");
+                return !(env && env[0] == '0');
             }(),
         .supports_quad_derivatives = instance_.IsQuadDerivativesSupported(), // AMD-306
         .vertex_order_check = instance_.IsVertexOrderCheckEnabled(),         // AMD-307
@@ -1802,10 +1863,50 @@ void PipelineCache::BuildOnScreen() {
 void PipelineCache::UpdateCatchUp(std::chrono::steady_clock::time_point now) {
     static const bool enabled = [] { const char* v = std::getenv("RYGT_COMPILE_CATCH_UP"); return !(v && v[0] == '0'); }();
     static const bool paced = [] { const char* v = std::getenv("RYGT_CATCH_UP_PACE"); return !(v && v[0] == '0'); }();
-    if (!enabled || !build_workers) return;
+    if (!build_workers) return;
     std::unique_lock lock{catch_up_mutex, std::try_to_lock};
     if (!lock.owns_lock()) return;
     auto& state = catch_up;
+    // FIX-GT7-109: in play (15 frames a second or more, each over 19 ms: a race, not a 60 fps
+    // menu), background compiles that read g_game_in_play pause. FIX-GT7-120: once in play, a
+    // heavy scene keeps it so at any speed (RYGT_PLAY_HOLD_DRAWS=<draws a frame>, 1000; 0: frame
+    // time only). Measured whatever RYGT_COMPILE_CATCH_UP says.
+    {
+        const auto totals = Common::GetGameFrameTotals();
+        const u64 draws = Common::GetWorkCounters().draws.load(std::memory_order_relaxed);
+        if (state.play_window == std::chrono::steady_clock::time_point{}) {
+            state.play_window = now;
+            state.play_frames = totals.frames;
+            state.play_us = totals.us;
+            state.play_draws = draws;
+        } else if (now - state.play_window >= std::chrono::seconds{1}) {
+            const u64 frames = totals.frames - state.play_frames;
+            const double ms =
+                frames ? double(totals.us - state.play_us) / 1000.0 / double(frames) : 1000.0;
+            const double draws_a_frame =
+                frames ? double(draws - state.play_draws) / double(frames) : 0.0;
+            state.play_window = now;
+            state.play_frames = totals.frames;
+            state.play_us = totals.us;
+            state.play_draws = draws;
+            static const double hold_draws = [] {
+                const char* env = std::getenv("RYGT_PLAY_HOLD_DRAWS");
+                return env && *env ? std::strtod(env, nullptr) : 1000.0;
+            }();
+            const double fps = 1000.0 / std::max(ms, 0.001);
+            const bool slow = state.in_play ? ms > 17.5 : ms > 19.0;
+            const bool held = state.in_play && hold_draws > 0.0 && draws_a_frame >= hold_draws;
+            const bool play = fps >= 5.0 && (slow || held);
+            g_game_in_play.store(play, std::memory_order_relaxed);
+            if (play != state.in_play) {
+                state.in_play = play;
+                LOG_INFO(Render_Vulkan,
+                         "FIX-GT7-109: the game at {:.1f} ms a frame, {:.0f} draws a frame: {}",
+                         ms, draws_a_frame, play ? "in play" : "not in play");
+            }
+        }
+    }
+    if (!enabled) return;
     if (state.window == std::chrono::steady_clock::time_point{}) { state.window = now; return; }
     const auto elapsed = now - state.window;
     if (elapsed < std::chrono::milliseconds{250}) return;
@@ -1863,11 +1964,37 @@ void PipelineCache::QueueBuild(const std::shared_ptr<PipelineBuild>& build, Buil
             FinishBuild(*build);
         }
     };
+    // PERF-171: tessellated pipelines (GT7's cars) are built before the other read-ahead
+    // ones, so the cars appear first (after the builds of draws waiting, on screen or gone on
+    // without their pipeline). RYGT_TESS_FIRST=0 keeps them in order.
+    static const bool tess_first = [] {
+        const char* env = std::getenv("RYGT_TESS_FIRST");
+        return !(env && env[0] == '0');
+    }();
+    if (kind == BuildQueue::Kind::Normal && tess_first &&
+        build->infos[u32(Shader::SwStage::TessellationControl)] != nullptr) {
+        kind = BuildQueue::Kind::Tessellated;
+    }
     build_workers->Push(std::move(job), kind,
         Common::PerfFeatureEnabled(79) &&
         QueueWholeTessellation(build->infos[u32(Shader::SwStage::TessellationControl)] != nullptr,
             build->preloading, PrecompileHoldsGame(),
             SharedPipelineLibrariesEnabled(instance.IsGraphicsPipelineLibrarySupported(), build->preloading)));
+}
+
+bool PipelineCache::FinishBuildUnlocked(const std::shared_ptr<PipelineBuild>& build,
+                                        std::chrono::steady_clock::time_point deadline) {
+    // shadgt7 PERF-GT7-020 / FIX-GT7-109 interface. Without the lookup lock: builds it here
+    // unless a worker started it (no deadline), or waits for a worker until `deadline`.
+    if (!build) {
+        return true;
+    }
+    if (deadline == std::chrono::steady_clock::time_point::max()) {
+        FinishBuild(*build);
+        build->done.wait();
+        return true;
+    }
+    return build->done.wait_until(deadline) == std::future_status::ready;
 }
 
 std::shared_ptr<PipelineCache::PipelineBuild> PipelineCache::StartPipelineBuild(bool urgent, bool in_order) {
@@ -4305,6 +4432,23 @@ PipelineCache::StoredListing PipelineCache::ReadStoredListing(u64 pgm_hash,
     // the stored ones), so the listing stops after a run of missing indices. Only file reads, so
     // the PERF-038 reader thread can do it too.
     StoredListing listing{.pgm_hash = pgm_hash};
+    // DIAG-191 (diagnosis, SHADGT_RETRANSLATE=<hex hash>,...): these programs are translated
+    // again (and dumped with GPU.dump_shaders) instead of loaded from the store.
+    static const std::vector<u64> retranslate = [] {
+        std::vector<u64> hashes;
+        if (const char* env = std::getenv("SHADGT_RETRANSLATE"); env && *env) {
+            const std::string list{env};
+            for (size_t start = 0; start < list.size();) {
+                const size_t end = std::min(list.find(',', start), list.size());
+                hashes.push_back(std::stoull(list.substr(start, end - start), nullptr, 16));
+                start = end + 1;
+            }
+        }
+        return hashes;
+    }();
+    if (std::ranges::find(retranslate, pgm_hash) != retranslate.end()) {
+        return listing;
+    }
     u32 missing = 0;
     for (size_t perm_idx = 0; perm_idx < 512 && missing < 8; ++perm_idx) {
         const auto name = fmt::format("{:#018x}", HashCombine(pgm_hash, perm_idx));
@@ -4723,6 +4867,9 @@ static bool LearnedOneOffWait(const AmdGpu::Regs& regs) {
 }
 
 bool PipelineCache::NeverSkipped(const std::array<const Shader::Info*, MaxShaderStages>& infos) {
+    // shadgt7 FIX-198 / PERF-GT7-020: a one-off target's draw (SetForceWait, SetWaitForShaders)
+    // waits for its pipeline and shaders.
+    if (force_wait || wait_for_shaders) return true;
     if (const auto* fragment = infos[u32(Shader::SwStage::Fragment)];
         fragment && IsGt7OneShotShader(fragment->pgm_hash)) return true;
     // A loading-time shadow bake may run only once. Preserve depth-only output
@@ -5328,7 +5475,7 @@ bool PipelineCache::SkipTranslationWait(SwStage sw_stage, const Shader::ShaderPa
     static const bool enabled = Common::PerfFeatureEnabled(171);
     if (!enabled || PreservesDepthOutput() || IsGt7OneShotShader(params.hash) ||
         regs_override != nullptr || sw_stage == SwStage::Compute ||
-        LearnedOneOffWait(Regs()) ||
+        force_wait || wait_for_shaders || LearnedOneOffWait(Regs()) ||
         !AsyncTranslation() || !AsyncPipelines() || MenusWait()) {
         return false;
     }

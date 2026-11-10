@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <filesystem>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <mutex>
 #include <utility>
 #if defined(_WIN32) && !defined(NDEBUG)
@@ -16,6 +20,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/decoder.h"
+#include "common/diagnostics.h"
 #include "common/div_ceil.h"
 #include "common/error.h"
 #include "common/multi_level_page_table.h"
@@ -126,6 +131,86 @@ void TracePageEvent(const char* source, u64 addr, u64 size, int op, int read_op,
 }
 }
 #endif
+// DIAG-196 (diagnosis): what protecting pages costs, reported with DIAG-190.
+struct ProtectCost {
+    std::atomic<u64> calls{}, lock_ns{}, imported_ns{}, rest_ns{};
+};
+static ProtectCost g_protect_cost;
+
+/// DIAG-190/196 (diagnosis, RYGT_DIAG_FAULT_COST=1): fault and protection costs are timed.
+/// PERF-GT7-051 (diagnosis, RYGT_PROTECT_MAP=1): protections, unprotections and CPU write
+/// faults counted by 1 MB of guest memory; the 15 busiest areas are logged every 10 s.
+static bool ProtectMapOn() {
+    if constexpr (!Common::DiagnosticsBuilt) {
+        return false;
+    }
+    static const bool on = [] {
+        // Or a file protect_map.on in the game's folder (the working directory), whatever
+        // started the game.
+        const char* env = std::getenv("RYGT_PROTECT_MAP");
+        std::error_code ec;
+        return (env && env[0] == '1') || std::filesystem::exists("protect_map.on", ec);
+    }();
+    return on;
+}
+struct ProtectMapEntry {
+    u64 protects = 0;
+    u64 unprotects = 0;
+    u64 bytes = 0;
+    u64 faults = 0;
+};
+static std::mutex g_protect_map_mutex;
+static std::unordered_map<u64, ProtectMapEntry> g_protect_map;
+static std::chrono::steady_clock::time_point g_protect_map_since = std::chrono::steady_clock::now();
+
+static void NoteProtectMap(u64 address, u64 size, int kind) {
+    std::scoped_lock lock{g_protect_map_mutex};
+    auto& entry = g_protect_map[address >> 20];
+    if (kind == 0) {
+        ++entry.protects;
+        entry.bytes += size;
+    } else if (kind == 1) {
+        ++entry.unprotects;
+        entry.bytes += size;
+    } else {
+        ++entry.faults;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - g_protect_map_since < std::chrono::seconds{10}) {
+        return;
+    }
+    std::vector<std::pair<u64, ProtectMapEntry>> top(g_protect_map.begin(), g_protect_map.end());
+    std::ranges::sort(top, [](const auto& a, const auto& b) {
+        return a.second.protects + a.second.unprotects + a.second.faults >
+               b.second.protects + b.second.unprotects + b.second.faults;
+    });
+    u64 total_protects = 0, total_unprotects = 0, total_faults = 0;
+    for (const auto& [base, e] : top) {
+        total_protects += e.protects;
+        total_unprotects += e.unprotects;
+        total_faults += e.faults;
+    }
+    LOG_WARNING(Render, "PERF-GT7-051: in 10 s {} protections, {} unprotections, {} write faults "
+                        "over {} MB areas; busiest:",
+                total_protects, total_unprotects, total_faults, top.size());
+    for (size_t i = 0; i < std::min<size_t>(15, top.size()); ++i) {
+        const auto& [base, e] = top[i];
+        LOG_WARNING(Render,
+                    "PERF-GT7-051:   {:#x}+1MB: {} protections, {} unprotections, {} write faults, "
+                    "{:.1f} MB changed",
+                    base << 20, e.protects, e.unprotects, e.faults, e.bytes / 1048576.0);
+    }
+    g_protect_map.clear();
+    g_protect_map_since = now;
+}
+
+static bool FaultCostDiag() {
+    static const bool on = [] {
+        const char* env = Common::DiagEnv("RYGT_DIAG_FAULT_COST");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
 
 struct PageManager::Impl {
     struct PageState {
@@ -133,6 +218,8 @@ struct PageManager::Impl {
         u8 num_read_watchers;
         // PERF-070: guards of GPU writes decoded but not recorded yet (no CPU access at all).
         u8 num_guards;
+        // PERF-105: the native renderer watches the page (one of its write watchers).
+        u8 native_watch;
 
         Core::MemoryPermission WritePerm() const noexcept {
             return num_write_watchers == 0 ? Core::MemoryPermission::Write
@@ -148,7 +235,9 @@ struct PageManager::Impl {
             if (num_guards != 0) {
                 return Core::MemoryPermission::None;
             }
-            return ReadPerm() | WritePerm();
+            // FIX-233: never write-only (x86 cannot protect so; it asserted on a tester's AMD
+            // PC when GPU-written pages lost their CPU write watch).
+            return HostPermission(num_read_watchers != 0, num_write_watchers != 0);
         }
 
         template <bool is_read>
@@ -391,6 +480,63 @@ struct PageManager::Impl {
         }
     }
 
+    /// PERF-105: the native renderer's watch of each page of the range, at most one a page (the
+    /// flag in the page's state, under its lock): watching a watched page or unwatching one
+    /// that isn't changes nothing. A run of pages is protected at once, its pages locked until
+    /// then; no lock is held across ranges, so a write fault on one page never waits for the
+    /// renderer to protect a whole region.
+    void UpdateNativeWatch(VAddr addr, u64 size, bool watch) {
+        const u64 page_start = addr >> PM_PAGE_BITS;
+        const u64 page_end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
+        EnsurePages(page_start << PM_PAGE_BITS, page_end << PM_PAGE_BITS);
+        constexpr u64 MaxRunPages = 1024;
+        u64 run_begin = 0;
+        u64 run_pages = 0;
+        Core::MemoryPermission run_perms{};
+        const auto flush = [&] {
+            if (run_pages == 0) {
+                return;
+            }
+            Protect(run_begin << PM_PAGE_BITS, run_pages << PM_PAGE_BITS, run_perms);
+            for (u64 page = run_begin; page != run_begin + run_pages; ++page) {
+                locks.find(page)->unlock();
+            }
+            run_pages = 0;
+        };
+        for (u64 page = page_start; page != page_end; ++page) {
+            PageState* state = cached_pages.find(page);
+            if (!state) {
+                flush();
+                continue;
+            }
+            auto& lock = locks[page];
+            lock.lock();
+            if ((state->native_watch != 0) == watch) {
+                lock.unlock();
+                flush();
+                continue;
+            }
+            const auto old_perms = state->Perms();
+            state->native_watch = watch ? 1 : 0;
+            const auto new_perms = state->Update(watch ? PageOp::Track : PageOp::Untrack);
+            if (new_perms == old_perms) {
+                lock.unlock();
+                flush();
+                continue;
+            }
+            if (run_pages != 0 && (new_perms != run_perms || run_begin + run_pages != page ||
+                                   run_pages >= MaxRunPages)) {
+                flush();
+            }
+            if (run_pages == 0) {
+                run_begin = page;
+                run_perms = new_perms;
+            }
+            ++run_pages;
+        }
+        flush();
+    }
+
     void UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,
                                      const RegionBits& write_mask, const RegionBits& read_mask,
                                      PageOp write_op, PageOp read_op) {
@@ -631,12 +777,25 @@ public:
 #endif // __linux__
 
 struct SignalImpl : public PageManager::Impl {
+    /// FIX-233: whether the page's reads / writes are watched (racy reads; a hint for faults).
+    /// Pages are 4 KiB (PageManager's PM_PAGE_BITS).
+    inline static SignalImpl* instance = nullptr;
+    static bool ReadWatched(VAddr page) {
+        const PageState* state = instance ? FindTrackedGuestPage(instance->cached_pages, page, 12) : nullptr;
+        return state && state->num_read_watchers != 0;
+    }
+    static bool WriteWatched(VAddr page) {
+        const PageState* state = instance ? FindTrackedGuestPage(instance->cached_pages, page, 12) : nullptr;
+        return state && state->num_write_watchers != 0;
+    }
+
     SignalImpl(Vulkan::Rasterizer* rasterizer_) : Impl() {
         rasterizer = rasterizer_;
 #if defined(_WIN32) && !defined(NDEBUG)
         // Open the opt-in trace before any page locks or exception callbacks can use it.
         if (TracePage() != ~u64{0}) (void)TraceFile();
 #endif
+        instance = this; // FIX-233
 
         // Should be called first.
         constexpr auto priority = std::numeric_limits<u32>::min();
@@ -651,13 +810,41 @@ struct SignalImpl : public PageManager::Impl {
 
     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
         RENDERER_TRACE;
+        // DIAG-196: the protections' cost (lock wait, the imported-view check, the rest).
+        const bool timed = FaultCostDiag();
+        const auto protect_start =
+            timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (timed) {
+            ++g_protect_cost.calls;
+        }
 #ifdef _WIN32
         // FIX-079: not while a write-through store has a page open (its protection is put back
-        // as it was when the store has run).
-        std::scoped_lock wt_lock{WriteThroughLock()};
+        // as it was when the store has run). PERF-106: there are none in native mode, and the
+        // lock had every write fault of the game's threads wait for the others' protections.
+        std::unique_lock<std::recursive_mutex> wt_lock{WriteThroughLock(), std::defer_lock};
+        if (rasterizer->WritesThrough()) {
+            wt_lock.lock();
+        }
 #endif
+        auto lap = timed ? std::chrono::steady_clock::now() : protect_start;
+        if (timed) {
+            g_protect_cost.lock_ns += u64((lap - protect_start).count());
+        }
+        struct Rest {
+            bool timed;
+            std::chrono::steady_clock::time_point* lap;
+            ~Rest() {
+                if (timed) {
+                    g_protect_cost.rest_ns +=
+                        u64((std::chrono::steady_clock::now() - *lap).count());
+                }
+            }
+        } rest{timed, &lap};
         ++Common::GetWorkCounters().protects;
         Common::GetWorkCounters().protect_bytes += size;
+        if (ProtectMapOn()) {
+            NoteProtectMap(address, size, perms == Core::MemoryPermission::ReadWrite ? 1 : 0);
+        }
         RYDIAG_SCOPE(Protect, address);
         // P2: imported guest views stay writable (the GPU faults on protected imported pages).
         if (VideoCore::g_imported_count.load(std::memory_order_acquire) != 0) {
@@ -675,6 +862,11 @@ struct SignalImpl : public PageManager::Impl {
                 }
                 return;
             }
+        }
+        if (timed) {
+            const auto now = std::chrono::steady_clock::now();
+            g_protect_cost.imported_ns += u64((now - lap).count());
+            lap = now;
         }
         auto* memory = Core::Memory::Instance();
         auto& impl = memory->GetAddressSpace();
@@ -785,8 +977,8 @@ struct SignalImpl : public PageManager::Impl {
 
     static bool TryWriteThrough(void* context, VAddr addr) {
         auto& state = WriteThrough();
-        if (state.active) {
-            return false;
+        if (state.active || !rasterizer->WritesThrough()) {
+            return false; // PERF-106: no instruction decode when it can't go through anyway
         }
         // One explicit memory operand, the destination: no second access can fault meanwhile.
         ZydisDecodedInstruction instruction;
@@ -856,12 +1048,133 @@ struct SignalImpl : public PageManager::Impl {
     static inline Vulkan::Rasterizer* g_write_through_rasterizer{};
 #endif
 
+    // DIAG-190: the faults' cost on the threads that take them (every 10 s).
+    struct FaultCost {
+        std::atomic<u64> faults{}, gpu_faults{}, reads{}, total_ns{}, fence_ns{}, guard_ns{},
+            invalidate_ns{};
+        std::atomic<s64> since{};
+    };
+    static FaultCost& Cost() {
+        static FaultCost cost;
+        return cost;
+    }
+    static u64 NsSince(std::chrono::steady_clock::time_point start) {
+        return u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now() - start)
+                       .count());
+    }
+    // DIAG-190: faults and handler time by thread (the busiest few are reported).
+    struct ThreadFaults {
+        std::atomic<u32> tid{};
+        std::atomic<u64> faults{}, ns{};
+    };
+    static std::array<ThreadFaults, 64>& FaultThreads() {
+        static std::array<ThreadFaults, 64> threads;
+        return threads;
+    }
+    static void NoteThreadFault(u64 ns) {
+#ifdef _WIN32
+        const u32 tid = GetCurrentThreadId();
+#else
+        const u32 tid = 0;
+#endif
+        auto& threads = FaultThreads();
+        for (auto& slot : threads) {
+            u32 seen = slot.tid.load(std::memory_order_relaxed);
+            if (seen == 0 && slot.tid.compare_exchange_strong(seen, tid)) {
+                seen = tid;
+            }
+            if (seen == tid) {
+                ++slot.faults;
+                slot.ns += ns;
+                return;
+            }
+        }
+    }
+    static std::string BusiestFaultThreads() {
+        std::vector<std::tuple<u64, u64, u32>> list;
+        for (auto& slot : FaultThreads()) {
+            if (const u32 tid = slot.tid.load(); tid != 0) {
+                list.emplace_back(slot.ns.exchange(0), slot.faults.exchange(0), tid);
+            }
+        }
+        std::ranges::sort(list, std::greater{});
+        std::string out;
+        for (size_t i = 0; i < std::min<size_t>(list.size(), 5); ++i) {
+            const auto& [ns, faults, tid] = list[i];
+            std::string name = std::to_string(tid);
+#ifdef _WIN32
+            if (HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid)) {
+                PWSTR description = nullptr;
+                if (SUCCEEDED(GetThreadDescription(thread, &description)) && description &&
+                    *description) {
+                    char narrow[64] = {};
+                    WideCharToMultiByte(CP_UTF8, 0, description, -1, narrow, sizeof(narrow) - 1,
+                                        nullptr, nullptr);
+                    name = narrow;
+                }
+                if (description) {
+                    LocalFree(description);
+                }
+                CloseHandle(thread);
+            }
+#endif
+            out += fmt::format(" {} {} faults {:.1f} ms;", name, faults, ns / 1e6);
+        }
+        return out;
+    }
+    static void ReportFaultCost() {
+        auto& cost = Cost();
+        const s64 now = std::chrono::steady_clock::now().time_since_epoch().count();
+        s64 since = cost.since.load(std::memory_order_relaxed);
+        if (since == 0) {
+            cost.since.compare_exchange_strong(since, now);
+            return;
+        }
+        if (now - since < 10'000'000'000 || !cost.since.compare_exchange_strong(since, now)) {
+            return;
+        }
+        LOG_INFO(Render, "DIAG-190: faults in {:.1f} s: {} ({} on GPU threads, {} reads); in the "
+                 "handler {:.1f} ms (early fences {:.1f} ms, guards {:.1f} ms, invalidation "
+                 "{:.1f} ms)", (now - since) / 1e9, cost.faults.exchange(0),
+                 cost.gpu_faults.exchange(0), cost.reads.exchange(0),
+                 cost.total_ns.exchange(0) / 1e6, cost.fence_ns.exchange(0) / 1e6,
+                 cost.guard_ns.exchange(0) / 1e6, cost.invalidate_ns.exchange(0) / 1e6);
+        LOG_INFO(Render, "DIAG-196: {} protections (all threads): {:.1f} ms waiting for the "
+                 "write-through lock, {:.1f} ms checking imported views, {:.1f} ms protecting",
+                 g_protect_cost.calls.exchange(0), g_protect_cost.lock_ns.exchange(0) / 1e6,
+                 g_protect_cost.imported_ns.exchange(0) / 1e6,
+                 g_protect_cost.rest_ns.exchange(0) / 1e6);
+        LOG_INFO(Render, "DIAG-190: faults by thread:{}", BusiestFaultThreads());
+    }
+
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
+        const bool timed = FaultCostDiag();
+        const auto handler_start =
+            timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        struct Total {
+            bool timed;
+            std::chrono::steady_clock::time_point start;
+            ~Total() {
+                if (timed) {
+                    const u64 ns = NsSince(start);
+                    Cost().total_ns += ns;
+                    NoteThreadFault(ns);
+                    ReportFaultCost();
+                }
+            }
+        } total{timed, handler_start};
+        if (timed) {
+            ++Cost().faults;
+        }
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         // Host/driver faults must continue to their own handlers. Besides
         // needless GPU drains, indexing the 40-bit guest table with a host
         // address can fault recursively and hide the original exception.
         if (!IsTrackedGuestAddress(addr)) return false;
+        if (ProtectMapOn()) {
+            NoteProtectMap(addr, 0, 2); // PERF-GT7-051
+        }
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
         // PERF-031: the draw pipe's recorder thread is a GPU thread too; a fault on the command
         // thread lets the recorder finish first, since the handling uses the caches.
@@ -880,12 +1193,46 @@ struct SignalImpl : public PageManager::Impl {
             }
         }
         const VAddr fault_page = PageManager::GetPageAddr(addr);
+#ifdef _WIN32
+        // DIAG-198 (diagnosis, SHADGT_PROFILE=2): game threads are sampled from their first fault
+        // on (Ryty makes them, so they are not registered where shadGT makes its own).
+        static thread_local bool profiled = false;
+        if (!profiled && !is_gpu_thread) {
+            profiled = true;
+            std::string name = "game";
+            PWSTR description = nullptr;
+            if (SUCCEEDED(GetThreadDescription(GetCurrentThread(), &description)) && description &&
+                *description) {
+                char narrow[64] = {};
+                WideCharToMultiByte(CP_UTF8, 0, description, -1, narrow, sizeof(narrow) - 1,
+                                    nullptr, nullptr);
+                name = narrow;
+            }
+            if (description) {
+                LocalFree(description);
+            }
+            Common::SamplingProfiler::RegisterGuestThread(name.c_str(), nullptr, nullptr);
+        }
+#endif
+        if (timed) {
+            Cost().gpu_faults += is_gpu_thread ? 1 : 0;
+            Cost().reads += Common::IsWriteError(context) ? 0 : 1;
+        }
         if (!is_gpu_thread) {
             // PERF-063: the game was told work is done (an early fence) that the recorder has
             // not recorded yet; if it reads this page, the access waits for it.
+            auto start = timed ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
             rasterizer->WaitForEarlyFences(fault_page);
+            if (timed) {
+                Cost().fence_ns += NsSince(start);
+                start = std::chrono::steady_clock::now();
+            }
             // PERF-070: a page a decoded GPU write guards opens once the write is recorded.
             rasterizer->WaitForGuard(fault_page);
+            if (timed) {
+                Cost().guard_ns += NsSince(start);
+            }
         } else if (rasterizer->GetPageManager().IsGuarded(fault_page)) {
             // PERF-070: an emulator thread reads or writes a guarded page itself: open it.
             rasterizer->GetPageManager().DropGuards(fault_page);
@@ -906,9 +1253,31 @@ struct SignalImpl : public PageManager::Impl {
         // The faulting instruction, with bit 63 set for a write.
         RYDIAG_SCOPE(WriteFault, reinterpret_cast<u64>(Common::GetRip(context)) |
                                      (u64(Common::IsWriteError(context)) << 63));
+        if (Common::IsWriteError(context) && ReadWatched(fault_page)) {
+            // FIX-233: the page holds GPU-written data the CPU has not read back; it is
+            // no-access (not write-only), so a CPU write lands here. The data is brought back
+            // as for a read first, so the write changes the GPU's data, not stale memory; then
+            // the write is handled as usual if the page's writes are watched too, else the
+            // write runs again on the now open page.
+            static std::atomic<u32> logged{};
+            if (const u32 n = ++logged; n <= 8 || n % 1000 == 0) {
+                LOG_WARNING(Render, "FIX-233: CPU write to a read-watched page at {:#x} ({} so far)",
+                            addr, n);
+            }
+            const bool read = rasterizer->ReadMemory(addr, size, assume_locks);
+            if (!WriteWatched(fault_page)) {
+                return read;
+            }
+        }
         if (Common::IsWriteError(context)) {
-            return rasterizer->InvalidateMemory(addr, size, assume_locks,
-                                                ExactWriteSize(context, addr));
+            const auto start = timed ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
+            const bool handled = rasterizer->InvalidateMemory(addr, size, assume_locks,
+                                                              ExactWriteSize(context, addr));
+            if (timed) {
+                Cost().invalidate_ns += NsSince(start);
+            }
+            return handled;
         } else {
             return rasterizer->ReadMemory(addr, size, assume_locks);
         }
@@ -953,6 +1322,14 @@ bool PageManager::IsUnwatched(VAddr page) const {
                       state->num_guards == 0);
 }
 
+bool PageManager::IsNativeWatched(VAddr page) const {
+    if (page >= (VAddr{1} << Impl::ADDRESS_BITS)) {
+        return false;
+    }
+    const auto* state = impl->cached_pages.find(page >> PM_PAGE_BITS);
+    return state && state->native_watch != 0;
+}
+
 #ifdef RYTY_GPU
 void PageManager::ReapplyProtection(VAddr address, u64 size) {
     impl->ReapplyProtection(address, size);
@@ -973,6 +1350,10 @@ void PageManager::OnGpuUnmap(VAddr address, size_t size) {
 
 void PageManager::UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) const {
     impl->UpdatePageWatchers(addr, size, write_op);
+}
+
+void PageManager::UpdateNativeWatch(VAddr addr, u64 size, bool watch) const {
+    impl->UpdateNativeWatch(addr, size, watch);
 }
 
 void PageManager::UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,

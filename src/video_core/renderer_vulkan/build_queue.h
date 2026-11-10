@@ -17,8 +17,19 @@
 
 namespace Vulkan {
 
+/// FIX-GT7-100: pipeline builds queued or running, for the compile notice.
+inline std::atomic<u32> g_build_jobs{0};
+
+/// FIX-GT7-109: the game is in play (a race: slow frames for a second; FIX-GT7-120: kept by a
+/// heavy scene), as PipelineCache::UpdateCatchUp measures it. Compile work then stays on its
+/// cores at its usual width, and background compiles that read it pause.
+inline std::atomic<bool> g_game_in_play{false};
+
 /// The pipeline build workers' jobs (PERF-019). Urgent jobs (a draw waits) run last-first,
-/// then Soon jobs (a draw went on) in draw order, then normal read-ahead in order.
+/// then FIX-GT7-009's Screen jobs (draws skipped again) in order, then Soon jobs (a draw went
+/// on, PERF-GT7-025) in draw order, then PERF-171's tessellated read-ahead jobs (the cars), then
+/// normal read-ahead in order. FIX-GT7-022: read-ahead jobs start only while fewer than
+/// `background_limit` jobs run.
 /// PERF-038: background jobs (stored pipelines built while
 /// the game runs) run only when neither waits, on at most `max_background` workers at once,
 /// and not while paused: each pipeline a draw needs pauses them for a while, so they never
@@ -27,7 +38,7 @@ class BuildQueue {
 public:
     using Job = std::function<void()>;
     using Clock = std::chrono::steady_clock;
-    enum class Kind { Urgent, Screen, Soon, Normal, Background };
+    enum class Kind { Urgent, Screen, Soon, Tessellated, Normal, Background };
 
     explicit BuildQueue(u32 max_foreground_, u32 max_background_, u32 max_boost_ = 0)
         : max_foreground{max_foreground_}, max_background{max_background_},
@@ -58,6 +69,9 @@ public:
             case Kind::Soon:
                 soon.push_back({std::move(job), heavy});
                 break;
+            case Kind::Tessellated:
+                tessellated.push_back({std::move(job), heavy});
+                break;
             case Kind::Normal:
                 normal.push_back({std::move(job), heavy});
                 break;
@@ -66,18 +80,20 @@ public:
                 break;
             }
         }
+        g_build_jobs.fetch_add(1, std::memory_order_relaxed); // FIX-GT7-100
         cv.notify_all();
     }
 
     /// Waits for the next job. False once stopped. `is_background` tells which queue it came
-    /// from; a background job must be followed by FinishedBackground.
+    /// from; a background job must be followed by FinishedBackground, any other by
+    /// FinishedForeground.
     bool Pop(Job& job, bool& is_background, std::stop_token stop, bool* is_heavy = nullptr, bool* is_read_ahead = nullptr) {
         std::unique_lock lk{mutex};
         while (true) {
             if (stop.stop_requested()) {
                 return false;
             }
-            if (auto* entries = RunnableForeground(); entries && HasCapacity(running_foreground, max_foreground)) {
+            if (auto* entries = RunnableForeground(); entries && HasCapacity(running_foreground, max_foreground + extra_running)) {
                 auto next = Runnable(*entries);
                 const bool heavy = next->heavy;
                 job = std::move(next->job);
@@ -85,7 +101,7 @@ public:
                 running_heavy += heavy;
                 if (is_heavy) *is_heavy = heavy;
                 is_background = false;
-                const bool read_ahead = entries == &normal;
+                const bool read_ahead = entries == &normal || entries == &tessellated;
                 if (is_read_ahead) *is_read_ahead = read_ahead;
                 running_read_ahead += read_ahead;
                 ++running_foreground;
@@ -109,14 +125,14 @@ public:
             }
             if (!background.empty() && paused) {
                 cv.wait_until(lk, stop, pause_until, [&] {
-                    return (RunnableForeground() && HasCapacity(running_foreground, max_foreground)) ||
+                    return (RunnableForeground() && HasCapacity(running_foreground, max_foreground + extra_running)) ||
                            boost.load(std::memory_order_relaxed) || Clock::now() >= pause_until;
                 });
             } else {
                 cv.wait(lk, stop, [&] {
                     const u32 limit = boost.load(std::memory_order_relaxed) ? max_boost
                                                                             : max_background;
-                    return (RunnableForeground() && HasCapacity(running_foreground, max_foreground)) ||
+                    return (RunnableForeground() && HasCapacity(running_foreground, max_foreground + extra_running)) ||
                            (Runnable(background) != background.end() && ReadAheadAvailable() && HasCapacity(running_background, limit));
                 });
             }
@@ -130,13 +146,15 @@ public:
             running_read_ahead -= read_ahead;
             running_heavy -= heavy;
         }
+        g_build_jobs.fetch_sub(1, std::memory_order_relaxed); // FIX-GT7-100
         cv.notify_all();
     }
 
     /// PERF-101: no draw or read-ahead build is queued or running.
     bool ForegroundIdle() {
         std::scoped_lock lk{mutex};
-        return urgent.empty() && screen.empty() && soon.empty() && normal.empty() && running_foreground == 0;
+        return urgent.empty() && screen.empty() && soon.empty() && tessellated.empty() &&
+               normal.empty() && running_foreground == 0;
     }
 
     void FinishedBackground(bool heavy = false) {
@@ -146,6 +164,7 @@ public:
             --running_read_ahead;
             running_heavy -= heavy;
         }
+        g_build_jobs.fetch_sub(1, std::memory_order_relaxed); // FIX-GT7-100
         cv.notify_all();
     }
 
@@ -163,17 +182,35 @@ public:
     /// PERF-160: jobs waiting for a worker, foreground and background.
     size_t Pending() {
         std::scoped_lock lk{mutex};
-        return urgent.size() + screen.size() + soon.size() + normal.size() + background.size();
+        return urgent.size() + screen.size() + soon.size() + tessellated.size() + normal.size() +
+               background.size();
     }
 
     bool Busy() {
         std::scoped_lock lk{mutex};
         return running_foreground || running_background || !urgent.empty() || !screen.empty() ||
-               !soon.empty() || !normal.empty() || !background.empty();
+               !soon.empty() || !tessellated.empty() || !normal.empty() || !background.empty();
     }
 
     void SetForegroundLimit(u32 limit) {
         { std::scoped_lock lk{mutex}; max_foreground = std::max(1u, limit); }
+        cv.notify_all();
+    }
+
+    /// PERF-GT7-034: the limit itself (fewer while the game runs late).
+    void SetMaxRunning(u32 limit) {
+        SetForegroundLimit(limit);
+    }
+
+    /// PERF-GT7-021: this many more jobs may run at once (0: back to the limit).
+    void SetExtraRunning(u32 extra) {
+        { std::scoped_lock lk{mutex}; extra_running = extra; }
+        cv.notify_all();
+    }
+
+    /// FIX-GT7-022: a read-ahead job starts only while fewer than this many jobs run.
+    void SetBackgroundLimit(u32 limit) {
+        { std::scoped_lock lk{mutex}; background_limit = limit; }
         cv.notify_all();
     }
 
@@ -195,17 +232,23 @@ private:
     std::mutex mutex;
     std::condition_variable_any cv;
     bool HasCapacity(u32 running_kind, u32 kind_limit) const {
-        const u32 total_limit = boost.load(std::memory_order_relaxed)
-                                   ? std::max(max_foreground, max_boost) : max_foreground;
-        return running_kind < kind_limit && running_foreground + running_background < total_limit;
+        const u32 total_limit = (boost.load(std::memory_order_relaxed)
+                                     ? std::max(max_foreground, max_boost)
+                                     : max_foreground) +
+                                extra_running;
+        return running_kind < kind_limit &&
+               running_foreground + running_background < total_limit;
     }
     bool ReadAheadAvailable() const {
-        return boost.load(std::memory_order_relaxed) || running_read_ahead < max_read_ahead;
+        return boost.load(std::memory_order_relaxed) ||
+               (running_read_ahead < max_read_ahead &&
+                running_foreground + running_background < background_limit);
     }
     struct Entry { Job job; bool heavy; };
     std::deque<Entry> urgent;
-    std::deque<Entry> screen;
-    std::deque<Entry> soon;
+    std::deque<Entry> screen;      ///< FIX-GT7-009
+    std::deque<Entry> soon;        ///< PERF-GT7-025
+    std::deque<Entry> tessellated; ///< PERF-171
     std::deque<Entry> normal;
     std::deque<Entry> background;
     // Keep queued heavy jobs out of worker threads until memory capacity is available.
@@ -220,9 +263,15 @@ private:
         for (auto* entries : {&urgent, &screen, &soon}) {
             if (Runnable(*entries) != entries->end()) return entries;
         }
-        return ReadAheadAvailable() && Runnable(normal) != normal.end() ? &normal : nullptr;
+        if (!ReadAheadAvailable()) return nullptr;
+        for (auto* entries : {&tessellated, &normal}) {
+            if (Runnable(*entries) != entries->end()) return entries;
+        }
+        return nullptr;
     }
     u32 max_read_ahead{UINT32_MAX};
+    u32 background_limit{~0u}; ///< FIX-GT7-022
+    u32 extra_running{};       ///< PERF-GT7-021
     u32 running_read_ahead{};
     u32 running_heavy{};
     u32 running_background{};

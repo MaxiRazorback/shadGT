@@ -54,6 +54,9 @@ public:
                     vk::ShaderModule module, SerializationSupport& sdata);
     ~ComputePipeline();
 
+    /// PERF-GT7-037: what builds this pipeline again exactly (its SPIR-V, set layout, push
+    /// range and subgroup size), written to `file`. WarmFromRecipe builds it from that file and
+    /// drops it: the driver's caches keep it, and a later build of the same pipeline is quick.
     bool SaveRecipe(const std::filesystem::path& file, std::span<const u32> spirv) const;
     static u64 RecipePolicy(const Instance& instance, const Shader::Profile& profile);
     static bool WarmFromRecipe(const Instance& instance, const Shader::Profile& profile, vk::PipelineCache cache,
@@ -66,7 +69,7 @@ public:
 
 private:
     ComputePipelineKey compute_key;
-    std::vector<vk::DescriptorSetLayoutBinding> recipe_bindings;
+    std::vector<vk::DescriptorSetLayoutBinding> recipe_bindings; ///< PERF-GT7-037
     bool recipe_push = false;
     bool recipe_subgroup_control = false;
     u32 recipe_subgroup = 0;

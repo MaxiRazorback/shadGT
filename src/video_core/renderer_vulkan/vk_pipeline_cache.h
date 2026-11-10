@@ -18,6 +18,7 @@
 #include "video_core/renderer_vulkan/guarded_shader_snapshot.h"
 #include "video_core/renderer_vulkan/read_ahead_retry_queue.h"
 #include <filesystem>
+#include <functional>
 #include <future>
 #include <mutex>
 #include <optional>
@@ -84,6 +85,7 @@ struct DrawIndirectParams {
     /// PERF-028: draw a quad list through the tessellation helpers instead of as triangles
     /// (indirect draws, or indices the command thread cannot read).
     bool tessellate_quads{};
+    /// FIX-192: an indirect draw, whose vertex and instance ids the shader unbiases.
     bool is_indirect{};
 };
 
@@ -149,6 +151,34 @@ public:
     void ReleaseCompletedPipelineOwners(std::vector<std::shared_ptr<const void>> owners);
 
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
+
+    struct PipelineBuild;
+    /// shadgt7's FIX-198 / PERF-GT7-020 / PERF-GT7-036 interface (lookup lock held). Here a
+    /// draw looked up while SetForceWait or SetWaitForShaders is set waits for its shaders and
+    /// pipeline as a never-skipped draw does (shadGT's GetGraphicsPipelineUnlocked is what
+    /// releases the lock during such waits), so TakeSkippedBuild and TakeShaderWait give nothing.
+    void SetForceWait(bool on) {
+        force_wait = on;
+    }
+    void SetWaitForShaders(bool on) {
+        wait_for_shaders = on;
+    }
+    void SetShadersUnlocked(bool on) {
+        shaders_unlocked = on;
+    }
+    std::shared_ptr<PipelineBuild> TakeSkippedBuild() {
+        return std::move(skipped_build);
+    }
+    /// FIX-GT7-109: the function waits until `deadline` at most; false when it gave up.
+    std::function<bool(std::chrono::steady_clock::time_point)> TakeShaderWait() {
+        return {};
+    }
+    /// PERF-GT7-020 (without the lookup lock): builds the pipeline here unless a worker started
+    /// it, and returns once it is built. FIX-GT7-109: with a deadline, never built here: false
+    /// when no worker had it ready by then.
+    bool FinishBuildUnlocked(const std::shared_ptr<PipelineBuild>& build,
+                             std::chrono::steady_clock::time_point deadline =
+                                 std::chrono::steady_clock::time_point::max());
     // Caller holds lock; required pipeline waits may release and reacquire it.
     const GraphicsPipeline* GetGraphicsPipelineUnlocked(const DrawIndirectParams params,
                                                         std::unique_lock<LookupLock>& lock);
@@ -221,7 +251,6 @@ private:
     /// registers at an upcoming draw (PERF-019).
     const AmdGpu::Regs& Regs() const;
     bool HasSupportedColorTargets() const;
-    struct PipelineBuild;
     class PipelineBuildWorkers;
     /// PERF-019: builds the pipeline for the current key on a worker thread.
     /// PERF-109: in_order queues a nonblocking draw in the FIFO Soon tier.
@@ -290,6 +319,10 @@ private:
                                    const std::span<const u32>& code, size_t perm_idx,
                                    Shader::Backend::Bindings& binding);
     const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::HwStage stage, Shader::SwStage l_stage);
+    /// shadgt7 FIX-217: pixel shaders (by code address) with a V_INTERP_MOV of a vertex's own value.
+    bool ReadsVertexValues(const AmdGpu::ShaderProgram& program);
+    std::mutex vertex_value_mutex;
+    std::unordered_map<VAddr, bool> vertex_value_programs;
     bool IsTessEmulatedDraw() const;
     /// PERF-028: the current draw is a quad list drawn as a triangle list.
     bool QuadListAsTriangles() const;
@@ -503,6 +536,10 @@ private:
         u64 frames{}, us{};
         u32 calm{}, fast{}, pace_limit{};
         bool on{}, stepped_back{};
+        // FIX-GT7-109/120: the in-play measure behind g_game_in_play.
+        std::chrono::steady_clock::time_point play_window{};
+        u64 play_frames{}, play_us{}, play_draws{};
+        bool in_play{};
     } catch_up;
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<PipelineBuild>> pending_builds;
     std::chrono::steady_clock::time_point stale_ahead_checked{};
@@ -545,6 +582,10 @@ private:
     std::jthread prewarm_reader;
     LookupLock lookup_mutex; // PERF-047, PERF-060; NAT-031: shared for job threads
     u32 unlocked_required_waits{}; // Protected by lookup_mutex.
+    bool force_wait{};       ///< shadgt7 FIX-198 (lookup lock held)
+    bool wait_for_shaders{}; ///< shadgt7 PERF-GT7-020 (lookup lock held)
+    bool shaders_unlocked{}; ///< shadgt7 PERF-GT7-036 (lookup lock held)
+    std::shared_ptr<PipelineBuild> skipped_build; ///< shadgt7 PERF-GT7-020: never set here
 
     /// FIX-078: a shader the read-ahead found with no matching translation is translated on a
     /// worker thread; the draw that needs it takes the result (or waits for it) instead of

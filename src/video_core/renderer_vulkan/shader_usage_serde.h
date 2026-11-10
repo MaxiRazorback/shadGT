@@ -73,4 +73,5 @@ inline void ReadResourceUsage(Serialization::Reader& in, Shader::Info& info) {
     info.image_srgb_used = std::bitset<Shader::NUM_IMAGES>{images};
 }
 
+
 } // namespace Vulkan

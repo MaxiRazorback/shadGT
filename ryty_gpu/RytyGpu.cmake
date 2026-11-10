@@ -95,6 +95,8 @@ ryty_add_library(ryty_gpu libSceVideoOut
         src/imgui/renderer/font_data.cpp
         src/imgui/renderer/font_stack.cpp
         src/imgui/renderer/texture_manager.cpp
+        # FIX-GT7-100: the compile notice shown while the game shows no new frame.
+        src/imgui/compile_notice_layer.cpp
         src/sdl_window.cpp
         ${INPUT}
         src/core/debug_state.cpp
@@ -150,6 +152,7 @@ ryty_add_library(ryty_gpu libSceVideoOut
 if (CMAKE_C_COMPILER_ID MATCHES "Clang|GNU" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i.86)$")
     set_source_files_properties(ryty_gpu/native/native_xxh512.c PROPERTIES COMPILE_OPTIONS "-march=x86-64")
 endif()
+# RYTY_DIAG: this library holds the stutter diagnostics (ryty_diag.h), when the build has them.
 target_compile_definitions(ryty_gpu PRIVATE RYTY_HAS_CPU_PATCHES=1
     $<${SHADGT_DIAGNOSTICS_ON}:RYTY_DIAG=1>)
 
@@ -241,17 +244,17 @@ foreach(source ${RYTY_NP_SOURCES})
 endforeach()
 ryty_add_library(ryty_np libSceNpAuth
     EXPORT_SOURCES ${RYTY_NP_EXPORT_SOURCES}
-    SOURCES ${RYTY_NP_SOURCES} ${SHADNET} ryty_gpu/ryty_np_entry.cpp ryty_gpu/ryty_np_shims.cpp
+    SOURCES ${RYTY_NP_SOURCES} ${SHADNET} ryty_gpu/ryty_np_entry.cpp ryty_gpu/ryty_np_shims.cpp ryty_gpu/ryty_np_p2p.cpp ryty_gpu/ryty_game_log.cpp
             ryty_gpu/ryty_hle_stubs.cpp src/core/libraries/network/net_upnp.cpp
             src/core/libraries/network/net_util.cpp
 )
-target_compile_definitions(ryty_np PRIVATE RYTY_GUEST_PTHREADS)
+target_compile_definitions(ryty_np PRIVATE RYTY_GUEST_PTHREADS RYTY_NP_LIBRARY)
 target_link_libraries(ryty_np PRIVATE libprotobuf Cpp_Httplib minimp3 miniupnpc::miniupnpc ws2_32 iphlpapi)
 target_include_directories(ryty_np PRIVATE "${SHADNET_PROTO_OUT}")
 
 # Non-renderer libraries do not link the Vulkan shader compiler.
 foreach(target IN ITEMS ryty_ngs2 ryty_ajm ryty_audio3d ryty_zlib ryty_discmap ryty_screenshot ryty_np)
-    target_sources(${target} PRIVATE ryty_gpu/ryty_hle_precompile.cpp)
+    target_sources(${target} PRIVATE ryty_gpu/ryty_hle_overlay_stub.cpp)
 endforeach()
 
 target_link_libraries(ryty_gpu PRIVATE bcrypt windowscodecs ole32 shell32 mfplat mfreadwrite mfuuid mmdevapi) # GTS-010, GTS-015
