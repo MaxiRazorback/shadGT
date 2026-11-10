@@ -457,6 +457,19 @@ private:
     void CreateDriverCache();
     void SaveDriverCache(bool wait);
     void MaybeSaveDriverCache();
+    /// PERF-GT7-108: the compile pack's start-up compile (RYGT_COMPILE_PACK=1), on its own thread.
+    void CompilePackShaders(std::stop_token stop);
+    std::jthread compile_pack_thread;
+    /// PERF-GT7-111: RYGT_MANIFEST_VERIFY=1 translates every manifest record again at start and
+    /// compares SPIR-V. PERF-GT7-117: RYGT_MANIFEST_PRETRANSLATE=1 stores the records of programs
+    /// the shader store does not have. Both off by default; joined with the cache.
+    void VerifyManifest(std::stop_token stop);
+    void PretranslateManifest(std::stop_token stop);
+    std::jthread verify_thread;
+    std::jthread pretranslate_thread;
+    /// PERF-GT7-108: the compile pack's thread asks the GPU thread for a save (the writer thread
+    /// is the GPU thread's to join and replace).
+    std::atomic<bool> driver_cache_save_requested{};
     std::filesystem::path driver_cache_path;
     static std::filesystem::path WarmComputeDir();
     void WarmComputePipelines(std::stop_token stop);
@@ -567,6 +580,10 @@ private:
     /// SHD-005: a draw of a race skipped while its new shader translates on a worker, instead of
     /// the command thread waiting for the translation.
     bool SkipTranslationWait(Shader::SwStage sw_stage, const Shader::ShaderParams& params);
+    /// PERF-GT7-115: the draw's wait for its hull shader translation is bounded by the window's
+    /// budget (RYGT_HS_WAIT_BUDGET_MS), under SHD-005's conditions (async pipelines, not a forced
+    /// or one-off wait).
+    bool HullWaitBudgeted(Shader::SwStage sw_stage, const Shader::ShaderParams& params);
     tsl::robin_map<u64, bool> code_writes_memory; ///< by program hash
     bool translation_skipped{};
     struct PrewarmStats {
@@ -631,9 +648,10 @@ private:
     static thread_local std::vector<std::shared_future<StoredListing>> unlocked_listings;
     /// FIX-078 (lookup lock held): moves the finished translations of a program to its ready
     /// list, first waiting for its unfinished ones when `wait`.
-    void HarvestTranslations(u64 hash, bool wait, Shader::HwStage hw_stage,
+    /// PERF-GT7-115: false when a `budgeted` wait ran out before the translation was done.
+    bool HarvestTranslations(u64 hash, bool wait, Shader::HwStage hw_stage,
                              Shader::SwStage sw_stage, const Shader::RuntimeInfo& runtime_info,
-                             const Shader::Backend::Bindings& binding);
+                             const Shader::Backend::Bindings& binding, bool budgeted = false);
     /// FIX-078 (lookup lock held): a ready translation made for the inputs of this lookup. A draw
     /// (`insert`) adds it as a permutation; the read-ahead only learns it exists. Translations
     /// no draw matches (made from read-ahead states that were never drawn) are dropped later.
@@ -669,6 +687,16 @@ private:
     class StoreReaders;
     std::unordered_map<u64, std::shared_future<StoredListing>> pending_listings;
     std::unique_ptr<StoreReaders> store_readers;
+    /// PERF-GT7-118: a stored permutation's module, made by a store reader from the SPIR-V it
+    /// read ahead (RYGT_PREFETCH_MODULES=0: not made); LoadStoredModule takes it.
+    void PrefetchStoredModule(u64 pgm_hash, size_t perm_idx, const std::vector<u32>& words);
+    std::mutex prefetched_mutex;
+    std::unordered_map<u64, vk::ShaderModule> prefetched_modules; ///< by HashCombine(program, permutation)
+    /// The keys in the order they were made: past MaxPrefetchedModules waiting, the oldest is
+    /// destroyed (a stored permutation no draw matches would otherwise stay for the session).
+    std::deque<u64> prefetched_order;
+    static constexpr size_t MaxPrefetchedModules = 1024;
+    u64 prefetched_evicted = 0; ///< under prefetched_mutex
 
     // Last member, so the workers stop before anything they use is destroyed.
     std::unique_ptr<PipelineBuildWorkers> build_workers;
