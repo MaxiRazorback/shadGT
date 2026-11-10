@@ -180,10 +180,19 @@ void CommandRing::WaitForWork(u64 seen, const std::stop_token& stoken) {
     // The recorder hands over commands steadily while it works; spin briefly before sleeping.
     // PERF-125: SHADGT_CMD_SPIN pauses (default 128). The spin was most of this thread's
     // CPU time (replay itself ~23% busy).
-    static const u32 spin = [] {
+    // PERF-416: when the recorder hands commands over just slower than the spin lasts, this
+    // thread slept after almost every command and the recorder woke it for each next one
+    // (WakeByAddress in Publish): on GT Sport's transmission screen with a car of many draws,
+    // a third of the recorder's draw recording. The spin now adapts: a sleep the next command
+    // ends within 300 us doubles it (up to 8192 pauses), a sleep over 2 ms (the recorder idle,
+    // between frames) halves it (down to 128). SHADGT_CMD_SPIN=<n>: a fixed spin, as before.
+    static const u32 fixed_spin = [] {
         const char* env = std::getenv("SHADGT_CMD_SPIN");
-        return env && *env ? u32(std::strtoul(env, nullptr, 10)) : 128u;
+        return env && *env ? u32(std::strtoul(env, nullptr, 10)) : 0u;
     }();
+    constexpr u32 MinSpin = 128;
+    constexpr u32 MaxSpin = 8192;
+    const u32 spin = fixed_spin ? fixed_spin : adaptive_spin;
     for (u32 i = 0; i < spin; ++i) {
         if (head.load(std::memory_order_acquire) != seen) {
             return;
@@ -196,7 +205,18 @@ void CommandRing::WaitForWork(u64 seen, const std::stop_token& stoken) {
         sleeping.store(false, std::memory_order_relaxed);
         return;
     }
+    if (fixed_spin) {
+        wake.wait(wake_value, std::memory_order_acquire);
+        return;
+    }
+    const auto slept_at = std::chrono::steady_clock::now();
     wake.wait(wake_value, std::memory_order_acquire);
+    const auto slept = std::chrono::steady_clock::now() - slept_at;
+    if (slept < std::chrono::microseconds(300)) {
+        adaptive_spin = std::min(adaptive_spin * 2, MaxSpin);
+    } else if (slept > std::chrono::milliseconds(2)) {
+        adaptive_spin = std::max(adaptive_spin / 2, MinSpin);
+    }
 }
 
 void Scheduler::SyncCommandThread() {
