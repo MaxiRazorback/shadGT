@@ -19434,9 +19434,13 @@ void NativeRenderer::EvictImages() {
             kept_texture_shard = 0;
         }
     }
-    // A loaded texture that went idle after the last full walk.
+    // A loaded texture that went idle after the last full walk (RYGT_NATIVE_KEEP_NEW_IDLE=0: not).
+    static const bool keep_new_idle = [] {
+        const char* env = std::getenv("RYGT_NATIVE_KEEP_NEW_IDLE");
+        return !(env && env[0] == '0');
+    }();
     const auto keep_new_texture = [&](Native::ImageEntry& entry) {
-        if (pressure || texture_budget == 0 || !entry.from_cpu || !entry.image) {
+        if (!keep_new_idle || pressure || texture_budget == 0 || !entry.from_cpu || !entry.image) {
             return false;
         }
         const u64 size = std::max<u64>(entry.info.guest_size, 1);
