@@ -125,6 +125,8 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|RYGT_NATIVE_NEXT|flag|Native recorder & sync|off|1 = on|Experimental PERF-GT7-013..016 path, including a faster buffer memo hash.",
     "RYGTSW1|RYGT_NATIVE_OVERLAP_PROGRAMS|string|Native recorder & sync|490b6362|'<hex>[,<hex>...]'; empty = none|Compute programs whose back-to-back dispatches run without barriers between them (GT7 probe filter).",
     "RYGTSW1|RYGT_NATIVE_PASS_BARRIERS|flag|Native recorder & sync|on|0 = off|Uses targeted barriers between passes instead of a full barrier at each pass change (NAT-140). 0 is slower.",
+    "RYGTSW1|RYGT_DIAG_NO_DRAW_BARRIERS|flag|Diagnostics & tracing|off|1 = on|Unsafe: skips the full barrier before draws that read just-written data, to measure its GPU cost (DIAG-GTS-454). Can draw wrong.",
+    "RYGTSW1|RYGT_NATIVE_PREPARE_MENUS|flag|Native recorder & sync|off|exactly 1 = on|Prepares draws on game job threads in menus too, not only in races (PERF-GTS-450). Experimental: may speed up slow menus or cause glitches.",
     "RYGTSW1|RYGT_NATIVE_PREPARE|flag|Native recorder & sync|on with native renderer|1 = on, 0 = off|Lets game job threads prepare draws for the recorder (PERF-316, about +12% FPS). 0 turns it off.",
     "RYGTSW1|RYGT_NATIVE_PREPARE_WORKERS|int|Native recorder & sync|4|number of prepare worker threads; 0 = walk jobs on the game's job thread as before|Number of renderer threads that walk GT7's ended jobs and prepare their draws off the game's critical path (GT7-PREP).",
     "RYGTSW1|RYGT_NATIVE_REGION_COMPARE|flag|Native recorder & sync|off|1 = on|Compares every page when refreshing a region, even ones only CPU-written recently. 1 is more work.",

@@ -23,6 +23,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <source_location>
 #include <span>
 #include <tuple>
 #include <unordered_map>
@@ -426,7 +427,8 @@ private:
     void EndRendering(u32 reason = 0);
     bool ContinueSmallParallelPass(const RenderState& target, u32 reason, bool safe);
     void BeginRendering(const RenderState& state);
-    void GlobalBarrier();
+    /// DIAG-GTS-451: Diagnostics builds count full barriers by the line that asked for them.
+    void GlobalBarrier(std::source_location where = std::source_location::current());
     /// NAT-140: attachment writes before it finish before attachment access after it (a pass
     /// drawing into what an earlier pass drew), without waiting for anything else.
     void PassBarrier();

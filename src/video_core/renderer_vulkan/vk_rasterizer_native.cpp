@@ -564,6 +564,7 @@ static std::unique_ptr<Native::Rhi::Buffer> scene_indirect_buffer;
 static std::vector<SceneIndirectArgs> scene_indirect_args;
 
 bool RytyGtsInRace();
+static bool PrepareScope(); // PERF-GTS-450: races, or menus with RYGT_NATIVE_PREPARE_MENUS=1
 bool RytyGtsRaceSession(); // WIDE-015
 int RytyGtsMenuScreen();   // WIDE-020
 float RytyDisplayAspect(); // GTS-009 (ryty_game_patch.cpp)
@@ -3834,7 +3835,34 @@ void NativeRenderer::BeginRendering(const RenderState& state) {
     NATIVE_DIAGNOSTIC(++stats.passes);
 }
 
-void NativeRenderer::GlobalBarrier() {
+#if !defined(NDEBUG)
+// DIAG-GTS-451: full barriers by the source line that asked for them, and the draw-path ones by
+// rule and vertex program (recorder thread; the 10-second report prints and clears them).
+namespace {
+std::map<u32, u64> g_barrier_sites;
+std::map<std::pair<u32, u64>, u64> g_barrier_draws; // (rule, vs hash) -> count
+u64 g_barrier_draw_vs = 0;
+u32 g_barrier_draw_rule = 0; // 1 reads written, 2 indirect args, 3 pass into read, 4 sources, 5 draw barrier
+std::array<u64, 8> g_run_barrier_reasons{}; // DIAG-GTS-452
+std::array<u64, 4> g_dispatch_work{}; // DIAG-GTS-452: image init, uploads, serial, all
+std::map<u32, u64> g_dispatch_work_sites; // last barrier line when the serial changed
+u32 g_last_barrier_line = 0;
+std::mutex g_barrier_stats_mutex;
+} // namespace
+#endif
+
+void NativeRenderer::GlobalBarrier([[maybe_unused]] std::source_location where) {
+#if !defined(NDEBUG)
+    {
+        std::scoped_lock lock{g_barrier_stats_mutex};
+        ++g_barrier_sites[where.line()];
+        g_last_barrier_line = where.line();
+        if (g_barrier_draw_rule) {
+            ++g_barrier_draws[{g_barrier_draw_rule, g_barrier_draw_vs}];
+            g_barrier_draw_rule = 0;
+        }
+    }
+#endif
     Stream& s = stream;
     EndRendering();
     ++s.resource_recording_serial;
@@ -9958,7 +9986,11 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                         if (prefix) {
                             EndRendering();
                             const vk::Buffer target{Handle<VkBuffer_T>(prefix->NativeHandle())};
-                            ++stream.resource_recording_serial;
+                            // PERF-GTS-453: no resource_recording_serial bump. The copy writes a
+                            // buffer made for this dispatch, and the transfer->compute barrier
+                            // below orders it; the bump only made RunNeedsBarrier add a full
+                            // barrier before every such dispatch (GT Sport's cube-map filter
+                            // 0xd0af5a54, ~144 dispatches a frame in the garage, never overlapped).
                             stream.cmd.copyBuffer(source, target,
                                 vk::BufferCopy{.srcOffset = offset, .dstOffset = 0,
                                                .size = PrefixSize});
@@ -11410,6 +11442,23 @@ bool NativeRenderer::RunNeedsBarrier(const Stream& s, const DrawBindings& b, u64
         }
         return list;
     }();
+#if !defined(NDEBUG)
+    // DIAG-GTS-452: for listed programs, which condition keeps the barrier.
+    if (std::ranges::find(listed, program) != listed.end()) {
+        std::scoped_lock lock{g_barrier_stats_mutex};
+        const auto note = [&](u32 bit, bool bad) {
+            if (bad) ++g_run_barrier_reasons[bit];
+        };
+        note(0, s.run_program != program);
+        note(1, s.run_commands != s.commands);
+        note(2, s.buffers_written.foreign);
+        note(3, recorded);
+        note(4, !writebacks.empty());
+        note(5, b.writes_buffers);
+        note(6, !s.attach_dirty.empty());
+        ++g_run_barrier_reasons[7]; // listed dispatches seen
+    }
+#endif
     if ((std::ranges::find(listed, program) == listed.end() && !texel) ||
         s.run_program != program || s.run_commands != s.commands || s.buffers_written.foreign ||
         recorded || !writebacks.empty() || b.writes_buffers || !s.attach_dirty.empty()) {
@@ -12809,7 +12858,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     // OPT-010: the draw a game job thread prepared, if any (job threads prepare direct draws).
     static const bool prepare = PrepareEnabled();
     PreparedDraw* prepared = nullptr;
-    if (prepare && !indirect && !r.FrameDumpCollecting() && RytyGtsInRace()) { // NAT-161: direct draws only
+    if (prepare && !indirect && !r.FrameDumpCollecting() && PrepareScope()) { // NAT-161: direct draws only
         prepared = TakePrepared(Rasterizer::t_draw_packet);
         NATIVE_DIAGNOSTIC(stats.prepared_missing += prepared ? 0 : 1);
     }
@@ -13521,17 +13570,39 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         // one now, whose second scope (all commands, all memory reads) takes in indirect command
         // reads; NeedsBarrierFor asks for it too, but the arguments keep it whatever that checks.
         const bool reads_arguments = indirect && s.buffers_written;
+#if !defined(NDEBUG)
+        {
+            // DIAG-GTS-451: which rule makes this draw's barrier, and whose draw it is.
+            const auto* vs_stage = pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
+            g_barrier_draw_vs = vs_stage ? vs_stage->pgm_hash : 0;
+            g_barrier_draw_rule = NeedsBarrierFor(b)                    ? 1
+                                  : reads_arguments                     ? 2
+                                  : (pass_change && targets_in(s.read)) ? 3
+                                                                        : 0;
+        }
+#endif
+        // DIAG-GTS-454 (diagnosis, unsafe, RYGT_DIAG_NO_DRAW_BARRIERS=1): no full barrier for a
+        // draw that only reads what was written since the last one, to measure what those cost
+        // the GPU (GT Sport's garage: ~45,000 in 10 s). Can draw wrong.
+        static const bool no_draw_barriers = [] {
+            const char* env = std::getenv("RYGT_DIAG_NO_DRAW_BARRIERS");
+            return env && env[0] == '1';
+        }();
+        const bool reads_written = !no_draw_barriers && NeedsBarrierFor(b);
         if (!pass_barriers) {
-            if (pass_change || NeedsBarrierFor(b) || reads_arguments) {
+            if (pass_change || reads_written || reads_arguments) {
                 GlobalBarrier();
             }
-        } else if (NeedsBarrierFor(b) || reads_arguments || (pass_change && targets_in(s.read))) {
+        } else if (reads_written || reads_arguments || (pass_change && targets_in(s.read))) {
             GlobalBarrier();
         } else if (pass_change && targets_in(s.attach_dirty)) {
             PassBarrier();
         } else if (pass_change) {
             NATIVE_DIAGNOSTIC(++stats.passes_unblocked);
         }
+#if !defined(NDEBUG)
+        g_barrier_draw_rule = 0; // DIAG-GTS-451
+#endif
     }
     // FIX-210: a target's pending pictures (from the targets it is made of, and from the larger
     // target it is a part of) go in before the draw, which counts as drawing its whole view.
@@ -13544,6 +13615,9 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             }
         }
         if (stats.source_copies != copies_before) {
+#if !defined(NDEBUG)
+            g_barrier_draw_rule = 4; // DIAG-GTS-451
+#endif
             GlobalBarrier(); // the copies are done before the draw writes the targets
         }
     }
@@ -15860,8 +15934,22 @@ void NativeRenderer::FreePrepared(PreparedDraw* draw) {
     prepared_free.push_back(draw);
 }
 
+// PERF-GTS-450 (RYGT_NATIVE_PREPARE_MENUS=1): draws are prepared on the game's job threads
+// (OPT-010) outside races too. In the garage menu the recorder spent most of each car-body
+// draw resolving buffers and textures (~15-19 us a draw for ~1,900 draws a frame).
+static bool PrepareOutsideRaces() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_PREPARE_MENUS");
+        return env && env[0] == '1' && env[1] == '\0';
+    }();
+    return enabled;
+}
+static bool PrepareScope() {
+    return RytyGtsInRace() || PrepareOutsideRaces();
+}
+
 bool NativeRenderer::HasPrepared(const void* packet) {
-    if (!RytyGtsInRace()) return false; // required menu work stays on the recorder
+    if (!PrepareScope()) return false; // required menu work stays on the recorder (PERF-GTS-450)
     if (!packet) {
         return false;
     }
@@ -15941,7 +16029,7 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
                                     std::shared_ptr<const void> pipeline_keepalive,
                                     std::span<const Shader::Info* const> stages, bool is_indexed,
                                     u32 index_offset) {
-    if (!RytyGtsInRace()) return; // do not retain speculative menu bindings
+    if (!PrepareScope()) return; // do not retain speculative menu bindings (PERF-GTS-450)
     AheadPrepareGuard ahead_guard{FindAhead(this)};
     auto proof_guard=PreparedSampledProofRequested()?prepared_proof_contexts.TryEnter(this):Native::Parallel::ProofProducerGuard{};
 
@@ -17635,6 +17723,19 @@ void NativeRenderer::DispatchDirect() {
     }
     ReadFillShader(pipeline->GetStage(Shader::SwStage::Compute), b); // NAT-120
     const bool image_work = device->PendingImageInit() || registry->HasPendingUploads();
+#if !defined(NDEBUG)
+    {
+        // DIAG-GTS-452: what "image work recorded" is, for listed programs' dispatches.
+        std::scoped_lock lock{g_barrier_stats_mutex};
+        if (device->PendingImageInit()) ++g_dispatch_work[0];
+        if (registry->HasPendingUploads()) ++g_dispatch_work[1];
+        if (s.resource_recording_serial != work_before) {
+            ++g_dispatch_work[2];
+            ++g_dispatch_work_sites[g_last_barrier_line];
+        }
+        ++g_dispatch_work[3];
+    }
+#endif
     PrepareImages();
     for (unsigned attempt = 0; b.region_writeback && !RegionPlanValid(*b.region_writeback) && attempt < 4; ++attempt) {
         b.Clear();
@@ -21218,6 +21319,52 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
     stats.region_binds = stats.regions_made = stats.region_refreshes = 0;
     stats.fill_shaders = stats.rewrite_clears = stats.rewrite_uploads = 0;
     stats.rewrite_partial = stats.rewrite_fills = 0;
+#if !defined(NDEBUG)
+    {
+        // DIAG-GTS-451: where the last 10 s of full barriers came from.
+        std::scoped_lock lock{g_barrier_stats_mutex};
+        std::vector<std::pair<u64, u32>> sites;
+        for (const auto& [line, count] : g_barrier_sites) sites.emplace_back(count, line);
+        std::ranges::sort(sites, std::greater{});
+        std::vector<std::pair<u64, std::pair<u32, u64>>> draws;
+        for (const auto& [key, count] : g_barrier_draws) draws.emplace_back(count, key);
+        std::ranges::sort(draws, std::greater{});
+        std::string site_text, draw_text;
+        for (size_t i = 0; i < sites.size() && i < 10; ++i) {
+            site_text += fmt::format(" line {}={}", sites[i].second, sites[i].first);
+        }
+        static constexpr std::array<const char*, 6> rule_names{"other", "reads-written",
+                                                               "indirect-args", "pass-into-read",
+                                                               "part-sources", "draw-barrier"};
+        for (size_t i = 0; i < draws.size() && i < 10; ++i) {
+            const auto [rule, vs] = draws[i].second;
+            draw_text += fmt::format(" {}:vs {:#x}={}", rule_names[std::min<u32>(rule, 5)], vs,
+                                     draws[i].first);
+        }
+        LOG_INFO(Render_Vulkan, "DIAG-GTS-451 full barriers (10 s) by site:{}; draws by rule:{}",
+                 site_text, draw_text);
+        const auto& r = g_run_barrier_reasons;
+        LOG_INFO(Render_Vulkan,
+                 "DIAG-GTS-452 listed dispatches (10 s): {} seen; barrier kept by other program "
+                 "{}, commands between {}, foreign buffer writes {}, image work recorded {}, "
+                 "write-backs due {}, writes buffers {}, attachments dirty {}",
+                 r[7], r[0], r[1], r[2], r[3], r[4], r[5], r[6]);
+        std::string work_sites;
+        for (const auto& [line, count] : g_dispatch_work_sites) {
+            work_sites += fmt::format(" line {}={}", line, count);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "DIAG-GTS-452 dispatch image work (10 s): {} dispatches; image init pending {}, "
+                 "uploads pending {}, recorded during setup {} (last barrier:{})",
+                 g_dispatch_work[3], g_dispatch_work[0], g_dispatch_work[1], g_dispatch_work[2],
+                 work_sites);
+        g_dispatch_work = {};
+        g_dispatch_work_sites.clear();
+        g_run_barrier_reasons = {};
+        g_barrier_sites.clear();
+        g_barrier_draws.clear();
+    }
+#endif
     stats.pass_barriers = stats.passes_unblocked = 0;
     stats.region_refresh_pages = stats.region_refresh_ns = 0;
     stats.guest_buffer_calls = stats.guest_buffer_ns = 0;
