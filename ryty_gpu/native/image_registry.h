@@ -120,7 +120,8 @@ public:
     /// NAT-109: hash of the guest bytes last uploaded (small textures; 0: none), so a texture
     /// made stale by a write to its page that left its bytes alone is not uploaded again.
     u64 content_hash = 0;
-    LayerHashState layer_hash;
+    /// PERF-GTS-452: shared with the background layer check (see LayerHashShared).
+    std::shared_ptr<LayerHashShared> layer_hash = std::make_shared<LayerHashShared>();
     /// A GPU-only target cannot be checked against a CPU hash. Its initial upload can instead
     /// establish that CPU writes to the complete backing range are already being watched.
     bool guest_writes_tracked = false;

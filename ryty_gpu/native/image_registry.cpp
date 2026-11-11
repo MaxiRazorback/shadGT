@@ -25,8 +25,13 @@ bool RytyWideScene(); // WIDE-001 (ryty_game_patch.cpp)
 #include "video_core/texture_cache/tiling_specialization.h"
 #include "video_core/texture_cache/packed_float.h"
 #include <array>
+#include <condition_variable>
 #include <cstdlib>
+#include <deque>
+#include <functional>
+#include <thread>
 #include <xxhash.h>
+#include "common/thread.h"
 
 #include "video_core/host_shaders/tiling_macro_128_comp.h"
 #include "video_core/host_shaders/tiling_macro_16_comp.h"
@@ -1498,22 +1503,102 @@ static bool LayerWholeHashEnabled() {
     return enabled;
 }
 
+namespace {
+// PERF-GTS-452: one thread that runs the layer checks, so the recorder does not hash them.
+class LayerHashWorker {
+public:
+    static LayerHashWorker& Get() {
+        static LayerHashWorker worker;
+        return worker;
+    }
+    bool Post(std::function<void()> job) {
+        {
+            std::scoped_lock lock{mutex};
+            if (queue.size() >= 256) return false;
+            queue.push_back(std::move(job));
+        }
+        ready.notify_one();
+        return true;
+    }
+
+private:
+    LayerHashWorker() {
+        std::thread([this] {
+            Common::SetCurrentThreadName("shadGT:LayerHash");
+            for (;;) {
+                std::function<void()> job;
+                {
+                    std::unique_lock lock{mutex};
+                    ready.wait(lock, [&] { return !queue.empty(); });
+                    job = std::move(queue.front());
+                    queue.pop_front();
+                }
+                job();
+            }
+        }).detach();
+    }
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::deque<std::function<void()>> queue;
+};
+
+bool LayerHashAsyncEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_NATIVE_LAYER_HASH_ASYNC");
+        return !(env && env[0] == '0');
+    }();
+    return enabled;
+}
+} // namespace
+
 bool ImageRegistry::LayersRewritten(ImageEntry& entry, u64 frame) {
     const bool samples = LayerSamplesEnabled();
     const bool whole = LayerWholeHashEnabled();
     const u64 size = entry.info.guest_size;
     const u32 layers = entry.info.resources.layers;
+    auto& shared = *entry.layer_hash;
     if (!samples || !entry.from_cpu || layers < 16 || size <= (4ull << 20) ||
         size % layers != 0 || entry.gpu_backing_written.load(std::memory_order_acquire) ||
-        entry.layer_hash.Checked(frame) || !memory_clamp ||
+        !memory_clamp) return false;
+    // PERF-GTS-452: a change the background check found since the last look.
+    if (shared.changed.exchange(false, std::memory_order_acq_rel)) {
+        MarkStale(entry, Stale::CpuWrite);
+        return true;
+    }
+    if (shared.checked_frame.load(std::memory_order_relaxed) == frame ||
         memory_clamp(entry.info.guest_address, size) != size) return false;
     const u64 layer_size = size / layers;
-    const bool changed = entry.layer_hash.Changed(layers, layer_size, frame,
-        [&](u32 layer, u64 offset, u64 bytes) {
-            return Core::HashGuestBytes(entry.info.guest_address + layer * layer_size + offset, bytes);
-        }, samples, whole);
-    if (changed) MarkStale(entry, Stale::CpuWrite);
-    return changed;
+    const VAddr address = entry.info.guest_address;
+    const auto hash = [address, layer_size](u32 layer, u64 offset, u64 bytes) {
+        return Core::HashGuestBytes(address + layer * layer_size + offset, bytes);
+    };
+    if (!LayerHashAsyncEnabled()) {
+        shared.checked_frame.store(frame, std::memory_order_relaxed);
+        std::scoped_lock lock{shared.mutex};
+        const bool changed = shared.state.Changed(layers, layer_size, frame, hash, samples, whole);
+        if (changed) MarkStale(entry, Stale::CpuWrite);
+        return changed;
+    }
+    // At most one check in flight per texture; the recorder only posts it. Found changes are
+    // applied at the texture's next use (a frame later, as the rotating whole-layer hashes
+    // already take several frames to cover an array).
+    if (shared.busy.exchange(true, std::memory_order_acq_rel)) return false;
+    shared.checked_frame.store(frame, std::memory_order_relaxed);
+    const u64 generation = shared.generation.load(std::memory_order_acquire);
+    std::shared_ptr<LayerHashShared> keep = entry.layer_hash;
+    const bool posted = LayerHashWorker::Get().Post([keep, layers, layer_size, frame, samples,
+                                                     whole, generation, hash] {
+        {
+            std::scoped_lock lock{keep->mutex};
+            const bool changed = keep->state.Changed(layers, layer_size, frame, hash, samples, whole);
+            if (changed && keep->generation.load(std::memory_order_acquire) == generation) {
+                keep->changed.store(true, std::memory_order_release);
+            }
+        }
+        keep->busy.store(false, std::memory_order_release);
+    });
+    if (!posted) shared.busy.store(false, std::memory_order_release);
+    return false;
 }
 
 void ImageRegistry::GpuWrote(VAddr address, u64 size, const std::array<u32, 2>* pattern,
@@ -2298,14 +2383,22 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
             memory_clamp && memory_clamp(info.guest_address, size) == size &&
             (source || gpu_source.kind == 2 || gpu_source.kind == 3)) {
             const u64 layer_size = size / info.resources.layers;
-            entry->layer_hash.Capture(info.resources.layers, layer_size,
+            auto& shared = *entry->layer_hash;
+            std::scoped_lock layer_lock{shared.mutex};
+            shared.state.Capture(info.resources.layers, layer_size,
                 [&](u32 layer, u64 offset, u64 bytes) {
                     const u64 at = layer * layer_size + offset;
                     return source ? XXH3_64bits(source->Mapped() + at, bytes) :
                                     Core::HashGuestBytes(info.guest_address + at, bytes);
                 }, LayerWholeHashEnabled());
+            shared.generation.fetch_add(1, std::memory_order_acq_rel); // PERF-GTS-452
+            shared.changed.store(false, std::memory_order_release);
         } else {
-            entry->layer_hash.ClearUpload();
+            auto& shared = *entry->layer_hash;
+            std::scoped_lock layer_lock{shared.mutex};
+            shared.state.ClearUpload();
+            shared.generation.fetch_add(1, std::memory_order_acq_rel); // PERF-GTS-452
+            shared.changed.store(false, std::memory_order_release);
         }
 #ifndef NDEBUG
         const u8 kind = source ? 4 : gpu_source.kind; // FIX-153 (diagnosis)
