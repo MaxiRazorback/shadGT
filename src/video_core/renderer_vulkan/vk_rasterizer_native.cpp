@@ -3844,6 +3844,9 @@ std::map<std::pair<u32, u64>, u64> g_barrier_draws; // (rule, vs hash) -> count
 u64 g_barrier_draw_vs = 0;
 u32 g_barrier_draw_rule = 0; // 1 reads written, 2 indirect args, 3 pass into read, 4 sources, 5 draw barrier
 std::array<u64, 8> g_run_barrier_reasons{}; // DIAG-GTS-452
+// DIAG-GTS-456: shader buffer paths by sw stage: [0] D3 binds [1] D3 bytes [2] mirror binds
+// [3] mirror bytes [4] first-use binds [5] first-use bytes [6] D3 written [7] D3 mirror-eligible
+std::array<std::array<u64, 8>, 8> g_stage_buffer_paths{};
 std::array<u64, 4> g_dispatch_work{}; // DIAG-GTS-452: image init, uploads, serial, all
 std::map<u32, u64> g_dispatch_work_sites; // last barrier line when the serial changed
 u32 g_last_barrier_line = 0;
@@ -9955,7 +9958,18 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                     vsharp.num_records != UINT32_MAX;
                 bool mirror_bound = mirrored_read;
                 std::optional<std::pair<vk::Buffer, u64>> in_view;
+#if !defined(NDEBUG)
+                const auto note_path = [&](u32 slot) { // DIAG-GTS-456
+                    std::scoped_lock lock{g_barrier_stats_mutex};
+                    auto& c = g_stage_buffer_paths[std::min<u32>(u32(stage.sw_stage), 7)];
+                    ++c[slot];
+                    c[slot + 1] += size;
+                };
+#endif
                 if (mirrored_read && !RegionOver(base, size) && !MirrorHolding(base, size)) {
+#if !defined(NDEBUG)
+                    note_path(4); // first use: mirror made, this bind reads a direct view
+#endif
                     std::ignore = MirrorBuffer(base, size);
                     mirror_bound = false;
                     if (direct && direct->EnsureImported(base, size)) {
@@ -9965,6 +9979,9 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                         }
                     }
                 }
+#if !defined(NDEBUG)
+                if (mirror_bound) note_path(2); // DIAG-GTS-456: bound from the mirror
+#endif
                 if (!freeze_fill_args && !mirror_bound && !in_view && direct &&
                     !(descriptor_postprocess && !desc.is_written) &&
                     desc.IsDirectEligible() && size < (u64{1} << 32) &&
@@ -10024,6 +10041,17 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                     if (InPlaceSampled()) {
                         in_place.Note(2, base, size); // NAT-142
                     }
+#if !defined(NDEBUG)
+                    {
+                        // DIAG-GTS-456: read in place over the page table, by stage.
+                        std::scoped_lock lock{g_barrier_stats_mutex};
+                        auto& c = g_stage_buffer_paths[std::min<u32>(u32(stage.sw_stage), 7)];
+                        ++c[0];
+                        c[1] += size;
+                        if (desc.is_written) ++c[6];
+                        if (mirrored_read) ++c[7];
+                    }
+#endif
                     log_buffer("in place through the page table (D3)");
                 } else if (const auto found = freeze_fill_args
                                                   ? SnapshotRange(base, 12)
@@ -21358,6 +21386,20 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
                  "uploads pending {}, recorded during setup {} (last barrier:{})",
                  g_dispatch_work[3], g_dispatch_work[0], g_dispatch_work[1], g_dispatch_work[2],
                  work_sites);
+        std::string path_text;
+        static constexpr std::array<const char*, 8> stage_names{"fragment", "hull", "domain",
+                                                                "vertex", "geometry", "compute",
+                                                                "?", "?"};
+        for (u32 st = 0; st < g_stage_buffer_paths.size(); ++st) {
+            const auto& c = g_stage_buffer_paths[st];
+            if (!c[0] && !c[2] && !c[4]) continue;
+            path_text += fmt::format(" [sw{} {}: in place {} ({:.1f} MB, {} written, {} could "
+                                     "mirror), mirror {} ({:.1f} MB), first use {} ({:.1f} MB)]",
+                                     st, stage_names[st], c[0], c[1] / 1048576.0, c[6], c[7],
+                                     c[2], c[3] / 1048576.0, c[4], c[5] / 1048576.0);
+        }
+        LOG_INFO(Render_Vulkan, "DIAG-GTS-456 shader buffer paths (10 s):{}", path_text);
+        g_stage_buffer_paths = {};
         g_dispatch_work = {};
         g_dispatch_work_sites.clear();
         g_run_barrier_reasons = {};

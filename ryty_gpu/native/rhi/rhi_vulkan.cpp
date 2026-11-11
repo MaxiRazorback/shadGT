@@ -913,11 +913,20 @@ std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
     case MemoryKind::DeviceLocal:
         alloc_ci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
         break;
-    case MemoryKind::Upload:
-        alloc_ci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+    case MemoryKind::Upload: {
+        // PERF-GTS-457 (RYGT_NATIVE_UPLOAD_VRAM=1): upload memory in video memory the CPU can
+        // write (Resizable BAR), falling back to system memory when there is none left. Shaders
+        // read snapshots from upload memory: GT Sport's tessellated car bodies read their hull
+        // shader data there every draw, and over PCIe each read waited (~16 us a draw).
+        static const bool vram = [] {
+            const char* env = std::getenv("RYGT_NATIVE_UPLOAD_VRAM");
+            return env && env[0] == '1';
+        }();
+        alloc_ci.usage = vram ? VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE : VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
         alloc_ci.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT |
                          VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
         break;
+    }
     case MemoryKind::Readback:
         alloc_ci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
         alloc_ci.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
