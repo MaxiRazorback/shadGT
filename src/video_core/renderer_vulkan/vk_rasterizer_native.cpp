@@ -20784,7 +20784,31 @@ void NativeRenderer::DumpFrame(const std::filesystem::path& dir) {
 #endif
 }
 
+u32* DiagLdsReadCounters(); // vk_pipeline_cache.cpp
+
 void NativeRenderer::Report() {
+    if (u32* counters = DiagLdsReadCounters()) {
+        // DIAG-GTS-459: every 10 s, each hull shader slot's emulated LDS reads and how many of
+        // them read past the patch's own control points (the writer pass serves only those).
+        static auto last = std::chrono::steady_clock::now();
+        const auto at = std::chrono::steady_clock::now();
+        if (at - last >= std::chrono::seconds{10}) {
+            last = at;
+            std::string text;
+            for (u32 slot = 0; slot < 64; ++slot) {
+                const u32 reads = counters[slot * 2];
+                const u32 outside = counters[slot * 2 + 1];
+                if (reads != 0) {
+                    text += fmt::format(" slot {}: {} reads, {} outside the patch;", slot, reads,
+                                        outside);
+                }
+                counters[slot * 2] = 0;
+                counters[slot * 2 + 1] = 0;
+            }
+            LOG_WARNING(Render_Vulkan, "DIAG-GTS-459 hull LDS reads (10 s):{}",
+                        text.empty() ? std::string{" none"} : text);
+        }
+    }
 #if !defined(NDEBUG)
     const auto now = std::chrono::steady_clock::now();
     if (now - last_report < std::chrono::seconds{10}) {

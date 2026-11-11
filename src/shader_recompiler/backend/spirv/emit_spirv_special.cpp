@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <vector>
 #include <fmt/format.h>
+#include "common/logging/log.h"
 #include "common/recoverable.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
@@ -37,6 +38,13 @@ static void EmitLdsEmulationPrologue(EmitContext& ctx) {
             tcs.ls_stride, num_cp, ctx.info.pgm_hash,
             ctx.info.pinned_tess_constants ? "constants of its draw"
                                            : "constants read at translation")};
+    if (ctx.profile.lds_read_counters != 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "DIAG-GTS-459: hs {:#x} (mode {}, {} input control points, LS stride {}, {} "
+                    "patches) counts its LDS reads in slot {}",
+                    ctx.info.pgm_hash, tcs.lds_emulation, num_cp, tcs.ls_stride, tcs.num_patches,
+                    ctx.info.pgm_hash % 64);
+    }
     const Id push_ptr = ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1]);
     const auto push_word = [&](u32 index) {
         return ctx.OpLoad(ctx.U32[1],
