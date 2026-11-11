@@ -4342,20 +4342,77 @@ void NativeRenderer::FlushWritebacks() {
         }
         use_batch = bytes != 0 && registry->BeginDownloads(batch, bytes, alignment);
     }
+    // PERF-GTS-462: the copies of a picture's downloaded bytes into guest memory and the regions
+    // over it wait until the batch is finished, for all the pictures of the batch together: one
+    // FinishDownloads (3 barriers, the re-tiling dispatches) and one barrier, instead of those for
+    // each picture (~85 a frame in GT Sport's garage, each draining the GPU: DIAG-GTS-460). A
+    // picture overlapping one whose copies wait flushes them first, so overlapping pictures keep
+    // their order. RYGT_NATIVE_WRITEBACK_COPY_EACH=1: each picture's copies at once, as before.
+    static const bool copy_each = [] {
+        const char* env = std::getenv("RYGT_NATIVE_WRITEBACK_COPY_EACH");
+        return env && env[0] == '1';
+    }();
+    struct DeferredCopies {
+        vk::Buffer out;
+        std::vector<DownloadCopy> scatter;
+        std::vector<DownloadCopy> copies;
+    };
+    std::vector<DeferredCopies> deferred;
+    std::vector<std::pair<VAddr, VAddr>> deferred_ranges;
+    const auto flush_deferred = [&] {
+        if (use_batch) {
+            registry->FinishDownloads(*s.list, batch);
+            batch_ranges.clear();
+        }
+        if (deferred.empty()) return;
+        // Image writes are authoritative for their entire byte range. A CPU-page
+        // delta cannot represent them: its saved baseline can already contain the
+        // same image bytes while an older native region contains something else.
+        // Order the image downloads before copying their exact overlap into each region.
+        const vk::MemoryBarrier2 downloaded{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferRead |
+                             vk::AccessFlagBits2::eTransferWrite,
+        };
+        s.cmd.pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &downloaded,
+        });
+        for (const auto& d : deferred) {
+            for (const auto& copy : d.scatter)
+                s.cmd.copyBuffer(d.out, copy.destination,
+                                 vk::BufferCopy{.srcOffset = copy.source_offset,
+                                                .dstOffset = copy.destination_offset, .size = copy.size});
+            for (const auto& copy : d.copies)
+                s.cmd.copyBuffer(d.out, copy.destination,
+                                 vk::BufferCopy{.srcOffset = copy.source_offset,
+                                                .dstOffset = copy.destination_offset, .size = copy.size});
+        }
+        deferred.clear();
+        deferred_ranges.clear();
+    };
+    const auto overlaps = [](const std::vector<std::pair<VAddr, VAddr>>& ranges, VAddr address,
+                             u64 size) {
+        return std::ranges::any_of(ranges, [&](const auto& range) {
+            return address < range.second && range.first < address + size;
+        });
+    };
     for (auto& plan : plans) {
         auto* entry = plan.entry;
         const VAddr address = entry->info.guest_address;
         const u64 size = entry->info.guest_size;
         SnapshotLease::MarkUnsafe(address, size, 16);
-        if (use_batch && std::ranges::any_of(batch_ranges, [&](const auto& range) {
-                return address < range.second && range.first < address + size;
-            })) {
+        if (overlaps(deferred_ranges, address, size)) {
+            flush_deferred();
+        } else if (use_batch && overlaps(batch_ranges, address, size)) {
             registry->FinishDownloads(*s.list, batch);
             batch_ranges.clear();
         }
         if (!plan.linear.empty()) {
             if (entry->reused.load(std::memory_order_acquire)) continue;
-            if (use_batch) { registry->FinishDownloads(*s.list, batch); batch_ranges.clear(); }
+            flush_deferred();
             // Capacity was reserved for all plans above. Transfer ownership before
             // the first command, including when later metadata allocation fails.
             Native::TransferLinearDownloadLeases(s.imported_view_leases, plan.imports);
@@ -4437,36 +4494,16 @@ void NativeRenderer::FlushWritebacks() {
             batch_ranges.emplace_back(address, address + size);
             NATIVE_DIAGNOSTIC(++stats.writebacks);
             if (!plan.scatter.empty() || !plan.copies.empty()) {
-                if (use_batch) {
-                    // GTS consumes the downloaded bytes in its native region now.
-                    // Complete this batch before recording that ordered copy-in.
-                    registry->FinishDownloads(*s.list, batch);
-                    batch_ranges.clear();
+                // GTS consumes the downloaded bytes in its native region. They are copied in
+                // once the batch is finished (PERF-GTS-462: for the whole batch at once).
+                try {
+                    deferred.push_back({vk::Buffer{Handle<VkBuffer_T>(plan.out->NativeHandle())},
+                                        std::move(plan.scatter), std::move(plan.copies)});
+                    deferred_ranges.emplace_back(address, address + size);
+                } catch (...) {
+                    std::terminate(); // the command stream is already mutated
                 }
-                // Image writes are authoritative for their entire byte range. A CPU-page
-                // delta cannot represent them: its saved baseline can already contain the
-                // same image bytes while an older native region contains something else.
-                // Order the image download before copying its exact overlap into each region.
-                const vk::MemoryBarrier2 downloaded{
-                    .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                    .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
-                    .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-                    .dstAccessMask = vk::AccessFlagBits2::eTransferRead |
-                                     vk::AccessFlagBits2::eTransferWrite,
-                };
-                s.cmd.pipelineBarrier2(vk::DependencyInfo{
-                    .memoryBarrierCount = 1,
-                    .pMemoryBarriers = &downloaded,
-                });
-                for (const auto& copy : plan.scatter)
-                    s.cmd.copyBuffer(vk::Buffer{Handle<VkBuffer_T>(plan.out->NativeHandle())}, copy.destination,
-                                     vk::BufferCopy{.srcOffset = copy.source_offset,
-                                                    .dstOffset = copy.destination_offset, .size = copy.size});
-                for (const auto& copy : plan.copies)
-                    s.cmd.copyBuffer(vk::Buffer{Handle<VkBuffer_T>(plan.out->NativeHandle())}, copy.destination,
-                                     vk::BufferCopy{.srcOffset = copy.source_offset,
-                                                    .dstOffset = copy.destination_offset, .size = copy.size});
-
+                if (copy_each) flush_deferred();
             }
             // NAT-146: regions over the picture's memory copy it in before their next use.
             if (RegionOver(address, size)) {
@@ -4497,7 +4534,7 @@ void NativeRenderer::FlushWritebacks() {
         s.keep.push_back(std::move(plan.out));
         for (auto& part : plan.imports) s.imported_view_leases.push_back(std::move(part.lease));
     }
-    if (use_batch) registry->FinishDownloads(*s.list, batch);
+    flush_deferred();
     writebacks.clear();
     writebacks_due = false;
     s.pipelines.Invalidate(); // the re-tiling binds its own pipeline
