@@ -277,6 +277,10 @@ public:
     /// Full-range indexed images, once each. Callback must not reenter the registry.
     /// Retirement must be serialized with this traversal.
     void ForEachImage(const std::function<void(ImageEntry&)>& fn);
+    /// PERF-GTS-450: the images of one shard (index below ShardCount()), for walks spread over
+    /// several frames. Same rules as ForEachImage.
+    void ForEachImageInShard(u32 index, const std::function<void(ImageEntry&)>& fn);
+    static constexpr u32 ShardCount() { return NumShards; }
 
     /// The image for this layout: one already at the address with the same layout (whatever
     /// its colour format, if the texel size matches), or a new one. A texture found nowhere is

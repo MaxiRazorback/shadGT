@@ -1169,6 +1169,15 @@ void ImageRegistry::ForEachImage(const std::function<void(ImageEntry&)>& fn) {
     }
 }
 
+void ImageRegistry::ForEachImageInShard(u32 index, const std::function<void(ImageEntry&)>& fn) {
+    Shard& shard = shards[index % NumShards];
+    std::shared_lock lock{shard.mutex};
+    for (const auto& [base, entry] : shard.images) {
+        const u64 span = std::clamp<u64>(entry->info.guest_size, 1, MaxIndexedSize);
+        if (base < ~VAddr{0} && base + span > base) fn(*entry);
+    }
+}
+
 std::vector<std::pair<VAddr, u32>> ImageRegistry::Crowded(u32 count) {
     std::unordered_map<VAddr, u32> per_address;
     for (Shard& shard : shards) {
