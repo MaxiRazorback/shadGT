@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <stop_token>
+#include <thread>
+#include <condition_variable>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -17,6 +20,7 @@
 #include <windows.h>
 #endif
 
+#include "common/thread.h"
 #include "common/logging/log.h"
 #include "common/thread.h"
 #include "core/memory.h"
@@ -29,6 +33,7 @@
 #include "ryty_gpu/native/slow_call_trace.h"
 #include "ryty_gpu/native/direct_coherence_registry.h"
 #include "ryty_gpu/native/parallel_direct_capability.h"
+#include "ryty_gpu/native/snapshot_backing_protocol.h"
 #include "video_core/buffer_cache/proto_import.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -50,6 +55,12 @@ using UnmapAliasFn = void (*)(void*);
 
 MapAliasFn MapAlias() {
 #ifdef _WIN32
+    const auto& protocol = Vulkan::SnapshotLease::BackingProtocol::Get();
+    // Alias bridge capability is distinct from snapshot admission. A cold
+    // driver prerequisite must not permanently select the legacy alias that
+    // poisons every future range. All actual reuse still checks the full gate.
+    if (protocol.AliasBridgeAvailable())
+        return reinterpret_cast<MapAliasFn>(protocol.renderer_alias);
     static const auto fn = [] {
         HMODULE libc = GetModuleHandleA("libc.prx");
         return libc ? reinterpret_cast<MapAliasFn>(GetProcAddress(libc, "TXQU8CpoEtI")) : nullptr;
@@ -218,8 +229,22 @@ bool DirectMemory::Covered(VAddr address, u64 size) const {
 
 std::optional<std::pair<const Buffer*, u64>> DirectMemory::FindBuffer(VAddr address,
                                                                      u64 size) const {
-    std::scoped_lock lk{mutex};
+    // PERF-GT7-127 (RYGT_DIRECT_FIND_RECENT=0 off): in a 20-car race the recorder asked for a
+    // view ~10,000 times a frame, each time under the lock and down the map (2.5% of its busy
+    // time in the map walk alone), almost always for one of a few dozen views. The thread's
+    // own memo of the views it found is checked before the lock: it is this thread's alone,
+    // and a view only goes when imported_view_epoch moves on.
+    static const bool recent_on = [] {
+        const char* env = std::getenv("RYGT_DIRECT_FIND_RECENT");
+        return !(env && env[0] == '0');
+    }();
     static thread_local Native::EpochRangeMemo<const Buffer*> memo;
+    if (recent_on) {
+        const auto epoch = imported_view_epoch.load(std::memory_order_acquire);
+        if (const auto found = memo.Find(this, epoch, address, size))
+            return std::make_pair(found->value, found->offset);
+    }
+    std::scoped_lock lk{mutex};
     const auto epoch = imported_view_epoch.load(std::memory_order_acquire);
     if (const auto found = memo.Find(this, epoch, address, size))
         return std::make_pair(found->value, found->offset);

@@ -3,6 +3,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#if defined(_M_X64) || defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
 #include <filesystem>
 #include <array>
 #include <map>
@@ -42,6 +45,7 @@
 #include "video_core/renderer_vulkan/pipeline_owner.h"
 #include "video_core/renderer_vulkan/draw_selection_identity.h"
 #include "video_core/renderer_vulkan/native_fence_batch.h"
+#include "common/elf_info.h"
 #ifdef RYTY_GPU
 #include "ryty_gpu/native/image_registry.h"
 #include "ryty_gpu/native/shadow.h"
@@ -281,7 +285,7 @@ void Rasterizer::CopySelectedStages(std::array<SelectedStage, Shader::MaxStageTy
     }
 }
 
-std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead(
+Rasterizer::SelectedPipelinePtr Rasterizer::SelectPipelineAhead(
     const DrawIndirectParams* indirect) {
     // The command thread's registers are those of the draw it is decoding.
     const auto& regs = liverpool->DrawRegs();
@@ -294,10 +298,14 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead(
     static const bool select_quads = Common::PerfFeatureEnabled(75);
     if (ClassifyDraw(regs, depth_copy, stencil_copy) != DrawFilter::Draw ||
         (quad_list && !select_quads)) {
-        return std::nullopt;
+        return nullptr;
     }
     Common::PhaseTimer timer{Common::Phase::SelectAhead};
-    SelectedPipeline selected = selected_recycler.Take(); // PERF-056
+    auto snapshot = selected_recycler.Take(); // PERF-056, PERF-GT7-125
+    if (!snapshot) {
+        snapshot = std::make_unique<SelectedPipeline>();
+    }
+    SelectedPipeline& selected = *snapshot;
     selected.is_compute = false;
     selected.compute = nullptr;
     selected.is_quad_list = quad_list;
@@ -326,7 +334,7 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectPipelineAhead(
             CopySelectedStages(selected.quad_tess_stages);
         }
     }
-    return selected;
+    return snapshot;
 }
 
 void Rasterizer::CopyComputeStage(std::array<SelectedStage, Shader::MaxStageTypes>& out) {
@@ -413,15 +421,19 @@ u64 Rasterizer::JobSharpsHash() {
     return SharpsHash(PipelineCache::JobInfos());
 }
 
-std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectComputePipelineAhead() {
+Rasterizer::SelectedPipelinePtr Rasterizer::SelectComputePipelineAhead() {
     // PERF-055: as SelectPipelineAhead, for a direct dispatch. -DisablePerf 66 looks every
     // compute pipeline up on the recorder, under the lookup lock, as before.
     static const bool enabled = Common::PerfFeatureEnabled(66);
     if (!enabled) {
-        return std::nullopt;
+        return nullptr;
     }
     Common::PhaseTimer timer{Common::Phase::SelectAhead};
-    SelectedPipeline selected = selected_recycler.Take(); // PERF-056
+    auto snapshot = selected_recycler.Take(); // PERF-056, PERF-GT7-125
+    if (!snapshot) {
+        snapshot = std::make_unique<SelectedPipeline>();
+    }
+    SelectedPipeline& selected = *snapshot;
     selected.pipeline = nullptr;
     selected.indirect = false;
     selected.is_compute = true;
@@ -431,7 +443,7 @@ std::optional<Rasterizer::SelectedPipeline> Rasterizer::SelectComputePipelineAhe
     if (selected.compute) {
         CopyComputeStage(selected.stages);
     }
-    return selected;
+    return snapshot;
 }
 
 const ComputePipeline* Rasterizer::AcquireComputePipeline() {
@@ -1144,6 +1156,25 @@ bool Rasterizer::InstallDrawStages(const Pipeline* pipeline,
             // PERF-065: moved, not copied; the selection is recycled after the draw and keeps
             // the shadow's old buffer (its capacity).
             std::swap(info.flattened_ud_buf, selected.flattened);
+            // PERF-GT7-122 (RYGT_FLAT_PREFETCH=0 off): the command thread wrote these dwords on
+            // another core a moment ago, and the first read of each stage's buffer descriptors
+            // was 40% of BindBuffers' own time in a 20-car race (profile by line, 2026-11-10):
+            // Asked for now, their cache lines arrive while the targets are resolved.
+            static const bool prefetch = [] {
+                const char* env = std::getenv("RYGT_FLAT_PREFETCH");
+                return !(env && env[0] == '0');
+            }();
+#if defined(_M_X64) || defined(__x86_64__)
+            if (prefetch) {
+                const char* const data = reinterpret_cast<const char*>(info.flattened_ud_buf.data());
+                const size_t bytes = std::min<size_t>(info.flattened_ud_buf.size() * sizeof(u32), 1024);
+                for (size_t at = 0; at < bytes; at += 64) {
+                    _mm_prefetch(data + at, _MM_HINT_T0);
+                }
+            }
+#else
+            static_cast<void>(prefetch);
+#endif
             // PERF-GT7-016 (C): in native mode only diagnostics read where the dwords came from
             // (zeros here anyway), so the zero fill at every draw is left out while the size holds.
             bool keep_sources = false;
@@ -1530,7 +1561,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     // DIAG-116 (SHADGT_DIAG_PASSES=1): draws per render pass (color target 0 and depth target,
     // with their sizes), every 4 s: where a frame's draws go.
     static const bool diag_passes = [] {
-        const char* env = Common::DebugEnv("SHADGT_DIAG_PASSES");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_PASSES");
         return env && (env[0] == '1' || env[0] == '2');
     }();
     if (diag_passes) {
@@ -1567,7 +1598,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         static std::unordered_map<u64, VideoCore::ImageId> to_dump;
         static bool dumped = false;
         static const auto dump_start = std::chrono::steady_clock::now();
-        static const bool dump_passes = Common::DebugEnv("SHADGT_DIAG_PASSES")[0] == '2';
+        static const bool dump_passes = Common::DiagEnv("SHADGT_DIAG_PASSES")[0] == '2';
         static bool cleared = !dump_passes;
         if (!cleared && std::chrono::steady_clock::now() - dump_start > std::chrono::seconds{229}) {
             cleared = true; // only targets of the last second before the dump
@@ -1763,7 +1794,7 @@ const char* RoleName(DiagRole role) {
 // only with SHADGT_DIAG_HISTORY=1.
 static bool DiagHistoryEnabled() {
     static const bool enabled = [] {
-        const char* env = Common::DebugEnv("SHADGT_DIAG_HISTORY");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_HISTORY");
         return env && env[0] == '1';
     }();
     return enabled;
@@ -1965,7 +1996,7 @@ FILE* g_draw_set_file{};
 
 bool DrawSetPerFrame() {
     static const bool enabled = [] {
-        const char* env = Common::DebugEnv("SHADGT_LOG_DRAW_SET");
+        const char* env = std::getenv("SHADGT_LOG_DRAW_SET");
         return env && env[0] == '2';
     }();
     return enabled;
@@ -1973,7 +2004,7 @@ bool DrawSetPerFrame() {
 
 bool DrawSetEnabled() {
     static const bool enabled = [] {
-        const char* env = Common::DebugEnv("SHADGT_LOG_DRAW_SET");
+        const char* env = std::getenv("SHADGT_LOG_DRAW_SET");
         return env && (env[0] == '1' || env[0] == '2');
     }();
     return enabled;
@@ -2195,7 +2226,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     // MT-002 test (SHADGT_MT_RING_TEST=1): the draw's commands go through a second ring and are
     // put back in order as a chunk, as a worker's will be.
     static const bool ring_test = [] {
-        const char* env = Common::DebugEnv("SHADGT_MT_RING_TEST");
+        const char* env = std::getenv("SHADGT_MT_RING_TEST");
         return env && env[0] == '1';
     }();
     struct ChunkScope {
@@ -2344,7 +2375,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     // ~33 ms bound (pipeline, image views, non-stream buffers; stream offsets ignored), i.e. what
     // a draw-state cache could reuse.
     static const bool diag_reuse = [] {
-        const char* env = Common::DebugEnv("SHADGT_DIAG_REUSE");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_REUSE");
         return env && env[0] == '1';
     }();
     if (diag_reuse) {
@@ -3016,7 +3047,7 @@ extern std::atomic<u64> g_defer_unflushed; // D5
 // into a cached copy that guest memory does not have yet.
 static bool DirectHazardDiag() {
     static const bool enabled = [] {
-        const char* env = Common::DebugEnv("SHADGT_DIAG_DIRECT_HAZARD");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_DIRECT_HAZARD");
         return env && env[0] == '1';
     }();
     return enabled;
@@ -3143,7 +3174,7 @@ static void NoteDirectRead() {
     g_last_direct_read_ms.store(NowMs() | 1, std::memory_order_relaxed);
     // DIAG-141 (SHADGT_DIAG_FROSTED=1): in-place reads while the menu bar is on screen.
     static const bool diag = [] {
-        const char* env = Common::DebugEnv("SHADGT_DIAG_FROSTED");
+        const char* env = Common::DiagEnv("SHADGT_DIAG_FROSTED");
         return env && env[0] == '1';
     }();
     if (diag && MenuBarShown()) {
@@ -3205,6 +3236,20 @@ std::optional<std::pair<const VideoCore::Buffer*, u64>> Rasterizer::DirectReadBu
 }
 
 #ifdef RYTY_GPU
+// FIX-419-GTS (follows shadgt7's fence batching): GT7's two labels its job threads spin on are
+// never batched. GT7 only (CUSA24767/CUSA24769 or its title): the addresses are GT7's.
+static bool Gt7SpunLabel(VAddr address) {
+    static const bool gt7 = [] {
+        const auto& elf = Common::ElfInfo::Instance();
+        const std::string_view id = elf.GameSerial();
+        const std::string_view name = elf.Title();
+        return id == "CUSA24767" || id == "CUSA24769" ||
+               (name.starts_with("Gran Turismo") && name.ends_with(" 7"));
+    }();
+    return gt7 && ((address >= 0x102046a3f0 && address < 0x102046a400) ||
+                   (address >= 0x10200004e0 && address < 0x1020000500));
+}
+
 static s64 NativeFenceBatchInterval() {
     static const s64 interval = [] {
         const char* value = std::getenv("RYGT_NATIVE_FENCE_BATCH_MS");
@@ -3340,7 +3385,7 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
     if (direct_hold && MenuBarShown()) {
         // DIAG-141: fences held while the menu bar is on screen.
         static const bool diag = [] {
-            const char* env = Common::DebugEnv("SHADGT_DIAG_FROSTED");
+            const char* env = Common::DiagEnv("SHADGT_DIAG_FROSTED");
             return env && env[0] == '1';
         }();
         static std::atomic<u32> n{};
@@ -3433,11 +3478,12 @@ bool Rasterizer::DeferFenceSignal(VAddr address, Common::UniqueFunction<void>&& 
         const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
         submit_now = SubmitNativeFence(liverpool && liverpool->Pipelined(), flush, hold_flush, readbacks_pending, address_pending,
-            direct_hold, now, last_native_fence_submit_ns.load(std::memory_order_relaxed), NativeFenceBatchInterval());
+            direct_hold, now, last_native_fence_submit_ns.load(std::memory_order_relaxed), NativeFenceBatchInterval()) ||
+            (flush && Gt7SpunLabel(address)); // FIX-419-GTS: shadgt7's SpunLabel exemption
         if (submit_now) last_native_fence_submit_ns.store(now, std::memory_order_relaxed);
         // This is submission batching only: callbacks remain deferred to GPU completion.
         // Recorder idle and WaitRegMem still force submission. The source's two GT7-only
-        // spun-label addresses must not be transplanted into the GT Sport address space.
+        // spun-label addresses apply to GT7 only (Gt7SpunLabel), never to GT Sport.
     }
 #endif
     if (submit_now) {
@@ -3465,7 +3511,7 @@ void Rasterizer::FrameDumpNoteOld() {
 
 bool Rasterizer::ExposureLogOn() {
     static const bool on = [] {
-        const char* env = Common::DebugEnv("RYGT_EXPOSURE_LOG");
+        const char* env = Common::DiagEnv("RYGT_EXPOSURE_LOG");
         return env && env[0] == '1';
     }();
     return on;
@@ -3484,7 +3530,7 @@ void Rasterizer::ExposureLogShader(const Shader::Info& stage, const char* render
     }
     exposure_last = now;
     static const float dump_exposure = [] {
-        const char* env = Common::DebugEnv("RYGT_FRAME_DUMP_EXPOSURE");
+        const char* env = Common::DiagEnv("RYGT_FRAME_DUMP_EXPOSURE");
         return env && *env ? float(std::atof(env)) : -1.0f;
     }();
     const float key = std::bit_cast<float>(now[1]);
@@ -3516,7 +3562,7 @@ void Rasterizer::FrameDumpFlip() {
     // CPU reads back of GPU results, per frame).
     static const std::vector<VAddr> peek = [] {
         std::vector<VAddr> list;
-        const char* env = Common::DebugEnv("RYGT_PEEK");
+        const char* env = Common::DiagEnv("RYGT_PEEK");
         for (const char* at = env; at && *at;) {
             char* end = nullptr;
             const VAddr address = std::strtoull(at, &end, 16);
@@ -3530,7 +3576,7 @@ void Rasterizer::FrameDumpFlip() {
     }();
     if (!peek.empty()) {
         static const double peek_at = [] {
-            const char* env = Common::DebugEnv("RYGT_PEEK_AT");
+            const char* env = Common::DiagEnv("RYGT_PEEK_AT");
             return env ? std::atof(env) : 200.0;
         }();
         static const auto peek_start = std::chrono::steady_clock::now();
@@ -3589,7 +3635,7 @@ void Rasterizer::FrameDumpFlip() {
     // several frames of one run, e.g. a lit and a dark cockpit).
     static const std::vector<double> dump_times = [] {
         std::vector<double> times;
-        if (const char* env = Common::DebugEnv("RYGT_FRAME_DUMP_AT"); env && *env) {
+        if (const char* env = Common::DiagEnv("RYGT_FRAME_DUMP_AT"); env && *env) {
             std::string list{env};
             for (size_t pos = 0; pos < list.size();) {
                 const size_t end = std::min(list.find(',', pos), list.size());
@@ -3710,7 +3756,7 @@ void Rasterizer::FrameDumpFlip() {
     // NAT-128 (RYGT_FRAME_DUMP_FRAMES=n): n frames are collected (events of each, the targets and
     // textures as the last one left them), for work the game does every few frames only.
     static const u32 dump_frames = [] {
-        const char* env = Common::DebugEnv("RYGT_FRAME_DUMP_FRAMES");
+        const char* env = Common::DiagEnv("RYGT_FRAME_DUMP_FRAMES");
         return env && *env ? std::max(std::atoi(env), 1) : 1;
     }();
     static u32 frames_seen = 0;
@@ -3909,7 +3955,7 @@ void Rasterizer::FrameDumpEvent(std::string text) {
 
 std::pair<VAddr, VAddr> Rasterizer::TraceRange() {
     static const std::pair<VAddr, VAddr> range = [] {
-        const char* env = Common::DebugEnv("RYGT_TRACE_RANGE");
+        const char* env = Common::DiagEnv("RYGT_TRACE_RANGE");
         if (!env || !*env) {
             return std::pair<VAddr, VAddr>{};
         }
@@ -4211,7 +4257,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
                                                             : 0;
         if (special != 0) {
             // DIAG-122 (SHADGT_DIAG_SPECIAL=1): which dispatches the renderer replaces.
-            static const bool diag = Common::DebugEnv("SHADGT_DIAG_SPECIAL") != nullptr;
+            static const bool diag = Common::DiagEnv("SHADGT_DIAG_SPECIAL") != nullptr;
             static std::atomic<u32> logged{};
             if (diag && logged++ < 400) {
                 const auto& info = pipeline->GetStage(Shader::SwStage::Compute);
@@ -4327,7 +4373,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     // DIAG-081 (SHADGT_TRACE_GS_INPUTS=N): the vertex inputs of the first N geometry-shader
     // draws after 150 s: each V# and the first floats at its address.
     if (static const int trace_gs = [] {
-            const char* env = Common::DebugEnv("SHADGT_TRACE_GS_INPUTS");
+            const char* env = Common::DiagEnv("SHADGT_TRACE_GS_INPUTS");
             return env ? std::atoi(env) : 0;
         }();
         trace_gs > 0 && pipeline->GetStages()[u32(Shader::SwStage::Geometry)] != nullptr) {
@@ -4919,7 +4965,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     // dispatch (cs 0xab6a2d10), then the vertex ranges of the grass draws that follow.
     static std::atomic<u32> grass_dispatches{};
     static const u32 dump_at = [] {
-        const char* env = Common::DebugEnv("SHADGT_DUMP_GRASS_AT");
+        const char* env = Common::DiagEnv("SHADGT_DUMP_GRASS_AT");
         return env && *env ? u32(std::stoul(env)) : 0u;
     }();
     if (stage.pgm_hash == 0xab6a2d10 && ++grass_dispatches == dump_at) {
@@ -5000,7 +5046,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 // DIAG-133 (SHADGT_DIAG_SLOW_US=<us>): busy-waits that long per direct table, to
                 // tell timing races from wrong reads.
                 static const s64 slow_us = [] {
-                    const char* env = Common::DebugEnv("SHADGT_DIAG_SLOW_US");
+                    const char* env = Common::DiagEnv("SHADGT_DIAG_SLOW_US");
                     return env && *env ? std::atoll(env) : s64{0};
                 }();
                 if (slow_us > 0) {
@@ -5161,7 +5207,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     // changed between recording (what a copy would have used) and the GPU's
                     // completion.
                     static const bool change_diag = [] {
-                        const char* env = Common::DebugEnv("SHADGT_DIAG_DIRECT_CHANGE");
+                        const char* env = Common::DiagEnv("SHADGT_DIAG_DIRECT_CHANGE");
                         return env && env[0] == '1';
                     }();
                     if (change_diag && size <= 64_KB) {
@@ -5766,7 +5812,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             // DIAG-139 (SHADGT_DIAG_FROSTED=1): the pictures GT Sport's frosted glass
             // (ps 0x90b5dcdd) reads, a few times a second.
             static const bool diag_frosted = [] {
-                const char* env = Common::DebugEnv("SHADGT_DIAG_FROSTED");
+                const char* env = Common::DiagEnv("SHADGT_DIAG_FROSTED");
                 return env && env[0] == '1';
             }();
             if (diag_frosted && ((stage.pgm_hash & 0xffffffff) == 0x90b5dcdd || t_frosted_rt ||
@@ -5851,7 +5897,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             auto& image = texture_cache.GetImage(image_id);
             // FIX-152 (diagnosis): RYGT_FRAME_DUMP_ALL_TEXTURES=1 dumps uploaded ones too.
             static const bool dump_all = [] {
-                const char* env = Common::DebugEnv("RYGT_FRAME_DUMP_ALL_TEXTURES");
+                const char* env = Common::DiagEnv("RYGT_FRAME_DUMP_ALL_TEXTURES");
                 return env && env[0] == '1';
             }();
             if (frame_dump_collecting && !is_storage &&
@@ -6161,7 +6207,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         {
             // DIAG-139: render targets in GT Sport's frosted-glass scratch memory.
             static const bool diag_frosted = [] {
-                const char* env = Common::DebugEnv("SHADGT_DIAG_FROSTED");
+                const char* env = Common::DiagEnv("SHADGT_DIAG_FROSTED");
                 return env && env[0] == '1';
             }();
             if (cb == 0) {
@@ -6907,6 +6953,12 @@ void Rasterizer::UpdateDepthStencilState() const {
             op = vk::CompareOp::eAlways; // DIAG-227: tessellated draws only
         }
         if (gequal_always && op == vk::CompareOp::eGreaterOrEqual) {
+            op = vk::CompareOp::eAlways;
+        }
+        // DIAG-GTS-445 (diagnosis, RYGT_DIAG_LEQUAL_ALWAYS=1): LESS_EQUAL depth tests always pass
+        // (whether a shader-object draw after a pipeline depth pre-pass fails its depth test).
+        static const bool lequal_always = Common::DiagEnv("RYGT_DIAG_LEQUAL_ALWAYS") != nullptr;
+        if (lequal_always && op == vk::CompareOp::eLessOrEqual) {
             op = vk::CompareOp::eAlways;
         }
         dynamic_state.SetDepthCompareOp(op);

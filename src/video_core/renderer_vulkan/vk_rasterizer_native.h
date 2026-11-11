@@ -23,6 +23,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <source_location>
 #include <span>
 #include <tuple>
 #include <unordered_map>
@@ -172,7 +173,7 @@ public:
     static bool PrepareEnabled();
     /// Whether the prepared draws are used (the recorder takes them, the command thread trusts them).
     static bool PreparedOn();
-    /// PERF-GT7-010 (PERF-314: opt-in): whether the native threads run above normal priority.
+    /// PERF-GT7-010 (on by default, PERF-419-GTS): whether the native threads run above normal priority.
     static bool BoostOn();
     /// PERF-GT7-013..016 (RYGT_NATIVE_NEXT=1, A/B mode C): the draw path's next changes under test.
     static bool NextOn();
@@ -423,13 +424,16 @@ private:
     std::chrono::steady_clock::time_point ring_ab_start{};
     u64 ring_ab_window{};
     bool command_priority_boosted{};
-    void EndRendering(u32 reason = 0);
+    /// DIAG-GTS-460: Diagnostics builds count the rendering scopes ended by the line that ended them.
+    void EndRendering(u32 reason = 0,
+                      std::source_location where = std::source_location::current());
     bool ContinueSmallParallelPass(const RenderState& target, u32 reason, bool safe);
     void BeginRendering(const RenderState& state);
-    void GlobalBarrier();
+    /// DIAG-GTS-451: Diagnostics builds count full barriers by the line that asked for them.
+    void GlobalBarrier(std::source_location where = std::source_location::current());
     /// NAT-140: attachment writes before it finish before attachment access after it (a pass
     /// drawing into what an earlier pass drew), without waiting for anything else.
-    void PassBarrier();
+    void PassBarrier(std::source_location where = std::source_location::current());
     /// PERF-109: `bound` are the pictures the work about to be recorded uses.
     void PrepareImages(std::span<const Native::ImageEntry* const> bound = {});
     void PrepareImages(const DrawBindings& b);
@@ -1488,7 +1492,7 @@ private:
 #if !defined(NDEBUG)
         // PERF-GT7-001: collecting per-binding page coverage is opt-in.
         static const bool on = [] {
-            const char* env = std::getenv("RYGT_NATIVE_INPLACE_STATS");
+            const char* env = Common::DiagEnv("RYGT_NATIVE_INPLACE_STATS");
             return env && env[0] == '1';
         }();
         return on && (frame & 7) == 0;

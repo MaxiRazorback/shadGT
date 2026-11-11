@@ -158,6 +158,31 @@ void DataBase::Open() {
                         parts += fmt::format(", {}={}", name, env[0]);
                     }
                 }
+                // FIX-GTS-441: translations with the invariant position (the default) are kept
+                // apart from those made without it.
+                if (const char* env = std::getenv("RYGT_INVARIANT_POSITION");
+                    !(env && env[0] == '0')) {
+                    parts += ", invariant position";
+                }
+                // DIAG-GTS-459: translations with this run's counter address are never reused.
+                if (const char* env = std::getenv("RYGT_DIAG_LDS_READS"); env && env[0] == '1') {
+                    parts += fmt::format(", lds read diag {}",
+                                         std::chrono::system_clock::now().time_since_epoch().count());
+                }
+                // PERF-GTS-458: hull LDS writer stores shared by the patch's invocations.
+                if (const char* env = std::getenv("RYGT_TESS_LDS_SPREAD");
+                    !(env && env[0] == '0')) {
+                    parts += ", lds spread";
+                }
+                // DIAG-GTS-447: constant-output diagnosis shaders get a store of their own.
+                if (const char* env = std::getenv("RYGT_DIAG_FS_CONST"); env && *env) {
+                    parts += fmt::format(", fs const {}", env);
+                }
+                // FIX-GTS-443: -1..1 depth converted in the vertex shader (opt-in).
+                if (const char* env = std::getenv("RYGT_DEPTH_CLIP_CONTROL");
+                    env && env[0] == '0') {
+                    parts += ", depth in shader";
+                }
                 return parts;
             }() + std::string{Shader::LaneReadStoreSuffix(Shader::LaneReadUnbranchEnabled())};
         const auto original = cache_path;
