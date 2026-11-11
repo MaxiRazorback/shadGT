@@ -2961,6 +2961,31 @@ void Rasterizer::WhenGpuDone(Common::UniqueFunction<void>&& func) {
     scheduler.DeferPriorityOperation(std::move(func));
 }
 
+void Rasterizer::WhenTickDone(u64 tick, Common::UniqueFunction<void>&& func) {
+    scheduler.DeferPriorityOperationAt(tick, std::move(func));
+}
+
+// FIX-GTS-358: a game takes "GPU idle" (sceGnmSubmitDone) as leave to rewrite memory its earlier
+// submissions read. Idle meant "recorded", and on a slow GCN card the GPU runs up to ~100 ms
+// behind that, so data was rewritten under it (GT7 on an RX 480: a rainbow-tinted or unlit
+// world and block noise). driveclub-recomp's renderer reports idle only once the work is done;
+// on GCN this one now does too. RX 6000 and newer and NVIDIA keep up and need no wait.
+bool Rasterizer::RetiresSubmitsOnGpu() const {
+    static const bool retire = [this] {
+        if (const char* env = std::getenv("RYGT_GPU_IDLE_RETIRE"); env && *env) {
+            const bool on = env[0] == '1';
+            LOG_INFO(Render_Vulkan, "FIX-GTS-358: GPU idle after GPU completion {} "
+                     "(RYGT_GPU_IDLE_RETIRE={})", on ? "on" : "off", env);
+            return on;
+        }
+        const bool on = instance.IsAmdGcn();
+        LOG_INFO(Render_Vulkan, "FIX-GTS-358: GPU idle after GPU completion {}",
+                 on ? "on (GCN Radeon)" : "off");
+        return on;
+    }();
+    return retire;
+}
+
 void Rasterizer::OnSubmit() {
     RecheckTonemapConstants();
     texture_cache.ReleaseFinishedReadbacks();
