@@ -10053,7 +10053,20 @@ void NativeRenderer::BindBuffers(const Shader::Info& stage, const AmdGpu::Regs& 
                         desc.post_op == Shader::SharpFetchPostOp::ReadConstPointer) {
                         constexpr u64 PrefixSize = 4_KB;
                         const auto [source, offset] = SnapshotRange(base, PrefixSize).value();
-                        auto prefix = device->CreateBuffer({
+                        // PERF-GTS-461: the dispatch reads the snapshot where it lies in the
+                        // list's upload memory (storage-aligned, kept until the list retires),
+                        // instead of a device-local copy made for it. Each copy came with a
+                        // transfer->compute barrier and ended rendering: ~170 GPU drains a frame
+                        // in GT Sport's garage. RYGT_COMPUTE_PREFIX_COPY=1: copy, as before.
+                        static const bool prefix_copy = [] {
+                            const char* env = std::getenv("RYGT_COMPUTE_PREFIX_COPY");
+                            return env && env[0] == '1';
+                        }();
+                        if (!prefix_copy) {
+                            info = {source, offset, PrefixSize};
+                            direct_entries[buffer_index][3] = u32(PrefixSize);
+                        }
+                        auto prefix = !prefix_copy ? nullptr : device->CreateBuffer({
                             .size = PrefixSize,
                             .usage = Native::Rhi::BufferUsageStorage |
                                      Native::Rhi::BufferUsageTransferDst,

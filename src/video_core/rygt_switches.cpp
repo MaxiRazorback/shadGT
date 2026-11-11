@@ -183,6 +183,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|RYGT_NATIVE_UPLOAD_VRAM|flag|Memory & VRAM|off|1 = on|Puts the renderer's upload memory in video memory the CPU can write (Resizable BAR) instead of system RAM, so the GPU reads it faster (PERF-GTS-457).",
     "RYGTSW1|RYGT_NATIVE_MIRROR_STORAGE|int|Memory & VRAM|64|MB, 0-4096|Read-only storage buffers up to this size (MB) are kept in reusable video-memory mirrors.",
     "RYGTSW1|RYGT_NATIVE_READABLE_CUT|flag|Memory & VRAM|on|0 = off|Cuts buffer bindings down to their readable part of guest memory. 0 binds the full size.",
+    "RYGTSW1|RYGT_COMPUTE_PREFIX_COPY|flag|Memory & VRAM|off|1 = on|Menus: copies each compute shader's 4 KB constant snapshot to video memory before the dispatch, as before PERF-GTS-461. Slower; for comparison.",
     "RYGTSW1|RYGT_NATIVE_SNAPSHOT_BELOW|int|Memory & VRAM|1048576 (1 MB)|bytes (decimal, hex 0x or octal accepted); 0 in races/replays|Buffers up to this size are snapshotted to upload memory in menus rather than mirrored. Not used in races.",
     "RYGTSW1|RYGT_NATIVE_WRITE_REGIONS|flag|Memory & VRAM|on|0 = off|Shader-written ranges live in video memory regions instead of guest memory over PCIe (NAT-144). 0 is much slower.",
     "RYGTSW1|RYGT_PAGEABLE_VRAM|flag|Memory & VRAM|on|0 = off|Lets supported video memory allocations spill to system RAM instead of failing, when the driver supports it; 0 turns it off.",
