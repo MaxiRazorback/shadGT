@@ -19224,8 +19224,8 @@ void NativeRenderer::ProbeWatchedPictures() {
 }
 
 void NativeRenderer::EvictImages() {
-    Native::SlowCallTrace<3> trace{true, "frame-retirement",
-        {"completed-views", "cold-mirrors", "cold-images"}};
+    Native::SlowCallTrace<4> trace{true, "frame-retirement",
+        {"completed-views", "cold-mirrors", "kept-textures", "cold-images"}};
     ProbeWatchedPictures(); // FIX-156 (diagnosis)
     {
         // PERF-GT7-052: each frame, the per-frame textures uploaded since are looked at again:
@@ -19377,7 +19377,12 @@ void NativeRenderer::EvictImages() {
         std::scoped_lock lock{entry.sources_mutex};
         return entry.sources.empty();
     };
-    std::unordered_set<const Native::ImageEntry*> kept_textures;
+    // PERF-GTS-450: the kept set is chosen again every 30 frames, not every frame. Choosing it
+    // walks and sorts every image the registry holds (thousands in a race) on the recorder
+    // thread, and frame retirement took ~1.5 ms each frame; the idle set it picks from changes
+    // slowly (KeepFrames is 120). Entries are only looked up by address, never read through.
+    auto& kept_textures = kept_texture_cache;
+    const bool choose_kept = frame >= kept_texture_frame + 30 || kept_texture_frame == 0;
     // VRAM-PRESSURE-001: a device allocation failed (a heavy track's 257 MB buffer on an 8 GB
     // card, 17 failures and then an abort, while up to 805 MB of idle textures were kept).
     // This pass keeps none of them, so the next attempt finds the room.
@@ -19387,7 +19392,13 @@ void NativeRenderer::EvictImages() {
         LOG_WARNING(Render_Vulkan, "VRAM-PRESSURE-001: device memory ran out; idle textures are "
                                    "released instead of kept");
     }
-    if (texture_budget != 0 && !pressure) {
+    if (pressure || texture_budget == 0) {
+        kept_textures.clear();
+        kept_texture_frame = 0;
+    }
+    if (texture_budget != 0 && !pressure && choose_kept) {
+        kept_textures.clear();
+        kept_texture_frame = frame;
         std::vector<Native::ImageEntry*> idle;
         registry->ForEachImage([&](Native::ImageEntry& entry) {
             if (entry.from_cpu && entry.image &&
@@ -19412,7 +19423,9 @@ void NativeRenderer::EvictImages() {
             kept_textures.insert(entry);
         }
     }
+    trace.Next(3);
     registry->Evict(frame - KeepFrames, [&](Native::ImageEntry& entry) {
+        kept_textures.erase(&entry);
         retired_watch_ranges.emplace_back(
             VideoCore::PageManager::GetPageAddr(entry.info.guest_address),
             VideoCore::PageManager::GetNextPageAddr(

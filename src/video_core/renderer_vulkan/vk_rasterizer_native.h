@@ -1193,6 +1193,9 @@ private:
     void ProbeDisplay(const Native::ImageEntry& entry);
     /// FIX-157: bytes of pictures kept past their idle time.
     u64 kept_bytes = 0;
+    /// PERF-GTS-450: idle textures kept past their idle time, chosen every 30 frames.
+    std::unordered_set<const Native::ImageEntry*> kept_texture_cache;
+    u64 kept_texture_frame = 0;
     std::vector<Native::ImageEntry*> writebacks;
     struct PendingLinearDownload;
     std::unordered_map<const Native::ImageEntry*, std::shared_ptr<PendingLinearDownload>> pending_linear_downloads;
