@@ -125,6 +125,9 @@ static void WriteDeferredFence(void* address, const void* data, u32 num_bytes) {
             memory->TryWriteBacking(address, data, num_bytes);
     };
 #ifdef RYTY_GPU
+    // PERF-GTS-359: map the page's alias view before taking the writeback gate. Ryty's map call
+    // waited 635 ms at Autopolis, and the recorder waits for the gate to defer its next fence.
+    Core::RytyMemory::PrepareCachedAlias(reinterpret_cast<VAddr>(address), num_bytes);
     Common::CompleteScopedMappingWriteback(writeback);
 #else
     writeback();

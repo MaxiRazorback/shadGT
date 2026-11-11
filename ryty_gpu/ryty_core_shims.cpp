@@ -96,6 +96,9 @@ bool IsExecutable(DWORD protect) {
 struct AliasCache {
     std::mutex mutex;
     Ryty::AliasEntries<> views;
+    // PERF-GTS-359: counts DropAliases calls, so a view mapped without the lock held is not
+    // cached if a mapping change came in while it was being mapped.
+    u64 drops = 0;
 };
 
 AliasCache& GetAliasCache() {
@@ -117,6 +120,7 @@ void DropAliases(VAddr address, u64 size) {
     std::vector<void*> retired;
     {
         std::scoped_lock lk{cache.mutex};
+        ++cache.drops; // PERF-GTS-359
         cache.views.RemoveRange(first, end, retired);
     }
     // No writer can use an extracted pointer. Host unmaps must not hold up a
@@ -131,47 +135,93 @@ void DropAliases(VAddr address, u64 size) {
 // without the VirtualQuery TryWriteBacking made for each write (fence and label writes: ~3% of the
 // recorder in a 20-car race). Pages without an alias (not Ryty shared memory) are remembered as
 // such (a null view) and return false, so the caller takes the usual path.
-bool WriteThroughCachedAlias(VAddr address, const void* source, u64 size) {
-    static const auto map_alias = RendererMapAlias();
-    static const auto unmap_alias = RytyFunction<UnmapAliasFn>("libc.prx", "674-w6lwWXI");
+constexpr VAddr AliasPage = 0x4000;
+
+bool AliasCacheEnabled() {
     static const bool cache_views = [] {
         const char* env = std::getenv("SHADGT_ALIAS_CACHE");
         return !(env && env[0] == '0');
     }();
-    if (!cache_views || map_alias == nullptr || unmap_alias == nullptr) {
-        return false;
-    }
-    constexpr VAddr AliasPage = 0x4000;
+    return cache_views;
+}
+
+// The first 16 KiB page of [address, address + size), or 0 when the range spans more than one.
+VAddr SingleAliasPage(VAddr address, u64 size) {
     const VAddr first = address & ~(AliasPage - 1);
-    if (((address + size + AliasPage - 1) & ~(AliasPage - 1)) - first != AliasPage) {
-        return false;
-    }
+    return ((address + size + AliasPage - 1) & ~(AliasPage - 1)) - first == AliasPage ? first : 0;
+}
+
+// PERF-GTS-359: maps the view of a page without holding the cache lock, then caches it unless a
+// mapping change came in meanwhile (that view may show the old mapping). Ryty's map call can wait
+// for Ryty's own memory lock: at Autopolis one fence write waited 635 ms in it, and with the cache
+// lock (and the writeback gate) held through the call, the recorder stopped for those 635 ms.
+void CacheAliasView(VAddr first) {
+    static const auto map_alias = RendererMapAlias();
+    static const auto unmap_alias = RytyFunction<UnmapAliasFn>("libc.prx", "674-w6lwWXI");
     auto& cache = GetAliasCache();
+    u64 drops = 0;
+    {
+        std::scoped_lock lk{cache.mutex};
+        if (cache.views.Find(first)) return;
+        drops = cache.drops;
+    }
+    void* alias = map_alias(first, AliasPage);
     void* retired = nullptr;
-    bool written = false;
-    void* pending_alias = nullptr;
     try {
         std::scoped_lock lk{cache.mutex};
-        auto found = cache.views.Find(first);
-        if (!found) {
-            pending_alias = map_alias(first, AliasPage);
-            retired = cache.views.Insert(first, pending_alias);
-            found = pending_alias;
-            pending_alias = nullptr;
-        }
-        if (*found) {
-            std::memcpy(static_cast<u8*>(*found) + (address - first), source, size);
-            written = true;
+        if (cache.drops == drops && !cache.views.Find(first)) {
+            retired = cache.views.Insert(first, alias);
+            alias = nullptr; // the cache owns it now
         }
     } catch (...) {
         // Insert did not take ownership; release the new view after unlocking.
-        if (pending_alias) unmap_alias(pending_alias);
+        if (alias) unmap_alias(alias);
         throw;
     }
+    if (alias) unmap_alias(alias); // not cached: another thread cached one, or the mapping changed
     // Capacity pressure retires one cold alias, never all 4096 at once.
     if (retired) unmap_alias(retired);
-    return written;
 }
+
+bool WriteThroughCachedAlias(VAddr address, const void* source, u64 size) {
+    static const auto map_alias = RendererMapAlias();
+    static const auto unmap_alias = RytyFunction<UnmapAliasFn>("libc.prx", "674-w6lwWXI");
+    if (!AliasCacheEnabled() || map_alias == nullptr || unmap_alias == nullptr) {
+        return false;
+    }
+    const VAddr first = SingleAliasPage(address, size);
+    if (first == 0) {
+        return false;
+    }
+    auto& cache = GetAliasCache();
+    // The copy stays under the cache lock, so the view can't be unmapped during it.
+    const auto write = [&] {
+        std::scoped_lock lk{cache.mutex};
+        const auto found = cache.views.Find(first);
+        if (!found) return std::optional<bool>{};
+        if (*found) std::memcpy(static_cast<u8*>(*found) + (address - first), source, size);
+        return std::optional<bool>{*found != nullptr};
+    };
+    if (const auto written = write()) return *written;
+    CacheAliasView(first);
+    // Still missing if the mapping changed while the view was mapped: the usual path writes it.
+    return write().value_or(false);
+}
+
+} // namespace
+
+// PERF-GTS-359: maps and caches the alias view a later TryWriteBacking of this range will write
+// through, so a fence write can call Ryty's map before it takes the writeback gate (the recorder
+// waits for that gate to defer its next fence).
+void Core::RytyMemory::PrepareCachedAlias(VAddr address, u64 size) {
+    static const auto map_alias = RendererMapAlias();
+    if (!AliasCacheEnabled() || map_alias == nullptr || size == 0) return;
+    if (!Common::PerfFeatureEnabled(112)) return; // TryWriteBacking won't use the cache
+    if (!Core::RytyMemory::IsValidMapping(address, size)) return;
+    if (const VAddr first = SingleAliasPage(address, size)) CacheAliasView(first);
+}
+
+namespace {
 
 bool CopyThroughAlias(VAddr address, void* dest, const void* source, u64 size) {
     static const auto map_alias = RendererMapAlias();
