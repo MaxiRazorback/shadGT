@@ -164,6 +164,11 @@ void DataBase::Open() {
                     !(env && env[0] == '0')) {
                     parts += ", invariant position";
                 }
+                // PERF-GTS-458: hull LDS writer stores shared by the patch's invocations.
+                if (const char* env = std::getenv("RYGT_TESS_LDS_SPREAD");
+                    !(env && env[0] == '0')) {
+                    parts += ", lds spread";
+                }
                 // DIAG-GTS-447: constant-output diagnosis shaders get a store of their own.
                 if (const char* env = std::getenv("RYGT_DIAG_FS_CONST"); env && *env) {
                     parts += fmt::format(", fs const {}", env);

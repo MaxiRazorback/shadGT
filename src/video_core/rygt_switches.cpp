@@ -202,6 +202,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|RYGT_HS_WAIT_BUDGET_MS|int|Tessellation|8|milliseconds per 33 ms window; 0 = always wait|How long per window the command thread waits for hull shader translations before skipping the draw a frame or two (PERF-GT7-115).",
     "RYGTSW1|RYGT_TESSELLATION|flag|Tessellation|on|0 = tessellated surfaces drawn flat|0 limits every tessellation factor to 1, drawing tessellated surfaces (car bodies) flat with no added detail (TESS-001).",
     "RYGTSW1|RYGT_TESS_DEPTH_BIAS|float|Tessellation|0 (off)|units of minimum resolvable depth|Small depth bias toward the camera for tessellated draws tested against a depth pre-pass, against black patches on cars (FIX-224).",
+    "RYGTSW1|RYGT_TESS_LDS_SPREAD|flag|Tessellation|on|0 = off (uses a separate shader store)|Hull shaders' LDS writer pass shares its stores across the patch's invocations as vec4 stores (PERF-GTS-458).",
     "RYGTSW1|RYGT_TESS_LDS_EMULATION|int|Tessellation|2|0 = off; first digit is the mode passed on|Mode of hull-shader LDS emulation for tessellated draws with several patches; 0 turns it off. Mode meanings not documented here.",
     // Frame pacing & present
     "RYGTSW1|RYGT_FAST_FLIPS|flag|Frame pacing & present|launcher's fast_flips option, else on in native mode without frame generation|1 = on, any other non-empty value = off|Frames flip as soon as they are ready between vblanks instead of on the vblank. Overrides the launcher option.",
