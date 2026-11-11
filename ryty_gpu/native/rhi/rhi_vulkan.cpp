@@ -415,7 +415,7 @@ public:
     void DrawIndexed(u32 indices, u32 instances, u32 first_index, s32 vertex_offset,
                      u32 first_instance) override;
     void Dispatch(u32 x, u32 y, u32 z) override;
-    void Barrier(u32 wait_for, u32 hold_back) override;
+    void Barrier(u32 wait_for, u32 hold_back, std::source_location where) override;
     void CopyBuffer(const Buffer* src, u64 src_offset, const Buffer* dst, u64 dst_offset,
                     u64 size) override;
     void CopyBufferToImage(const Buffer* src, const Image* dst,
@@ -2198,14 +2198,14 @@ void VulkanCommandList::Dispatch(u32 x, u32 y, u32 z) {
     C().dispatch(x, y, z);
 }
 
-void VulkanCommandList::Barrier(u32 wait_for, u32 hold_back) {
+void VulkanCommandList::Barrier(u32 wait_for, u32 hold_back, std::source_location where) {
     vk::MemoryBarrier2 barrier{};
     ScopeToVk(wait_for, true, barrier.srcStageMask, barrier.srcAccessMask);
     ScopeToVk(hold_back, false, barrier.dstStageMask, barrier.dstAccessMask);
     C().pipelineBarrier2(vk::DependencyInfo{
         .memoryBarrierCount = 1,
         .pMemoryBarriers = &barrier,
-    });
+    }, where);
 }
 
 void VulkanCommandList::CopyBuffer(const Buffer* src, u64 src_offset, const Buffer* dst,

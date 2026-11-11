@@ -3677,10 +3677,13 @@ void NativeRenderer::FlushLdsReaders(u32) {
     s.vertex_state_known = false;
 }
 
-void NativeRenderer::EndRendering(u32 reason) {
+void NativeRenderer::EndRendering(u32 reason, [[maybe_unused]] std::source_location where) {
     if (!stream.lds_readers.empty()) FlushLdsReaders(reason);
     RecordPartitionClock end_partition{t_record_partition_end};
     auto* sidecar=FindParallelRuntime(this);
+#if !defined(NDEBUG)
+    if (stream.rendering || (sidecar && sidecar->active)) DiagNotePassEnd(where);
+#endif
     if(sidecar)sidecar->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::EndPass);
     if(sidecar)sidecar->FinishSerialEligibleRun();
     if (sidecar && sidecar->active) {
@@ -3851,7 +3854,63 @@ std::array<u64, 4> g_dispatch_work{}; // DIAG-GTS-452: image init, uploads, seri
 std::map<u32, u64> g_dispatch_work_sites; // last barrier line when the serial changed
 u32 g_last_barrier_line = 0;
 std::mutex g_barrier_stats_mutex;
+
+// DIAG-GTS-460: every barrier recorded through a CmdBuf and every rendering scope ended, by the
+// source line that asked for it, and how often compute work follows graphics work or the other
+// way round (each switch makes the GPU drain). Any thread may record, so a mutex guards them.
+struct DiagSite {
+    std::string_view file;
+    u32 line;
+    auto operator<=>(const DiagSite&) const = default;
+};
+std::mutex g_drain_mutex;
+std::map<DiagSite, u64> g_cmd_barrier_sites;
+std::map<DiagSite, u64> g_pass_end_sites;
+u64 g_cmd_barriers = 0, g_pass_ends = 0, g_dispatches = 0;
+u64 g_to_compute = 0, g_to_graphics = 0;
+u32 g_last_work = 0; // 0 none, 1 graphics (a rendering scope), 2 compute
+
+DiagSite ToDiagSite(const std::source_location& where) {
+    std::string_view file = where.file_name();
+    if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
+        file.remove_prefix(slash + 1);
+    }
+    return {file, where.line()};
+}
+
+std::string DiagTopSites(const std::map<DiagSite, u64>& sites, size_t count) {
+    std::vector<std::pair<u64, DiagSite>> sorted;
+    for (const auto& [site, n] : sites) sorted.emplace_back(n, site);
+    std::ranges::sort(sorted, std::greater{});
+    std::string text;
+    for (size_t i = 0; i < sorted.size() && i < count; ++i) {
+        text += fmt::format(" {}:{}={}", sorted[i].second.file, sorted[i].second.line,
+                            sorted[i].first);
+    }
+    return text;
+}
 } // namespace
+
+void DiagNoteCmdBarrier(std::source_location where) {
+    std::scoped_lock lock{g_drain_mutex};
+    ++g_cmd_barriers;
+    ++g_cmd_barrier_sites[ToDiagSite(where)];
+}
+
+void DiagNoteDispatch() {
+    std::scoped_lock lock{g_drain_mutex};
+    ++g_dispatches;
+    if (g_last_work == 1) ++g_to_compute;
+    g_last_work = 2;
+}
+
+void DiagNotePassEnd(std::source_location where) {
+    std::scoped_lock lock{g_drain_mutex};
+    ++g_pass_ends;
+    ++g_pass_end_sites[ToDiagSite(where)];
+    if (g_last_work == 2) ++g_to_graphics;
+    g_last_work = 1;
+}
 #endif
 
 void NativeRenderer::GlobalBarrier([[maybe_unused]] std::source_location where) {
@@ -3867,7 +3926,7 @@ void NativeRenderer::GlobalBarrier([[maybe_unused]] std::source_location where) 
     }
 #endif
     Stream& s = stream;
-    EndRendering();
+    EndRendering(0, where);
     ++s.resource_recording_serial;
     const vk::MemoryBarrier2 barrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -3878,7 +3937,7 @@ void NativeRenderer::GlobalBarrier([[maybe_unused]] std::source_location where) 
     s.cmd.pipelineBarrier2(vk::DependencyInfo{
         .memoryBarrierCount = 1,
         .pMemoryBarriers = &barrier,
-    });
+    }, where);
     GpuTimeMark(s); // DIAG-GT7-001
     s.written.clear();
     s.buffers_written = false;
@@ -3889,9 +3948,9 @@ void NativeRenderer::GlobalBarrier([[maybe_unused]] std::source_location where) 
     FlushWritebacks();
 }
 
-void NativeRenderer::PassBarrier() {
+void NativeRenderer::PassBarrier(std::source_location where) {
     Stream& s = stream;
-    EndRendering();
+    EndRendering(0, where);
     constexpr auto stages = vk::PipelineStageFlagBits2::eColorAttachmentOutput |
                             vk::PipelineStageFlagBits2::eEarlyFragmentTests |
                             vk::PipelineStageFlagBits2::eLateFragmentTests;
@@ -3908,7 +3967,7 @@ void NativeRenderer::PassBarrier() {
     s.cmd.pipelineBarrier2(vk::DependencyInfo{
         .memoryBarrierCount = 1,
         .pMemoryBarriers = &barrier,
-    });
+    }, where);
     s.attach_dirty.clear();
     NATIVE_DIAGNOSTIC(++stats.pass_barriers);
 }
@@ -21423,6 +21482,18 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
                                      c[2], c[3] / 1048576.0, c[4], c[5] / 1048576.0);
         }
         LOG_INFO(Render_Vulkan, "DIAG-GTS-456 shader buffer paths (10 s):{}", path_text);
+        {
+            std::scoped_lock drain_lock{g_drain_mutex};
+            LOG_WARNING(Render_Vulkan,
+                        "DIAG-GTS-460 drains (10 s): {} barriers, {} rendering scopes ended, {} "
+                        "dispatches, {} graphics->compute and {} compute->graphics switches; "
+                        "barriers by site:{}; scopes ended by site:{}",
+                        g_cmd_barriers, g_pass_ends, g_dispatches, g_to_compute, g_to_graphics,
+                        DiagTopSites(g_cmd_barrier_sites, 16), DiagTopSites(g_pass_end_sites, 16));
+            g_cmd_barrier_sites.clear();
+            g_pass_end_sites.clear();
+            g_cmd_barriers = g_pass_ends = g_dispatches = g_to_compute = g_to_graphics = 0;
+        }
         g_stage_buffer_paths = {};
         g_dispatch_work = {};
         g_dispatch_work_sites.clear();
