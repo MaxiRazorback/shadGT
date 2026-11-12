@@ -7035,7 +7035,18 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
                                                                             bool write,
                                                                             bool mirror) {
     if (write) SnapshotLease::MarkUnsafe(address, size, 16);
-    if (write) stream.gathers.clear(); // PERF-GTS-365: a gather from before this write is stale
+    // PERF-GTS-365: a gather from before this write is stale where it overlaps it. Only those are
+    // dropped: clearing them all at every written binding made the list gather again and again.
+    if (write && !stream.gathers.empty()) {
+        const u64 end = address + size;
+        for (auto it = stream.gathers.begin(); it != stream.gathers.end() && it->first.first < end;) {
+            if (it->first.first + it->first.second > address) {
+                it = stream.gathers.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
     last_bound = Bound::Region;
     NotePerFrameRange(address, size); // FIX-GT7-122
     // NAT-114: ranges in (or reaching into) a region use it.
@@ -7516,17 +7527,18 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GatherOnGpu(VAddr addr
         gs.gathers.clear();
         gs.gather_unmaps = unmaps;
     }
+    static u64 reused = 0, made = 0; // recorder thread only
+    static auto since = std::chrono::steady_clock::now();
+    if (const auto now = std::chrono::steady_clock::now(); now - since >= std::chrono::seconds{10}) {
+        LOG_INFO(Render_Vulkan, "PERF-GTS-365 (10 s): GPU gathers {} reused, {} made", reused, made);
+        reused = made = 0;
+        since = now;
+    }
     if (const auto found = gs.gathers.find({address, size}); found != gs.gathers.end()) {
-        static u64 reused = 0;
-        static auto since = std::chrono::steady_clock::now();
         ++reused;
-        if (const auto now = std::chrono::steady_clock::now(); now - since >= std::chrono::seconds{10}) {
-            LOG_INFO(Render_Vulkan, "PERF-GTS-365 (10 s): GPU gathers reused {} times", reused);
-            reused = 0;
-            since = now;
-        }
         return std::pair{found->second, u64{0}};
     }
+    ++made;
     auto gathered = device->CreateBuffer({.size = size,
                                           .usage = Native::Rhi::BufferUsageStorage |
                                                    Native::Rhi::BufferUsageVertex |
