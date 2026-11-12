@@ -1487,6 +1487,30 @@ vk::Format Instance::GetSupportedFormat(const vk::Format format,
     return format;
 }
 
+bool Instance::IsAmdGcn() const {
+    if (driver_id != vk::DriverId::eAmdProprietary) {
+        return false;
+    }
+    const std::string_view model = GetModelName();
+    if (model.find("Vega") != std::string_view::npos ||
+        model.find("Radeon VII") != std::string_view::npos ||
+        model.find("R9 ") != std::string_view::npos ||
+        model.find("R7 ") != std::string_view::npos) {
+        return true;
+    }
+    // RX 460 ... RX 590, RX 640: three digits ("Radeon (TM) RX 480 Graphics"). RX 5300 and newer:
+    // four digits (RDNA).
+    const auto rx = model.find("RX ");
+    if (rx == std::string_view::npos) {
+        return false;
+    }
+    std::size_t digits = 0;
+    for (std::size_t i = rx + 3; i < model.size() && model[i] >= '0' && model[i] <= '9'; ++i) {
+        ++digits;
+    }
+    return digits == 3;
+}
+
 namespace {
 // DIAG-243: a ring of the last draws recorded (pipeline key hash, info word).
 struct FaultDraw {
