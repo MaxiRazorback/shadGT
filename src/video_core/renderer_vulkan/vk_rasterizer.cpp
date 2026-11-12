@@ -6753,6 +6753,7 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
         {"native-invalidate", "import-invalidate", "buffer-invalidate", "gpu-command-sync", "mapped-ranges"}};
     trace.Next(0, addr, size);
     tsharp_epoch.fetch_add(1, std::memory_order_release); // FIX-046
+    g_guest_unmaps.fetch_add(1, std::memory_order_release); // FIX-GTS-361
 #ifdef RYTY_GPU
     if (native) {
         native->OnUnmap(addr, size); // NAT-100

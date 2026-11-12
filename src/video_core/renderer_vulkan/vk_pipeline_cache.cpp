@@ -5112,7 +5112,16 @@ bool PipelineCache::RefreshGraphicsStages() {
     // address changes. -DisablePerf 36 reads it anyway.
     static const bool check_programs = Common::PerfFeatureEnabled(36);
     if (check_programs) {
-        static std::array<VAddr, 6> checked{};
+        // FIX-GTS-361: an address checked once stayed trusted after the game unmapped it, and the
+        // read-ahead later read a program there (car selection unloads cars; GPU recorder crash
+        // reading 0x1020429c00 in SearchBinaryInfo). Forget the checked addresses after any
+        // unmap. Per thread: several threads refresh keys, and the shared array had no lock.
+        thread_local std::array<VAddr, 6> checked{};
+        thread_local u64 checked_unmaps = 0;
+        if (const u64 unmaps = g_guest_unmaps.load(std::memory_order_acquire); unmaps != checked_unmaps) {
+            checked.fill(0);
+            checked_unmaps = unmaps;
+        }
         for (u32 stage = 0; stage < checked.size(); ++stage) {
             const auto* pgm = regs.ProgramForStage(stage);
             const VAddr address = pgm ? pgm->Address<VAddr>() : 0;
