@@ -339,6 +339,7 @@ private:
         /// writes guest memory in place, and after the game unmaps memory (`gather_unmaps`).
         std::map<std::pair<u64, u64>, vk::Buffer> gathers;
         u64 gather_unmaps = 0;
+        u64 gather_max = 0; ///< largest size in `gathers`, to bound the overlap scan
         /// PERF-GT7-043: the program of the last dispatch, if it is the last command so far.
         u64 run_program = 0;
         u32 run_commands = 0;

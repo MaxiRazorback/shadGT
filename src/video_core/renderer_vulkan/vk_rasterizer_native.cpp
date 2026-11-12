@@ -2738,6 +2738,7 @@ void NativeRenderer::SpliceHudStream(u64 tick) {
     s.pooled_snapshots.clear();
     s.keep.clear();
     s.gathers.clear(); // PERF-GTS-365: they went with the list
+    s.gather_max = 0;
     s.list = nullptr;
     s.cmd = CmdBuf{};
     ++s.serial;        // OPT-015: the list's upload memory retires with it
@@ -7037,9 +7038,12 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
     if (write) SnapshotLease::MarkUnsafe(address, size, 16);
     // PERF-GTS-365: a gather from before this write is stale where it overlaps it. Only those are
     // dropped: clearing them all at every written binding made the list gather again and again.
+    // The scan starts the largest gather's size below the write: nothing starting earlier reaches it.
     if (write && !stream.gathers.empty()) {
         const u64 end = address + size;
-        for (auto it = stream.gathers.begin(); it != stream.gathers.end() && it->first.first < end;) {
+        const u64 from = address > stream.gather_max ? address - stream.gather_max : 0;
+        for (auto it = stream.gathers.lower_bound({from, 0});
+             it != stream.gathers.end() && it->first.first < end;) {
             if (it->first.first + it->first.second > address) {
                 it = stream.gathers.erase(it);
             } else {
@@ -7520,23 +7524,26 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GatherOnGpu(VAddr addr
         const char* env = std::getenv("RYGT_GATHER_REUSE");
         return !(env && env[0] == '0');
     }();
-    Stream& gs = Begin();
-    if (!reuse_gathers) {
-        gs.gathers.clear();
-    } else if (const u64 unmaps = g_guest_unmaps.load(std::memory_order_acquire); unmaps != gs.gather_unmaps) {
-        gs.gathers.clear();
-        gs.gather_unmaps = unmaps;
-    }
-    static u64 reused = 0, made = 0; // recorder thread only
+    // The open list's gathers; none when no list is open (they go with it), so a hit needs no
+    // Begin(). The report reads the clock every 1024 calls, not on each one.
+    static u64 reused = 0, made = 0, calls = 0; // recorder thread only
     static auto since = std::chrono::steady_clock::now();
-    if (const auto now = std::chrono::steady_clock::now(); now - since >= std::chrono::seconds{10}) {
-        LOG_INFO(Render_Vulkan, "PERF-GTS-365 (10 s): GPU gathers {} reused, {} made", reused, made);
-        reused = made = 0;
-        since = now;
+    if ((++calls & 1023) == 0) {
+        if (const auto now = std::chrono::steady_clock::now(); now - since >= std::chrono::seconds{10}) {
+            LOG_INFO(Render_Vulkan, "PERF-GTS-365 (10 s): GPU gathers {} reused, {} made", reused, made);
+            reused = made = 0;
+            since = now;
+        }
     }
-    if (const auto found = gs.gathers.find({address, size}); found != gs.gathers.end()) {
-        ++reused;
-        return std::pair{found->second, u64{0}};
+    if (reuse_gathers && !stream.gathers.empty()) {
+        if (const u64 unmaps = g_guest_unmaps.load(std::memory_order_acquire); unmaps != stream.gather_unmaps) {
+            stream.gathers.clear();
+            stream.gather_max = 0;
+            stream.gather_unmaps = unmaps;
+        } else if (const auto found = stream.gathers.find({address, size}); found != stream.gathers.end()) {
+            ++reused;
+            return std::pair{found->second, u64{0}};
+        }
     }
     ++made;
     auto gathered = device->CreateBuffer({.size = size,
@@ -7566,7 +7573,11 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GatherOnGpu(VAddr addr
     if (!all) {
         return std::nullopt;
     }
-    if (reuse_gathers) s.gathers.emplace(std::pair{address, size}, dst); // PERF-GTS-365
+    if (reuse_gathers) { // PERF-GTS-365
+        if (s.gathers.empty()) s.gather_unmaps = g_guest_unmaps.load(std::memory_order_acquire);
+        s.gathers.emplace(std::pair{address, size}, dst);
+        s.gather_max = std::max(s.gather_max, size);
+    }
     NATIVE_DIAGNOSTIC(++stats.gathers);
     NATIVE_DIAGNOSTIC(stats.gathered_bytes += size);
     return std::pair{dst, u64{0}};
@@ -19991,6 +20002,7 @@ void NativeRenderer::Splice() {
     s.pooled_snapshots.clear();
     s.keep.clear(); // freed by the device once the GPU ran this list (NAT-107)
     s.gathers.clear(); // PERF-GTS-365: they went with the list
+    s.gather_max = 0;
     device->Collect(); // objects the GPU finished with (staging buffers of uploads)
     s.wrapped_list.reset();
     s.list = nullptr;
