@@ -583,6 +583,15 @@ public:
         const u64 step = (u64{1} << (std::bit_width(size - 1) - 1)) / 4;
         return (size + step - 1) / step * step;
     }
+    /// PERF-GTS-364: a VMA pool for recycled upload buffers whose memory is allocated once, up
+    /// front (RYGT_UPLOAD_COPY_RESERVE_MB, default 256, in 128 MB blocks; 0 = none). A copy the
+    /// PERF-GTS-362 pool cannot serve yet (a texture seen for the first time) is then placed in
+    /// memory that exists, instead of VMA allocating a new 32 MB block on the recorder (6 to 7 ms
+    /// each, several in a row when large buildings come into view). It never grows: when full,
+    /// buffers are allocated as before. Null when there is none.
+    VmaPool UploadReserve(const VkBufferCreateInfo& buffer_ci, const VmaAllocationCreateInfo& alloc_ci);
+    std::once_flag upload_reserve_once;
+    VmaPool upload_reserve = VK_NULL_HANDLE;
     bool TakeRecycled(u64 bytes, u32 usage, MemoryKind memory, RecycledBuffer& out);
     /// Keeps a buffer the GPU is done with, or destroys it when the pool is full.
     void Recycle(const RecycledBuffer& buffer);
@@ -830,6 +839,11 @@ VulkanDevice::~VulkanDevice() {
         retired_object.destroy();
     }
     DropRecycled(); // PERF-GTS-362: after the retired buffers above returned to the pool
+    if (upload_reserve) { // PERF-GTS-364: only once nothing is left in it
+        VmaStatistics stats{};
+        vmaGetPoolStatistics(allocator, upload_reserve, &stats);
+        if (stats.allocationCount == 0) vmaDestroyPool(allocator, upload_reserve);
+    }
     for (auto& [id, pool] : pools) {
         for (auto& list : pool->all) {
             if (list->descriptor_pool) {
@@ -1010,10 +1024,23 @@ std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
     struct AllocationResult {
       VkResult result;
     };
+    // PERF-GTS-364: recycled upload buffers go into the reserved memory first.
+    const VmaPool reserve =
+        recycle_bytes && desc.memory == MemoryKind::Upload ? UploadReserve(buffer_ci, alloc_ci) : VK_NULL_HANDLE;
     const auto result = Common::AllocateWithPressureRetry(
         [&] {
           buffer = VK_NULL_HANDLE;
           allocation = nullptr;
+          if (reserve) {
+              VmaAllocationCreateInfo reserved_ci = alloc_ci;
+              reserved_ci.pool = reserve;
+              if (vmaCreateBuffer(allocator, &buffer_ci, &reserved_ci, &buffer, &allocation,
+                                  &info) == VK_SUCCESS) {
+                  return AllocationResult{VK_SUCCESS};
+              }
+              buffer = VK_NULL_HANDLE; // full (it never grows) or unsuitable: allocate as before
+              allocation = nullptr;
+          }
           return AllocationResult{vmaCreateBuffer(
               allocator, &buffer_ci, &alloc_ci, &buffer, &allocation, &info)};
         },
@@ -1053,6 +1080,40 @@ std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
         ++recycle_allocated;
     }
     return made;
+}
+
+VmaPool VulkanDevice::UploadReserve(const VkBufferCreateInfo& buffer_ci,
+                                    const VmaAllocationCreateInfo& alloc_ci) {
+    std::call_once(upload_reserve_once, [&] {
+        constexpr u64 BlockBytes = 128ULL << 20;
+        const char* env = std::getenv("RYGT_UPLOAD_COPY_RESERVE_MB");
+        char* end = nullptr;
+        u64 mb = env && *env ? std::strtoull(env, &end, 10) : 256;
+        if (end && *end) mb = 256;
+        mb = std::min<u64>(mb, 4096);
+        if (mb == 0) return;
+        const u64 blocks = ((mb << 20) + BlockBytes - 1) / BlockBytes;
+        u32 type = 0;
+        if (vmaFindMemoryTypeIndexForBufferInfo(allocator, &buffer_ci, &alloc_ci, &type) != VK_SUCCESS) {
+            LOG_WARNING(Render_Vulkan, "PERF-GTS-364: no memory type for the upload copy reserve");
+            return;
+        }
+        VmaPoolCreateInfo pool_ci{};
+        pool_ci.memoryTypeIndex = type;
+        pool_ci.blockSize = BlockBytes;
+        pool_ci.minBlockCount = static_cast<size_t>(blocks);
+        pool_ci.maxBlockCount = static_cast<size_t>(blocks);
+        const auto start = std::chrono::steady_clock::now();
+        if (vmaCreatePool(allocator, &pool_ci, &upload_reserve) != VK_SUCCESS) {
+            upload_reserve = VK_NULL_HANDLE;
+            LOG_WARNING(Render_Vulkan, "PERF-GTS-364: could not reserve {} MB for upload copies", mb);
+            return;
+        }
+        LOG_INFO(Render_Vulkan, "PERF-GTS-364: reserved {} MB for upload copies in memory type {} ({} ms)",
+                 blocks * (BlockBytes >> 20), type,
+                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
+    });
+    return upload_reserve;
 }
 
 bool VulkanDevice::TakeRecycled(u64 bytes, u32 usage, MemoryKind memory, RecycledBuffer& out) {
