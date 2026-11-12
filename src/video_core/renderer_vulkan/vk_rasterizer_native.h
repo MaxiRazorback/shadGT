@@ -334,6 +334,11 @@ private:
             }
         };
         WrittenFlag buffers_written;                    ///< by shaders since the last barrier
+        /// PERF-GTS-365: ranges GatherOnGpu copied into a buffer of this list, by (address,
+        /// size), for later binds of the same range in it. Forgotten with the list, when a draw
+        /// writes guest memory in place, and after the game unmaps memory (`gather_unmaps`).
+        std::map<std::pair<u64, u64>, vk::Buffer> gathers;
+        u64 gather_unmaps = 0;
         /// PERF-GT7-043: the program of the last dispatch, if it is the last command so far.
         u64 run_program = 0;
         u32 run_commands = 0;

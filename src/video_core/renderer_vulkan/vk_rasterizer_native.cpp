@@ -2737,6 +2737,7 @@ void NativeRenderer::SpliceHudStream(u64 tick) {
     }
     s.pooled_snapshots.clear();
     s.keep.clear();
+    s.gathers.clear(); // PERF-GTS-365: they went with the list
     s.list = nullptr;
     s.cmd = CmdBuf{};
     ++s.serial;        // OPT-015: the list's upload memory retires with it
@@ -7034,6 +7035,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
                                                                             bool write,
                                                                             bool mirror) {
     if (write) SnapshotLease::MarkUnsafe(address, size, 16);
+    if (write) stream.gathers.clear(); // PERF-GTS-365: a gather from before this write is stale
     last_bound = Bound::Region;
     NotePerFrameRange(address, size); // FIX-GT7-122
     // NAT-114: ranges in (or reaching into) a region use it.
@@ -7499,6 +7501,26 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GatherOnGpu(VAddr addr
     if (!direct || size > 256_MB || !direct->EnsureImported(address, size)) {
         return std::nullopt;
     }
+    // PERF-GTS-365: every bind of a range that spans imported views made a new buffer and copy,
+    // kept until the list retired. At the Nurburgring start one 3.6 MB range bound by many draws
+    // filled 8 to 15 GB of video memory this way (6.7 GB budget): the driver paged, and frames
+    // took 300 ms to 3.5 s. A list now gathers each range once.
+    Stream& gs = Begin();
+    if (const u64 unmaps = g_guest_unmaps.load(std::memory_order_acquire); unmaps != gs.gather_unmaps) {
+        gs.gathers.clear();
+        gs.gather_unmaps = unmaps;
+    }
+    if (const auto found = gs.gathers.find({address, size}); found != gs.gathers.end()) {
+        static u64 reused = 0;
+        static auto since = std::chrono::steady_clock::now();
+        ++reused;
+        if (const auto now = std::chrono::steady_clock::now(); now - since >= std::chrono::seconds{10}) {
+            LOG_INFO(Render_Vulkan, "PERF-GTS-365 (10 s): GPU gathers reused {} times", reused);
+            reused = 0;
+            since = now;
+        }
+        return std::pair{found->second, u64{0}};
+    }
     auto gathered = device->CreateBuffer({.size = size,
                                           .usage = Native::Rhi::BufferUsageStorage |
                                                    Native::Rhi::BufferUsageVertex |
@@ -7526,6 +7548,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GatherOnGpu(VAddr addr
     if (!all) {
         return std::nullopt;
     }
+    s.gathers.emplace(std::pair{address, size}, dst); // PERF-GTS-365
     NATIVE_DIAGNOSTIC(++stats.gathers);
     NATIVE_DIAGNOSTIC(stats.gathered_bytes += size);
     return std::pair{dst, u64{0}};
@@ -19949,6 +19972,7 @@ void NativeRenderer::Splice() {
     }
     s.pooled_snapshots.clear();
     s.keep.clear(); // freed by the device once the GPU ran this list (NAT-107)
+    s.gathers.clear(); // PERF-GTS-365: they went with the list
     device->Collect(); // objects the GPU finished with (staging buffers of uploads)
     s.wrapped_list.reset();
     s.list = nullptr;
