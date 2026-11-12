@@ -564,7 +564,17 @@ public:
         u32 usage;
         MemoryKind memory;
     };
-    static constexpr u64 RecycleLimit = 256ULL << 20; ///< most bytes kept at once
+    /// Most bytes kept at once: RYGT_UPLOAD_COPY_POOL_MB, default 512; 0 keeps none. At 256 MB
+    /// the pool filled in the first 40 s of Autopolis and copies of new sizes were freed again.
+    static u64 RecycleLimit() {
+        static const u64 limit = [] {
+            const char* env = std::getenv("RYGT_UPLOAD_COPY_POOL_MB");
+            char* end = nullptr;
+            const unsigned long long mb = env && *env ? std::strtoull(env, &end, 10) : 512;
+            return (end && *end ? 512ULL : std::min<u64>(mb, 4096)) << 20;
+        }();
+        return limit;
+    }
     static constexpr u64 RecycleLargest = 64ULL << 20;   ///< larger buffers are freed as before
     static constexpr u64 RecycleSmallest = 256ULL << 10; ///< smaller ones VMA suballocates cheaply
     /// The size a recycled buffer of `size` bytes is allocated with: rounded up to a quarter of
@@ -951,7 +961,7 @@ std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
     }
     // PERF-GTS-362: a recycled buffer reuses a kept one of its size class, or is allocated at
     // that size so the next one can.
-    const u64 recycle_bytes = desc.recycle && desc.size >= RecycleSmallest &&
+    const u64 recycle_bytes = desc.recycle && RecycleLimit() != 0 && desc.size >= RecycleSmallest &&
                                       desc.size <= RecycleLargest
                                   ? RecycleBytes(desc.size)
                                   : 0;
@@ -1064,7 +1074,7 @@ void VulkanDevice::Recycle(const RecycledBuffer& buffer) {
     bool keep = false;
     {
         std::scoped_lock lock{recycle_mutex};
-        if (recycled_bytes + buffer.bytes <= RecycleLimit) {
+        if (recycled_bytes + buffer.bytes <= RecycleLimit()) {
             recycled.push_back(buffer);
             recycled_bytes += buffer.bytes;
             keep = true;
