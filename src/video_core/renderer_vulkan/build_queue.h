@@ -81,7 +81,13 @@ public:
             }
         }
         g_build_jobs.fetch_add(1, std::memory_order_relaxed); // FIX-GT7-100
-        cv.notify_all();
+        // PERF-GTS-360: one new job needs one worker. Only Pop waits on cv, and every worker
+        // waits for the same condition, so if the woken one cannot take the job (no capacity)
+        // none could, and the finish that frees capacity wakes them all. Waking every worker
+        // for each job made the recorder, which queues the builds a draw needs, lose its core
+        // in notify_all while they fought for cv's lock: a quarter of its time in Autopolis's
+        // pipeline-build freezes (Nsight Systems trace).
+        cv.notify_one();
     }
 
     /// Waits for the next job. False once stopped. `is_background` tells which queue it came
