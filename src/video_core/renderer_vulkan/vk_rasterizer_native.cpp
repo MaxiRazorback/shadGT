@@ -4683,13 +4683,19 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
     trace.Next(5);
     const auto create = [&] {
         Chunk result;
+        const u64 capacity = UploadChunkCapacity(size, ChunkSize());
         result.buffer = device->CreateBuffer({
-        .size = UploadChunkCapacity(size, ChunkSize()),
+        .size = capacity,
         .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageUniform |
                  Native::Rhi::BufferUsageIndex | Native::Rhi::BufferUsageVertex |
                  Native::Rhi::BufferUsageIndirect | Native::Rhi::BufferUsageTransferSrc,
         .memory = Native::Rhi::MemoryKind::Upload,
         .name = "native upload",
+        // PERF-GTS-363: a chunk made for one large texture (a CPU-staged upload larger than
+        // the standard chunk) took 100 to 145 ms to create, and the chunk cache's 128 MB
+        // budget freed it again before the next large texture: a long frame each time.
+        // Freed, its memory waits in the upload copy pool for the next one of its size.
+        .recycle = capacity > ChunkSize(),
         });
         return result;
     };
