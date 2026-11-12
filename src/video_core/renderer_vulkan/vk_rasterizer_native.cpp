@@ -2276,7 +2276,12 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
                                                            Native::Rhi::BufferUsageTransferSrc |
                                                            Native::Rhi::BufferUsageTransferDst,
                                                   .memory = Native::Rhi::MemoryKind::Upload,
-                                                  .name = "native upload copy"});
+                                                  .name = "native upload copy",
+                                                  // PERF-GTS-362: each copy was a new
+                                                  // dedicated allocation and its own free;
+                                                  // meeting another thread's in the driver,
+                                                  // either took ~100 ms and held the frame.
+                                                  .recycle = true});
                 if (copy && copy->Mapped() &&
                     Core::RytyMemory::GuardedCopy(copy->Mapped(),
                                                   reinterpret_cast<const void*>(address), size)) {
