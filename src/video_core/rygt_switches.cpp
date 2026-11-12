@@ -196,6 +196,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     // Memory & VRAM
     "RYGTSW1|RYGT_COMPUTE_PREFIX_COPY|flag|Memory & VRAM|off|1 = on|Menus: copies each compute shader's 4 KB constant snapshot to video memory before the dispatch, as before PERF-GTS-461. Slower; for comparison.",
     "RYGTSW1|RYGT_D1_VIEW_MB|int|Memory & VRAM|256|MB per imported piece; 0 = whole allocation at once|Imports large GPU memory allocations in pieces of this many MB when first used (PERF-GT7-022); 0 pins the whole allocation.",
+    "RYGTSW1|RYGT_GATHER_REUSE|flag|Memory & VRAM|on|0 = off|Draws in one command list that read the same guest buffer spanning several imported pieces share one GPU copy of it, instead of a new copy each (PERF-GTS-365; VRAM filled at the Nurburgring without it).",
     "RYGTSW1|RYGT_UPLOAD_COPY_RESERVE_MB|int|Memory & VRAM|256|MB, 0-4096, in 128 MB blocks; 0 = off|Reserves this much upload memory up front for texture upload copies, so textures seen for the first time do not wait for an allocation (PERF-GTS-364). Uses that much more VRAM.",
     "RYGTSW1|RYGT_UPLOAD_COPY_POOL_MB|int|Memory & VRAM|512|MB, 0-4096; 0 = off|Keeps this many MB of finished texture upload copies for reuse, so streaming does not allocate GPU memory for each one (PERF-GTS-362). Uses that much more VRAM.",
     "RYGTSW1|RYGT_HOT_PAGE_FAULTS|int|Memory & VRAM|8|1..64 write faults|Number of CPU write faults before a memory page is treated as hot and stops being protected (PERF-GT7-050).",

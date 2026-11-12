@@ -7505,8 +7505,14 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GatherOnGpu(VAddr addr
     // kept until the list retired. At the Nurburgring start one 3.6 MB range bound by many draws
     // filled 8 to 15 GB of video memory this way (6.7 GB budget): the driver paged, and frames
     // took 300 ms to 3.5 s. A list now gathers each range once.
+    static const bool reuse_gathers = [] {
+        const char* env = std::getenv("RYGT_GATHER_REUSE");
+        return !(env && env[0] == '0');
+    }();
     Stream& gs = Begin();
-    if (const u64 unmaps = g_guest_unmaps.load(std::memory_order_acquire); unmaps != gs.gather_unmaps) {
+    if (!reuse_gathers) {
+        gs.gathers.clear();
+    } else if (const u64 unmaps = g_guest_unmaps.load(std::memory_order_acquire); unmaps != gs.gather_unmaps) {
         gs.gathers.clear();
         gs.gather_unmaps = unmaps;
     }
@@ -7548,7 +7554,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GatherOnGpu(VAddr addr
     if (!all) {
         return std::nullopt;
     }
-    s.gathers.emplace(std::pair{address, size}, dst); // PERF-GTS-365
+    if (reuse_gathers) s.gathers.emplace(std::pair{address, size}, dst); // PERF-GTS-365
     NATIVE_DIAGNOSTIC(++stats.gathers);
     NATIVE_DIAGNOSTIC(stats.gathered_bytes += size);
     return std::pair{dst, u64{0}};
