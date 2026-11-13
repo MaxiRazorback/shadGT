@@ -9,7 +9,8 @@ namespace Vulkan {
 // Descriptor records/images are fixed after preparation. Ordered commit updates
 // buffer-info slots in place, so refresh those slots before hashing or lookup.
 struct PreparedDescriptorKey {
-    struct BufferPatch { const vk::DescriptorBufferInfo* info; std::size_t word; };
+    /// `slot`: the info's binding in its set (dstBinding + its index in the write), PERF-GTS-391.
+    struct BufferPatch { const vk::DescriptorBufferInfo* info; std::uint32_t word; std::uint32_t slot; };
     std::vector<std::uint64_t> words;
     std::vector<BufferPatch> buffers;
     bool cacheable = false;
@@ -48,7 +49,7 @@ struct PreparedDescriptorKey {
             if (write.pBufferInfo) {
                 for (std::uint32_t i = 0; i < write.descriptorCount; ++i) {
                     const auto& info = write.pBufferInfo[i];
-                    buffers.push_back({&info, next});
+                    buffers.push_back({&info, static_cast<std::uint32_t>(next), write.dstBinding + i});
                     words[next++] = std::uint64_t(VkBuffer(info.buffer));
                     words[next++] = info.offset;
                     words[next++] = info.range;
