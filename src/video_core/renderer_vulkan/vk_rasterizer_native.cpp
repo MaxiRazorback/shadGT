@@ -4630,6 +4630,15 @@ void NativeRenderer::ChunkFlushCheck() {
     if (feed_min == 0 || stream.commands < feed_min || (stream.commands & 15) != 0) {
         return;
     }
+    // PERF-GTS-397: not while a parallel pass is open. With parallel recording the GPU is
+    // often idle, so this ran every 16 draws: each time the open pass was closed (they
+    // averaged 19 draws of the 64 one holds), the recorder waited for the pass workers
+    // (0.6 s in 10 s at Tokyo), ended its list, submitted and began a new one, without the
+    // command ring: 12,000 to 23,000 lists and 31,000 passes in 10 s. The list is still run
+    // at SpliceAfter commands, and here once the pass has ended.
+    if (const auto* parallel = FindParallelRuntime(this); parallel && parallel->active) {
+        return;
+    }
     const u64 tick = r.scheduler.CurrentTick();
     if (tick > 1 && r.scheduler.IsFree(tick - 1)) {
         Splice();
