@@ -91,23 +91,55 @@ const char* StageName(VkShaderStageFlagBits stage) {
     }
 }
 
-std::string Statistics(VkDevice device, VkPipeline pipeline) {
-    if (!capture_statistics || !get_executables || !get_statistics || !pipeline) return {};
+// amdvlk can fault inside these queries for some pipelines; a fault turns statistics off
+// for the rest of the run instead of taking the game down.
+std::atomic<bool> statistics_faulted{false};
+
+VkResult SafeExecutables(VkDevice device, const VkPipelineInfoKHR* info, u32* count,
+                         VkPipelineExecutablePropertiesKHR* out) {
+#ifdef _WIN32
+    __try {
+        return get_executables(device, info, count, out);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        statistics_faulted.store(true);
+        return VK_ERROR_UNKNOWN;
+    }
+#else
+    return get_executables(device, info, count, out);
+#endif
+}
+
+VkResult SafeStatistics(VkDevice device, const VkPipelineExecutableInfoKHR* info, u32* count,
+                        VkPipelineExecutableStatisticKHR* out) {
+#ifdef _WIN32
+    __try {
+        return get_statistics(device, info, count, out);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        statistics_faulted.store(true);
+        return VK_ERROR_UNKNOWN;
+    }
+#else
+    return get_statistics(device, info, count, out);
+#endif
+}
+std::string Statistics(VkDevice device, VkPipeline pipeline, bool captured) {
+    // amdvlk crashes when asked about a pipeline built without the capture flag.
+    if (!captured || !capture_statistics || statistics_faulted.load() || !get_executables || !get_statistics || !pipeline) return {};
     const VkPipelineInfoKHR info{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, nullptr, pipeline};
     u32 count = 0;
-    if (get_executables(device, &info, &count, nullptr) != VK_SUCCESS || count == 0) return {};
+    if (SafeExecutables(device, &info, &count, nullptr) != VK_SUCCESS || count == 0) return {};
     std::vector<VkPipelineExecutablePropertiesKHR> executables(
         count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
-    if (get_executables(device, &info, &count, executables.data()) != VK_SUCCESS) return {};
+    if (SafeExecutables(device, &info, &count, executables.data()) != VK_SUCCESS) return {};
     std::string out;
     for (u32 i = 0; i < count; ++i) {
         const VkPipelineExecutableInfoKHR exe{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR,
                                               nullptr, pipeline, i};
         u32 stats = 0;
-        if (get_statistics(device, &exe, &stats, nullptr) != VK_SUCCESS || stats == 0) continue;
+        if (SafeStatistics(device, &exe, &stats, nullptr) != VK_SUCCESS || stats == 0) continue;
         std::vector<VkPipelineExecutableStatisticKHR> values(
             stats, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
-        if (get_statistics(device, &exe, &stats, values.data()) != VK_SUCCESS) continue;
+        if (SafeStatistics(device, &exe, &stats, values.data()) != VK_SUCCESS) continue;
         out += fmt::format("{}[", executables[i].name);
         for (u32 j = 0; j < stats; ++j) {
             const auto& v = values[j];
@@ -130,7 +162,7 @@ std::string Statistics(VkDevice device, VkPipeline pipeline) {
 void LogPipeline(VkDevice device, const char* kind, VkPipeline pipeline, double ms,
                  const VkPipelineCreationFeedback& whole,
                  const VkPipelineCreationFeedback* stages, const VkPipelineShaderStageCreateInfo* infos,
-                 u32 stage_count, VkResult result) {
+                 u32 stage_count, VkResult result, bool captured) {
     const bool valid = whole.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT;
     const bool hit = whole.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT;
     std::string stage_text;
@@ -144,7 +176,7 @@ void LogPipeline(VkDevice device, const char* kind, VkPipeline pipeline, double 
     WriteRow(fmt::format("{:.3f},{},{},{:#x},{:.3f},{:.3f},{},{},{},{}", NowMs(), ThreadId(), kind,
                          reinterpret_cast<u64>(pipeline), ms, driver_ms,
                          valid ? (hit ? "hit" : "miss") : "unknown", Quote(stage_text),
-                         static_cast<int>(result), Quote(Statistics(device, pipeline))));
+                         static_cast<int>(result), Quote(Statistics(device, pipeline, captured && result == VK_SUCCESS))));
     if (pipeline && insert_label) {
         std::scoped_lock lock{pending_mutex};
         pending[pipeline] = fmt::format("RyGT compile {} {:.1f} ms {}", kind, ms,
@@ -181,6 +213,7 @@ VkResult CreateLogged(VkDevice device, VkPipelineCache cache, u32 count, const C
     std::vector<VkPipelineCreationFeedbackCreateInfo> feedback(count);
     std::vector<const VkPipelineCreationFeedbackCreateInfo*> theirs(count);
     std::vector<const char*> kinds(count);
+    std::vector<char> captured(count, 0);
     for (u32 i = 0; i < count; ++i) {
         auto& ci = copies[i];
         kinds[i] = KindOf(ci, whole_kind);
@@ -203,6 +236,7 @@ VkResult CreateLogged(VkDevice device, VkPipelineCache cache, u32 count, const C
         if (capture_statistics && kinds[i] == whole_kind &&
             !FindInChain(infos[i].pNext, VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO)) {
             ci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+            captured[i] = 1;
         }
     }
     const auto begin = std::chrono::steady_clock::now();
@@ -220,7 +254,7 @@ VkResult CreateLogged(VkDevice device, VkPipelineCache cache, u32 count, const C
         }
         LogPipeline(device, kinds[i], pipelines[i], ms, *fb->pPipelineCreationFeedback,
                     fb->pPipelineStageCreationFeedbacks, stage_infos,
-                    fb->pipelineStageCreationFeedbackCount, result);
+                    fb->pipelineStageCreationFeedbackCount, result, captured[i] != 0);
     }
     return result;
 }
