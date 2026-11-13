@@ -1607,6 +1607,12 @@ private:
         std::array<uint64_t, 9> bind_phase_ns{};
         std::array<uint64_t, 8> commit_phase_ns{};
         uint64_t bind_phase_calls = 0, commit_phase_calls = 0;
+        /// DIAG-GTS-373: allocated graphics sets whose key, with buffer offsets left out, was
+        /// seen before in the same list, in the same frame, or in the last 10 s.
+        uint64_t reuse_diag_sets = 0, reuse_diag_exact = 0, reuse_diag_list = 0,
+                 reuse_diag_frame = 0, reuse_diag_window = 0;
+        uint64_t reuse_diag_serial = ~uint64_t{0}, reuse_diag_frame_number = ~uint64_t{0};
+        std::unordered_set<uint64_t> reuse_diag_in_list, reuse_diag_in_frame, reuse_diag_in_window;
         u64 prepared_used = 0, prepared_missing = 0;
         std::array<u64, 5> prepared_rejected{};
         u64 prepared_vertices = 0, prepared_vertices_rejected = 0; ///< OPT-011

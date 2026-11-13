@@ -11044,6 +11044,34 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
             NATIVE_DIAGNOSTIC(++descriptor_hash_reused);
         }
         const u64 key_hash = cacheable ? prepared_key.hash : 0;
+        // DIAG-GTS-373 (RYGT_DIAG_DESCRIPTOR_REUSE=1): what dynamic buffer offsets would buy.
+        // Counts only; nothing recorded changes.
+        static const bool reuse_diag = [] {
+            const char* env = std::getenv("RYGT_DIAG_DESCRIPTOR_REUSE");
+            return env && env[0] == '1';
+        }();
+        if (reuse_diag && cacheable && bind_point == vk::PipelineBindPoint::eGraphics) {
+            static thread_local std::vector<u64> without_offsets;
+            without_offsets.assign(key.begin(), key.end());
+            for (const auto& patch : prepared_key.buffers) {
+                without_offsets[patch.word + 1] = 0;
+            }
+            const u64 loose = Native::Parallel::AdaptiveXXH3(
+                without_offsets.data(), without_offsets.size() * sizeof(u64));
+            if (stats.reuse_diag_serial != s.serial) {
+                stats.reuse_diag_serial = s.serial;
+                stats.reuse_diag_in_list.clear();
+            }
+            if (stats.reuse_diag_frame_number != frame) {
+                stats.reuse_diag_frame_number = frame;
+                stats.reuse_diag_in_frame.clear();
+            }
+            ++stats.reuse_diag_sets;
+            stats.reuse_diag_list += !stats.reuse_diag_in_list.insert(loose).second;
+            stats.reuse_diag_frame += !stats.reuse_diag_in_frame.insert(loose).second;
+            stats.reuse_diag_window += !stats.reuse_diag_in_window.insert(loose).second;
+            stats.reuse_diag_exact += bool(s.descriptor_sets.Find(key_hash, descriptor_key));
+        }
         if (cacheable) {
             if (const auto reused = s.descriptor_sets.Find(key_hash, descriptor_key)) {
                 sets[index] = reused;
@@ -21473,6 +21501,19 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
                  us(stats.bind_phase_ns, stats.bind_phase_calls), stats.bind_phase_calls,
                  us(stats.commit_phase_ns, stats.commit_phase_calls), stats.commit_phase_calls);
     }
+    if (stats.reuse_diag_sets != 0) {
+        const auto pct = [&](uint64_t n) { return 100.0 * double(n) / double(stats.reuse_diag_sets); };
+        LOG_INFO(Render_Vulkan,
+                 "DIAG-GTS-373 (10 s): {} graphics sets looked up; reused as now {:.1f}%; with "
+                 "buffer offsets left out of the key, seen before in the same list {:.1f}%, in "
+                 "the same frame {:.1f}%, in these 10 s {:.1f}% ({} distinct)",
+                 stats.reuse_diag_sets, pct(stats.reuse_diag_exact), pct(stats.reuse_diag_list),
+                 pct(stats.reuse_diag_frame), pct(stats.reuse_diag_window),
+                 stats.reuse_diag_in_window.size());
+    }
+    stats.reuse_diag_sets = stats.reuse_diag_exact = stats.reuse_diag_list = 0;
+    stats.reuse_diag_frame = stats.reuse_diag_window = 0;
+    stats.reuse_diag_in_window.clear();
     stats.bind_phase_ns = {};
     stats.commit_phase_ns = {};
     stats.bind_phase_calls = stats.commit_phase_calls = 0;
