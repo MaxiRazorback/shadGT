@@ -9,7 +9,10 @@
 #include <cstdlib>
 #include <mutex>
 #include <string>
+#include <filesystem>
+#include <fstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <cstring>
 #include <type_traits>
@@ -168,14 +171,33 @@ std::string Statistics(VkDevice device, VkPipeline pipeline, bool captured) {
 std::mutex module_mutex;
 std::unordered_map<VkShaderModule, u64> module_hashes;
 
+// Level 4: each distinct SPIR-V is written once to logs/spirv/<hash>.spv, for offline compiles
+// (RGA) of the shaders the CSV shows as slow.
+std::unordered_set<u64> dumped_spirv;
+void DumpSpirv(u64 hash, const u32* code, size_t size) {
+    if (Level() < 4) return;
+    {
+        std::scoped_lock lock{module_mutex};
+        if (!dumped_spirv.insert(hash).second) return;
+    }
+    const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "spirv";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    std::ofstream out(dir / fmt::format("{:016x}.spv", hash), std::ios::binary);
+    out.write(reinterpret_cast<const char*>(code), static_cast<std::streamsize>(size));
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL CreateModule(VkDevice device, const VkShaderModuleCreateInfo* info,
                                             const VkAllocationCallbacks* alloc,
                                             VkShaderModule* module) {
     const VkResult result = real_create_module(device, info, alloc, module);
     if (result == VK_SUCCESS && info && info->pCode) {
         const u64 hash = XXH3_64bits(info->pCode, info->codeSize);
-        std::scoped_lock lock{module_mutex};
-        module_hashes[*module] = hash;
+        {
+            std::scoped_lock lock{module_mutex};
+            module_hashes[*module] = hash;
+        }
+        DumpSpirv(hash, info->pCode, info->codeSize);
     }
     return result;
 }
@@ -193,6 +215,7 @@ std::string StageHashes(const VkPipelineShaderStageCreateInfo* infos, u32 count)
                        FindInChain(s.pNext, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO));
                    inline_code && inline_code->pCode) {
             hash = XXH3_64bits(inline_code->pCode, inline_code->codeSize);
+            DumpSpirv(hash, inline_code->pCode, inline_code->codeSize);
         }
         out += fmt::format("{}{}={:016x}", i ? ";" : "", StageName(s.stage), hash);
         if (s.pSpecializationInfo && s.pSpecializationInfo->dataSize) {
@@ -474,7 +497,7 @@ VkResult CreateLogged(VkDevice device, VkPipelineCache cache, u32 count, const C
         std::max<u32>(count, 1);
     // Level 3: build each whole pipeline a second time at once with the same cache. If even
     // this repeat misses, the driver does not keep whole pipelines in the application cache.
-    if (Level() >= 3 && result == VK_SUCCESS && destroy_pipeline) {
+    if (Level() == 3 && result == VK_SUCCESS && destroy_pipeline) {
         for (u32 i = 0; i < count; ++i) {
             if (kinds[i] != whole_kind || theirs[i]) continue;
             VkPipelineCreationFeedback repeat_whole{};
