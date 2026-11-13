@@ -16,14 +16,29 @@ inline RegionMergeDisposition RegionMergePolicy(bool valid, bool, std::uint64_t,
 template <class Map, class Validate, class Allocate, class Removed>
 RegionMergeDisposition ReplaceOverlappingRegions(Map& regions, std::uint64_t& begin,
     std::uint64_t& end, bool write, std::uint64_t write_size, std::uint64_t max_size,
-    Validate validate, Allocate allocate, Removed removed) {
+    Validate validate, Allocate allocate, Removed removed, std::uint64_t grow_slack = 0) {
+    bool grows = false;
     for (const auto& [base, region] : regions) {
         if (region.begin < end && region.end > begin) {
             begin = std::min(begin, region.begin);
             end = std::max(end, region.end);
+            grows = true;
         }
     }
-    const auto action = RegionMergePolicy(validate(begin, end), write, write_size, max_size);
+    bool valid = validate(begin, end);
+    // PERF-GTS-369: a region that grows gets room past the asked end (up to its size and
+    // grow_slack, short of the next region), so the next bind just past it needs no new one.
+    // GT Sport's race start grew one region 16 -> 181 MB in about 20 rebuilds, each a new
+    // buffer, a copy of the old one and its pages watched again.
+    if (valid && grows && grow_slack != 0) {
+        std::uint64_t padded = end + std::min(grow_slack, end - begin);
+        if (padded - begin > max_size) padded = begin + max_size;
+        for (const auto& [base, region] : regions) {
+            if (region.begin >= end && region.begin < padded) padded = region.begin;
+        }
+        if (padded > end && validate(begin, padded)) end = padded;
+    }
+    const auto action = RegionMergePolicy(valid, write, write_size, max_size);
     if (action == RegionMergeDisposition::Preserve) return action;
     if (action == RegionMergeDisposition::Replace && !allocate(begin, end))
         return RegionMergeDisposition::Preserve;

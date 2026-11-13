@@ -4849,6 +4849,18 @@ NativeRenderer::Region* NativeRenderer::RegionOver(VAddr address, u64 size) {
     return nullptr;
 }
 
+namespace {
+// PERF-GTS-369: room a growing region gets past the asked end; RYGT_REGION_GROW_MB (default 64,
+// 0 = off, the old exact size).
+u64 RegionGrowSlack() {
+    static const u64 slack = [] {
+        const char* env = std::getenv("RYGT_REGION_GROW_MB");
+        return u64(env && *env ? std::strtoull(env, nullptr, 10) : 64) * 1_MB;
+    }();
+    return slack;
+}
+} // namespace
+
 NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool write) {
     auto* direct = r.buffer_cache.GetDirectMemory();
     // The new region takes in every region it overlaps (their GPU-written contents kept).
@@ -4888,7 +4900,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
                 retired_watch_ranges.emplace_back(old.begin, old.end);
                 merged.push_back(std::move(old));
                 ++regions_taken_in;
-        });
+        }, RegionGrowSlack());
         if (action == Native::RegionMergeDisposition::Preserve) return nullptr;
     }
     ++buffer_generation; // OPT-003: regions are taken in or made
