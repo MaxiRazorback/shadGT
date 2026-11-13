@@ -5963,10 +5963,17 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         UNREACHABLE_MSG("native region refresh allocation failed");
         return;
     }
+    // PERF-GTS-390: the pages are read into ordinary memory, compared there and written to the
+    // upload memory once. They were read into the upload memory and compared from it, 16 bytes
+    // a memcmp call (256 calls a page): upload memory is mapped for writing only, and with
+    // RYGT_NATIVE_UPLOAD_VRAM=1 reading it reads video memory back, uncached. 1.75% of the
+    // recorder's CPU time in a race at Tokyo was in those calls, from dispatches alone. The
+    // bytes compared and uploaded are the same as before.
+    const auto cpu_copy = std::make_unique_for_overwrite<u8[]>(pages.size() * 4096);
     for (size_t i = 0; i < pages.size(); ++i) {
         if (refresh[i].remapped) continue;
         const u64 bytes = std::min<u64>(4096, region.end - pages[i]);
-        if (!Core::RytyMemory::GuardedCopy(refresh[i].mapped,
+        if (!Core::RytyMemory::GuardedCopy(cpu_copy.get() + i * 4096,
                 reinterpret_cast<const void*>(pages[i]), bytes)) {
             UNREACHABLE_MSG("native region refresh cannot safely read guest page");
             return;
@@ -6014,11 +6021,12 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
     for (size_t i = 0; i < pages.size(); ++i) {
         if (refresh[i].remapped) continue;
         const u64 bytes = std::min<u64>(4096, region.end - pages[i]);
-        if (!Core::RytyMemory::GuardedCopy(refresh[i].mapped,
+        if (!Core::RytyMemory::GuardedCopy(cpu_copy.get() + i * 4096,
                 reinterpret_cast<const void*>(pages[i]), bytes)) {
             UNREACHABLE_MSG("native region refresh cannot safely read guest page");
             return;
         }
+        std::memcpy(refresh[i].mapped, cpu_copy.get() + i * 4096, bytes); // PERF-GTS-390
     }
     for (auto& page : refresh) {
         for (auto& part : page.whole) s.imported_view_leases.push_back(part.lease);
@@ -6080,7 +6088,7 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         };
         if (refresh[i].remapped) { copy_imported(page, refresh[i].whole); copy_downloads(); continue; }
         if (opened_ahead[i] && !was_recent && !before) { copy_downloads(); continue; }
-        const u8* now = refresh[i].mapped;
+        const u8* now = cpu_copy.get() + i * 4096; // PERF-GTS-390: not the upload memory
         if (force_whole || !before || (NativeRegionWritebackEnabled() && !opened_ahead[i] &&
                                       (!was_recent || (!gpu_wrote && !compare_all)))) {
             copy_snapshot(i, page, page_bytes);
@@ -6091,9 +6099,21 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         constexpr u64 Piece = 16;
         u64 run_begin = 0, run_end = 0, changed = 0;
         bool in_run = false;
-        for (u64 at = 0; at < page_bytes; at += Piece) {
+        // PERF-GTS-390: a page that did not change is found with one compare; a whole piece is
+        // compared as two 64-bit words, not with a memcmp call. The runs found are the same.
+        const bool page_same = std::memcmp(now, before->data(), page_bytes) == 0;
+        const auto piece_same = [&](u64 at, u64 n) {
+            if (n != Piece) {
+                return std::memcmp(now + at, before->data() + at, n) == 0;
+            }
+            std::array<u64, 2> a, b;
+            std::memcpy(a.data(), now + at, Piece);
+            std::memcpy(b.data(), before->data() + at, Piece);
+            return ((a[0] ^ b[0]) | (a[1] ^ b[1])) == 0;
+        };
+        for (u64 at = 0; !page_same && at < page_bytes; at += Piece) {
             const u64 n = std::min(Piece, page_bytes - at);
-            if (std::memcmp(now + at, before->data() + at, n) == 0) {
+            if (piece_same(at, n)) {
                 continue;
             }
             if (in_run && at - run_end < 64) {
