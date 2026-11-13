@@ -4799,8 +4799,9 @@ vk::DescriptorPool NativeRenderer::TakeDescriptorPool() {
         if (reset) std::ignore = vk_device.resetDescriptorPool(ready);
         return ready;
     }
-    static constexpr std::array<vk::DescriptorPoolSize, 4> sizes{{
+    static constexpr std::array<vk::DescriptorPoolSize, 5> sizes{{
         {vk::DescriptorType::eStorageBuffer, 8192},
+        {vk::DescriptorType::eStorageBufferDynamic, 8192}, // PERF-GTS-374
         {vk::DescriptorType::eSampledImage, 8192},
         {vk::DescriptorType::eStorageImage, 1024},
         {vk::DescriptorType::eSampler, 4096},
@@ -10988,6 +10989,20 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
     static thread_local boost::container::small_vector<vk::WriteDescriptorSet, 64> updates;
     updates.clear();
     std::array<vk::DescriptorSet, Shader::Backend::MaxDescriptorSets> sets{};
+    // PERF-GTS-374: a dynamic set's offsets (by binding), the infos its new set is written
+    // with (offset 0) and its key without the offsets.
+    static thread_local std::array<boost::container::static_vector<u32, 96>,
+                                   Shader::Backend::MaxDescriptorSets> dynamic_offsets;
+    static thread_local std::vector<vk::DescriptorBufferInfo> dynamic_infos;
+    static thread_local std::vector<u64> dynamic_key;
+    for (auto& offsets : dynamic_offsets) {
+        if (!offsets.empty()) offsets.clear();
+    }
+    dynamic_infos.clear();
+    dynamic_infos.reserve(512);
+    const auto dynamic_offset_fits = [](const vk::DescriptorBufferInfo& info) {
+        return info.buffer && info.range != VK_WHOLE_SIZE && info.offset <= 0xFFFFFFFFull;
+    };
     PendingDescriptorUpdates* pending=parallel_binding_capture && pending_owner ? &pending_owner->descriptor_updates : nullptr;
     bool deferred=false;u64 staged_before=0;
     if(pending) {
@@ -11036,14 +11051,39 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         const bool key_changed = prepared_key.RefreshBuffers<false>();
         const auto& key = prepared_key.words;
         const bool cacheable = prepared_key.cacheable;
-        const std::span<const u64> descriptor_key{key.data(), key.size()};
+        std::span<const u64> descriptor_key{key.data(), key.size()};
         if (cacheable && key_changed) {
             prepared_key.hash = Native::Parallel::AdaptiveXXH3(key.data(), key.size() * sizeof(u64));
             NATIVE_DIAGNOSTIC(++descriptor_hash_refreshed);
         } else if (cacheable) {
             NATIVE_DIAGNOSTIC(++descriptor_hash_reused);
         }
-        const u64 key_hash = cacheable ? prepared_key.hash : 0;
+        u64 key_hash = cacheable ? prepared_key.hash : 0;
+        const u32 dynamic_buffers = pipeline.DynamicBuffers(index);
+        if (dynamic_buffers != 0) {
+            // PERF-GTS-374: the offsets go to the bind; the set is looked up without them.
+            auto& offsets = dynamic_offsets[index];
+            offsets.assign(dynamic_buffers, 0u);
+            if (cacheable) dynamic_key.assign(key.begin(), key.end());
+            size_t patch = 0;
+            for (const auto& write : writes) {
+                if (!write.pBufferInfo) continue;
+                for (u32 n = 0; n < write.descriptorCount; ++n, ++patch) {
+                    const auto& info = write.pBufferInfo[n];
+                    const u32 slot = write.dstBinding + n;
+                    if (slot >= dynamic_buffers || !dynamic_offset_fits(info)) continue;
+                    offsets[slot] = static_cast<u32>(info.offset);
+                    if (cacheable && patch < prepared_key.buffers.size()) {
+                        dynamic_key[prepared_key.buffers[patch].word + 1] = 0;
+                    }
+                }
+            }
+            if (cacheable) {
+                descriptor_key = std::span<const u64>{dynamic_key.data(), dynamic_key.size()};
+                key_hash = Native::Parallel::AdaptiveXXH3(dynamic_key.data(),
+                                                         dynamic_key.size() * sizeof(u64));
+            }
+        }
         // DIAG-GTS-373 (RYGT_DIAG_DESCRIPTOR_REUSE=1): what dynamic buffer offsets would buy.
         // Counts only; nothing recorded changes.
         static const bool reuse_diag = [] {
@@ -11152,6 +11192,28 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         trace.Next(5);
         if(deferred)pending->Stage(writes,set);
         else Native::AppendDescriptorUpdates(writes,set,updates);
+        if (dynamic_buffers != 0 && !deferred) {
+            // PERF-GTS-374: written as dynamic buffers at offset 0 (the bind gives the offset).
+            for (size_t u = updates.size() - writes.size(); u < updates.size(); ++u) {
+                auto& update = updates[u];
+                if (!update.pBufferInfo ||
+                    update.descriptorType != vk::DescriptorType::eStorageBuffer) {
+                    continue;
+                }
+                update.descriptorType = vk::DescriptorType::eStorageBufferDynamic;
+                const size_t first = dynamic_infos.size();
+                ASSERT_MSG(first + update.descriptorCount <= dynamic_infos.capacity(),
+                           "PERF-GTS-374: more buffer writes than reserved");
+                for (u32 n = 0; n < update.descriptorCount; ++n) {
+                    auto info = update.pBufferInfo[n];
+                    if (update.dstBinding + n < dynamic_buffers && dynamic_offset_fits(info)) {
+                        info.offset = 0;
+                    }
+                    dynamic_infos.push_back(info);
+                }
+                update.pBufferInfo = dynamic_infos.data() + first;
+            }
+        }
         trace.Next(7);
         if (cacheable) s.descriptor_sets.Store(key_hash, descriptor_key, set);
         sets[index] = set;
@@ -11240,6 +11302,15 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
             else if (reuse) s.binding_commands.ForgetSet(index);
         },
         [&](u32 index,vk::DescriptorSet set) {
+            if (const auto& offsets = dynamic_offsets[index]; !offsets.empty()) {
+                // PERF-GTS-374: the same set with other offsets is another binding.
+                flush_bind_run();
+                trace.Next(8);
+                cmdbuf.bindDescriptorSets(bind_point, pipeline.GetLayout(), index, set,
+                    vk::ArrayProxy<const u32>{static_cast<u32>(offsets.size()), offsets.data()});
+                if (reuse) s.binding_commands.ForgetSet(index);
+                return;
+            }
             if (reuse && s.binding_commands.SameSet(index, set)) return;
             if (bind_count && index != bind_first + bind_count) flush_bind_run();
             if (!bind_count) bind_first = index;
