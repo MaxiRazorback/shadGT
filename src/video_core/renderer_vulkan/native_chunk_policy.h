@@ -9,7 +9,7 @@
 namespace Vulkan {
 inline std::uint64_t NativeChunkBytes(const char* value) {
     constexpr std::uint64_t mb = 1024 * 1024;
-    if (!value || !*value) return mb;
+    if (!value || !*value) return 64 * mb; // PERF-GTS-407: 64 MB unless set
     std::uint64_t count{};
     const auto end = value + std::strlen(value);
     const auto result = std::from_chars(value, end, count);

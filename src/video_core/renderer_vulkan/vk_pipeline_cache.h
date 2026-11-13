@@ -62,6 +62,9 @@ class DataBase;
 }
 
 namespace Vulkan {
+/// FIX-GTS-361: counts guest unmaps (Rasterizer::UnmapMemory), so addresses checked as mapped
+/// before one are checked again.
+inline std::atomic<u64> g_guest_unmaps{0};
 #ifndef NDEBUG
 class ReadAheadKeyTrace;
 #endif

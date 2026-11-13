@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <boost/container/small_vector.hpp>
+#include "ryty_gpu/native/descriptor_dead_handles.h"
 #include <boost/container/static_vector.hpp>
 #include "video_core/renderer_vulkan/descriptor_write_groups.h"
 #include "ryty_gpu/native/descriptor_update_batch.h"
@@ -20,7 +21,14 @@ Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorH
     : instance{instance_}, scheduler{scheduler_}, desc_heap{desc_heap_}, profile{profile_},
       is_compute{is_compute_} {}
 
-Pipeline::~Pipeline() = default;
+Pipeline::~Pipeline() {
+    // PERF-GTS-375: sets kept across lists were allocated with these layouts.
+    for (const auto& layout : desc_layouts) {
+        if (layout) {
+            Native::DeadHandles::Note(static_cast<VkDescriptorSetLayout>(*layout));
+        }
+    }
+}
 
 void Pipeline::BindResources(DescriptorWrites& set_writes, const WriteSets& write_sets,
                              const Shader::PushData& push_data) const {

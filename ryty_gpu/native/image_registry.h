@@ -136,6 +136,8 @@ public:
     std::atomic<bool> gpu_backing_written{false};
     bool from_cpu = false; ///< texture data the CPU wrote; render targets are GPU-only
     std::atomic<bool> needs_upload{false};
+    /// PERF-GTS-384: the frame of its last upload (see ImageRegistry::UploadDue).
+    std::atomic<u64> upload_frame{UINT64_MAX};
     std::atomic<u64> last_use{0};
     /// FIX-157: the frame it was made (how long a picture has been in use). A picture the GPU
     /// wrote is `kept` past its idle time while nothing else wrote its memory (its pages are
@@ -210,7 +212,7 @@ std::string WatchedBytes(VAddr address);
 struct DownloadBatch {
     struct Tiling {
         const Rhi::Pipeline* pipeline;
-        std::unique_ptr<Rhi::Buffer> params;
+        const Rhi::Buffer* params; ///< the picture's own (PERF-GTS-370)
         const Rhi::Buffer* out;
         u64 out_offset;
         u64 size;
@@ -293,6 +295,12 @@ public:
     /// OPT-010: whether no picture was made or dropped over any of the ranges since generation
     /// `since` (false when the log of changes no longer reaches back that far).
     bool Untouched(u64 since, std::span<const std::pair<VAddr, VAddr>> ranges);
+    /// PERF-GTS-404: as Untouched, for work that holds pictures by pointer: an eviction
+    /// counts only when it took a picture whose own range (address and size) is one of
+    /// `held`, the ranges of the pictures held. A picture made or reused over `ranges`
+    /// counts as before. `held` must have every held picture's own range.
+    bool UntouchedHolding(u64 since, std::span<const std::pair<VAddr, VAddr>> ranges,
+                          std::span<const std::pair<VAddr, VAddr>> held);
 
     /// OPT-002: changes whenever a picture is made or dropped (what Find returns may change).
     u64 Generation() const {
@@ -347,9 +355,35 @@ public:
     /// NAT-120: uploads the image from guest memory before its next use.
     // Admission happens on actual image use, not on each intermediate streaming write.
     // Duplicate requests are harmless: RecordUploads atomically consumes needs_upload.
+    /// PERF-GTS-384 (RYGT_UPLOAD_ONCE_A_FRAME=1): whether a stale texture is uploaded at this
+    /// use. GT Sport streams a track's 4096x4096 textures (21 MB with their mips) in while draws
+    /// already sample them: each write made the texture stale and the next draw uploaded all of
+    /// it again, up to four times a frame (85 MB), in frames of 45 to 57 ms. A large texture
+    /// the CPU wrote is now uploaded at most once a frame; one written again after that stays
+    /// stale and is uploaded at its first use in the next frame. GPU writes and unmaps (forced
+    /// uploads) are not held back.
+    bool UploadDue(const ImageEntry& entry) const {
+        if (!entry.needs_upload.load(std::memory_order_acquire)) {
+            return false;
+        }
+        static const bool once_a_frame = [] {
+            const char* env = std::getenv("RYGT_UPLOAD_ONCE_A_FRAME");
+            return !env || !*env || env[0] == '1'; // PERF-GTS-407: on unless set to something else
+        }();
+        if (!once_a_frame || !entry.from_cpu || entry.info.guest_size < (4ull << 20) ||
+            entry.force_upload.load(std::memory_order_relaxed)) {
+            return true;
+        }
+        return entry.upload_frame.load(std::memory_order_relaxed) !=
+               upload_frame_now.load(std::memory_order_relaxed);
+    }
+    /// The frame being recorded (the renderer tells before it asks for uploads).
+    void SetUploadFrame(u64 frame) {
+        upload_frame_now.store(frame, std::memory_order_relaxed);
+    }
+    std::atomic<u64> upload_frame_now{0};
     void QueueUploadForUse(ImageEntry& entry) {
-        if (entry.from_cpu &&
-            entry.needs_upload.load(std::memory_order_acquire)) {
+        if (entry.from_cpu && UploadDue(entry)) {
             std::scoped_lock lock{upload_mutex};
             pending_uploads.push_back(&entry);
         }
@@ -480,12 +514,22 @@ private:
         u64 generation = 0;
         VAddr begin = 0;
         VAddr end = 0;
+        u8 kind = 0; ///< DIAG-GTS-401: 1 a picture made, 2 pictures evicted, 3 a picture reused
     };
     std::mutex changes_mutex;
     std::array<Change, 1024> changes{};
     u64 change_count = 0;
     /// Logs the ranges, then moves the generation on.
-    void NoteChanges(std::span<const std::pair<VAddr, VAddr>> ranges);
+    void NoteChanges(std::span<const std::pair<VAddr, VAddr>> ranges, u8 kind = 0);
+
+public:
+    /// DIAG-GTS-401: why Untouched said no: a change of that kind over the ranges, or the log
+    /// no longer reaching back to `since` (index 0).
+    std::array<std::atomic<u64>, 4> untouched_no{};
+    /// DIAG-GTS-402: where the change that last made Untouched say no began.
+    std::atomic<u64> untouched_no_begin{0};
+
+private:
     // Recorder-only scratch shared by sequential untile dispatch/copy pairs.
     std::unique_ptr<Rhi::Buffer> upload_scratch;
     std::unique_ptr<Rhi::Buffer> upload_gather_scratch;

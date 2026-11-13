@@ -2176,6 +2176,45 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             break;
         }
     }
+    // PERF-GTS-374 (RYGT_DYNAMIC_BUFFER_OFFSETS=1, native mode): the sets that are not pushed
+    // take their buffers with dynamic offsets. A race draw's buffers sit at new offsets each
+    // time (its constants are copied to fresh upload memory), so with the offset in the
+    // descriptor nearly every draw made and wrote new sets (5% reused); with it given at the
+    // bind, 42% match a set of the same list and 93% one of the last 10 s (DIAG-GTS-373).
+    // All or nothing for a pipeline: the device limits dynamic storage buffers per layout.
+    set_dynamic_buffers = {};
+#ifdef RYTY_GPU
+    static const bool dynamic_requested = [] {
+        const char* env = std::getenv("RYGT_DYNAMIC_BUFFER_OFFSETS");
+        // PERF-GTS-407: on unless set to something else
+        return (!env || !*env || env[0] == '1') && NativeModeRequested();
+    }();
+    if (dynamic_requested) {
+        static const u32 dynamic_limit = instance.GetPhysicalDevice()
+                                             .getProperties()
+                                             .limits.maxDescriptorSetStorageBuffersDynamic;
+        std::array<u32, Shader::Backend::MaxDescriptorSets> counts{};
+        u32 total = 0;
+        for (u32 set = 0; set < set_bindings.size(); ++set) {
+            if (set == push_set) continue;
+            for (const auto& binding : set_bindings[set]) {
+                counts[set] += binding.descriptorType == vk::DescriptorType::eStorageBuffer;
+            }
+            total += counts[set];
+        }
+        if (total != 0 && total <= dynamic_limit) {
+            for (u32 set = 0; set < set_bindings.size(); ++set) {
+                if (counts[set] == 0 || counts[set] > 255) continue;
+                for (auto& binding : set_bindings[set]) {
+                    if (binding.descriptorType == vk::DescriptorType::eStorageBuffer) {
+                        binding.descriptorType = vk::DescriptorType::eStorageBufferDynamic;
+                    }
+                }
+                set_dynamic_buffers[set] = static_cast<u8>(counts[set]);
+            }
+        }
+    }
+#endif
     const vk::Device device = instance.GetDevice();
     num_sets = 0;
     set_layout_hashes = {};

@@ -5,7 +5,8 @@
 
 TEST(NativeChunkPolicy, DefaultsOverridesAndBoundedRegionSteps) {
     constexpr std::uint64_t mb = 1024 * 1024;
-    EXPECT_EQ(Vulkan::NativeChunkBytes(nullptr), mb);
+    EXPECT_EQ(Vulkan::NativeChunkBytes(nullptr), 64 * mb);
+    EXPECT_EQ(Vulkan::NativeChunkBytes(""), 64 * mb);
     EXPECT_EQ(Vulkan::NativeChunkBytes("0"), mb);
     EXPECT_EQ(Vulkan::NativeChunkBytes("-1"), mb);
     EXPECT_EQ(Vulkan::NativeChunkBytes("8junk"), mb);

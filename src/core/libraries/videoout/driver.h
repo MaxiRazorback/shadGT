@@ -139,6 +139,8 @@ private:
     std::queue<Request> requests;
     // PERF-111: EOP flips requested and not shown yet.
     std::atomic<s32> eop_flips_in_flight{0};
+    /// PERF-GTS-410: flips queued in `requests` now (read without the mutex for pacing).
+    std::atomic<u32> request_depth{0};
     std::mutex pace_mutex;
     std::condition_variable pace_cv;
 };

@@ -16,6 +16,7 @@
 #include "ryty_gpu/native/linear_image_download.h"
 #include "ryty_gpu/native/parallel_direct_capability.h"
 #include "ryty_gpu/native/parallel_gate_histogram.h"
+#include "ryty_gpu/native/descriptor_dead_handles.h"
 #include "core/emulator_settings.h"
 #include "ryty_gpu/native/parallel_rotate_segment.h"
 #include "ryty_gpu/native/natural_scope_boundary.h"
@@ -268,6 +269,9 @@ namespace {
 // consume immutable pass packets and RHI device/instance handles.
 struct ParallelBindingCapture {
     std::array<vk::DescriptorSet,Shader::Backend::MaxDescriptorSets> sets{};
+    // FIX-GTS-394: as Native::Parallel::Draw's.
+    std::array<u8,Shader::Backend::MaxDescriptorSets> dynamic_counts{};
+    boost::container::static_vector<u32,128> dynamic_offsets{};
     AheadLease* ahead{};bool ahead_used{},write_structure_proven{},counts_proven{};
     std::size_t ordinary_writes{},ordinary_buffers{},ordinary_images{};
 };
@@ -2276,7 +2280,12 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
                                                            Native::Rhi::BufferUsageTransferSrc |
                                                            Native::Rhi::BufferUsageTransferDst,
                                                   .memory = Native::Rhi::MemoryKind::Upload,
-                                                  .name = "native upload copy"});
+                                                  .name = "native upload copy",
+                                                  // PERF-GTS-362: each copy was a new
+                                                  // dedicated allocation and its own free;
+                                                  // meeting another thread's in the driver,
+                                                  // either took ~100 ms and held the frame.
+                                                  .recycle = true});
                 if (copy && copy->Mapped() &&
                     Core::RytyMemory::GuardedCopy(copy->Mapped(),
                                                   reinterpret_cast<const void*>(address), size)) {
@@ -2532,6 +2541,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
     }
 }
 
+static bool ParallelRingOn(); // PERF-GTS-399, below
 NativeRenderer::~NativeRenderer() {
     auto expected_observer = one_off_observer;
     g_one_off_observer.compare_exchange_strong(expected_observer, {}, std::memory_order_acq_rel);
@@ -2577,6 +2587,10 @@ NativeRenderer::~NativeRenderer() {
     if (stream.list) Splice();
     // Snapshot owners also need GPU retirement when direct imports are unavailable.
     r.scheduler.Finish();
+    if (ParallelRingOn()) { // PERF-GTS-399: as without parallel recording, above
+        ApplyRingPriority(false);
+        r.scheduler.SyncCommandThread();
+    }
     retired_pipeline_owners.ClearAfterGpuIdle();
     stream.writeback_plan_leases.clear();
     retired_writeback_plans.ClearAfterGpuIdle();
@@ -2732,6 +2746,8 @@ void NativeRenderer::SpliceHudStream(u64 tick) {
     }
     s.pooled_snapshots.clear();
     s.keep.clear();
+    s.gathers.clear(); // PERF-GTS-365: they went with the list
+    s.gather_max = 0;
     s.list = nullptr;
     s.cmd = CmdBuf{};
     ++s.serial;        // OPT-015: the list's upload memory retires with it
@@ -3228,18 +3244,55 @@ void NativeRenderer::ApplyRingPriority(bool enabled) {
     }
 }
 
+// PERF-GTS-399 (RYGT_PARALLEL_RING=1, with RYGT_PARALLEL_RECORDING=1): the recorder's own lists
+// go through the command ring with parallel recording too. The ring was off in that mode, so
+// every command the recorder still records itself was a driver call on its thread (13% of its
+// CPU time in a race at Tokyo, the command thread at 12% of a core): the pass code took raw
+// handles of the recorder's lists (the list after a pass, a pass the recorder records itself,
+// the lists run at a splice), which a ring-recorded list does not have on this thread. Those
+// now take the list's command stream. The pass workers' own lists stay raw; they are run in
+// order by commands the recorder puts on the ring once the workers have ended them.
+static bool ParallelRingOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_PARALLEL_RING");
+        return env && env[0] == '1' && env[1] == '\0' && ParallelRecordingRequested();
+    }();
+    return on;
+}
+
+Native::Rhi::CommandList* NativeRenderer::AcquireReplacementList() {
+    if (ParallelRingOn() && RingEnabled() && !Native::GpuCheckpoints::Requested() &&
+        !Scheduler::ThreadRing()) {
+        if (CommandRing* ring = r.scheduler.CommandThreadRing()) {
+            if (auto* list = device->AcquireDeferredCommandList(ring)) {
+                return list;
+            }
+        }
+    }
+    return device->AcquireCommandList(Native::Rhi::CommandListLevel::Secondary);
+}
+
+CmdBuf NativeRenderer::StreamCmdOf(Native::Rhi::CommandList& list) const {
+    if (const auto* slot = list.NativeHandleSlot()) {
+        return CmdBuf{r.scheduler.CommandThreadRing(),
+                      reinterpret_cast<const vk::CommandBuffer*>(slot)};
+    }
+    return CmdBuf{vk::CommandBuffer{Handle<VkCommandBuffer_T>(list.NativeHandle())}};
+}
+
 void NativeRenderer::AcquireList(Stream& s) {
     const bool enabled = RingEnabled();
     static const bool logged = [enabled] {
         if (enabled && ParallelRecordingRequested())
-            LOG_INFO(Render_Vulkan, "Native command ring disabled while parallel recording is requested");
+            LOG_INFO(Render_Vulkan, "Native command ring {} while parallel recording is requested",
+                     ParallelRingOn() ? "kept on (RYGT_PARALLEL_RING=1)" : "disabled");
         return true;
     }();
     (void)logged;
     // ImageRegistry's optional checkpoint path records a raw Vulkan handle.
     // Keep that diagnostic on the direct path until it can enqueue its markers.
-    if (enabled && !ParallelRecordingRequested() && !Native::GpuCheckpoints::Requested() &&
-        !Scheduler::ThreadRing()) {
+    if (enabled && (!ParallelRecordingRequested() || ParallelRingOn()) &&
+        !Native::GpuCheckpoints::Requested() && !Scheduler::ThreadRing()) {
         if (CommandRing* ring = r.scheduler.CommandThreadRing()) {
             if (auto* list = device->AcquireDeferredCommandList(ring)) {
                 ApplyRingPriority(true);
@@ -3699,7 +3752,7 @@ void NativeRenderer::EndRendering(u32 reason, [[maybe_unused]] std::source_locat
             sidecar->coordinator->FinishStream(ticket);
             stream.list=sidecar->coordinator->StreamReplacement(ticket);
             ASSERT_MSG(stream.list,"stream replacement command list missing");
-            stream.cmd=CmdBuf{vk::CommandBuffer{reinterpret_cast<VkCommandBuffer>(stream.list->NativeHandle())}};
+            stream.cmd=StreamCmdOf(*stream.list); // PERF-GTS-399
             stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;
             sidecar->sync_pins.Queued(sidecar->pin_slot);
             NATIVE_DIAGNOSTIC(++sidecar->queued);
@@ -3716,16 +3769,15 @@ void NativeRenderer::EndRendering(u32 reason, [[maybe_unused]] std::source_locat
         bool queued=false;
         if((pass.draws.size()>=8 || ParallelSmallPassBatchEnabled()) && !sidecar->closing) {
             const auto reset=[&]() noexcept {stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;};
-            auto direct_cmd = stream.cmd.Direct();
             if(Native::Parallel::RotateSegment(*sidecar->coordinator,*device,sidecar->epoch,
-                    stream.list,direct_cmd,sidecar->lease,64*1024,reset,
+                    stream.list,[this]{return AcquireReplacementList();},sidecar->lease,64*1024,reset,
 #if !defined(NDEBUG)
                     &sidecar->rotation_diag
 #else
                     nullptr
 #endif
                     )) {
-                stream.cmd = CmdBuf{direct_cmd};
+                stream.cmd = StreamCmdOf(*stream.list); // PERF-GTS-399
                 std::size_t bytes=sizeof(pass)+pass.draws.capacity()*sizeof(Native::Parallel::Draw);
                 for(const auto& draw:pass.draws) bytes+=draw.descriptor_bytes;
                 try {queued=pass.draws.size()>=8 ? (sidecar->transfer_applied_mode.Enabled() ? sidecar->coordinator->TryPassTransfer(sidecar->epoch,pass,bytes) : sidecar->coordinator->TryPass(sidecar->epoch,pass,bytes)) : sidecar->coordinator->TrySmallPass(sidecar->epoch,pass,bytes);}
@@ -3734,7 +3786,7 @@ void NativeRenderer::EndRendering(u32 reason, [[maybe_unused]] std::source_locat
         }
         if(queued) {NATIVE_DIAGNOSTIC(++sidecar->queued);sidecar->sync_pins.Queued(sidecar->pin_slot);} else {
             NATIVE_DIAGNOSTIC(++sidecar->synchronous);
-            ASSERT_MSG(Native::Parallel::RecordPass(stream.cmd.Direct(),r.instance,pass),"parallel pass synchronous fallback failed");
+            ASSERT_MSG(Native::Parallel::RecordPass(stream.cmd,r.instance,pass),"parallel pass synchronous fallback failed");
             ASSERT_MSG(sidecar->sync_pins.Tag(sidecar->pin_slot,sidecar->epoch),"parallel synchronous owner pin failed");
             stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;
         }
@@ -3771,7 +3823,7 @@ bool NativeRenderer::ContinueSmallParallelPass(const RenderState& target,u32 rea
     NATIVE_DIAGNOSTIC(++sidecar->pass_size_hist[std::min<std::size_t>(8,draws)]);
     u64 begin=0,end=0;const bool timed=ParallelGateDiagEnabled() && DescriptorThreadCpu100ns(begin);
     vk::Pipeline last{};
-    ASSERT_MSG(Native::Parallel::RecordPassInline(stream.cmd.Direct(),r.instance,pass,stream.dynamic,last),
+    ASSERT_MSG(Native::Parallel::RecordPassInline(stream.cmd,r.instance,pass,stream.dynamic,last),
                "parallel pass inline continuation failed");
     ASSERT_MSG(sidecar->sync_pins.Tag(sidecar->pin_slot,sidecar->epoch),"parallel synchronous owner pin failed");
     NATIVE_DIAGNOSTIC(++sidecar->synchronous);NATIVE_DIAGNOSTIC(++sidecar->inline_continuations);
@@ -4453,6 +4505,7 @@ void NativeRenderer::FlushWritebacks() {
                         const VAddr begin = std::max(from, region.begin), end = std::min(to, region.end);
                         for (VAddr page = Common::AlignDown(begin, 4096); begin < end && page < end; page += 4096) {
                             region.dirty_pages.push_back(page);
+                            diag_region_marks[3].fetch_add(1, std::memory_order_relaxed); // DIAG-GTS-411
                             Native::AddPageDownloadRange(downloaded_ranges[page], std::max(begin, page),
                                                          std::min(end, page + 4096));
                         }
@@ -4513,6 +4566,7 @@ void NativeRenderer::FlushWritebacks() {
                     const VAddr to = std::min(address + size, region.end);
                     for (VAddr page = Common::AlignDown(from, 4096); from < to && page < to; page += 4096) {
                         region.dirty_pages.push_back(page);
+                        diag_region_marks[4].fetch_add(1, std::memory_order_relaxed); // DIAG-GTS-411
                         Native::AddPageDownloadRange(downloaded_ranges[page], std::max(from, page),
                                                      std::min(to, page + 4096));
                     }
@@ -4558,9 +4612,10 @@ void NativeRenderer::PrepareImages(std::span<const Native::ImageEntry* const> bo
         {"pending-init-lock", "pending-upload-lock", "end-rendering", "initialize", "global-barrier", "uploads"}};
     const bool init = device->PendingImageInit();
     trace.Next(1);
+    registry->SetUploadFrame(frame); // PERF-GTS-384
     // PERF-109: the stale textures the work uses, with the uploads queued.
-    const bool bound_stale = std::ranges::any_of(bound, [](const Native::ImageEntry* entry) {
-        return entry && entry->from_cpu && entry->needs_upload.load(std::memory_order_relaxed);
+    const bool bound_stale = std::ranges::any_of(bound, [&](const Native::ImageEntry* entry) {
+        return entry && entry->from_cpu && registry->UploadDue(*entry);
     });
     const bool uploads = bound_stale || registry->HasPendingUploads();
     if (!init && !uploads) {
@@ -4616,6 +4671,15 @@ void NativeRenderer::ChunkFlushCheck() {
         return std::max<u32>(u32(value), 1u);
     }();
     if (feed_min == 0 || stream.commands < feed_min || (stream.commands & 15) != 0) {
+        return;
+    }
+    // PERF-GTS-397: not while a parallel pass is open. With parallel recording the GPU is
+    // often idle, so this ran every 16 draws: each time the open pass was closed (they
+    // averaged 19 draws of the 64 one holds), the recorder waited for the pass workers
+    // (0.6 s in 10 s at Tokyo), ended its list, submitted and began a new one, without the
+    // command ring: 12,000 to 23,000 lists and 31,000 passes in 10 s. The list is still run
+    // at SpliceAfter commands, and here once the pass has ended.
+    if (const auto* parallel = FindParallelRuntime(this); parallel && parallel->active) {
         return;
     }
     const u64 tick = r.scheduler.CurrentTick();
@@ -4678,13 +4742,19 @@ NativeRenderer::Chunk NativeRenderer::TakeChunk(u64 size) {
     trace.Next(5);
     const auto create = [&] {
         Chunk result;
+        const u64 capacity = UploadChunkCapacity(size, ChunkSize());
         result.buffer = device->CreateBuffer({
-        .size = UploadChunkCapacity(size, ChunkSize()),
+        .size = capacity,
         .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageUniform |
                  Native::Rhi::BufferUsageIndex | Native::Rhi::BufferUsageVertex |
                  Native::Rhi::BufferUsageIndirect | Native::Rhi::BufferUsageTransferSrc,
         .memory = Native::Rhi::MemoryKind::Upload,
         .name = "native upload",
+        // PERF-GTS-363: a chunk made for one large texture (a CPU-staged upload larger than
+        // the standard chunk) took 100 to 145 ms to create, and the chunk cache's 128 MB
+        // budget freed it again before the next large texture: a long frame each time.
+        // Freed, its memory waits in the upload copy pool for the next one of its size.
+        .recycle = capacity > ChunkSize(),
         });
         return result;
     };
@@ -4786,8 +4856,9 @@ vk::DescriptorPool NativeRenderer::TakeDescriptorPool() {
         if (reset) std::ignore = vk_device.resetDescriptorPool(ready);
         return ready;
     }
-    static constexpr std::array<vk::DescriptorPoolSize, 4> sizes{{
+    static constexpr std::array<vk::DescriptorPoolSize, 5> sizes{{
         {vk::DescriptorType::eStorageBuffer, 8192},
+        {vk::DescriptorType::eStorageBufferDynamic, 8192}, // PERF-GTS-374
         {vk::DescriptorType::eSampledImage, 8192},
         {vk::DescriptorType::eStorageImage, 1024},
         {vk::DescriptorType::eSampler, 4096},
@@ -4836,6 +4907,18 @@ NativeRenderer::Region* NativeRenderer::RegionOver(VAddr address, u64 size) {
     return nullptr;
 }
 
+namespace {
+// PERF-GTS-369: room a growing region gets past the asked end; RYGT_REGION_GROW_MB (default 64,
+// 0 = off, the old exact size).
+u64 RegionGrowSlack() {
+    static const u64 slack = [] {
+        const char* env = std::getenv("RYGT_REGION_GROW_MB");
+        return u64(env && *env ? std::strtoull(env, nullptr, 10) : 64) * 1_MB;
+    }();
+    return slack;
+}
+} // namespace
+
 NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool write) {
     auto* direct = r.buffer_cache.GetDirectMemory();
     // The new region takes in every region it overlaps (their GPU-written contents kept).
@@ -4875,7 +4958,7 @@ NativeRenderer::Region* NativeRenderer::MakeRegion(VAddr address, u64 size, bool
                 retired_watch_ranges.emplace_back(old.begin, old.end);
                 merged.push_back(std::move(old));
                 ++regions_taken_in;
-        });
+        }, RegionGrowSlack());
         if (action == Native::RegionMergeDisposition::Preserve) return nullptr;
     }
     ++buffer_generation; // OPT-003: regions are taken in or made
@@ -4989,6 +5072,9 @@ void NativeRenderer::SortRegionWrites() {
                      page += 4096) {
                     region.dirty_pages.push_back(page);
                 }
+                diag_region_marks[5].fetch_add(
+                    (std::min(end, region.end) - std::max(begin, region.begin) + 4095) / 4096,
+                    std::memory_order_relaxed); // DIAG-GTS-411
                 region.dirty_sorted = false;
             }
         }
@@ -5016,6 +5102,7 @@ void NativeRenderer::SortRegionWrites() {
                     dynamic = true;
                     if(mirror_diag && blocked_granule==~u64{0}) {blocked_granule=granule<<16;blocked_age=frame-written->second;}
                     dynamic_granules[granule] = frame;
+                    ++dynamic_strikes[granule]; // PERF-GTS-386 (the mirror goes below: once a drop)
                 }
                 written->second = frame;
             }
@@ -5035,7 +5122,7 @@ void NativeRenderer::SortRegionWrites() {
                 mirror_bytes -= mirror.end - mirror.begin;
                 NATIVE_DIAGNOSTIC(++stats.mirrors_dropped);
                 ++buffer_generation; // OPT-003
-                buffer_log.Note(mirror.begin, mirror.end); // OPT-010
+                buffer_log.Note(mirror.begin, mirror.end, true); // OPT-010
                 retired_watch_ranges.emplace_back(mirror.begin, mirror.end);
                 std::unique_lock map_lock{buffer_map_mutex};
                 it = mirrors.erase(it); // freed once the GPU is done with it
@@ -5087,12 +5174,31 @@ bool NativeRenderer::IsDynamic(VAddr begin, VAddr end, u64* blocked_granule, u64
     if (dynamic_granules.empty()) {
         return false;
     }
+    // PERF-GTS-386 (RYGT_MIRROR_DROP_BACKOFF=1): memory the game keeps rewriting was mirrored
+    // again every 600 frames, written, and dropped again: in a race about 15 mirrors a second
+    // went that way (as many as granules left the list), each drop made the mirrors beside it
+    // anew (up to 1.2 GB of copies in 10 s at Tokyo) and refused the 150 or so prepared draws
+    // over it, 5 to 10% of all draws. Once a mirror is dropped its pages are no longer
+    // watched, so later writes are not seen; instead a dropped granule is read in place for
+    // 3600 frames (a minute at 60 fps), and for 19200 (about five minutes) once it was
+    // dropped a second time. (Doubling from 600 frames took minutes to settle: after 70 s of
+    // a race the drops had only fallen from 150 to 55 in 10 s.)
+    static const bool backoff = [] {
+        const char* env = std::getenv("RYGT_MIRROR_DROP_BACKOFF");
+        return !env || !*env || env[0] == '1'; // PERF-GTS-407: on unless set to something else
+    }();
     for (u64 granule = begin >> 16; granule <= (end - 1) >> 16; ++granule) {
         const auto it = dynamic_granules.find(granule);
         if (it == dynamic_granules.end()) {
             continue;
         }
-        if (frame - it->second < DynamicFrames) {
+        u64 wait = DynamicFrames;
+        if (backoff) {
+            const auto strikes = dynamic_strikes.find(granule);
+            wait = strikes != dynamic_strikes.end() && strikes->second > 1 ? DynamicFrames * 32
+                                                                            : DynamicFrames * 6;
+        }
+        if (frame - it->second < wait) {
             if(blocked_granule)*blocked_granule=granule << 16;
             if(blocked_age)*blocked_age=frame-it->second;
             return true;
@@ -5294,6 +5400,49 @@ void NativeRenderer::MakePendingMirrors() {
             end = std::max(end, it->second.end);
             taken += it->second.end - it->second.begin;
         }
+        // PERF-GTS-388 (RYGT_MIRROR_ROUND_MB=<power of two>, 0 = off): a mirror made over
+        // existing ones copies all they held again, and the game's vertex data grows a little
+        // at a time: at Tokyo 105 to 207 of the 150 to 335 mirrors made in 10 s were such
+        // regrowths, and 85 to 93% of the 460 to 1210 MB copied was in a mirror already
+        // (DIAG-GTS-387); each also refuses the prepared draws over it. The range is widened
+        // to that boundary, so the next ranges nearby are inside it. Only when the widened
+        // range is mirrorable as a whole (mapped, no region, no CPU-written granule, no CPU
+        // stack); else it is made as asked.
+        static const u64 round = [] {
+            const char* env = std::getenv("RYGT_MIRROR_ROUND_MB");
+            // PERF-GTS-407: 4 MB unless set (0 = off).
+            const u64 mb = env && *env ? std::strtoull(env, nullptr, 10) : 4;
+            return mb != 0 && (mb & (mb - 1)) == 0 && mb <= 64 ? mb * 1_MB : u64{0};
+        }();
+        if (round != 0 && direct) {
+            const VAddr wide_begin = begin & ~(round - 1);
+            const VAddr wide_end = (end + round - 1) & ~(round - 1);
+            if ((wide_begin != begin || wide_end != end) && wide_end - wide_begin <= 256_MB &&
+                !RegionOver(wide_begin, wide_end - wide_begin) &&
+                !IsDynamic(wide_begin, wide_end, nullptr, nullptr)) {
+                bool allowed;
+                {
+                    Native::CpuStackRegistry::Lease lease{Native::CpuStacks()};
+                    allowed = lease.Allowed(wide_begin, wide_end);
+                }
+                auto outcome = VideoCore::DirectMemory::PartOutcome::Invalid;
+                if (allowed) {
+                    direct->TryForEachPart(wide_begin, wide_end - wide_begin, [] { return false; },
+                        [](const VideoCore::Buffer&, u64, u64, u64) {}, &outcome);
+                }
+                if (outcome == VideoCore::DirectMemory::PartOutcome::Covered) {
+                    begin = wide_begin;
+                    end = wide_end;
+                    taken = 0;
+                    for (auto it = FirstMirror(begin); it != mirrors.end() && it->second.begin < end;
+                         ++it) {
+                        begin = std::min(begin, it->second.begin);
+                        end = std::max(end, it->second.end);
+                        taken += it->second.end - it->second.begin;
+                    }
+                }
+            }
+        }
         if (end - begin > 256_MB) {
             continue;
         }
@@ -5360,7 +5509,7 @@ void NativeRenderer::MakePendingMirrors() {
                     mirror_bytes -= it->second.end - it->second.begin;
                     NATIVE_DIAGNOSTIC(++stats.mirrors_evicted);
                     ++buffer_generation;
-                    buffer_log.Note(it->second.begin, it->second.end);
+                    buffer_log.Note(it->second.begin, it->second.end, true);
                     retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
                     it = mirrors.erase(it);
                 } else {
@@ -5438,7 +5587,7 @@ void NativeRenderer::MakePendingMirrors() {
                 it = mirrors.erase(it); // freed once the GPU is done with it
             }
         }
-        buffer_log.Note(begin, end); // OPT-010
+        buffer_log.Note(begin, end, true); // OPT-010 (PERF-GTS-405: with the mirrors it took in)
         // Copy commands were recorded under the source-view guard above;
         // allocation and bounded import warming happened on the worker.
         // CPU writes to it from now on are copied in before its next use.
@@ -5448,6 +5597,10 @@ void NativeRenderer::MakePendingMirrors() {
         mirror_bytes += end - begin;
         NATIVE_DIAGNOSTIC(++stats.mirrors_made);
         NATIVE_DIAGNOSTIC(stats.mirror_made_bytes += end - begin);
+        // DIAG-GTS-387: how much of what is copied was in a mirror already.
+        NATIVE_DIAGNOSTIC(stats.mirrors_regrown += taken != 0);
+        NATIVE_DIAGNOSTIC(stats.mirror_retaken_bytes += taken);
+        NATIVE_DIAGNOSTIC(stats.mirror_largest = std::max<u64>(stats.mirror_largest, end - begin));
         promotion_trace.Next(6);
         mirrors.emplace(begin, Mirror{.begin = begin,
                                       .end = end,
@@ -5467,7 +5620,7 @@ void NativeRenderer::DropMirrors(VAddr address, u64 size, u32 diagnostic_reason)
             NoteMirrorDiagnostic(diagnostic_reason,address,address+size,it->second.begin,it->second.end,unmap_generation.load());
         mirror_bytes -= it->second.end - it->second.begin;
         ++buffer_generation; // OPT-003
-        buffer_log.Note(it->second.begin, it->second.end); // OPT-010
+        buffer_log.Note(it->second.begin, it->second.end, true); // OPT-010
         retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
         std::unique_lock map_lock{buffer_map_mutex};
         it = mirrors.erase(it); // freed once the GPU is done with it
@@ -5791,6 +5944,12 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         }
     } timed{refresh_start, stats.region_refresh_ns};
     NATIVE_DIAGNOSTIC(stats.region_refresh_pages += pages.size());
+    {
+        auto& by = diag_region_refresh[region.begin]; // DIAG-GTS-411
+        by.end = region.end;
+        by.pages += pages.size();
+        ++by.refreshes;
+    }
 
 #endif
     auto* direct = r.buffer_cache.GetDirectMemory();
@@ -5869,10 +6028,17 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         UNREACHABLE_MSG("native region refresh allocation failed");
         return;
     }
+    // PERF-GTS-390: the pages are read into ordinary memory, compared there and written to the
+    // upload memory once. They were read into the upload memory and compared from it, 16 bytes
+    // a memcmp call (256 calls a page): upload memory is mapped for writing only, and with
+    // RYGT_NATIVE_UPLOAD_VRAM=1 reading it reads video memory back, uncached. 1.75% of the
+    // recorder's CPU time in a race at Tokyo was in those calls, from dispatches alone. The
+    // bytes compared and uploaded are the same as before.
+    const auto cpu_copy = std::make_unique_for_overwrite<u8[]>(pages.size() * 4096);
     for (size_t i = 0; i < pages.size(); ++i) {
         if (refresh[i].remapped) continue;
         const u64 bytes = std::min<u64>(4096, region.end - pages[i]);
-        if (!Core::RytyMemory::GuardedCopy(refresh[i].mapped,
+        if (!Core::RytyMemory::GuardedCopy(cpu_copy.get() + i * 4096,
                 reinterpret_cast<const void*>(pages[i]), bytes)) {
             UNREACHABLE_MSG("native region refresh cannot safely read guest page");
             return;
@@ -5920,11 +6086,12 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
     for (size_t i = 0; i < pages.size(); ++i) {
         if (refresh[i].remapped) continue;
         const u64 bytes = std::min<u64>(4096, region.end - pages[i]);
-        if (!Core::RytyMemory::GuardedCopy(refresh[i].mapped,
+        if (!Core::RytyMemory::GuardedCopy(cpu_copy.get() + i * 4096,
                 reinterpret_cast<const void*>(pages[i]), bytes)) {
             UNREACHABLE_MSG("native region refresh cannot safely read guest page");
             return;
         }
+        std::memcpy(refresh[i].mapped, cpu_copy.get() + i * 4096, bytes); // PERF-GTS-390
     }
     for (auto& page : refresh) {
         for (auto& part : page.whole) s.imported_view_leases.push_back(part.lease);
@@ -5986,7 +6153,7 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         };
         if (refresh[i].remapped) { copy_imported(page, refresh[i].whole); copy_downloads(); continue; }
         if (opened_ahead[i] && !was_recent && !before) { copy_downloads(); continue; }
-        const u8* now = refresh[i].mapped;
+        const u8* now = cpu_copy.get() + i * 4096; // PERF-GTS-390: not the upload memory
         if (force_whole || !before || (NativeRegionWritebackEnabled() && !opened_ahead[i] &&
                                       (!was_recent || (!gpu_wrote && !compare_all)))) {
             copy_snapshot(i, page, page_bytes);
@@ -5997,9 +6164,21 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         constexpr u64 Piece = 16;
         u64 run_begin = 0, run_end = 0, changed = 0;
         bool in_run = false;
-        for (u64 at = 0; at < page_bytes; at += Piece) {
+        // PERF-GTS-390: a page that did not change is found with one compare; a whole piece is
+        // compared as two 64-bit words, not with a memcmp call. The runs found are the same.
+        const bool page_same = std::memcmp(now, before->data(), page_bytes) == 0;
+        const auto piece_same = [&](u64 at, u64 n) {
+            if (n != Piece) {
+                return std::memcmp(now + at, before->data() + at, n) == 0;
+            }
+            std::array<u64, 2> a, b;
+            std::memcpy(a.data(), now + at, Piece);
+            std::memcpy(b.data(), before->data() + at, Piece);
+            return ((a[0] ^ b[0]) | (a[1] ^ b[1])) == 0;
+        };
+        for (u64 at = 0; !page_same && at < page_bytes; at += Piece) {
             const u64 n = std::min(Piece, page_bytes - at);
-            if (std::memcmp(now + at, before->data() + at, n) == 0) {
+            if (piece_same(at, n)) {
                 continue;
             }
             if (in_run && at - run_end < 64) {
@@ -7023,6 +7202,21 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GuestBufferLookup(VAdd
                                                                             bool write,
                                                                             bool mirror) {
     if (write) SnapshotLease::MarkUnsafe(address, size, 16);
+    // PERF-GTS-365: a gather from before this write is stale where it overlaps it. Only those are
+    // dropped: clearing them all at every written binding made the list gather again and again.
+    // The scan starts the largest gather's size below the write: nothing starting earlier reaches it.
+    if (write && !stream.gathers.empty()) {
+        const u64 end = address + size;
+        const u64 from = address > stream.gather_max ? address - stream.gather_max : 0;
+        for (auto it = stream.gathers.lower_bound({from, 0});
+             it != stream.gathers.end() && it->first.first < end;) {
+            if (it->first.first + it->first.second > address) {
+                it = stream.gathers.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
     last_bound = Bound::Region;
     NotePerFrameRange(address, size); // FIX-GT7-122
     // NAT-114: ranges in (or reaching into) a region use it.
@@ -7488,6 +7682,36 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GatherOnGpu(VAddr addr
     if (!direct || size > 256_MB || !direct->EnsureImported(address, size)) {
         return std::nullopt;
     }
+    // PERF-GTS-365: every bind of a range that spans imported views made a new buffer and copy,
+    // kept until the list retired. At the Nurburgring start one 3.6 MB range bound by many draws
+    // filled 8 to 15 GB of video memory this way (6.7 GB budget): the driver paged, and frames
+    // took 300 ms to 3.5 s. A list now gathers each range once.
+    static const bool reuse_gathers = [] {
+        const char* env = std::getenv("RYGT_GATHER_REUSE");
+        return !(env && env[0] == '0');
+    }();
+    // The open list's gathers; none when no list is open (they go with it), so a hit needs no
+    // Begin(). The report reads the clock every 1024 calls, not on each one.
+    static u64 reused = 0, made = 0, calls = 0; // recorder thread only
+    static auto since = std::chrono::steady_clock::now();
+    if ((++calls & 1023) == 0) {
+        if (const auto now = std::chrono::steady_clock::now(); now - since >= std::chrono::seconds{10}) {
+            LOG_INFO(Render_Vulkan, "PERF-GTS-365 (10 s): GPU gathers {} reused, {} made", reused, made);
+            reused = made = 0;
+            since = now;
+        }
+    }
+    if (reuse_gathers && !stream.gathers.empty()) {
+        if (const u64 unmaps = g_guest_unmaps.load(std::memory_order_acquire); unmaps != stream.gather_unmaps) {
+            stream.gathers.clear();
+            stream.gather_max = 0;
+            stream.gather_unmaps = unmaps;
+        } else if (const auto found = stream.gathers.find({address, size}); found != stream.gathers.end()) {
+            ++reused;
+            return std::pair{found->second, u64{0}};
+        }
+    }
+    ++made;
     auto gathered = device->CreateBuffer({.size = size,
                                           .usage = Native::Rhi::BufferUsageStorage |
                                                    Native::Rhi::BufferUsageVertex |
@@ -7514,6 +7738,11 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::GatherOnGpu(VAddr addr
     s.keep.push_back(std::move(gathered));
     if (!all) {
         return std::nullopt;
+    }
+    if (reuse_gathers) { // PERF-GTS-365
+        if (s.gathers.empty()) s.gather_unmaps = g_guest_unmaps.load(std::memory_order_acquire);
+        s.gathers.emplace(std::pair{address, size}, dst);
+        s.gather_max = std::max(s.gather_max, size);
     }
     NATIVE_DIAGNOSTIC(++stats.gathers);
     NATIVE_DIAGNOSTIC(stats.gathered_bytes += size);
@@ -10871,14 +11100,426 @@ vk::ImageView NativeRenderer::DepthStandIn(bool array, bool may_create) {
     return vk::ImageView{handle};
 }
 
+void NativeRenderer::EnsureAheadArena() {
+    if (ahead_arena.tried) return;
+    ahead_arena.tried = true;
+    // PERF-GTS-377 (RYGT_AHEAD_UPLOAD_MB, 0 = off): a race draw's constants (about 550 bytes,
+    // 25 to 34 MB a second) were hashed, copied to upload memory and copied again as a
+    // reference by the recorder at commit: about 1.0 us of the 8.2 us a draw costs it.
+    const char* env = std::getenv("RYGT_AHEAD_UPLOAD_MB");
+    // PERF-GTS-407: 128 MB unless set (0 = off).
+    const u64 megabytes = env && *env ? std::strtoull(env, nullptr, 10) : 128;
+    if (megabytes == 0) return;
+    const u64 capacity = std::bit_ceil(std::clamp<u64>(megabytes, 16, 1024)) << 20;
+    auto buffer = device->CreateBuffer({
+        .size = capacity,
+        .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageUniform |
+                 Native::Rhi::BufferUsageIndex | Native::Rhi::BufferUsageVertex |
+                 Native::Rhi::BufferUsageIndirect | Native::Rhi::BufferUsageTransferSrc,
+        .memory = Native::Rhi::MemoryKind::Upload,
+        .name = "native ahead upload",
+    });
+    if (!buffer || !buffer->Mapped()) {
+        LOG_WARNING(Render_Vulkan, "PERF-GTS-377: no {} MB ahead upload arena", capacity >> 20);
+        return;
+    }
+    const u64 segments = capacity >> AheadArena::SegmentBits;
+    ahead_arena.busy = std::make_unique<std::atomic<u64>[]>(segments);
+    for (u64 i = 0; i < segments; ++i) ahead_arena.busy[i].store(0, std::memory_order_relaxed);
+    ahead_arena.capacity = capacity;
+    ahead_arena.handle = vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())};
+    u8* const mapped = buffer->Mapped();
+    ahead_arena.buffer = std::move(buffer);
+    ahead_arena.mapped.store(mapped, std::memory_order_release);
+    LOG_INFO(Render_Vulkan, "PERF-GTS-377: job threads copy draw constants into a {} MB arena",
+             capacity >> 20);
+}
+
+bool NativeRenderer::AheadAllocate(u32 size, u64& position, u8*& data) {
+    auto& arena = ahead_arena;
+    u8* const mapped = arena.mapped.load(std::memory_order_acquire);
+    if (!mapped || size == 0 || size > (u64{1} << AheadArena::SegmentBits)) return false;
+    const u64 bytes = Common::AlignUp<u64>(size, AheadArena::Align);
+    const u64 capacity = arena.capacity;
+    u64 pos = 0, offset = 0;
+    for (u32 attempt = 0;; ++attempt) {
+        // The claim first, then the look at the segments (the recorder marks a segment first
+        // and then looks at the head): one of the two always sees the other.
+        pos = arena.head.fetch_add(bytes, std::memory_order_seq_cst);
+        offset = pos & (capacity - 1);
+        if (offset + bytes <= capacity) break; // else it straddles the end: claim again
+        if (attempt == 2) return false;
+    }
+    auto* const semaphore = r.scheduler.GetWorkSemaphore();
+    u64 known = semaphore->KnownGpuTick();
+    const u64 first = offset >> AheadArena::SegmentBits;
+    const u64 last = (offset + bytes - 1) >> AheadArena::SegmentBits;
+    const u64 lap = pos / capacity;
+    bool asked = false;
+    for (u64 segment = first; segment <= last; ++segment) {
+        // A segment's mark is the lap and the GPU tick of the last bytes bound in it. Bytes
+        // of this lap are other claims, beside this one: only an earlier lap's can lie under
+        // it. (Without the lap, the draws just bound in the segment being filled refused 30
+        // to 45% of the copies.)
+        const u64 mark = arena.busy[segment].load(std::memory_order_seq_cst);
+        if ((mark >> AheadArena::TickBits) >= lap) continue;
+        const u64 tick = mark & AheadArena::TickMask;
+        if (tick > known && !asked) {
+            semaphore->Refresh(); // the known tick is only as new as the last question
+            known = semaphore->KnownGpuTick();
+            asked = true;
+        }
+        if (tick > known) {
+            arena.refused.fetch_add(1, std::memory_order_relaxed);
+            return false; // the GPU has not run what was bound there
+        }
+    }
+    position = pos;
+    data = mapped + offset;
+    arena.copied.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool NativeRenderer::AheadCommit(u64 position, u32 size, vk::DescriptorBufferInfo& info) {
+    auto& arena = ahead_arena;
+    if (!arena.buffer) return false;
+    const u64 bytes = Common::AlignUp<u64>(size, AheadArena::Align);
+    const u64 capacity = arena.capacity;
+    const u64 offset = position & (capacity - 1);
+    // The list being recorded binds them: the segments wait for the GPU to run it.
+    const u64 tick = r.scheduler.CurrentTick() + 1;
+    const u64 mark = ((position / capacity) << AheadArena::TickBits) |
+                     (tick & AheadArena::TickMask);
+    const u64 first = offset >> AheadArena::SegmentBits;
+    const u64 last = (offset + bytes - 1) >> AheadArena::SegmentBits;
+    for (u64 segment = first; segment <= last; ++segment) {
+        auto& busy = arena.busy[segment];
+        u64 seen = busy.load(std::memory_order_seq_cst);
+        while (seen < mark && !busy.compare_exchange_weak(seen, mark, std::memory_order_seq_cst)) {
+        }
+    }
+    // Claims only grow: once the head is a capacity past the position, a later claim may
+    // have the same offsets.
+    if (arena.head.load(std::memory_order_seq_cst) - position >= capacity) {
+        ++arena.stale;
+        return false;
+    }
+    info = vk::DescriptorBufferInfo{arena.handle, offset, size};
+    ++arena.bound;
+    return true;
+}
+
+static bool LongLivedSetsOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_LONG_LIVED_SETS");
+        // PERF-GTS-407: on unless set to something else
+        const bool enabled = (!env || !*env || env[0] == '1') && !UiHires::Enabled();
+        if (enabled) Native::DeadHandles::enabled.store(true, std::memory_order_release);
+        return enabled;
+    }();
+    return on;
+}
+
+// PERF-GTS-398 (with RYGT_PARALLEL_RECORDING=1; RYGT_PARALLEL_LATE_BINDINGS=0: as before): a
+// draw recorded by a pass worker has its descriptor sets looked up by that worker. The
+// recorder did it for every such draw (PushBindings, 9.6% of its CPU time in a race at Tokyo
+// with 87% of the draws recorded by workers), and handed over the sets.
+static bool LateBindingsOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_PARALLEL_LATE_BINDINGS");
+        return !(env && env[0] == '0') && ParallelRecordingRequested();
+    }();
+    return on;
+}
+
+void NativeRenderer::LongSetsUpkeep() {
+    if (!LongLivedSetsOn()) return;
+    static thread_local std::vector<u64> dead;
+    const bool some = Native::DeadHandles::Take(dead);
+    std::unique_lock<std::mutex> lock{long_sets_mutex, std::defer_lock};
+    if (ParallelRecordingRequested()) lock.lock();
+    if (some) DropLongSets(dead);
+    if (long_sets.entries.Size() > 200000 || long_sets.unused_sets > 20000) FlushLongSets();
+}
+
+bool NativeRenderer::CanBindLate(const Pipeline& pipeline, DrawBindings& b) {
+    if (!LateBindingsOn() || !LongLivedSetsOn() || b.writes.empty()) return false;
+    if (!b.groups_ready) b.PrepareWriteGroups();
+    if (b.key_layout != pipeline.GetLayout()) b.PrepareDescriptorKeys(pipeline);
+    u32 offsets = 0;
+    bool any = false;
+    for (u32 index = 0; index < b.grouped_writes.size(); ++index) {
+        if (b.grouped_writes[index].empty() || index == pipeline.PushSet()) continue;
+        const u32 dynamic = pipeline.DynamicBuffers(index);
+        if (dynamic == 0 || !b.descriptor_keys[index].cacheable || !pipeline.SetLayout(index)) {
+            return false; // a set of the list's own cache: the recorder's
+        }
+        offsets += dynamic;
+        any = true;
+    }
+    return any && offsets <= 128;
+}
+
+void NativeRenderer::BindLateThunk(void* owner, void* prepared,
+        std::array<vk::DescriptorSet, Shader::Backend::MaxDescriptorSets>& sets,
+        std::array<u8, Shader::Backend::MaxDescriptorSets>& counts,
+        boost::container::static_vector<u32, 128>& offsets) {
+    static_cast<NativeRenderer*>(owner)->BindLate(*static_cast<PreparedDraw*>(prepared), sets,
+                                                  counts, offsets);
+}
+
+void NativeRenderer::BindLate(PreparedDraw& p,
+        std::array<vk::DescriptorSet, Shader::Backend::MaxDescriptorSets>& sets,
+        std::array<u8, Shader::Backend::MaxDescriptorSets>& counts,
+        boost::container::static_vector<u32, 128>& offsets) {
+    // As PushBindings does for a long-lived set, without the stream: the key without the
+    // offsets, the table, and on a miss a set written at once (it is bound right after, and
+    // another thread may find it in the table as soon as the lock is given up).
+    const Pipeline& pipeline = *p.pipeline;
+    DrawBindings& b = p.bindings;
+    const vk::Device vk_device = r.instance.GetDevice();
+    static thread_local std::vector<u64> key;
+    static thread_local std::vector<vk::WriteDescriptorSet> updates;
+    static thread_local std::vector<vk::DescriptorBufferInfo> infos;
+    static thread_local std::vector<u64> handles;
+    const auto fits = [](const vk::DescriptorBufferInfo& info) {
+        return info.buffer && info.range != VK_WHOLE_SIZE && info.offset <= 0xFFFFFFFFull;
+    };
+    for (u32 index = 0; index < b.grouped_writes.size() && index < sets.size(); ++index) {
+        const auto& writes = b.grouped_writes[index];
+        if (writes.empty() || index == pipeline.PushSet()) continue;
+        const u32 dynamic = pipeline.DynamicBuffers(index);
+        auto& prepared_key = b.descriptor_keys[index];
+        if (dynamic == 0 || offsets.size() + dynamic > offsets.capacity()) continue; // CanBindLate
+        prepared_key.RefreshBuffers<false>();
+        const auto& words = prepared_key.words;
+        const size_t at = offsets.size();
+        offsets.resize(at + dynamic, 0u);
+        key.assign(words.begin(), words.end());
+        for (const auto& entry : prepared_key.buffers) {
+            const u64 buffer = words[entry.word];
+            const u64 offset = words[entry.word + 1];
+            const u64 range = words[entry.word + 2];
+            if (entry.slot >= dynamic || buffer == 0 || range == VK_WHOLE_SIZE ||
+                offset > 0xFFFFFFFFull) {
+                continue;
+            }
+            offsets[at + entry.slot] = static_cast<u32>(offset);
+            key[entry.word + 1] = 0;
+        }
+        const XXH128_hash_t wide = XXH3_128bits(key.data(), key.size() * sizeof(u64));
+        counts[index] = static_cast<u8>(dynamic);
+        const vk::DescriptorSetLayout layout = pipeline.SetLayout(index);
+        const u64 layout_key = u64(VkDescriptorSetLayout(layout));
+        std::scoped_lock lock{long_sets_mutex};
+        if (const auto kept = long_sets.entries.Find(wide.low64, wide.high64)) {
+            sets[index] = kept;
+            ++long_sets.late_hits;
+            continue;
+        }
+        const vk::DescriptorSet set = MakeLongSet(layout);
+        if (!set) continue; // as a draw the recorder finds no set for: not bound
+        size_t buffer_count = 0;
+        for (const auto& write : writes) {
+            if (write.pBufferInfo) buffer_count += write.descriptorCount;
+        }
+        updates.clear();
+        infos.clear();
+        infos.reserve(buffer_count);
+        handles.clear();
+        handles.push_back(layout_key);
+        for (const auto& write : writes) {
+            auto update = write;
+            update.dstSet = set;
+            if (write.pBufferInfo) {
+                const size_t first = infos.size();
+                for (u32 n = 0; n < write.descriptorCount; ++n) {
+                    auto info = write.pBufferInfo[n];
+                    handles.push_back(u64(VkBuffer(info.buffer)));
+                    if (write.descriptorType == vk::DescriptorType::eStorageBuffer &&
+                        write.dstBinding + n < dynamic && fits(info)) {
+                        info.offset = 0;
+                    }
+                    infos.push_back(info);
+                }
+                if (write.descriptorType == vk::DescriptorType::eStorageBuffer) {
+                    update.descriptorType = vk::DescriptorType::eStorageBufferDynamic;
+                }
+                update.pBufferInfo = infos.data() + first;
+            } else if (write.pImageInfo) {
+                for (u32 n = 0; n < write.descriptorCount; ++n) {
+                    handles.push_back(u64(VkImageView(write.pImageInfo[n].imageView)));
+                    handles.push_back(u64(VkSampler(write.pImageInfo[n].sampler)));
+                }
+            }
+            updates.push_back(update);
+        }
+        vk_device.updateDescriptorSets(
+            vk::ArrayProxy<const vk::WriteDescriptorSet>{static_cast<u32>(updates.size()),
+                                                         updates.data()}, {});
+        // A handle of the set that died after the draw went into its packet: the recorder
+        // has dropped that handle's sets already and would not see this one. It is used for
+        // this draw and written again once the GPU ran the draw's list.
+        bool died = long_sets.dead_count - p.late_dead_seq > long_sets.dead_ring.size();
+        for (u64 n = p.late_dead_seq; !died && n < long_sets.dead_count; ++n) {
+            const u64 dead = long_sets.dead_ring[n % long_sets.dead_ring.size()];
+            died = std::ranges::find(handles, dead) != handles.end();
+        }
+        if (died) {
+            long_sets.retired.push_back({p.late_retire_tick, layout_key, set});
+            ++long_sets.late_not_kept;
+        } else {
+            StoreLongSet(wide.low64, wide.high64, layout, set, handles);
+            ++long_sets.late_made;
+        }
+        sets[index] = set;
+    }
+}
+
+vk::DescriptorSet NativeRenderer::MakeLongSet(vk::DescriptorSetLayout layout) {
+    const vk::Device vk_device = r.instance.GetDevice();
+    // PERF-GTS-376: a set of a dropped entry first (the GPU is done with it).
+    const u64 layout_key = u64(VkDescriptorSetLayout(layout));
+    if (!long_sets.retired.empty()) {
+        const u64 done = r.scheduler.GetWorkSemaphore()->KnownGpuTick();
+        while (!long_sets.retired.empty() && long_sets.retired.front().tick <= done) {
+            const auto& ready = long_sets.retired.front();
+            long_sets.spare[ready.layout].push_back(ready.set);
+            long_sets.retired.pop_front();
+        }
+    }
+    if (const auto it = long_sets.spare.find(layout_key);
+        it != long_sets.spare.end() && !it->second.empty()) {
+        const vk::DescriptorSet set = it->second.back();
+        it->second.pop_back();
+        ++long_sets.rewritten;
+        return set;
+    }
+    for (u32 attempt = 0; attempt < 2; ++attempt) {
+        if (long_sets.pools.empty() || attempt == 1) {
+            long_sets.pools.push_back(TakeDescriptorPool());
+        }
+        const vk::DescriptorSetAllocateInfo alloc{
+            .descriptorPool = long_sets.pools.back(),
+            .descriptorSetCount = 1,
+            .pSetLayouts = &layout,
+        };
+        vk::DescriptorSet set{};
+        if (vk_device.allocateDescriptorSets(&alloc, &set) == vk::Result::eSuccess) {
+            return set;
+        }
+    }
+    return {};
+}
+
+bool NativeRenderer::AheadRetained(const PreparedDraw& p, size_t info_index,
+                                   const vk::DescriptorBufferInfo& info) {
+    // FIX-GTS-393: with RYGT_AHEAD_UPLOAD_MB a prepared draw's constants are bound from the
+    // ahead arena (PERF-GTS-377), not from one of the list's upload chunks. Parallel recording
+    // only took a buffer info for upload memory when its buffer was one of those chunks, so
+    // with the arena on it refused every draw (742,275 of 840,428 in 10 s at Tokyo, all at
+    // this check). The arena's bytes hold as a chunk's do: the segments are marked with the
+    // tick of the list being recorded, and no thread writes there before the GPU ran it. The
+    // mark is made again here, for the list open now (a Splice since the commit opened a new
+    // one), and the position is checked against the head as at the commit.
+    const auto& arena = ahead_arena;
+    if (!arena.buffer || info.buffer != arena.handle || info.range == 0 ||
+        info.range == VK_WHOLE_SIZE) {
+        return false;
+    }
+    for (const auto& upload : p.uploads) {
+        if (upload.info != info_index || upload.size != info.range || upload.ahead == ~u64{0} ||
+            (upload.ahead & (arena.capacity - 1)) != info.offset) {
+            continue;
+        }
+        vk::DescriptorBufferInfo again;
+        return AheadCommit(upload.ahead, upload.size, again) && again.offset == info.offset;
+    }
+    return false;
+}
+
+void NativeRenderer::StoreLongSet(u64 hash, u64 check, vk::DescriptorSetLayout layout,
+                                  vk::DescriptorSet set, std::span<const u64> handles) {
+    long_sets.entries.Insert(hash, check, u64(VkDescriptorSetLayout(layout)), set);
+    // PERF-GTS-378: a list per handle. In a multimap every set's entry for a handle they all
+    // hold (the ahead upload arena, a sampler) was inserted after a walk over that handle's
+    // other entries: up to 1.8 us a draw once the constants all came from one buffer. The
+    // arena lives as long as the renderer and is left out.
+    const u64 arena_handle = u64(VkBuffer(ahead_arena.handle));
+    for (const u64 handle : handles) {
+        if (handle == 0 || handle == arena_handle) continue;
+        auto& list = long_sets.users[handle];
+        if (list.size() > 2 * long_sets.entries.Size() + 4096) {
+            std::erase_if(list, [&](const auto& key) {
+                return !long_sets.entries.Find(key.first, key.second);
+            });
+        }
+        list.emplace_back(hash, check);
+    }
+    ++long_sets.made;
+}
+
+void NativeRenderer::DropLongSets(std::span<const u64> dead_handles) {
+    for (const u64 handle : dead_handles) {
+        long_sets.dead_ring[long_sets.dead_count++ % long_sets.dead_ring.size()] = handle; // PERF-GTS-398
+        const auto found = long_sets.users.find(handle);
+        if (found == long_sets.users.end()) continue;
+        // The open list may have bound the set: it is written again only after the GPU ran it.
+        const u64 tick = r.scheduler.CurrentTick() + 1;
+        for (const auto& key : found->second) {
+            vk::DescriptorSet set{};
+            u64 layout = 0;
+            if (!long_sets.entries.Erase(key.first, key.second, set, layout)) {
+                continue;
+            }
+            ++long_sets.dropped;
+            if (layout == handle) {
+                ++long_sets.unused_sets; // its layout goes: no pipeline can use it again
+            } else {
+                long_sets.retired.push_back({tick, layout, set});
+            }
+        }
+        long_sets.users.erase(found);
+        long_sets.spare.erase(handle); // sets of a layout that goes
+    }
+}
+
+void NativeRenderer::FlushLongSets() {
+    // The open list may bind these sets: the pools are reset once the GPU ran it.
+    const u64 tick = r.scheduler.CurrentTick() + 1;
+    {
+        std::scoped_lock chunk_lock{chunk_mutex};
+        for (const auto pool : long_sets.pools) {
+            retiring_pools.emplace_back(tick, pool);
+        }
+    }
+    long_sets.pools.clear();
+    long_sets.entries.Clear();
+    long_sets.users.clear();
+    long_sets.retired.clear();
+    long_sets.spare.clear();
+    long_sets.unused_sets = 0;
+    ++long_sets.flushes;
+}
+
 void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoint bind_point,
                                   DrawBindings& b) {
+    // PERF-GTS-375 (RYGT_LONG_LIVED_SETS=1, with RYGT_DYNAMIC_BUFFER_OFFSETS=1): sets with
+    // dynamic offsets are kept across lists. A list has about 40 draws, so its own cache reused
+    // 18% of them; 93% match a set of the last 10 s (DIAG-GTS-373).
+    static const bool long_sets_on = LongLivedSetsOn();
+    // PERF-GTS-398: with parallel recording the table is the pass workers' too.
+    static const bool long_sets_shared = ParallelRecordingRequested();
+    LongSetsUpkeep();
     auto* pending_owner=FindParallelRuntime(this);
     if(!parallel_binding_capture && pending_owner)
         pending_owner->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::Serial);
     Native::SlowCallTrace<9> trace{t_timed, "descriptor-bindings",
         {"push-constants", "groups-keys", "push-descriptor", "hash-lookup", "allocate",
          "copy-writes", "update-descriptors", "store-key", "bind-set"}};
+    if (bind_point == vk::PipelineBindPoint::eGraphics) {
+        trace.AccumulateInto(stats.bind_phase_ns, stats.bind_phase_calls); // DIAG-GTS-372
+    }
     Stream& s = stream;
     const CmdBuf cmdbuf{s.cmd};
     static const bool reuse_enabled = [] {
@@ -10910,6 +11551,20 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
     static thread_local boost::container::small_vector<vk::WriteDescriptorSet, 64> updates;
     updates.clear();
     std::array<vk::DescriptorSet, Shader::Backend::MaxDescriptorSets> sets{};
+    // PERF-GTS-374: a dynamic set's offsets (by binding), the infos its new set is written
+    // with (offset 0) and its key without the offsets.
+    static thread_local std::array<boost::container::static_vector<u32, 96>,
+                                   Shader::Backend::MaxDescriptorSets> dynamic_offsets;
+    static thread_local std::vector<vk::DescriptorBufferInfo> dynamic_infos;
+    static thread_local std::vector<u64> dynamic_key;
+    for (auto& offsets : dynamic_offsets) {
+        if (!offsets.empty()) offsets.clear();
+    }
+    dynamic_infos.clear();
+    dynamic_infos.reserve(512);
+    const auto dynamic_offset_fits = [](const vk::DescriptorBufferInfo& info) {
+        return info.buffer && info.range != VK_WHOLE_SIZE && info.offset <= 0xFFFFFFFFull;
+    };
     PendingDescriptorUpdates* pending=parallel_binding_capture && pending_owner ? &pending_owner->descriptor_updates : nullptr;
     bool deferred=false;u64 staged_before=0;
     if(pending) {
@@ -10958,15 +11613,109 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         const bool key_changed = prepared_key.RefreshBuffers<false>();
         const auto& key = prepared_key.words;
         const bool cacheable = prepared_key.cacheable;
-        const std::span<const u64> descriptor_key{key.data(), key.size()};
-        if (cacheable && key_changed) {
+        std::span<const u64> descriptor_key{key.data(), key.size()};
+        const u32 dynamic_buffers = pipeline.DynamicBuffers(index);
+        u64 key_check = 0; // PERF-GTS-376: the other half of a dynamic set's 128-bit hash
+        if (dynamic_buffers != 0) {
+            // hashed below, without the offsets
+        } else if (cacheable && key_changed) {
             prepared_key.hash = Native::Parallel::AdaptiveXXH3(key.data(), key.size() * sizeof(u64));
             NATIVE_DIAGNOSTIC(++descriptor_hash_refreshed);
         } else if (cacheable) {
             NATIVE_DIAGNOSTIC(++descriptor_hash_reused);
         }
-        const u64 key_hash = cacheable ? prepared_key.hash : 0;
-        if (cacheable) {
+        u64 key_hash = cacheable ? prepared_key.hash : 0;
+        if (dynamic_buffers != 0) {
+            // PERF-GTS-374: the offsets go to the bind; the set is looked up without them.
+            auto& offsets = dynamic_offsets[index];
+            offsets.assign(dynamic_buffers, 0u);
+            if (cacheable) dynamic_key.assign(key.begin(), key.end());
+            size_t patch = 0;
+            // PERF-GTS-391: a cacheable key lists every buffer info of the set in order, with
+            // its binding, and RefreshBuffers has just made its words equal to the infos: the
+            // offsets are taken from the key, without going over the writes and their infos
+            // again (that loop was 1.6% of the recorder's CPU time in a race at Tokyo, at
+            // 110,000 sets a second). The offsets and the key are the same as from the loop.
+            if (cacheable) {
+                for (const auto& entry : prepared_key.buffers) {
+                    const u64 buffer = key[entry.word];
+                    const u64 offset = key[entry.word + 1];
+                    const u64 range = key[entry.word + 2];
+                    if (entry.slot >= dynamic_buffers || buffer == 0 || range == VK_WHOLE_SIZE ||
+                        offset > 0xFFFFFFFFull) {
+                        continue;
+                    }
+                    offsets[entry.slot] = static_cast<u32>(offset);
+                    dynamic_key[entry.word + 1] = 0;
+                }
+            } else
+            for (const auto& write : writes) {
+                if (!write.pBufferInfo) continue;
+                for (u32 n = 0; n < write.descriptorCount; ++n, ++patch) {
+                    const auto& info = write.pBufferInfo[n];
+                    const u32 slot = write.dstBinding + n;
+                    if (slot >= dynamic_buffers || !dynamic_offset_fits(info)) continue;
+                    offsets[slot] = static_cast<u32>(info.offset);
+                    if (cacheable && patch < prepared_key.buffers.size()) {
+                        dynamic_key[prepared_key.buffers[patch].word + 1] = 0;
+                    }
+                }
+            }
+            if (cacheable) {
+                descriptor_key = std::span<const u64>{dynamic_key.data(), dynamic_key.size()};
+                const XXH128_hash_t wide =
+                    XXH3_128bits(dynamic_key.data(), dynamic_key.size() * sizeof(u64));
+                key_hash = wide.low64;
+                key_check = wide.high64;
+            }
+        }
+        // DIAG-GTS-373 (RYGT_DIAG_DESCRIPTOR_REUSE=1): what dynamic buffer offsets would buy.
+        // Counts only; nothing recorded changes.
+        static const bool reuse_diag = [] {
+            const char* env = std::getenv("RYGT_DIAG_DESCRIPTOR_REUSE");
+            return env && env[0] == '1';
+        }();
+        if (reuse_diag && cacheable && bind_point == vk::PipelineBindPoint::eGraphics) {
+            static thread_local std::vector<u64> without_offsets;
+            without_offsets.assign(key.begin(), key.end());
+            for (const auto& patch : prepared_key.buffers) {
+                without_offsets[patch.word + 1] = 0;
+            }
+            const u64 loose = Native::Parallel::AdaptiveXXH3(
+                without_offsets.data(), without_offsets.size() * sizeof(u64));
+            if (stats.reuse_diag_serial != s.serial) {
+                stats.reuse_diag_serial = s.serial;
+                stats.reuse_diag_in_list.clear();
+            }
+            if (stats.reuse_diag_frame_number != frame) {
+                stats.reuse_diag_frame_number = frame;
+                stats.reuse_diag_in_frame.clear();
+            }
+            ++stats.reuse_diag_sets;
+            stats.reuse_diag_list += !stats.reuse_diag_in_list.insert(loose).second;
+            stats.reuse_diag_frame += !stats.reuse_diag_in_frame.insert(loose).second;
+            stats.reuse_diag_window += !stats.reuse_diag_in_window.insert(loose).second;
+            stats.reuse_diag_exact += bool(s.descriptor_sets.Find(key_hash, descriptor_key));
+        }
+        // PERF-GTS-396: for a draw captured for a parallel pass too. They were left out, so
+        // every draw a worker recorded had its sets made and written anew by the recorder (25
+        // descriptor rows a draw, 55,000 to 93,000 sets reused in 10 s at Tokyo where the
+        // serial recorder reuses a million): 11.5 us a draw for 5.6. The worker binds a kept
+        // set with its offsets as the recorder does (FIX-GTS-394); a new one's rows are
+        // staged and written before the pass is handed over, and before any serial draw.
+        bool long_lived = long_sets_on && dynamic_buffers != 0 && cacheable;
+        // PERF-GTS-398: held from the lookup until the new set is in the table.
+        std::unique_lock<std::mutex> long_lock{long_sets_mutex, std::defer_lock};
+        if (long_lived) {
+            if (long_sets_shared) long_lock.lock();
+            if (const auto kept = long_sets.entries.Find(key_hash, key_check)) {
+                sets[index] = kept;
+                ++long_sets.hits;
+                NATIVE_DIAGNOSTIC(++stats.descriptor_reuses);
+                continue;
+            }
+        }
+        if (cacheable && !long_lived) {
             if (const auto reused = s.descriptor_sets.Find(key_hash, descriptor_key)) {
                 sets[index] = reused;
                 NATIVE_DIAGNOSTIC(++stats.descriptor_reuses);
@@ -10977,13 +11726,17 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         trace.Next(4);
         const u64 layout_key = u64(VkDescriptorSetLayout(layout));
         vk::DescriptorSet set{};
-        if(parallel_binding_capture && parallel_binding_capture->ahead) {
+        if(parallel_binding_capture && parallel_binding_capture->ahead && !long_lived) {
             auto* ahead=parallel_binding_capture->ahead;
             if(ahead->pipeline_layout==pipeline.GetLayout() && ahead->layouts[index]==layout && ahead->sets[index]) {
                 set=ahead->sets[index];++ahead->used_sets;ahead->context->used_sets.fetch_add(1,std::memory_order_relaxed);parallel_binding_capture->ahead_used=true;
             }
         }
         const bool ahead_hit=bool(set);
+        if (long_lived) {
+            set = MakeLongSet(layout);
+            if (!set) long_lived = false; // as before, from the list's pools
+        }
         if(!set)set=s.descriptor_reserve.Take(layout_key);
         const bool reserve_hit=bool(set) && !ahead_hit;
         if(reserve_hit)NATIVE_DIAGNOSTIC(++stats.descriptor_reserve_hits);
@@ -11044,10 +11797,70 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         // A miss needs mutable destinations. Hits and push sets borrow the original
         // writes directly; never leave a destination handle in per-draw storage.
         trace.Next(5);
-        if(deferred)pending->Stage(writes,set);
+        // PERF-GTS-398: a set a worker may find in the table is written before it is put
+        // there, not staged or batched (a worker would bind it unwritten).
+        const bool write_now = long_lived && long_sets_shared;
+        if(deferred && !write_now) {
+            pending->Stage(writes,set);
+            // FIX-GTS-394: the staged rows too are written as dynamic buffers at offset 0 (as
+            // the rows below are). They were staged as plain storage buffers at their offsets,
+            // into a set whose layout has dynamic ones (RYGT_DYNAMIC_BUFFER_OFFSETS=1).
+            if(dynamic_buffers!=0)for(size_t u=pending->nw-writes.size();u<pending->nw;++u) {
+                auto& row=pending->writes[u];
+                if(!row.pBufferInfo || row.descriptorType!=vk::DescriptorType::eStorageBuffer)continue;
+                row.descriptorType=vk::DescriptorType::eStorageBufferDynamic;
+                auto* const infos=pending->buffers.data()+(row.pBufferInfo-pending->buffers.data()); // Stage's copies
+                for(u32 n=0;n<row.descriptorCount;++n)
+                    if(row.dstBinding+n<dynamic_buffers && dynamic_offset_fits(infos[n]))infos[n].offset=0;
+            }
+        }
         else Native::AppendDescriptorUpdates(writes,set,updates);
+        if (dynamic_buffers != 0 && (!deferred || write_now)) {
+            // PERF-GTS-374: written as dynamic buffers at offset 0 (the bind gives the offset).
+            for (size_t u = updates.size() - writes.size(); u < updates.size(); ++u) {
+                auto& update = updates[u];
+                if (!update.pBufferInfo ||
+                    update.descriptorType != vk::DescriptorType::eStorageBuffer) {
+                    continue;
+                }
+                update.descriptorType = vk::DescriptorType::eStorageBufferDynamic;
+                const size_t first = dynamic_infos.size();
+                ASSERT_MSG(first + update.descriptorCount <= dynamic_infos.capacity(),
+                           "PERF-GTS-374: more buffer writes than reserved");
+                for (u32 n = 0; n < update.descriptorCount; ++n) {
+                    auto info = update.pBufferInfo[n];
+                    if (update.dstBinding + n < dynamic_buffers && dynamic_offset_fits(info)) {
+                        info.offset = 0;
+                    }
+                    dynamic_infos.push_back(info);
+                }
+                update.pBufferInfo = dynamic_infos.data() + first;
+            }
+        }
+        if (write_now) {
+            const size_t rows = writes.size();
+            vk_device.updateDescriptorSets(
+                vk::ArrayProxy<const vk::WriteDescriptorSet>{static_cast<u32>(rows),
+                                                             updates.data() + (updates.size() - rows)}, {});
+            updates.resize(updates.size() - rows);
+        }
         trace.Next(7);
-        if (cacheable) s.descriptor_sets.Store(key_hash, descriptor_key, set);
+        if (long_lived) {
+            static thread_local std::vector<u64> handles;
+            handles.clear();
+            handles.push_back(u64(VkDescriptorSetLayout(layout)));
+            for (const auto& write : writes) {
+                for (u32 n = 0; n < write.descriptorCount; ++n) {
+                    if (write.pBufferInfo) {
+                        handles.push_back(u64(VkBuffer(write.pBufferInfo[n].buffer)));
+                    } else if (write.pImageInfo) {
+                        handles.push_back(u64(VkImageView(write.pImageInfo[n].imageView)));
+                        handles.push_back(u64(VkSampler(write.pImageInfo[n].sampler)));
+                    }
+                }
+            }
+            StoreLongSet(key_hash, key_check, layout, set, handles);
+        } else if (cacheable) s.descriptor_sets.Store(key_hash, descriptor_key, set);
         sets[index] = set;
     }} catch(...) {
         // A partially built immediate draw may already have published earlier sets.
@@ -11063,7 +11876,20 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         if(deferred && pending->staged_rows!=staged_before)NATIVE_DIAGNOSTIC(++pending->logical_draws);
         if(!updates.empty()) {trace.Next(6);vk_device.updateDescriptorSets(updates,{});
             if(pending){NATIVE_DIAGNOSTIC(++pending->actual_calls);NATIVE_DIAGNOSTIC(++pending->logical_draws);NATIVE_DIAGNOSTIC(++pending->immediate_draws);}}
-        parallel_binding_capture->sets=sets;
+        // FIX-GTS-394: the offsets the worker binds each dynamic set with. A draw with more
+        // of them than a packet holds loses that set, and is recorded by the recorder.
+        auto& capture=*parallel_binding_capture;
+        capture.dynamic_counts={};capture.dynamic_offsets.clear();
+        for(u32 index=0;index<sets.size();++index) {
+            const auto& offsets=dynamic_offsets[index];
+            if(!sets[index] || offsets.empty())continue;
+            if(offsets.size()>capture.dynamic_offsets.capacity()-capture.dynamic_offsets.size()) {
+                sets[index]=vk::DescriptorSet{};continue;
+            }
+            capture.dynamic_counts[index]=static_cast<u8>(offsets.size());
+            capture.dynamic_offsets.insert(capture.dynamic_offsets.end(),offsets.begin(),offsets.end());
+        }
+        capture.sets=sets;
         return;
     }
     std::array<vk::DescriptorSet, Shader::Backend::MaxDescriptorSets> bind_run{};
@@ -11080,8 +11906,25 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         }
         bind_count = 0;
     };
+    // PERF-GTS-371 (RYGT_ASYNC_DESCRIPTOR_UPDATES=1): a race draw allocates and writes about two
+    // new descriptor sets (1,040,164 sets for 514,080 draws in 10 s, 3% reused), each write a
+    // driver call on the recorder. The sets are new, so nothing binds them before the binds
+    // recorded below: the writes go into the command ring ahead of those binds and are made by
+    // the command thread (5 to 7% busy) when it replays them.
+    static const bool async_updates = [] {
+        const char* env = std::getenv("RYGT_ASYNC_DESCRIPTOR_UPDATES");
+        return env && env[0] == '1';
+    }();
     Native::CommitDescriptorBatch(updates,sets,pipeline.PushSet(),by_set,
-        [&](const auto& all) {trace.Next(6);vk_device.updateDescriptorSets(all,{});},
+        [&](const auto& all) {
+            trace.Next(6);
+            const vk::ArrayProxy<const vk::WriteDescriptorSet> proxy{u32(all.size()), all.data()};
+            if (async_updates && cmdbuf.updateDescriptorSets(vk_device, proxy)) {
+                NATIVE_DIAGNOSTIC(++stats.descriptor_async_updates);
+                return;
+            }
+            vk_device.updateDescriptorSets(all,{});
+        },
         [&](u32 index,const auto& writes) {
             static thread_local std::vector<u64> signature;
             signature.clear();
@@ -11117,6 +11960,15 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
             else if (reuse) s.binding_commands.ForgetSet(index);
         },
         [&](u32 index,vk::DescriptorSet set) {
+            if (const auto& offsets = dynamic_offsets[index]; !offsets.empty()) {
+                // PERF-GTS-374: the same set with other offsets is another binding.
+                flush_bind_run();
+                trace.Next(8);
+                cmdbuf.bindDescriptorSets(bind_point, pipeline.GetLayout(), index, set,
+                    vk::ArrayProxy<const u32>{static_cast<u32>(offsets.size()), offsets.data()});
+                if (reuse) s.binding_commands.ForgetSet(index);
+                return;
+            }
             if (reuse && s.binding_commands.SameSet(index, set)) return;
             if (bind_count && index != bind_first + bind_count) flush_bind_run();
             if (!bind_count) bind_first = index;
@@ -12742,8 +13594,30 @@ struct PixelTrace {
 } // namespace
 #endif
 
+void NativeRenderer::YieldToMappingChanges() {
+    // PERF-GTS-368: the recorder takes `mutex` for each draw and dispatch and took it straight
+    // back after each one, so a game thread unmapping memory (OnUnmap) waited out whole
+    // stretches of recording: 250 to 390 ms at the Autopolis start (no CPU time used), and
+    // the game's GPU work waited for that thread. With a mapping change waiting, the recorder
+    // lets it in before its next lock; at most 4 ms, so a lock this thread already holds
+    // further up cannot deadlock it. Off unless RYGT_UNMAP_HANDOFF=1: A/B runs at Autopolis came
+    // out even (the long waits are one draw building a region, not lock starvation).
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_UNMAP_HANDOFF");
+        return env && env[0] == '1';
+    }();
+    if (!enabled || mapping_waiters.load(std::memory_order_acquire) == 0) return;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(4);
+    while (mapping_waiters.load(std::memory_order_acquire) != 0 &&
+           std::chrono::steady_clock::now() < until) {
+        std::this_thread::yield();
+    }
+}
+
 void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect) {
+    YieldToMappingChanges(); // PERF-GTS-368
     std::scoped_lock lock{mutex};
+    EnsureAheadArena(); // PERF-GTS-377
     struct StreamUnwindGuard {
         NativeRenderer& renderer;
         int exceptions=std::uncaught_exceptions();
@@ -12832,7 +13706,13 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                     worker_affinity_masks.size(), worker_count);
                 worker_affinity_masks.clear();
             }
-            sidecar->coordinator=std::make_unique<Native::Parallel::PassCoordinator>(*device,r.instance,*timeline,worker_count,32,64*1024*1024,64,worker_affinity_masks);
+            // PERF-GTS-400: 256 nodes and 256 MB of packets in flight (64 and 64 MB). A pass and the
+            // recorder's list before it stay charged until the GPU ran them; with the lists longer
+            // (PERF-GTS-397) and the ring on (399) the 64 MB were full most of the time, and a
+            // third of the passes (10,824 of 33,035 in 10 s at Tokyo) were refused and recorded
+            // by the recorder itself.
+            sidecar->coordinator=std::make_unique<Native::Parallel::PassCoordinator>(*device,r.instance,*timeline,worker_count,32,256*1024*1024,256,worker_affinity_masks);
+            if(ParallelRingOn())sidecar->coordinator->acquire_replacement=[this]{return AcquireReplacementList();}; // PERF-GTS-399
 #if !defined(NDEBUG)
             if(const char* path=std::getenv("RYGT_PARALLEL_TRANSFER_MODE_FILE");path && *path)
                 sidecar->transfer_mode_controller=std::make_unique<Native::Parallel::ModeController>(std::filesystem::path(path),sidecar->transfer_applied_mode.Enabled());
@@ -12998,6 +13878,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     if (prepare && !indirect && !r.FrameDumpCollecting() && PrepareScope()) { // NAT-161: direct draws only
         prepared = TakePrepared(Rasterizer::t_draw_packet);
         NATIVE_DIAGNOSTIC(stats.prepared_missing += prepared ? 0 : 1);
+    }
+    if (!late_bound_done.empty()) { // PERF-GTS-398
+        for (PreparedDraw* done : late_bound_done) FreePrepared(done);
+        late_bound_done.clear();
     }
     struct GiveBack {
         NativeRenderer& n;
@@ -13388,7 +14272,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         // MirrorBuffer may process CPU writes after CommitPrepared. A changed
         // range invalidates both prepared bindings and vertices, not only vi.
         if(prepared->unmap_gen!=unmap_generation.load(std::memory_order_acquire) ||
-           !buffer_log.Untouched(prepared->buffer_seq,prepared->buffer_ranges)) {
+           !PreparedBuffersUntouched(*prepared,prepared->buffer_seq)) {
             from_prepared=false;prepared_vertices_valid=false;buffer_freshness_certified=false;
         } else {
             buffer_freshness_seq=buffer_log.Seq();
@@ -13815,6 +14699,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     bool parallel_draw=false;
     bool parallel_index_safe=false;u64 parallel_index_bytes=0;
     ParallelBindingCapture parallel_bindings{};
+    bool parallel_late_bind=false; // PERF-GTS-398
     std::shared_ptr<const DescriptorSnapshot> parallel_push_writes;
     std::size_t parallel_descriptor_bytes=0;
     u32 parallel_required_sets=0;
@@ -13887,7 +14772,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         // Draw while its sequence is unchanged; otherwise scan the original ranges.
         if(!fast_reject && (prepared->unmap_gen!=unmap_generation.load(std::memory_order_acquire) ||
            !(from_prepared && buffer_freshness_certified && buffer_log.Seq()==buffer_freshness_seq) &&
-           !buffer_log.Untouched(prepared->buffer_seq,prepared->buffer_ranges))) fast_reject=true;
+           !PreparedBuffersUntouched(*prepared,prepared->buffer_seq))) fast_reject=true;
         if(fast_reject) {
             NATIVE_DIAGNOSTIC(++parallel->fast_rejected);if(no_pass_room)NATIVE_DIAGNOSTIC(++parallel->no_pass_room_rejected);if(extended && any_clear)NATIVE_DIAGNOSTIC(++parallel->extended_clear_rejected);if(serial_scope_bypass)NATIVE_DIAGNOSTIC(++parallel->serial_scope_bypassed);
             if(ParallelGateDiagEnabled()) {
@@ -14199,7 +15084,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                                    if(!chunk.buffer || !chunk.buffer->Mapped() ||
                                       vk::Buffer{Handle<VkBuffer_T>(chunk.buffer->NativeHandle())}!=info.buffer)return false;
                                    const u64 size=chunk.buffer->Size();return info.offset<=size && info.range<=size-info.offset;
-                               }))) {buffer_prefix=false;break;}
+                               }) && !AheadRetained(*prepared,upload.info,info))) {buffer_prefix=false;break;} // FIX-GTS-393
                         }
                         if(!buffer_prefix)native_upload_receipt_used=false;
                     }
@@ -14380,7 +15265,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                                    info->range==VK_WHOLE_SIZE || !info->range)return false;
                                 const u64 size=chunk.buffer->Size();return info->offset<=size && info->range<=size-info->offset;
                             });});};
-                            const bool retained=recorded && retained_scan();
+                            // FIX-GTS-393: or bytes of the ahead arena (PERF-GTS-377).
+                            const bool retained=recorded && (retained_scan() || (prepared && AheadRetained(*prepared,index,*info)));
                             const auto readonly_slot=[&]() -> bool {
                                 if(!ParallelReadonlyDescriptorEnabled() || write.descriptorType!=vk::DescriptorType::eStorageBuffer || !info->buffer || !info->range ||
                                    info->range==VK_WHOLE_SIZE || prepared->buffer_ranges.size()>64 || prepared->regions.size()>64)return false;
@@ -14554,8 +15440,16 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                                     if(std::ranges::any_of(it->second,[&](const auto& view){return (view.use==ViewUse::Sampled || view.use==ViewUse::CubeSampled) && *view.view==wanted;}))return true;}
                                 return false;
                             };
-                            bool known=false;
-                            if(PreparedSampledProofRequested() && from_prepared && prepared && prepared->pipeline==pipeline &&
+                            // FIX-GTS-395: the depth stand-in (FIX-GT7-133) is no picture of the registry,
+                            // so no entry of b.sampled owns its view and every draw that binds it for an
+                            // empty shadow map was refused here (404,241 of 476,119 draws considered in
+                            // 10 s at Tokyo, as many as images were bound empty). It is the renderer's own
+                            // 1x1 image, cleared once when made and never written again, kept as long as
+                            // the renderer: a worker may bind it as it is.
+                            const VkImageView raw_view=static_cast<VkImageView>(info.imageView);
+                            bool known=raw_view==depth_stand_in_handles[0].load(std::memory_order_acquire) ||
+                                       raw_view==depth_stand_in_handles[1].load(std::memory_order_acquire);
+                            if(!known && PreparedSampledProofRequested() && from_prepared && prepared && prepared->pipeline==pipeline &&
                                prepared->proof_context && prepared->proof_context->Valid(prepared->proof_mode_state)) {
                                 NATIVE_DIAGNOSTIC(++parallel->prepared_view_attempts);
                                 const auto slot=static_cast<std::size_t>(&info-b.images.data());
@@ -15087,9 +15981,16 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                 parallel->ahead_flights[ahead_slot].lease=ahead;parallel->ahead_flights[ahead_slot].release=std::move(ahead_release);parallel->ahead_flights[ahead_slot].tick=0;++parallel->ahead_live;
             }
             if(!serial_split_prebound) {
+                // PERF-GTS-398: the worker looks the sets up when it records the draw.
+                parallel_late_bind=from_prepared && prepared && prepared->pipeline==pipeline &&
+                    CanBindLate(*pipeline,b);
+                if(parallel_late_bind) {
+                    LongSetsUpkeep();
+                } else {
                 parallel_bindings.write_structure_proven=true; // descriptor_safe validated every source row
                 set_count_proof();
                 {ScopedParallelBindingCapture capture{parallel_bindings};PushBindings(*pipeline,vk::PipelineBindPoint::eGraphics,b);}
+                }
             }
             if(parallel_bindings.ahead_used) {
                 ASSERT_MSG(ahead && ahead_slot<parallel->ahead_flights.size(),"ahead descriptor lease missing");
@@ -15103,7 +16004,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             if(!b.writes.empty()) for(u32 i=0;i<b.grouped_writes.size();++i) {
                 if(i==pipeline->PushSet() || b.grouped_writes[i].empty())continue;
                 parallel_required_sets|=u32{1}<<i;
-                if(!parallel_bindings.sets[i])missing=true;
+                if(!parallel_late_bind && !parallel_bindings.sets[i])missing=true;
             }
             if(missing) {
                 // A fresh secondary cannot inherit a serial command buffer's old
@@ -15161,6 +16062,15 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             captured.pipeline=pipeline->Handle();captured.layout=pipeline->GetLayout();
             captured.pipeline_owner=prepared->pipeline_keepalive;captured.dynamic=s.dynamic;captured.push=b.push;
             captured.sets=parallel_bindings.sets;captured.required_sets_mask=parallel_required_sets;
+            captured.dynamic_counts=parallel_bindings.dynamic_counts;captured.dynamic_offsets=parallel_bindings.dynamic_offsets; // FIX-GTS-394
+            if(parallel_late_bind) {
+                // PERF-GTS-398: the packet points at the prepared draw, which is kept until the
+                // list's passes have been recorded (Splice).
+                prepared->late_dead_seq=long_sets.dead_count;
+                prepared->late_retire_tick=r.scheduler.CurrentTick()+1;
+                captured.late_bind=&NativeRenderer::BindLateThunk;captured.late_owner=this;captured.late_prepared=prepared;
+                late_bound_prepared.push_back(prepared);give_back.p=nullptr;
+            }
             captured.immutable_upload_buffers_verified=true;captured.push_writes=std::move(parallel_push_writes);
             captured.push_set=pipeline->PushSet()<captured.sets.size()?pipeline->PushSet():static_cast<u32>(captured.sets.size());
             captured.descriptor_bytes=parallel_descriptor_bytes;
@@ -16013,6 +16923,8 @@ void NativeRenderer::PreparedDraw::Reset() {
     bindings.Clear();
     regions.clear();
     image_ranges.clear();
+    picture_ranges.clear(); // PERF-GTS-404
+    mirror_ranges.clear();  // PERF-GTS-405
     buffer_ranges.clear();
     upload_bytes.clear();
     uploads.clear();
@@ -16026,15 +16938,65 @@ void NativeRenderer::PreparedDraw::Reset() {
     index_address = 0;
     mirrors.clear();
     in_place.clear();
+    missing_pictures.clear(); // PERF-GTS-403
     for (auto& copy : stage_copies) {
         copy.present = false;
     }
 }
 
-void NativeRenderer::ChangeLog::Note(VAddr begin, VAddr end) {
+void NativeRenderer::ChangeLog::Note(VAddr begin, VAddr end, bool mirror) {
     const u64 next = seq.load(std::memory_order_relaxed) + 1;
-    entries[next % entries.size()] = {next, begin, end};
+    entries[next % entries.size()] = {next, begin, end, mirror};
     seq.store(next, std::memory_order_release);
+}
+
+bool NativeRenderer::ChangeLog::UntouchedHolding(
+    u64 since, std::span<const std::pair<VAddr, VAddr>> ranges,
+    std::span<const std::pair<VAddr, VAddr>> held) const {
+    const u64 now = seq.load(std::memory_order_acquire);
+    if (now == since) {
+        return true;
+    }
+    if (now - since > entries.size()) {
+        no_lost.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    const FreshnessRangeSearch<VAddr> search{ranges};
+    for (u64 at = since + 1; at <= now; ++at) {
+        const Entry& entry = entries[at % entries.size()];
+        if (entry.mirror) {
+            // A mirror is bound only as a vertex or index buffer, by the work that holds it.
+            // What reads the same memory in place, or binds it as a shader's buffer, reads
+            // what it read before.
+            for (const auto& [begin, end] : held) {
+                if (entry.begin < end && entry.end > begin) {
+                    no_changed.fetch_add(1, std::memory_order_relaxed);
+                    return false;
+                }
+            }
+            continue;
+        }
+        if (search.Intersects(entry.begin, entry.end)) {
+            no_changed.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+    return true;
+}
+
+// PERF-GTS-405 (RYGT_PREPARED_MIRROR_EXACT=1): a mirror made or dropped turns a prepared draw
+// down only when the draw holds a mirror over that range. Any mirror change over memory the
+// draw binds did, also for the constants it reads in place and for vertices it reads in place:
+// 100 to 41,400 draws in 10 s at Tokyo, in bursts when a large mirror is made again.
+bool NativeRenderer::PreparedBuffersUntouched(const PreparedDraw& p, u64 since) const {
+    static const bool mirror_exact = [] {
+        const char* env = std::getenv("RYGT_PREPARED_MIRROR_EXACT");
+        return !env || !*env || (env[0] == '1' && env[1] == '\0'); // PERF-GTS-407: on unless set to something else
+    }();
+    return mirror_exact
+               ? buffer_log.UntouchedHolding(since, p.buffer_ranges,
+                                             {p.mirror_ranges.data(), p.mirror_ranges.size()})
+               : buffer_log.Untouched(since, p.buffer_ranges);
 }
 
 bool NativeRenderer::ChangeLog::Untouched(u64 since,
@@ -16044,29 +17006,50 @@ bool NativeRenderer::ChangeLog::Untouched(u64 since,
         return true;
     }
     if (now - since > entries.size()) {
+        no_lost.fetch_add(1, std::memory_order_relaxed); // DIAG-GTS-401
         return false;
     }
     const FreshnessRangeSearch<VAddr> search{ranges};
     for (u64 at = since + 1; at <= now; ++at) {
         const Entry& entry = entries[at % entries.size()];
-        if (search.Intersects(entry.begin, entry.end)) return false;
+        if (search.Intersects(entry.begin, entry.end)) {
+            no_changed.fetch_add(1, std::memory_order_relaxed); // DIAG-GTS-401
+            return false;
+        }
     }
     return true;
 }
 
 NativeRenderer::PreparedDraw* NativeRenderer::NewPrepared() {
-    std::scoped_lock lock{prepared_pool_mutex};
-    if (!prepared_free.empty()) {
-        PreparedDraw* draw = prepared_free.back();
+    PreparedDraw* draw;
+    {
+        std::scoped_lock lock{prepared_pool_mutex};
+        if (prepared_free.empty()) {
+            prepared_all.push_back(std::make_unique<PreparedDraw>());
+            return prepared_all.back().get();
+        }
+        draw = prepared_free.back();
         prepared_free.pop_back();
-        return draw;
     }
-    prepared_all.push_back(std::make_unique<PreparedDraw>());
-    return prepared_all.back().get();
+    if (draw->reset_pending) { // PERF-GTS-392: here, on the thread that fills it again
+        draw->Reset();
+        draw->reset_pending = false;
+    }
+    return draw;
 }
 
 void NativeRenderer::FreePrepared(PreparedDraw* draw) {
-    draw->Reset();
+    // PERF-GTS-392: the recorder gave each prepared draw back cleared: Reset was 1.9% of its
+    // CPU time in a race at Tokyo, most of it clearing fields the recorder had never read
+    // (written by the worker that prepared the draw, on another core). The draw is now cleared
+    // by the thread that takes it for the next draw, which writes those fields anyway. What
+    // holds something for others is still released here: the pipeline and the descriptor sets
+    // prepared ahead.
+    if (AheadRequested()) {
+        draw->ahead_descriptor_lease.store({}, std::memory_order_release);
+    }
+    draw->pipeline_keepalive.reset();
+    draw->reset_pending = true;
     std::scoped_lock lock{prepared_pool_mutex};
     prepared_free.push_back(draw);
 }
@@ -16245,7 +17228,8 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
     if (DrawPreparationEnabled(2)) StableUniquePrepared(p->regions);
     p->bindings.PrepareWriteGroups(); // binding-owned spans, published with this draw
     p->bindings.PrepareDescriptorKeys(pipeline);
-    if (ParallelRecordingRequested()) try {
+    // PERF-GTS-403: not for a draw with a picture still to be made (its views are not known).
+    if (ParallelRecordingRequested() && p->missing_pictures.empty()) try {
         auto* candidate=&p->cpu_proof;candidate->prepared_identity=p;candidate->pipeline_identity=&pipeline;
         candidate->pipeline_layout=pipeline.GetLayout();
         const auto& b=p->bindings;candidate->writes_data=b.writes.data();candidate->writes_size=b.writes.size();
@@ -16574,6 +17558,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobGuestBuffer(VAddr a
         std::shared_lock map_lock{buffer_map_mutex};
         if (Region* region = RegionOver(address, size)) {
             if (address < region->begin || address + size > region->end) {
+                NATIVE_DIAGNOSTIC(++prepare_stats.why[2]);
                 return std::nullopt; // the region grows over it first
             }
             p.regions.push_back({region, address, size});
@@ -16582,6 +17567,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobGuestBuffer(VAddr a
         }
     }
     if (write) {
+        NATIVE_DIAGNOSTIC(++prepare_stats.why[3]);
         return std::nullopt; // a region is made for it (NAT-144), or mirrors dropped
     }
     auto* direct = r.buffer_cache.GetDirectMemory();
@@ -16590,6 +17576,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobGuestBuffer(VAddr a
             return std::pair{found->first->Handle(), found->second};
         }
     }
+    NATIVE_DIAGNOSTIC(++prepare_stats.why[4]);
     return std::nullopt; // gathered or copied, in GPU order
 }
 
@@ -16647,6 +17634,12 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
         const auto* bytes = static_cast<const u8*>(data);
         p.upload_bytes.insert(p.upload_bytes.end(), bytes, bytes + size);
         p.uploads.push_back({static_cast<u32>(b.buffers.size()), offset, size});
+        u64 position = 0;
+        u8* ahead = nullptr;
+        if (AheadAllocate(size, position, ahead)) {
+            std::memcpy(ahead, bytes, size); // PERF-GTS-377
+            p.uploads.back().ahead = position;
+        }
         return vk::DescriptorBufferInfo{VK_NULL_HANDLE, 0, size};
     };
     u32 index = 0;
@@ -16665,6 +17658,14 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
                 if (size != 0) {
                     p.uploads.push_back({static_cast<u32>(b.buffers.size()), 0, size,
                                          static_cast<s32>(stage.sw_stage)});
+                    u64 position = 0;
+                    u8* ahead = nullptr;
+                    if (AheadAllocate(size, position, ahead)) {
+                        // PERF-GTS-377: this thread's copy of the user data; bound when the
+                        // recorder installs the stages from this prepared draw (trusted).
+                        std::memcpy(ahead, stage.flattened_ud_buf.data(), size);
+                        p.uploads.back().ahead = position;
+                    }
                     info = vk::DescriptorBufferInfo{VK_NULL_HANDLE, 0, size};
                 }
                 break;
@@ -16701,6 +17702,7 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
                 break;
             }
             default:
+                NATIVE_DIAGNOSTIC(++prepare_stats.why[0]);
                 return false; // compute-only kinds and the unsupported ones: the recorder
             }
         } else {
@@ -16753,7 +17755,10 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
             // A region can appear after a worker's overlap check. Recheck any
             // truncated/empty range on the serialized recorder rather than
             // publishing an untracked truncated descriptor.
-            if (size != original_size) return false;
+            if (size != original_size) {
+                NATIVE_DIAGNOSTIC(++prepare_stats.why[1]);
+                return false;
+            }
             if (bindable && size != 0) {
                 bool region_over;
                 {
@@ -16833,6 +17838,7 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
     for (const auto& image_desc : stage.images) {
         auto tsharp = image_desc.GetSharp(stage);
         if (!MatchExperimentalCompositionTexture(tsharp, stage, image_desc, *registry)) {
+            NATIVE_DIAGNOSTIC(++prepare_stats.why[5]);
             return false; // Wait for preceding target registrations on the recorder.
         }
         const bool cube_sampling = image_desc.post_op == Shader::SharpFetchPostOp::NativeCubeSampling;
@@ -16860,6 +17866,7 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
                                                ? DepthStandIn(image_desc.is_array, false)
                                                : vk::ImageView{};
             if (wants_stand_in && !stand_in && DepthStandInOn()) {
+                NATIVE_DIAGNOSTIC(++prepare_stats.why[7]);
                 return false; // FIX-GT7-133: made and cleared on the recorder, which binds it
             }
             for (u32 i = 0; i < num_bindings; ++i) {
@@ -16878,6 +17885,7 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
                                ((image_desc.constant_mip_index & 0xff) << 6) |
                                (num_bindings << 16) | (u32(cube_sampling) << 31);
         if (num_bindings > 4 || stage.pgm_hash == 0xaa3822a3) {
+            NATIVE_DIAGNOSTIC(++prepare_stats.why[6]);
             return false; // the recorder (FIX-081's grass shader, long arrays)
         }
         const u64 memo_generation = p.image_generation + p.unmap_gen;
@@ -16921,6 +17929,7 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
                     for(u32 i=0;i<num_bindings;++i)Native::Parallel::AddSampledViewProof(p.sampled_view_proofs,first+i,b.sampled.size()-1,memo.views[i],entry,proof_epoch,cube_sampling);
             }
             p.image_ranges.emplace_back(entry->info.guest_address, entry->info.guest_address + std::max<u64>(entry->info.guest_size, 1));
+            p.picture_ranges.emplace_back(entry->info.guest_address, entry->info.guest_address + std::max<u64>(entry->info.guest_size, 1)); // PERF-GTS-404
             add_write();
             continue;
         }
@@ -16977,11 +17986,68 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
         if (!storage && (!entry || entry->needs_upload.load(std::memory_order_relaxed))) {
             warm_upload(desc.info.guest_address, desc.info.guest_size);
         }
+        // PERF-GTS-403 (RYGT_PREPARE_MISSING_PICTURES=1): a sampled picture that is not there
+        // yet no longer costs the whole prepared draw. GT Sport's light grid (30x17, 16
+        // layers) moves by a few hundred bytes now and then, each time a new picture: every
+        // lit draw of that frame (1,000 to 2,800) missed it here and took the recorder's own
+        // lookups, 7,700 to 51,500 draws in 10 s at Tokyo, a third of the frames of 34 ms and
+        // more beside such a burst. The draw keeps what was found; the recorder makes the
+        // picture in GPU order at commit and fills its views in.
+        static const bool leave_missing = [] {
+            const char* env = std::getenv("RYGT_PREPARE_MISSING_PICTURES");
+            // PERF-GTS-407: on unless set to something else
+            return !env || !*env || (env[0] == '1' && env[1] == '\0');
+        }();
+        if (!entry && leave_missing && !storage) {
+            for (u32 i = 0; i < num_bindings; ++i) {
+                b.images.push_back({VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral});
+            }
+            p.missing_pictures.push_back({first, image_desc.constant_mip_index,
+                                          static_cast<u8>(num_bindings),
+                                          static_cast<u8>(image_desc.mip_fallback_mode),
+                                          cube_sampling, desc.info, desc.view_info});
+            prepare_stats.left_missing.fetch_add(1, std::memory_order_relaxed);
+            add_write();
+            continue;
+        }
         if (!entry) {
+            NATIVE_DIAGNOSTIC(++prepare_stats.why[8]);
+#if !defined(NDEBUG)
+            {
+                // DIAG-GTS-402: every miss, by the picture's address.
+                std::scoped_lock missing_lock{prepare_stats.missing_mutex};
+                auto& miss = prepare_stats.missing[desc.info.guest_address];
+                if (miss.count == 0) miss.first_frame = static_cast<u32>(now_frame);
+                if (miss.width != desc.info.size.width || miss.height != desc.info.size.height ||
+                    miss.layers != desc.info.resources.layers) {
+                    ++miss.sizes;
+                }
+                ++miss.count;
+                miss.bytes = desc.info.guest_size;
+                miss.program = stage.pgm_hash;
+                miss.width = desc.info.size.width;
+                miss.height = desc.info.size.height;
+                miss.layers = desc.info.resources.layers;
+                miss.levels = desc.info.resources.levels;
+                miss.depth = image_desc.is_depth;
+                miss.last_frame = static_cast<u32>(now_frame);
+            }
+            // DIAG-GTS-401: the first few pictures a job thread did not find, each 10 s.
+            if (prepare_stats.missing_logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_INFO(Render_Vulkan,
+                         "DIAG-GTS-401: picture not there for a job thread: {:#x}+{:#x} {}x{} "
+                         "levels {} layers {} tile {} storage {} depth {} program {:#x} (frame {})",
+                         desc.info.guest_address, desc.info.guest_size, desc.info.size.width,
+                         desc.info.size.height, desc.info.resources.levels,
+                         desc.info.resources.layers, u32(desc.info.tile_mode), storage,
+                         image_desc.is_depth, stage.pgm_hash, now_frame);
+            }
+#endif
             return false; // made by the recorder, in GPU order
         }
         if (storage && !(vk::ImageUsageFlags{entry->backend_usage} &
                          vk::ImageUsageFlagBits::eStorage)) {
+            NATIVE_DIAGNOSTIC(++prepare_stats.why[9]);
             return false; // Let the recorder handle the unsupported storage binding.
         }
         const auto fallback = image_desc.mip_fallback_mode;
@@ -17018,6 +18084,9 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
         p.image_ranges.emplace_back(desc.info.guest_address,
                                     desc.info.guest_address +
                                         std::max<u64>(desc.info.guest_size, 1));
+        p.picture_ranges.emplace_back(entry->info.guest_address, // PERF-GTS-404: the picture's own
+                                      entry->info.guest_address +
+                                          std::max<u64>(entry->info.guest_size, 1));
         add_write();
     }
     for (const auto& sampler : stage.samplers) {
@@ -17102,6 +18171,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobVertexBuffer(VAddr 
                 if (lease.Allowed(mirror->begin, mirror->end)) {
                     if (std::ranges::find(p.mirrors, mirror) == p.mirrors.end()) {
                         p.mirrors.push_back(mirror);
+                        p.mirror_ranges.emplace_back(mirror->begin, mirror->end); // PERF-GTS-405
                     }
                     *mirror_out = mirror;
                     if(native_receipt)*native_receipt=valid_native(*mirror);
@@ -17257,6 +18327,26 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     Native::SlowCallTrace<8> trace{t_timed, "commit-prepared",
         {"stage-validation", "image-freshness", "sort-cpu-writes", "buffer-freshness",
          "refresh-regions", "upload-data", "image-rewrite-sources", "push-data"}};
+    trace.AccumulateInto(stats.commit_phase_ns, stats.commit_phase_calls); // DIAG-GTS-372
+    // PERF-GTS-381 (RYGT_PICTURE_PREFETCH=0 off): a race draw samples about 7 pictures, and
+    // the first check to read each one's record waited for it from memory, about 80 ns each
+    // (0.5 to 0.7 us a draw, DIAG-GTS-379). They are asked for now, and arrive while the
+    // validation, region refreshes and uploads below run.
+    static const bool prefetch_pictures = [] {
+        const char* env = std::getenv("RYGT_PICTURE_PREFETCH");
+        return !(env && env[0] == '0');
+    }();
+    if (prefetch_pictures) {
+        constexpr size_t Bytes = std::min<size_t>(sizeof(Native::ImageEntry), 512);
+        const auto ask = [](const Native::ImageEntry* entry) {
+            const char* const at = reinterpret_cast<const char*>(entry);
+            for (size_t offset = 0; offset < Bytes; offset += 64) {
+                _mm_prefetch(at + offset, _MM_HINT_T0);
+            }
+        };
+        for (const auto* sampled : p.bindings.sampled) ask(sampled);
+        for (const auto* stored : p.bindings.stored) ask(stored);
+    }
     const auto reject = [&](u32 why) {
         NATIVE_DIAGNOSTIC(++stats.prepared_rejected[why]);
         return false;
@@ -17283,7 +18373,29 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
         return reject(2);
     }
     trace.Next(1);
-    if (!registry->Untouched(p.image_generation, p.image_ranges)) {
+    // DIAG-GTS-401: which kind of change (or a log too short) turned the prepared draw down.
+    std::array<u64, 4> image_no_before{};
+    for (size_t i = 0; i < image_no_before.size(); ++i) {
+        image_no_before[i] = registry->untouched_no[i].load(std::memory_order_relaxed);
+    }
+    // PERF-GTS-404 (RYGT_PREPARED_EVICT_EXACT=1): an eviction turns a prepared draw down only
+    // when it took a picture the draw holds. Any eviction over the draw's pictures' memory did:
+    // GT Sport's light grid moves by a few hundred bytes now and then, each old copy is evicted
+    // when it has gone unused, and every prepared draw sampling the current copy (over the same
+    // memory) was turned down with it, 3,500 to 18,800 draws in 10 s at Tokyo.
+    static const bool evict_exact = [] {
+        const char* env = std::getenv("RYGT_PREPARED_EVICT_EXACT");
+        return !env || !*env || (env[0] == '1' && env[1] == '\0'); // PERF-GTS-407: on unless set to something else
+    }();
+    if (!(evict_exact
+              ? registry->UntouchedHolding(p.image_generation, p.image_ranges, p.picture_ranges)
+              : registry->Untouched(p.image_generation, p.image_ranges))) {
+        for (size_t i = 0; i < image_no_before.size(); ++i) {
+            NATIVE_DIAGNOSTIC(stats.prepared_image_no[i] +=
+                registry->untouched_no[i].load(std::memory_order_relaxed) - image_no_before[i]);
+        }
+        NATIVE_DIAGNOSTIC(++prepare_stats.turned_down_at[
+            registry->untouched_no_begin.load(std::memory_order_relaxed)]); // DIAG-GTS-402
         return reject(3);
     }
     trace.Next(2);
@@ -17292,8 +18404,47 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     // A successful first scan certifies history through this earlier checkpoint;
     // the second scan must still check every later change. Sampling after the scan is unsafe.
     const u64 recheck_from = buffer_log.Seq();
-    if (!buffer_log.Untouched(p.buffer_seq, p.buffer_ranges)) {
+    const u64 buffer_lost_before = buffer_log.no_lost.load(std::memory_order_relaxed);
+    if (!PreparedBuffersUntouched(p, p.buffer_seq)) {
+        const bool lost = buffer_log.no_lost.load(std::memory_order_relaxed) != buffer_lost_before;
+        NATIVE_DIAGNOSTIC(++stats.prepared_buffer_no[lost ? 1 : 0]);
+        static_cast<void>(lost);
         return reject(4);
+    }
+    // PERF-GTS-403: the pictures the job thread did not find are looked up again and made
+    // now, in GPU order, as BindTextures makes them; the loop over the sampled pictures below
+    // then treats them as the others. The keys were made without their views.
+    if (!p.missing_pictures.empty()) {
+        for (const auto& missing : p.missing_pictures) {
+            Native::ImageEntry* const entry = registry->Find(missing.info, false, frame);
+            if (!entry) {
+                return reject(3); // the recorder's own lookups bind what there is
+            }
+            const auto fallback = static_cast<Shader::MipStorageFallbackMode>(missing.fallback);
+            for (u32 i = 0; i < missing.bindings; ++i) {
+                auto view_info = missing.view_info;
+                if (fallback == Shader::MipStorageFallbackMode::ConstantIndex) {
+                    view_info.range.base.level += missing.constant_mip;
+                    view_info.range.extent.levels = 1;
+                } else if (fallback == Shader::MipStorageFallbackMode::DynamicIndex) {
+                    view_info.range.base.level += i;
+                    view_info.range.extent.levels = 1;
+                }
+                p.bindings.images[missing.first + i].imageView =
+                    View(*entry, view_info,
+                         missing.cube ? ViewUse::CubeSampled : ViewUse::Sampled);
+            }
+            p.bindings.sampled.push_back(entry);
+            p.image_ranges.emplace_back(missing.info.guest_address,
+                                        missing.info.guest_address +
+                                            std::max<u64>(missing.info.guest_size, 1));
+            p.picture_ranges.emplace_back(entry->info.guest_address, // PERF-GTS-404
+                                          entry->info.guest_address +
+                                              std::max<u64>(entry->info.guest_size, 1));
+            NATIVE_DIAGNOSTIC(++stats.prepared_pictures_made);
+        }
+        p.missing_pictures.clear();
+        p.bindings.key_layout = nullptr;
     }
     // The ordered part, as BindBuffers and BindTextures do it.
     trace.Next(4);
@@ -17308,6 +18459,14 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     const bool receipt_requested=trusted && p.proof_context && p.proof_context->Valid(p.proof_mode_state);
     bool uploads_proven=receipt_requested && upload_incarnation && !p.uploads.empty();
     for (const auto& upload : p.uploads) {
+        // PERF-GTS-377: already copied by the job thread, when its bytes still stand.
+        if (upload.ahead != ~u64{0} && (upload.flat_stage < 0 || trusted)) {
+            if (vk::DescriptorBufferInfo info; AheadCommit(upload.ahead, upload.size, info)) {
+                p.bindings.buffers[upload.info] = info;
+                uploads_proven = false;
+                continue;
+            }
+        }
         bool backing_proven=false;
         const u8* source = p.upload_bytes.data() + upload.offset;
         u32 size = upload.size;
@@ -17327,6 +18486,12 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     if(uploads_proven && stream.upload_incarnation==upload_incarnation)
         p.upload_receipt_incarnation=upload_incarnation;
     trace.Next(6);
+    {
+    // DIAG-GTS-379: which of the checks each picture gets costs the 1.0 us a draw of this step.
+    Native::SlowCallTrace<7> checks{t_timed, "commit-picture-checks",
+        {"stored", "last-use", "layers", "rewrite", "depth-twin", "small-rewrite", "sources"}};
+    checks.AccumulateInto(stats.image_check_ns, stats.image_check_calls);
+    if (t_timed) stats.image_check_pictures += p.bindings.stored.size() + p.bindings.sampled.size();
     for (const auto* stored : p.bindings.stored) {
         auto& entry = *const_cast<Native::ImageEntry*>(stored);
         entry.last_use.store(frame, std::memory_order_relaxed);
@@ -17335,14 +18500,21 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     }
     for (const auto* sampled : p.bindings.sampled) {
         auto& entry = *const_cast<Native::ImageEntry*>(sampled);
+        checks.Next(1);
         entry.last_use.store(frame, std::memory_order_relaxed);
+        checks.Next(2);
         if (entry.from_cpu) registry->LayersRewritten(entry, frame);
+        checks.Next(3);
         ApplyRewrite(entry); // NAT-120, NAT-133
+        checks.Next(4);
         SyncDepthTwin(entry); // FIX-212
+        checks.Next(5);
         if (entry.from_cpu && registry->RewrittenSmall(entry)) {
             ++stats.small_rewrites; // FIX-202
         }
+        checks.Next(6);
         RefreshSources(entry); // NAT-104 (FIX-197: targets too)
+    }
     }
     // RefreshRegion can process CPU writes again after the first freshness
     // check and retire a prepared mirror. Settle any new stream/promotion,
@@ -17350,7 +18522,7 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     // dereferencing its vertex mirrors if any prepared range changed.
     Begin();
     if (p.unmap_gen != unmap_generation.load(std::memory_order_acquire)) return reject(2);
-    if (!buffer_log.Untouched(recheck_from, p.buffer_ranges)) return reject(4);
+    if (!PreparedBuffersUntouched(p, recheck_from)) return reject(4);
     // The viewport transform the shaders get, from the registers as recorded.
     trace.Next(7);
     const Shader::PushData fresh = UserData(regs);
@@ -17804,6 +18976,7 @@ bool NativeRenderer::MetaClearDispatch(const Shader::Info& cs) {
 }
 
 void NativeRenderer::DispatchDirect() {
+    YieldToMappingChanges(); // PERF-GTS-368
     std::scoped_lock lock{mutex};
     AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::Dispatches};
 #if !defined(NDEBUG)
@@ -17917,7 +19090,9 @@ void NativeRenderer::DispatchDirect() {
         return p && *p ? std::strtoull(p,nullptr,0) : u64{0};
     }();
     static u64 captures=0;
-    const char* forced_descriptor=std::getenv("RYGT_A82D2FE_DESCRIPTOR_ONLY");
+    // PERF-GTS-389: read once. Asked at every dispatch it was 1.4% of the recorder's CPU time
+    // in a race at Tokyo (8,000 dispatches a second; getenv takes a lock and walks the block).
+    static const char* const forced_descriptor=std::getenv("RYGT_A82D2FE_DESCRIPTOR_ONLY");
     const bool after_race_ready=A82CaptureAfterRace();
     if (after_race_ready && capture_budget && captures < capture_budget && frame >= capture_from &&
         diag_cs.pgm_hash == 0xa82d2fe && forced_descriptor && forced_descriptor[0]=='1' &&
@@ -18230,6 +19405,7 @@ void NativeRenderer::DispatchDirect() {
 }
 
 void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+    YieldToMappingChanges(); // PERF-GTS-368
     std::scoped_lock lock{mutex};
 #if !defined(NDEBUG)
     SceneTrace::CpuScope scene_trace{r.FrameDumpCollecting(),frame,"dispatch-indirect"};
@@ -18562,6 +19738,7 @@ void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is
     if (num_bytes == 0) {
         return;
     }
+    YieldToMappingChanges(); // PERF-GTS-368
     std::scoped_lock lock{mutex};
     if (!is_gds) {
         SyncUiRange(address, num_bytes, false);
@@ -18633,6 +19810,7 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
     if (num_bytes == 0) {
         return;
     }
+    YieldToMappingChanges(); // PERF-GTS-368
     std::scoped_lock lock{mutex};
     if (!src_gds) {
         SyncUiRange(src, num_bytes, true);
@@ -18710,6 +19888,7 @@ bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
         return false;
     }
     NoteHistory(address, data.size(), 6, 0); // DIAG-187 (diagnosis)
+    YieldToMappingChanges(); // PERF-GTS-368
     std::scoped_lock lock{mutex};
     SnapshotLease::MarkUnsafe(address, data.size(), 16);
     auto* direct = r.buffer_cache.GetDirectMemory();
@@ -18764,6 +19943,10 @@ void NativeRenderer::CancelLinearDownloads(VAddr address, u64 size) {
 }
 
 void NativeRenderer::OnUnmap(VAddr address, u64 size) {
+    // PERF-GTS-368: which part of an unmap waits (the guest-unmap trace has it as one phase).
+    Native::SlowCallTrace<5> trace{true, "native-unmap",
+        {"ui", "unwatch", "registry", "renderer-lock", "drop"}};
+    trace.Next(0, address, size);
     if (UiHires::Enabled()) {
         auto& ui = UiHires::Get();
         std::scoped_lock lock{ui.mutex};
@@ -18795,12 +19978,18 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
     // protected nothing, and was never set again (the page was "watched"). GT Sport maps a car's
     // models and textures into the same memory each time: the showroom's 32x32 lighting texture
     // kept the zeros of the fresh mapping, and the car screens came out blown out.
+    trace.Next(1);
     if (size != 0) {
         UnwatchPages(VideoCore::PageManager::GetPageAddr(address),
                      VideoCore::PageManager::GetNextPageAddr(address + size - 1));
     }
+    trace.Next(2);
     registry->Invalidate(address, size, Native::ImageRegistry::Stale::Unmap);
+    trace.Next(3);
+    mapping_waiters.fetch_add(1, std::memory_order_acq_rel); // PERF-GTS-368
     std::scoped_lock lock{mutex};
+    mapping_waiters.fetch_sub(1, std::memory_order_acq_rel);
+    trace.Next(4);
     CancelLinearDownloads(address, size);
     if (FaultAheadEnabled() && size != 0) {
         page_watches.ClearExclusions(VideoCore::PageManager::GetPageAddr(address),
@@ -18860,7 +20049,9 @@ u32 NativeRenderer::DropRegionsOver(VAddr address, u64 size, u32 mirror_reason) 
 
 void NativeRenderer::OnNewMapping(VAddr address, u64 size) {
     if (!size) return;
+    mapping_waiters.fetch_add(1, std::memory_order_acq_rel); // PERF-GTS-368
     std::scoped_lock lock{mutex};
+    mapping_waiters.fetch_sub(1, std::memory_order_acq_rel);
     CancelLinearDownloads(address, size);
     std::optional<std::vector<Native::MappingRefreshRange>> plan;
     std::unordered_set<VAddr> prepared_pages;
@@ -18893,6 +20084,8 @@ void NativeRenderer::OnNewMapping(VAddr address, u64 size) {
         std::scoped_lock dirty_lock{region_dirty_mutex};
         for (const auto& range : *plan) {
             auto& region = regions.at(range.region);
+            diag_region_marks[2].fetch_add((range.end - range.first) / 4096,
+                                           std::memory_order_relaxed); // DIAG-GTS-411
             for (VAddr page = range.first; page < range.end; page += 4096) {
                 region.dirty_pages.push_back(page);
                 region.cpu_pages->erase(page);
@@ -19247,6 +20440,8 @@ void NativeRenderer::EvictImages() {
     {
         const u64 done = r.scheduler.GetWorkSemaphore()->KnownGpuTick();
         while (!retired_views.empty() && retired_views.front().first <= done) {
+            Native::DeadHandles::Note(
+                static_cast<VkImageView>(*retired_views.front().second)); // PERF-GTS-375
             retired_views.pop_front();
         }
     }
@@ -19662,6 +20857,7 @@ void NativeRenderer::FaultAhead(VAddr begin, VAddr end) {
                 r.page_manager.UpdatePageWatchers(address, bytes, VideoCore::PageOp::Untrack);
                 std::scoped_lock lock{region_dirty_mutex};
                 pending_region_writes.emplace_back(address, address + bytes);
+                diag_region_marks[1].fetch_add(bytes / 4096, std::memory_order_relaxed); // DIAG-GTS-411
                 has_pending_region_writes.store(true, std::memory_order_release);
         });
     }
@@ -19785,6 +20981,7 @@ void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
     {
         std::scoped_lock pending_lock{region_dirty_mutex};
         pending_region_writes.emplace_back(begin, end);
+        diag_region_marks[0].fetch_add((end - begin) / 4096, std::memory_order_relaxed); // DIAG-GTS-411
     }
     has_pending_region_writes.store(true, std::memory_order_release);
     FaultAhead(begin, end);
@@ -19911,8 +21108,8 @@ void NativeRenderer::Splice() {
         const bool drained=sidecar->coordinator->Drain(signal,
             [&](Native::Rhi::CommandList* list,Native::Parallel::PassCoordinator::JobPtr,
                 Native::Parallel::PassCoordinator::PrefixPtr) noexcept {
-                const vk::CommandBuffer cmd{reinterpret_cast<VkCommandBuffer>(list->NativeHandle())};
-                r.scheduler.CommandBuffer().executeCommands(cmd);
+                // PERF-GTS-399: a recorder list (raw or ring-recorded) or a worker's raw one.
+                r.scheduler.CommandBuffer().executeCommands(StreamCmdOf(*list));
                 device->MarkExecuted(list,{timeline.get(),signal});
             });
 #if !defined(NDEBUG)
@@ -19925,6 +21122,11 @@ void NativeRenderer::Splice() {
     if (!wrapped) {
         r.scheduler.CommandBuffer().executeCommands(s.cmd);
     }
+    // PERF-GTS-398: every pass of the list has been recorded: its packets' prepared draws go
+    // (at the next draw: a draw that is being recorded may have asked for this splice).
+    late_bound_done.insert(late_bound_done.end(), late_bound_prepared.begin(),
+                           late_bound_prepared.end());
+    late_bound_prepared.clear();
     const u64 tick = r.scheduler.CurrentTick();
     GpuTimeCollect(); // DIAG-GT7-001: lists the GPU finished
     SpliceHudStream(tick); // GT7-UW
@@ -19982,6 +21184,8 @@ void NativeRenderer::Splice() {
     }
     s.pooled_snapshots.clear();
     s.keep.clear(); // freed by the device once the GPU ran this list (NAT-107)
+    s.gathers.clear(); // PERF-GTS-365: they went with the list
+    s.gather_max = 0;
     device->Collect(); // objects the GPU finished with (staging buffers of uploads)
     s.wrapped_list.reset();
     s.list = nullptr;
@@ -21340,8 +22544,10 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
         sidecar->readonly_range_hint_hits=sidecar->readonly_range_hint_misses=sidecar->readonly_region_hint_hits=sidecar->readonly_region_hint_misses=0;
         sidecar->absent_sampled_attempts=sidecar->absent_sampled_accepted=sidecar->absent_sampled_rejected=sidecar->sampled_null_view=sidecar->sampled_nonnull_sampler=sidecar->sampled_nongeneral=sidecar->sampled_canonical_null=sidecar->absent_mode0_attempts=sidecar->absent_mode0_accepted=sidecar->absent_mode0_rejected=sidecar->natural_preclosed=sidecar->natural_captured=sidecar->natural_serial_fallback=sidecar->natural_binding_skip=sidecar->sampler_proof_hits=sidecar->sampler_proof_misses=sidecar->sampler_scan_steps=sidecar->sampler_scan_positives=sidecar->proof_table_builds=sidecar->proof_table_hits=sidecar->extended_clear_rejected=sidecar->fast_rejected=sidecar->no_pass_room_rejected=sidecar->serial_scope_bypassed=sidecar->owner_slot_pressure=sidecar->eligible_in_serial_scope=sidecar->eligible_in_active_scope=sidecar->eligible_at_boundary=sidecar->vertex_candidates=sidecar->vertex_preflight_draws=sidecar->vertex_backing_pass=sidecar->vertex_bad_structure=sidecar->vertex_bad_binding=sidecar->vertex_bad_pnext=sidecar->vertex_unknown_backing=sidecar->vertex_direct_ranges=sidecar->vertex_direct_attempts=sidecar->vertex_direct_matches=sidecar->descriptor_readonly_attempts=sidecar->descriptor_readonly_regions=sidecar->descriptor_readonly_imports=sidecar->descriptor_readonly_uncontained=sidecar->descriptor_readonly_unmatched=sidecar->descriptor_clip_nulls=sidecar->direct_slot_attempts=sidecar->direct_slot_accepted=sidecar->passes=sidecar->draws=sidecar->queued=sidecar->synchronous=sidecar->considered=sidecar->eligible=sidecar->unknown_resource_key=sidecar->buffer_rejected=sidecar->alias_rejected=sidecar->descriptor_rejected=sidecar->missing_sets=sidecar->preflight_samples=sidecar->preflight_wall_ns=sidecar->preflight_cpu_100ns=sidecar->preflight_cpu_samples=sidecar->drain_ns=sidecar->coordinator_cpu_100ns=sidecar->coordinator_cpu_samples=0;
     }
-    LOG_INFO(Render_Vulkan, "NAT: descriptor allocation calls={} reserve hits={} unused={}",
-             stats.descriptor_allocate_calls, stats.descriptor_reserve_hits, stream.descriptor_reserve.SpareCount());
+    LOG_INFO(Render_Vulkan, "NAT: descriptor allocation calls={} reserve hits={} unused={}; "
+             "update calls left to the command thread {} (PERF-GTS-371)",
+             stats.descriptor_allocate_calls, stats.descriptor_reserve_hits, stream.descriptor_reserve.SpareCount(),
+             stats.descriptor_async_updates);
     if (DescriptorAllocDiagEnabled() && descriptor_alloc_owner == this) {
         const auto& m=descriptor_alloc_metrics;
         for (u32 kind=0;kind<2;++kind) LOG_INFO(Render_Vulkan,
@@ -21360,6 +22566,94 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
         descriptor_alloc_metrics={};
     }
     stats.descriptor_allocate_calls = stats.descriptor_reserve_hits = 0;
+    stats.descriptor_async_updates = 0;
+    if (stats.bind_phase_calls != 0 || stats.commit_phase_calls != 0) {
+        const auto us = [](const auto& ns, uint64_t calls) {
+            std::string text;
+            for (const auto value : ns) {
+                text += fmt::format("{}{:.2f}", text.empty() ? "" : "/",
+                                    calls ? double(value) / 1000.0 / double(calls) : 0.0);
+            }
+            return text;
+        };
+        LOG_INFO(Render_Vulkan,
+                 "DIAG-GTS-372 (10 s): us a timed draw in bindings push-constants/groups-keys/"
+                 "push-descriptor/hash-lookup/allocate/copy-writes/update-descriptors/store-key/"
+                 "bind-set {} ({} calls); in prepared commit stage-validation/image-freshness/"
+                 "sort-cpu-writes/buffer-freshness/refresh-regions/upload-data/"
+                 "image-rewrite-sources/push-data {} ({} calls)",
+                 us(stats.bind_phase_ns, stats.bind_phase_calls), stats.bind_phase_calls,
+                 us(stats.commit_phase_ns, stats.commit_phase_calls), stats.commit_phase_calls);
+    }
+    if (ahead_arena.buffer) {
+        LOG_INFO(Render_Vulkan,
+                 "PERF-GTS-377 (10 s): draw constants copied by job threads: {} copies, {} bound "
+                 "by the recorder, {} written over before their draw (copied at commit), {} "
+                 "copies refused (the GPU still needed the space)",
+                 ahead_arena.copied.exchange(0), ahead_arena.bound, ahead_arena.stale,
+                 ahead_arena.refused.exchange(0));
+        ahead_arena.bound = ahead_arena.stale = 0;
+    }
+    {
+    std::scoped_lock long_lock{long_sets_mutex};
+    if (long_sets.hits + long_sets.made != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "PERF-GTS-375 (10 s): sets kept across lists: {} reused, {} made ({} in the set "
+                 "of a dropped one), {} dropped (an object of theirs was destroyed), {} flushes; "
+                 "{} kept in {} pools, {} waiting for the GPU",
+                 long_sets.hits, long_sets.made, long_sets.rewritten, long_sets.dropped,
+                 long_sets.flushes, long_sets.entries.Size(), long_sets.pools.size(),
+                 long_sets.retired.size());
+    }
+    if (long_sets.late_hits + long_sets.late_made + long_sets.late_not_kept != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "PERF-GTS-398 (10 s): sets looked up by pass workers: {} reused, {} made, {} "
+                 "made and not kept (a handle of theirs had died)",
+                 long_sets.late_hits, long_sets.late_made, long_sets.late_not_kept);
+    }
+    long_sets.hits = long_sets.made = long_sets.dropped = long_sets.flushes = 0;
+    long_sets.rewritten = 0;
+    long_sets.late_hits = long_sets.late_made = long_sets.late_not_kept = 0;
+    }
+    if (stats.reuse_diag_sets != 0) {
+        const auto pct = [&](uint64_t n) { return 100.0 * double(n) / double(stats.reuse_diag_sets); };
+        LOG_INFO(Render_Vulkan,
+                 "DIAG-GTS-373 (10 s): {} graphics sets looked up; reused as now {:.1f}%; with "
+                 "buffer offsets left out of the key, seen before in the same list {:.1f}%, in "
+                 "the same frame {:.1f}%, in these 10 s {:.1f}% ({} distinct)",
+                 stats.reuse_diag_sets, pct(stats.reuse_diag_exact), pct(stats.reuse_diag_list),
+                 pct(stats.reuse_diag_frame), pct(stats.reuse_diag_window),
+                 stats.reuse_diag_in_window.size());
+    }
+    stats.reuse_diag_sets = stats.reuse_diag_exact = stats.reuse_diag_list = 0;
+    stats.reuse_diag_frame = stats.reuse_diag_window = 0;
+    stats.reuse_diag_in_window.clear();
+    if (stats.mirrors_made != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "DIAG-GTS-387 (10 s): {} mirrors made ({:.1f} MB), {} of them over existing "
+                 "mirrors that held {:.1f} MB of it; largest {:.1f} MB",
+                 stats.mirrors_made, stats.mirror_made_bytes / 1048576.0, stats.mirrors_regrown,
+                 stats.mirror_retaken_bytes / 1048576.0, stats.mirror_largest / 1048576.0);
+    }
+    stats.mirrors_regrown = stats.mirror_retaken_bytes = stats.mirror_largest = 0;
+    if (stats.image_check_calls != 0) {
+        std::string text;
+        for (const auto value : stats.image_check_ns) {
+            text += fmt::format("{}{:.3f}", text.empty() ? "" : "/",
+                                double(value) / 1000.0 / double(stats.image_check_calls));
+        }
+        LOG_INFO(Render_Vulkan,
+                 "DIAG-GTS-379 (10 s): us a timed draw in the picture checks stored/last-use/"
+                 "layers/rewrite/depth-twin/small-rewrite/sources {} ({} draws, {:.2f} pictures "
+                 "a draw)",
+                 text, stats.image_check_calls,
+                 double(stats.image_check_pictures) / double(stats.image_check_calls));
+    }
+    stats.image_check_ns = {};
+    stats.image_check_calls = stats.image_check_pictures = 0;
+    stats.bind_phase_ns = {};
+    stats.commit_phase_ns = {};
+    stats.bind_phase_calls = stats.commit_phase_calls = 0;
     stats.descriptor_reuses = stats.descriptor_allocations = 0;
     LOG_INFO(Render_Vulkan, "DESC-HASH: {} prepared hashes reused, {} refreshed after buffer changes",
              descriptor_hash_reused, descriptor_hash_refreshed);
@@ -21515,6 +22809,111 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
     stats.snapshot_direct_attempts = stats.snapshot_direct_hits = stats.snapshot_direct_faults = stats.snapshot_direct_bytes = 0;
     stats.snapshot_memo_hits = stats.snapshot_memo_misses = stats.snapshot_upload_bytes_saved = 0;
     stats.record_ns = {};
+    {
+        // DIAG-GTS-401: why draws reach the recorder without a usable prepared draw.
+        std::array<u64, 10> why{};
+        u64 any = 0;
+        for (size_t i = 0; i < why.size(); ++i) any += why[i] = prepare_stats.why[i].exchange(0);
+        std::array<u64, 4> image_no{};
+        for (size_t i = 0; i < image_no.size(); ++i) {
+            any += image_no[i] = stats.prepared_image_no[i];
+            stats.prepared_image_no[i] = 0;
+        }
+        const u64 buffer_changed = stats.prepared_buffer_no[0];
+        const u64 buffer_lost = stats.prepared_buffer_no[1];
+        stats.prepared_buffer_no[0] = stats.prepared_buffer_no[1] = 0;
+        prepare_stats.missing_logged.store(0, std::memory_order_relaxed);
+#if !defined(NDEBUG)
+        {
+            // DIAG-GTS-402: the pictures behind those counts, the ten most frequent.
+            std::vector<std::pair<u64, PrepareStats::Missing>> rows;
+            {
+                std::scoped_lock missing_lock{prepare_stats.missing_mutex};
+                rows.assign(prepare_stats.missing.begin(), prepare_stats.missing.end());
+                prepare_stats.missing.clear();
+            }
+            std::ranges::sort(rows, [](const auto& a, const auto& b) {
+                return a.second.count > b.second.count;
+            });
+            u64 all = 0;
+            for (const auto& row : rows) all += row.second.count;
+            std::string text;
+            for (size_t i = 0; i < rows.size() && i < 10; ++i) {
+                const auto& [address, miss] = rows[i];
+                text += fmt::format(" | {:#x}+{:#x} x{} last {}x{} layers {} levels {}{} in {} "
+                                    "sizes, frames {}-{}, program {:#x}",
+                                    address, miss.bytes, miss.count, miss.width, miss.height,
+                                    miss.layers, miss.levels, miss.depth ? " depth" : "",
+                                    miss.sizes, miss.first_frame, miss.last_frame, miss.program);
+            }
+            if (const u64 left = prepare_stats.left_missing.exchange(0);
+                left + stats.prepared_pictures_made != 0) {
+                LOG_INFO(Render_Vulkan, "PERF-GTS-403 (10 s): job threads left {} pictures for "
+                         "the recorder; it filled {} in at commit", left,
+                         stats.prepared_pictures_made);
+                stats.prepared_pictures_made = 0;
+            }
+            {
+                // DIAG-GTS-411: after several track loads the recorder refreshed 40 times the
+                // region pages (1.6 million in 10 s, 5.4 s of its time) with most of them
+                // unchanged. Which regions, and what marked their pages as written.
+                std::vector<std::pair<VAddr, DiagRegionRefresh>> top(diag_region_refresh.begin(),
+                                                                     diag_region_refresh.end());
+                diag_region_refresh.clear();
+                std::ranges::sort(top, [](const auto& a, const auto& b) {
+                    return a.second.pages > b.second.pages;
+                });
+                std::string list;
+                for (size_t i = 0; i < top.size() && i < 6; ++i) {
+                    list += fmt::format(" {:#x}+{:.1f}MB: {} pages in {} refreshes;", top[i].first,
+                                        (top[i].second.end - top[i].first) / 1048576.0,
+                                        top[i].second.pages, top[i].second.refreshes);
+                }
+                std::array<u64, 6> marks{};
+                for (size_t i = 0; i < marks.size(); ++i) {
+                    marks[i] = diag_region_marks[i].exchange(0, std::memory_order_relaxed);
+                }
+                LOG_INFO(Render_Vulkan,
+                         "DIAG-GTS-411 (10 s): pages marked written: CPU write faults {}, unwatched "
+                         "ahead of a fault {} ({} of both in regions), new mappings {}, pictures "
+                         "copied back {}, picture memory over a region {}; {} regions refreshed, "
+                         "most pages:{}",
+                         marks[0], marks[1], marks[5], marks[2], marks[3], marks[4], top.size(),
+                         list);
+            }
+            if (!rows.empty()) {
+                LOG_INFO(Render_Vulkan, "DIAG-GTS-402 (10 s): {} misses over {} picture "
+                         "addresses on job threads (frame now {}):{}", all, rows.size(), frame,
+                         text);
+            }
+            std::vector<std::pair<u64, u64>> down(prepare_stats.turned_down_at.begin(),
+                                                  prepare_stats.turned_down_at.end());
+            prepare_stats.turned_down_at.clear();
+            std::ranges::sort(down, [](const auto& a, const auto& b) { return a.second > b.second; });
+            std::string down_text;
+            for (size_t i = 0; i < down.size() && i < 8; ++i) {
+                down_text += fmt::format(" {:#x} x{}", down[i].first, down[i].second);
+            }
+            if (!down.empty()) {
+                LOG_INFO(Render_Vulkan, "DIAG-GTS-402 (10 s): prepared draws turned down for a "
+                         "picture change beginning at ({} addresses):{}", down.size(), down_text);
+            }
+        }
+#endif
+        if (any + buffer_changed + buffer_lost != 0) {
+            LOG_INFO(Render_Vulkan,
+                     "DIAG-GTS-401 (10 s): job threads could not prepare: buffer kind {}, buffer "
+                     "cut short {}, region must grow {}, written buffer without a region {}, "
+                     "buffer not imported {}, composition texture {}, long array or grass {}, "
+                     "depth stand-in not made {}, picture not made yet {}, storage picture {}. "
+                     "Prepared draws turned down for their pictures: picture made {}, pictures "
+                     "evicted {}, picture reused {}, log too short {}. For their buffers: range "
+                     "changed {}, log too short {}",
+                     why[0], why[1], why[2], why[3], why[4], why[5], why[6], why[7], why[8],
+                     why[9], image_no[1], image_no[2], image_no[3], image_no[0], buffer_changed,
+                     buffer_lost);
+        }
+    }
     prepare_stats.made = 0;
     prepare_stats.failed = 0;
     prepare_stats.replaced = 0;

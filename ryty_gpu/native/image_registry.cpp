@@ -8,6 +8,10 @@ bool RytyWideScene(); // WIDE-001 (ryty_game_patch.cpp)
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <stop_token>
+#include <thread>
 #include <algorithm>
 #include <bit>
 #include <cstring>
@@ -585,7 +589,7 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         IndexEntry(*result);
         const std::pair<VAddr, VAddr> range{info.guest_address,
                                             info.guest_address + std::max<u64>(info.guest_size, 1)};
-        NoteChanges({&range, 1}); // OPT-002, OPT-010
+        NoteChanges({&range, 1}, 1); // OPT-002, OPT-010
     }
     fill_lock.unlock();
 #ifndef NDEBUG
@@ -675,11 +679,11 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
     return result;
 }
 
-void ImageRegistry::NoteChanges(std::span<const std::pair<VAddr, VAddr>> ranges) {
+void ImageRegistry::NoteChanges(std::span<const std::pair<VAddr, VAddr>> ranges, u8 kind) {
     std::scoped_lock lock{changes_mutex};
     const u64 next = generation.load(std::memory_order_relaxed) + 1;
     for (const auto& [begin, end] : ranges) {
-        changes[change_count++ % changes.size()] = {next, begin, end};
+        changes[change_count++ % changes.size()] = {next, begin, end, kind};
     }
     generation.fetch_add(1, std::memory_order_acq_rel);
 }
@@ -697,11 +701,55 @@ bool ImageRegistry::Untouched(u64 since, std::span<const std::pair<VAddr, VAddr>
         }
         for (const auto& [begin, end] : ranges) {
             if (change.begin < end && change.end > begin) {
+                untouched_no[change.kind >= 1 && change.kind <= 3 ? change.kind : 1].fetch_add(
+                    1, std::memory_order_relaxed); // DIAG-GTS-401
+                untouched_no_begin.store(change.begin, std::memory_order_relaxed); // DIAG-GTS-402
                 return false;
             }
         }
     }
     // Every change kept is newer: the log reaches back far enough only if none was lost.
+    if (change_count > changes.size()) {
+        untouched_no[0].fetch_add(1, std::memory_order_relaxed); // DIAG-GTS-401
+    }
+    return change_count <= changes.size();
+}
+
+bool ImageRegistry::UntouchedHolding(u64 since, std::span<const std::pair<VAddr, VAddr>> ranges,
+                                     std::span<const std::pair<VAddr, VAddr>> held) {
+    if (generation.load(std::memory_order_acquire) == since) {
+        return true;
+    }
+    std::scoped_lock lock{changes_mutex};
+    const u64 kept = std::min<u64>(change_count, changes.size());
+    for (u64 i = 0; i < kept; ++i) {
+        const Change& change = changes[(change_count - 1 - i) % changes.size()];
+        if (change.generation <= since) {
+            return true;
+        }
+        if (change.kind == 2) {
+            // An evicted picture is gone for whoever held it, and for nobody else: a lookup
+            // that answered with another picture still answers with that one.
+            for (const auto& [begin, end] : held) {
+                if (change.begin == begin && change.end == end) {
+                    untouched_no[2].fetch_add(1, std::memory_order_relaxed);
+                    untouched_no_begin.store(change.begin, std::memory_order_relaxed);
+                    return false;
+                }
+            }
+            continue;
+        }
+        for (const auto& [begin, end] : ranges) {
+            if (change.begin < end && change.end > begin) {
+                untouched_no[change.kind == 3 ? 3 : 1].fetch_add(1, std::memory_order_relaxed);
+                untouched_no_begin.store(change.begin, std::memory_order_relaxed);
+                return false;
+            }
+        }
+    }
+    if (change_count > changes.size()) {
+        untouched_no[0].fetch_add(1, std::memory_order_relaxed);
+    }
     return change_count <= changes.size();
 }
 
@@ -1216,8 +1264,20 @@ u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_
     // Scan metadata in every shard: a heavily populated single shard must still
     // be able to retire a full budget every frame, rather than once per rotation.
     // Rotate the selection order so a busy shard cannot starve the others.
-    const u32 visits = NumShards;
-    if (bounded) eviction_shard_cursor = (first + 1) % NumShards;
+    // PERF-GTS-385 (RYGT_EVICT_SCAN_SHARDS=<1..64>, default 64 = as before): the bounded
+    // per-frame scan read every picture's last use, a cache miss each: 7.5% of the recorder's
+    // CPU time in a 20-car race at Tokyo (about 1.2 ms a frame), and a second walk of every
+    // shard whenever something went (1.8%). With fewer shards a frame the scan goes round
+    // the table over several frames; a frame's budget is still filled whenever the shards
+    // it visits hold that many idle pictures.
+    static const u32 scan_shards = [] {
+        const char* env = std::getenv("RYGT_EVICT_SCAN_SHARDS");
+        // PERF-GTS-407: 8 shards a frame unless set.
+        const u32 value = env && *env ? u32(std::strtoul(env, nullptr, 10)) : 8;
+        return std::clamp<u32>(value, 1, NumShards);
+    }();
+    const u32 visits = bounded ? scan_shards : NumShards;
+    if (bounded) eviction_shard_cursor = (first + visits) % NumShards;
     for (u32 i = 0; i < visits; ++i) {
         Shard& shard = shards[(first + i) % NumShards];
         std::shared_lock lock{shard.mutex};
@@ -1277,7 +1337,7 @@ u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_
             ranges.emplace_back(entry->info.guest_address,
                                 entry->info.guest_address + std::max<u64>(entry->info.guest_size, 1));
         }
-        NoteChanges(ranges); // OPT-002, OPT-010
+        NoteChanges(ranges, 2); // OPT-002, OPT-010
     }
     // The links between textures and targets that went (NAT-111: both directions).
     for (const auto& entry : taken) {
@@ -1452,7 +1512,7 @@ void ImageRegistry::MarkReused(ImageEntry& entry) {
     const std::pair<VAddr, VAddr> range{entry.info.guest_address,
                                         entry.info.guest_address +
                                             std::max<u64>(entry.info.guest_size, 1)};
-    NoteChanges({&range, 1});
+    NoteChanges({&range, 1}, 3);
 #ifndef NDEBUG
     if (WatchedTexture(entry.info.guest_address, entry.info.guest_address + 1)) {
         LOG_WARNING(Render_Vulkan, "FIX-157 watch: kept {:#x} reused", entry.info.guest_address);
@@ -2083,7 +2143,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
     }
     // PERF-109: the stale textures the work uses (an entry listed twice is uploaded once).
     for (ImageEntry* entry : bound) {
-        if (entry && entry->from_cpu && entry->needs_upload.load(std::memory_order_relaxed)) {
+        if (entry && entry->from_cpu && UploadDue(*entry)) {
             pending.push_back(entry);
         }
     }
@@ -2094,9 +2154,14 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
     u32 uploaded = 0;
     std::vector<std::unique_ptr<Rhi::Buffer>> staging; // freed after the GPU used them
     for (ImageEntry* entry : pending) {
+        if (!UploadDue(*entry)) {
+            continue; // PERF-GTS-384: not stale, or uploaded this frame already (stays stale)
+        }
         if (!entry->needs_upload.exchange(false)) {
             continue;
         }
+        entry->upload_frame.store(upload_frame_now.load(std::memory_order_relaxed),
+                                  std::memory_order_relaxed);
         const VideoCore::ImageInfo& info = entry->info;
         const u64 size = info.guest_size;
 #ifndef NDEBUG
@@ -2516,7 +2581,7 @@ void ImageRegistry::FinishDownloads(Rhi::CommandList& list, DownloadBatch& batch
              .offset = tiling.tiled_offset, .size = tiling.size},
             {.slot = 1, .type = Rhi::BindingType::StorageBuffer, .buffer = batch.scratch.get(),
              .offset = tiling.linear_offset, .size = tiling.size},
-            {.slot = 2, .type = Rhi::BindingType::UniformBuffer, .buffer = tiling.params.get(),
+            {.slot = 2, .type = Rhi::BindingType::UniformBuffer, .buffer = tiling.params,
              .size = sizeof(TilingParams)},
         }};
         list.PushBindings(bindings);
@@ -2549,7 +2614,14 @@ bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, co
         return true;
     }
     const Rhi::Pipeline* tile = TilingPipeline(info, true);
-    auto batch_params = batch && tile ? TilingParamsBuffer(info) : nullptr;
+    // PERF-GTS-370: a batched write-back made a new params buffer each time (PERF-314 reused the
+    // picture's only for unbatched ones): 11% of the recorder's time at the Autopolis start went
+    // to creating them. The picture's own, made once, is the same bytes; the entry outlives the
+    // batch, which FinishDownloads records in the same flush.
+    if (batch && tile && !entry.download_params) {
+        entry.download_params = TilingParamsBuffer(info);
+    }
+    const Rhi::Buffer* batch_params = batch && tile ? entry.download_params.get() : nullptr;
     if (batch && tile && batch_params) {
         // The tiling leaves padding unwritten: the copy back keeps what guest memory holds there.
         const u64 step = Common::AlignUp(size, batch->alignment);
@@ -2567,7 +2639,7 @@ bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, co
         list.CopyImageToBuffer(entry.image.get(), batch->scratch.get(), copies);
         list.CopyBuffer(&out, out_offset, batch->scratch.get(), tiled_offset, size);
         batch->tilings.push_back({.pipeline = tile,
-                                  .params = std::move(batch_params),
+                                  .params = batch_params,
                                   .out = &out,
                                   .out_offset = out_offset,
                                   .size = size,

@@ -251,7 +251,7 @@ PassCoordinator::StreamTicket PassCoordinator::BeginStream(u64 epoch,const std::
         group->jobs.push_back(job);group->draws=source->draws.size();
         auto prefix_lease=std::make_shared<PrefixLease>(std::move(prefix_resources),std::move(*prefix_credit));
         auto release=MakeRelease(job);
-        replacement=device_.AcquireCommandList(Rhi::CommandListLevel::Secondary);
+        replacement=acquire_replacement?acquire_replacement():device_.AcquireCommandList(Rhi::CommandListLevel::Secondary);
         if(!replacement)return reject();
         replacement->Begin();stream->replacement=replacement;
         if(!stream->publication.Publish(source->draws.size()))std::terminate();

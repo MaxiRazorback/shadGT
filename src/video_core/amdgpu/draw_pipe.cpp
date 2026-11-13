@@ -205,6 +205,7 @@ void DrawPipe::Push(Work&& work, JobKind kind, Prepare&& prepare, Work&& order) 
         done_cv.wait(lk, [this] { return queue.size() < max_pending; });
     }
     queue.push_back(std::move(work));
+    has_work.store(true, std::memory_order_release); // PERF-GTS-382
     stats.max_queued = std::max(stats.max_queued, queue.size());
     if (recorder_waiting) {
         work_cv.notify_one();
@@ -218,6 +219,7 @@ void DrawPipe::Forward(Work&& work) {
         done_cv.wait(lk, [this] { return queue.size() < max_pending; });
     }
     queue.push_back(std::move(work));
+    has_work.store(true, std::memory_order_release); // PERF-GTS-382
     stats.max_queued = std::max(stats.max_queued, queue.size());
     if (recorder_waiting) {
         work_cv.notify_one();
@@ -575,6 +577,27 @@ void DrawPipe::Run(std::stop_token stop) {
                     done_cv.notify_all();
                 }
             }
+            // PERF-GTS-382 (RYGT_RECORDER_SPIN_US, default 100; 0 = sleep at once as before):
+            // the recorder slept the moment it ran dry, and the next push had to wake it with
+            // a system call. With the recorder about 65% busy in a race that was most pushes:
+            // 68% of the command processor's samples were in Push, 83% of them in the kernel,
+            // and that thread ran at 90% of a core. It now looks for work a short while first.
+            static const u64 spin_us = [] {
+                const char* env = std::getenv("RYGT_RECORDER_SPIN_US");
+                return env && *env ? std::strtoull(env, nullptr, 10) : u64{100};
+            }();
+            if (queue.empty() && spin_us != 0 && !stop.stop_requested()) {
+                lk.unlock();
+                const auto until =
+                    std::chrono::steady_clock::now() + std::chrono::microseconds{spin_us};
+                u32 turns = 0;
+                while (!has_work.load(std::memory_order_acquire) &&
+                       !has_urgent.load(std::memory_order_acquire)) {
+                    _mm_pause();
+                    if ((++turns & 63) == 0 && std::chrono::steady_clock::now() >= until) break;
+                }
+                lk.lock();
+            }
             if (queue.empty()) {
                 recorder_waiting = true;
                 const auto idle_from = std::chrono::steady_clock::now();
@@ -597,6 +620,7 @@ void DrawPipe::Run(std::stop_token stop) {
             }
             // Take what is queued now; new work keeps queueing behind it meanwhile.
             batch.swap(queue);
+            has_work.store(false, std::memory_order_release); // PERF-GTS-382 (under the lock)
             if (batch.size() >= max_pending) {
                 done_cv.notify_all(); // A producer may wait for space.
             }

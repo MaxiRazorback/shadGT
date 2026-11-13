@@ -1,4 +1,5 @@
 #include "ryty_gpu/native/rhi/completed_owner_release.h"
+#include "ryty_gpu/native/descriptor_dead_handles.h"
 #include "ryty_gpu/native/descriptor_update_batch.h"
 #include "ryty_gpu/native/rhi/descriptor_batch_test_spv.h"
 #include "ryty_gpu/native/rhi/gpu_timing_lease.h"
@@ -274,6 +275,11 @@ public:
     u64 size;
     u64 address;
     u8* mapped;
+    // PERF-GTS-362: for a recycled buffer, the allocated size and what it was made for.
+    u64 recycle_bytes = 0;
+    u32 recycle_usage = 0;
+    MemoryKind recycle_memory = MemoryKind::DeviceLocal;
+    bool recycle_reserved = false; // PERF-GTS-367: allocated in the upload copy reserve
 };
 
 class VulkanImage final : public Image {
@@ -550,6 +556,59 @@ public:
     /// Destroys GPU objects once the GPU has run the lists recorded so far. Those are submitted
     /// with the next submission at the latest (render jobs record during a frame and the frame is
     /// submitted once), so one more submission is a safe margin.
+    /// PERF-GTS-362: recycled buffers the GPU is done with, kept for CreateBuffer.
+    struct RecycledBuffer {
+        vk::Buffer buffer;
+        VmaAllocation allocation;
+        u8* mapped;
+        u64 address;
+        u64 bytes;
+        u32 usage;
+        MemoryKind memory;
+        bool reserved = false; ///< PERF-GTS-367: its memory is in the upload copy reserve
+    };
+    /// PERF-GTS-367: takes a kept buffer whose memory is in the reserve, to free it for another.
+    bool TakeReservedRecycled(RecycledBuffer& out);
+    /// Most bytes kept at once: RYGT_UPLOAD_COPY_POOL_MB, default 512; 0 keeps none. At 256 MB
+    /// the pool filled in the first 40 s of Autopolis and copies of new sizes were freed again.
+    static u64 RecycleLimit() {
+        static const u64 limit = [] {
+            const char* env = std::getenv("RYGT_UPLOAD_COPY_POOL_MB");
+            char* end = nullptr;
+            const unsigned long long mb = env && *env ? std::strtoull(env, &end, 10) : 512;
+            return (end && *end ? 512ULL : std::min<u64>(mb, 4096)) << 20;
+        }();
+        return limit;
+    }
+    static constexpr u64 RecycleLargest = 64ULL << 20;   ///< larger buffers are freed as before
+    static constexpr u64 RecycleSmallest = 256ULL << 10; ///< smaller ones VMA suballocates cheaply
+    /// The size a recycled buffer of `size` bytes is allocated with: rounded up to a quarter of
+    /// its power of two (at most a quarter more), so similar sizes share buffers.
+    static u64 RecycleBytes(u64 size) {
+        const u64 step = (u64{1} << (std::bit_width(size - 1) - 1)) / 4;
+        return (size + step - 1) / step * step;
+    }
+    /// PERF-GTS-364: a VMA pool for recycled upload buffers whose memory is allocated once, up
+    /// front (RYGT_UPLOAD_COPY_RESERVE_MB, default 256, in 128 MB blocks; 0 = none). A copy the
+    /// PERF-GTS-362 pool cannot serve yet (a texture seen for the first time) is then placed in
+    /// memory that exists, instead of VMA allocating a new 32 MB block on the recorder (6 to 7 ms
+    /// each, several in a row when large buildings come into view). It never grows: when full,
+    /// buffers are allocated as before. Null when there is none.
+    VmaPool UploadReserve(const VkBufferCreateInfo& buffer_ci, const VmaAllocationCreateInfo& alloc_ci);
+    std::once_flag upload_reserve_once;
+    VmaPool upload_reserve = VK_NULL_HANDLE;
+    bool TakeRecycled(u64 bytes, u32 usage, MemoryKind memory, RecycledBuffer& out);
+    /// Keeps a buffer the GPU is done with, or destroys it when the pool is full.
+    void Recycle(const RecycledBuffer& buffer);
+    /// Destroys every kept buffer (memory pressure, shutdown).
+    void DropRecycled();
+    std::mutex recycle_mutex;
+    std::vector<RecycledBuffer> recycled;
+    u64 recycled_bytes = 0;
+    u64 recycle_reused = 0, recycle_allocated = 0, recycle_allocated_reserved = 0,
+        recycle_dropped = 0, recycle_evicted = 0;
+    std::chrono::steady_clock::time_point recycle_report{};
+
     void Retire(std::function<void()>&& destroy) {
         const u64 now = external_current ? external_current()
                                          : submitted.load(std::memory_order_relaxed);
@@ -618,9 +677,14 @@ void VulkanBuffer::ReleaseCompleted() {
     if (!owned) {
         return;
     }
-    if (allocation) {
+    if (recycle_bytes) {
+        device.Recycle({buffer, allocation, mapped, address, recycle_bytes, recycle_usage,
+                        recycle_memory, recycle_reserved}); // PERF-GTS-362
+    } else if (allocation) {
+        Native::DeadHandles::Note(static_cast<VkBuffer>(buffer)); // PERF-GTS-375
         vmaDestroyBuffer(device.allocator, static_cast<VkBuffer>(buffer), allocation);
     } else {
+        Native::DeadHandles::Note(static_cast<VkBuffer>(buffer)); // PERF-GTS-375
         device.device.destroyBuffer(buffer);
         device.device.freeMemory(memory);
     }
@@ -637,6 +701,13 @@ VulkanBuffer::~VulkanBuffer() {
     if (!owned) {
         return; // NAT-107: wrapped
     }
+    if (recycle_bytes) {
+        // PERF-GTS-362: kept for the next upload copy once the GPU is done with it.
+        device.Retire([owner = &device, kept = VulkanDevice::RecycledBuffer{
+                           buffer, allocation, mapped, address, recycle_bytes, recycle_usage,
+                           recycle_memory, recycle_reserved}] { owner->Recycle(kept); });
+        return;
+    }
     device.Retire([dev = device.device, alloc = device.allocator, buffer = buffer,
                    allocation = allocation, memory = memory] {
 #ifndef NDEBUG
@@ -649,8 +720,10 @@ VulkanBuffer::~VulkanBuffer() {
 #ifndef NDEBUG
             vmaGetAllocationInfo(alloc, allocation, &allocation_info);
 #endif
+            Native::DeadHandles::Note(static_cast<VkBuffer>(buffer)); // PERF-GTS-375
             vmaDestroyBuffer(alloc, static_cast<VkBuffer>(buffer), allocation);
         } else {
+            Native::DeadHandles::Note(static_cast<VkBuffer>(buffer)); // PERF-GTS-375
             dev.destroyBuffer(buffer);
             dev.freeMemory(memory);
         }
@@ -679,10 +752,16 @@ VulkanImage::~VulkanImage() {
     });
 }
 VulkanImageView::~VulkanImageView() {
-    device.Retire([dev = device.device, view = view] { dev.destroyImageView(view); });
+    device.Retire([dev = device.device, view = view] {
+        Native::DeadHandles::Note(static_cast<VkImageView>(view)); // PERF-GTS-375
+        dev.destroyImageView(view);
+    });
 }
 VulkanSampler::~VulkanSampler() {
-    device.Retire([dev = device.device, sampler = sampler] { dev.destroySampler(sampler); });
+    device.Retire([dev = device.device, sampler = sampler] {
+        Native::DeadHandles::Note(static_cast<VkSampler>(sampler)); // PERF-GTS-375
+        dev.destroySampler(sampler);
+    });
 }
 VulkanPipelineLayout::~VulkanPipelineLayout() {
     device.Retire([dev = device.device, set_layout = set_layout, layout = layout] {
@@ -774,6 +853,12 @@ VulkanDevice::~VulkanDevice() {
     completed_resources.DrainAndStop();
     for (auto& retired_object : retired) {
         retired_object.destroy();
+    }
+    DropRecycled(); // PERF-GTS-362: after the retired buffers above returned to the pool
+    if (upload_reserve) { // PERF-GTS-364: only once nothing is left in it
+        VmaStatistics stats{};
+        vmaGetPoolStatistics(allocator, upload_reserve, &stats);
+        if (stats.allocationCount == 0) vmaDestroyPool(allocator, upload_reserve);
     }
     for (auto& [id, pool] : pools) {
         for (auto& list : pool->all) {
@@ -904,8 +989,26 @@ std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
     if (desc.usage & BufferUsageDeviceAddress) {
         usage |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
     }
+    // PERF-GTS-362: a recycled buffer reuses a kept one of its size class, or is allocated at
+    // that size so the next one can.
+    const u64 recycle_bytes = desc.recycle && RecycleLimit() != 0 && desc.size >= RecycleSmallest &&
+                                      desc.size <= RecycleLargest
+                                  ? RecycleBytes(desc.size)
+                                  : 0;
+    if (recycle_bytes) {
+        if (RecycledBuffer kept{}; TakeRecycled(recycle_bytes, desc.usage, desc.memory, kept)) {
+            auto reused = std::make_unique<VulkanBuffer>(*this, kept.buffer, kept.allocation,
+                                                         vk::DeviceMemory{}, desc.size,
+                                                         kept.address, kept.mapped);
+            reused->recycle_bytes = kept.bytes;
+            reused->recycle_usage = kept.usage;
+            reused->recycle_memory = kept.memory;
+            reused->recycle_reserved = kept.reserved;
+            return reused;
+        }
+    }
     const VkBufferCreateInfo buffer_ci = static_cast<VkBufferCreateInfo>(vk::BufferCreateInfo{
-        .size = desc.size,
+        .size = recycle_bytes ? recycle_bytes : desc.size,
         .usage = usage,
     });
     VmaAllocationCreateInfo alloc_ci{};
@@ -920,7 +1023,7 @@ std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
         // shader data there every draw, and over PCIe each read waited (~16 us a draw).
         static const bool vram = [] {
             const char* env = std::getenv("RYGT_NATIVE_UPLOAD_VRAM");
-            return env && env[0] == '1';
+            return !env || !*env || env[0] == '1'; // PERF-GTS-407: on unless set to something else
         }();
         alloc_ci.usage = vram ? VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE : VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
         alloc_ci.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT |
@@ -938,15 +1041,43 @@ std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
     struct AllocationResult {
       VkResult result;
     };
+    // PERF-GTS-364: recycled upload buffers go into the reserved memory first.
+    const VmaPool reserve =
+        recycle_bytes && desc.memory == MemoryKind::Upload ? UploadReserve(buffer_ci, alloc_ci) : VK_NULL_HANDLE;
+    bool from_reserve = false;
     const auto result = Common::AllocateWithPressureRetry(
         [&] {
           buffer = VK_NULL_HANDLE;
           allocation = nullptr;
+          if (reserve) {
+              VmaAllocationCreateInfo reserved_ci = alloc_ci;
+              reserved_ci.pool = reserve;
+              // PERF-GTS-367: the reserve filled with idle kept copies of other sizes (the pool
+              // keeps up to 512 MB, the reserve is 256), so a copy of a new size was allocated
+              // on the recorder after all: 59 and 63 ms at the start of an Autopolis race, 7 to
+              // 8 ms later. When it is full, idle kept copies in it are freed (inside the reserve:
+              // no vkFreeMemory) until the new one fits.
+              for (u32 evicted = 0;; ++evicted) {
+                  if (vmaCreateBuffer(allocator, &buffer_ci, &reserved_ci, &buffer, &allocation,
+                                      &info) == VK_SUCCESS) {
+                      from_reserve = true;
+                      return AllocationResult{VK_SUCCESS};
+                  }
+                  buffer = VK_NULL_HANDLE;
+                  allocation = nullptr;
+                  RecycledBuffer idle{};
+                  if (evicted == 16 || !TakeReservedRecycled(idle)) break;
+                  Native::DeadHandles::Note(static_cast<VkBuffer>(idle.buffer)); // PERF-GTS-375
+                  vmaDestroyBuffer(allocator, static_cast<VkBuffer>(idle.buffer), idle.allocation);
+              }
+              // Still no room (or unsuitable): allocate as before.
+          }
           return AllocationResult{vmaCreateBuffer(
               allocator, &buffer_ci, &alloc_ci, &buffer, &allocation, &info)};
         },
         [&] {
           Collect();
+          DropRecycled(); // PERF-GTS-362
           const auto reclaimed = Vulkan::TrimEmptyVmaBlocks(allocator);
           g_device_memory_pressure.store(true, std::memory_order_relaxed); // VRAM-PRESSURE-001
           LOG_WARNING(Render_Vulkan,
@@ -969,8 +1100,127 @@ std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
     if (desc.usage & BufferUsageDeviceAddress) {
         address = device.getBufferAddress(vk::BufferDeviceAddressInfo{.buffer = buffer});
     }
-    return std::make_unique<VulkanBuffer>(*this, buffer, allocation, vk::DeviceMemory{}, desc.size,
-                                          address, static_cast<u8*>(info.pMappedData));
+    auto made = std::make_unique<VulkanBuffer>(*this, buffer, allocation, vk::DeviceMemory{},
+                                               desc.size, address,
+                                               static_cast<u8*>(info.pMappedData));
+    if (recycle_bytes) {
+        made->recycle_bytes = recycle_bytes;
+        made->recycle_usage = desc.usage;
+        made->recycle_memory = desc.memory;
+        made->recycle_reserved = from_reserve;
+        std::scoped_lock lock{recycle_mutex};
+        ++recycle_allocated;
+        recycle_allocated_reserved += from_reserve;
+    }
+    return made;
+}
+
+VmaPool VulkanDevice::UploadReserve(const VkBufferCreateInfo& buffer_ci,
+                                    const VmaAllocationCreateInfo& alloc_ci) {
+    std::call_once(upload_reserve_once, [&] {
+        constexpr u64 BlockBytes = 128ULL << 20;
+        const char* env = std::getenv("RYGT_UPLOAD_COPY_RESERVE_MB");
+        char* end = nullptr;
+        u64 mb = env && *env ? std::strtoull(env, &end, 10) : 256;
+        if (end && *end) mb = 256;
+        mb = std::min<u64>(mb, 4096);
+        if (mb == 0) return;
+        const u64 blocks = ((mb << 20) + BlockBytes - 1) / BlockBytes;
+        u32 type = 0;
+        if (vmaFindMemoryTypeIndexForBufferInfo(allocator, &buffer_ci, &alloc_ci, &type) != VK_SUCCESS) {
+            LOG_WARNING(Render_Vulkan, "PERF-GTS-364: no memory type for the upload copy reserve");
+            return;
+        }
+        VmaPoolCreateInfo pool_ci{};
+        pool_ci.memoryTypeIndex = type;
+        pool_ci.blockSize = BlockBytes;
+        pool_ci.minBlockCount = static_cast<size_t>(blocks);
+        pool_ci.maxBlockCount = static_cast<size_t>(blocks);
+        const auto start = std::chrono::steady_clock::now();
+        if (vmaCreatePool(allocator, &pool_ci, &upload_reserve) != VK_SUCCESS) {
+            upload_reserve = VK_NULL_HANDLE;
+            LOG_WARNING(Render_Vulkan, "PERF-GTS-364: could not reserve {} MB for upload copies", mb);
+            return;
+        }
+        LOG_INFO(Render_Vulkan, "PERF-GTS-364: reserved {} MB for upload copies in memory type {} ({} ms)",
+                 blocks * (BlockBytes >> 20), type,
+                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
+    });
+    return upload_reserve;
+}
+
+bool VulkanDevice::TakeReservedRecycled(RecycledBuffer& out) {
+    std::scoped_lock lock{recycle_mutex};
+    for (auto it = recycled.begin(); it != recycled.end(); ++it) {
+        if (it->reserved) {
+            out = *it;
+            recycled_bytes -= it->bytes;
+            recycled.erase(it); // keeps the rest in the order they came back: oldest first
+            ++recycle_evicted;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool VulkanDevice::TakeRecycled(u64 bytes, u32 usage, MemoryKind memory, RecycledBuffer& out) {
+    std::scoped_lock lock{recycle_mutex};
+    for (auto it = recycled.begin(); it != recycled.end(); ++it) {
+        if (it->bytes == bytes && it->usage == usage && it->memory == memory) {
+            out = *it;
+            recycled_bytes -= it->bytes;
+            *it = recycled.back();
+            recycled.pop_back();
+            ++recycle_reused;
+            return true;
+        }
+    }
+    return false;
+}
+
+void VulkanDevice::Recycle(const RecycledBuffer& buffer) {
+    bool keep = false;
+    {
+        std::scoped_lock lock{recycle_mutex};
+        if (recycled_bytes + buffer.bytes <= RecycleLimit()) {
+            recycled.push_back(buffer);
+            recycled_bytes += buffer.bytes;
+            keep = true;
+        } else {
+            ++recycle_dropped;
+        }
+        if (const auto now = std::chrono::steady_clock::now(); now >= recycle_report) {
+            if (recycle_report != std::chrono::steady_clock::time_point{} &&
+                recycle_reused + recycle_allocated != 0) {
+                LOG_INFO(Render_Vulkan,
+                         "PERF-GTS-362 (10 s): upload copies {} reused, {} allocated ({} in the "
+                         "reserve), {} freed (pool full), {} freed for room in the reserve "
+                         "(PERF-GTS-367); {} kept ({} MB)",
+                         recycle_reused, recycle_allocated, recycle_allocated_reserved,
+                         recycle_dropped, recycle_evicted, recycled.size(), recycled_bytes >> 20);
+            }
+            recycle_reused = recycle_allocated = recycle_allocated_reserved = recycle_dropped =
+                recycle_evicted = 0;
+            recycle_report = now + std::chrono::seconds{10};
+        }
+    }
+    if (!keep) {
+        Native::DeadHandles::Note(static_cast<VkBuffer>(buffer.buffer)); // PERF-GTS-375
+        vmaDestroyBuffer(allocator, static_cast<VkBuffer>(buffer.buffer), buffer.allocation);
+    }
+}
+
+void VulkanDevice::DropRecycled() {
+    std::vector<RecycledBuffer> dropped;
+    {
+        std::scoped_lock lock{recycle_mutex};
+        dropped.swap(recycled);
+        recycled_bytes = 0;
+    }
+    for (const auto& buffer : dropped) {
+        Native::DeadHandles::Note(static_cast<VkBuffer>(buffer.buffer)); // PERF-GTS-375
+        vmaDestroyBuffer(allocator, static_cast<VkBuffer>(buffer.buffer), buffer.allocation);
+    }
 }
 
 std::unique_ptr<Buffer> VulkanDevice::ImportHostMemory(void* memory, u64 size, u32 usage,
@@ -1163,6 +1413,7 @@ std::unique_ptr<Image> VulkanDevice::CreateImageFrom(const VkImageCreateInfo& im
         },
         [&] {
           Collect();
+          DropRecycled(); // PERF-GTS-362
           const auto reclaimed = Vulkan::TrimEmptyVmaBlocks(allocator);
           g_device_memory_pressure.store(true, std::memory_order_relaxed); // VRAM-PRESSURE-001
           LOG_WARNING(Render_Vulkan,

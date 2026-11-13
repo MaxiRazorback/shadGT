@@ -63,6 +63,10 @@ struct BufferDesc {
     u32 usage = BufferUsageNone;
     MemoryKind memory = MemoryKind::DeviceLocal;
     std::string_view name;
+    /// PERF-GTS-362: a short-lived buffer made again and again (an upload copy): its memory is
+    /// kept for the next one of a similar size once the GPU is done with it, instead of freed.
+    /// It may be larger than `size` and holds whatever the last user left in it.
+    bool recycle = false;
 };
 
 enum class ImageDim : u8 { D1, D2, D3 };

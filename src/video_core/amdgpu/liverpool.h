@@ -643,7 +643,11 @@ private:
         ComputeProgram cs_state{};
         std::atomic<u32> pending{}; // Compute submissions awaiting decode.
         u32 parked{}; // Accessed only by the command thread.
+        /// PERF-GTS-383: the nested command buffers of the submission being decoded, outermost
+        /// first (command thread only). The last one not finished is the one to resume.
+        std::vector<Task::Handle> nest;
     };
+    static bool DirectNestedResume();
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
     std::atomic<u32> num_mapped_queues{1u}; // GFX is always available.
     bool ComputeQueueRunnable() const {

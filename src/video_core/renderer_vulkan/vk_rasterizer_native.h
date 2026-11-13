@@ -28,6 +28,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include "ryty_gpu/native/kept_set_table.h"
 #include <vector>
 
 #include <boost/container/static_vector.hpp>
@@ -334,6 +335,12 @@ private:
             }
         };
         WrittenFlag buffers_written;                    ///< by shaders since the last barrier
+        /// PERF-GTS-365: ranges GatherOnGpu copied into a buffer of this list, by (address,
+        /// size), for later binds of the same range in it. Forgotten with the list, when a draw
+        /// writes guest memory in place, and after the game unmaps memory (`gather_unmaps`).
+        std::map<std::pair<u64, u64>, vk::Buffer> gathers;
+        u64 gather_unmaps = 0;
+        u64 gather_max = 0; ///< largest size in `gathers`, to bound the overlap scan
         /// PERF-GT7-043: the program of the last dispatch, if it is the last command so far.
         u64 run_program = 0;
         u32 run_commands = 0;
@@ -448,6 +455,77 @@ private:
     void TrimIdleChunks();
     vk::DescriptorBufferInfo UploadFlatData(u32 stage, const u8* source, u32 size, bool* backing_proven = nullptr);
     vk::DescriptorPool TakeDescriptorPool();
+    /// PERF-GTS-399: a list for the recorder to go on in after a parallel pass (not begun): one
+    /// recorded through the command ring when the ring is on for parallel recording, else a
+    /// secondary of this thread. And the command stream of a list of either kind.
+    Native::Rhi::CommandList* AcquireReplacementList();
+    CmdBuf StreamCmdOf(Native::Rhi::CommandList& list) const;
+    /// PERF-GTS-375: descriptor sets with dynamic buffer offsets kept across command lists.
+    /// Recorder thread only. An entry goes when a handle it holds is about to be destroyed
+    /// (Native::DeadHandles); its set stays unused in its pool until the next Flush.
+    struct LongSets {
+        /// PERF-GTS-376: a dropped entry's set, written again once the GPU ran the lists
+        /// that may have bound it.
+        struct Retired {
+            u64 tick;
+            u64 layout;
+            vk::DescriptorSet set;
+        };
+        Native::KeptSetTable<vk::DescriptorSet> entries;                ///< by 128-bit key hash
+        /// handle -> the key hashes of the sets that hold it (and of sets since dropped: a
+        /// list is thinned when it is much longer than the table)
+        std::unordered_map<u64, std::vector<std::pair<u64, u64>>> users;
+        std::deque<Retired> retired;
+        std::unordered_map<u64, std::vector<vk::DescriptorSet>> spare;  ///< by layout
+        std::vector<vk::DescriptorPool> pools;
+        u64 unused_sets = 0; ///< sets whose layout was destroyed, still in the pools
+        u64 hits = 0, made = 0, dropped = 0, flushes = 0, rewritten = 0;
+        /// PERF-GTS-398: the handles DropLongSets was given, in order (a ring; `dead_count`
+        /// is how many in all). A set made late for a draw recorded before one of its
+        /// handles died is not kept.
+        std::array<u64, 4096> dead_ring{};
+        u64 dead_count = 0;
+        u64 late_hits = 0, late_made = 0, late_not_kept = 0;
+    };
+    LongSets long_sets;
+    /// PERF-GTS-398: with parallel recording the pass workers look sets up and make them too:
+    /// then everything of `long_sets` is read and changed under this.
+    std::mutex long_sets_mutex;
+    /// The recorder: dead handles' sets dropped, the table flushed when it is too large.
+    void LongSetsUpkeep();
+    /// PERF-GTS-377: upload memory the job threads copy a prepared draw's constants into, so
+    /// the recorder only binds them. One buffer used as a ring; positions only grow (the offset
+    /// is the position modulo the capacity). A draw's bytes hold until the head is a whole
+    /// capacity past them (checked at commit), and no thread writes into a 1 MB segment before
+    /// the GPU ran the lists that bound bytes of it.
+    struct AheadArena {
+        static constexpr u64 SegmentBits = 20;
+        static constexpr u64 Align = 64;
+        /// A segment's mark: the lap in the high bits, the GPU tick in the low ones.
+        static constexpr u64 TickBits = 44;
+        static constexpr u64 TickMask = (u64{1} << TickBits) - 1;
+        std::unique_ptr<Native::Rhi::Buffer> buffer;
+        vk::Buffer handle{};
+        u64 capacity = 0;
+        std::atomic<u8*> mapped{nullptr}; ///< set last: the job threads' sign that it is there
+        std::atomic<u64> head{0};
+        std::unique_ptr<std::atomic<u64>[]> busy; ///< by segment: its mark (lap and GPU tick)
+        std::atomic<u64> copied{0}, refused{0};   ///< by the job threads
+        u64 bound = 0, stale = 0;                 ///< by the recorder
+        bool tried = false;
+    };
+    AheadArena ahead_arena;
+    void EnsureAheadArena();
+    /// A job thread: space for `size` bytes. False when there is none now.
+    bool AheadAllocate(u32 size, u64& position, u8*& data);
+    /// The recorder: the bytes at `position` are still the draw's, and stay until the GPU ran
+    /// the list being recorded. False when they were written over.
+    bool AheadCommit(u64 position, u32 size, vk::DescriptorBufferInfo& info);
+    vk::DescriptorSet MakeLongSet(vk::DescriptorSetLayout layout);
+    void StoreLongSet(u64 hash, u64 check, vk::DescriptorSetLayout layout, vk::DescriptorSet set,
+                      std::span<const u64> handles);
+    void DropLongSets(std::span<const u64> dead_handles);
+    void FlushLongSets();
 
     /// NAT-114: a range shaders write that no single imported view holds lives in a buffer of
     /// its own on the GPU (a region), filled from guest memory when made; every later binding
@@ -477,6 +555,15 @@ private:
     std::unordered_map<VAddr, u64> cpu_recent_pages; ///< under region_dirty_mutex
     std::unordered_set<VAddr> ahead_pages; ///< under region_dirty_mutex
     std::unordered_set<VAddr> remapped_pages; ///< complete newly mapped pages awaiting refresh
+    /// DIAG-GTS-411: pages marked as written in 10 s, by what marked them: 0 a CPU write fault,
+    /// 1 the pages unwatched ahead of one, 2 a new mapping, 3 a picture copied back to memory,
+    /// 4 a picture's memory over a region, 5 those of 0 and 1 that fell in a region.
+    std::array<std::atomic<u64>, 6> diag_region_marks{};
+    struct DiagRegionRefresh {
+        VAddr end = 0;
+        u64 pages = 0, refreshes = 0;
+    };
+    std::unordered_map<VAddr, DiagRegionRefresh> diag_region_refresh; ///< recorder, by begin
     std::unordered_map<VAddr, u64> fault_chunks; ///< under region_dirty_mutex
     std::unordered_map<VAddr, std::vector<std::pair<VAddr, VAddr>>> downloaded_ranges;
     void FaultAhead(VAddr begin, VAddr end);
@@ -722,6 +809,8 @@ private:
     OptionalMirrorBudget mirror_promotion_budget; ///< shared across lists of this frame
     std::unordered_map<u64, u64> mirror_writes;    ///< granule -> frame the CPU wrote a mirror there
     std::unordered_map<u64, u64> dynamic_granules; ///< granule -> frame it was found CPU-written
+    /// PERF-GTS-386: granule -> how often a mirror over it was dropped as CPU-written.
+    std::unordered_map<u64, u32> dynamic_strikes;
     /// The first mirror that may overlap memory from `begin` on.
     std::map<VAddr, Mirror>::iterator FirstMirror(VAddr begin);
     /// The mirror holding all of the range, if any.
@@ -1339,6 +1428,11 @@ private:
         };
         boost::container::small_vector<RegionUse, 4> regions;
         std::vector<std::pair<VAddr, VAddr>> image_ranges;
+        /// PERF-GTS-404: the own range (address and size) of every picture held in
+        /// bindings.sampled and bindings.stored, as the registry logs it when it evicts one.
+        std::vector<std::pair<VAddr, VAddr>> picture_ranges;
+        /// PERF-GTS-405: the ranges of the mirrors held in `mirrors`.
+        boost::container::small_vector<std::pair<VAddr, VAddr>, 4> mirror_ranges;
         std::vector<std::pair<VAddr, VAddr>> buffer_ranges;
         /// Upload memory (flattened user data, clip planes, D3 tables): bytes copied at commit
         /// into the list's upload memory, and the buffer info that binds them.
@@ -1347,6 +1441,9 @@ private:
             u32 offset = 0;
             u32 size = 0;
             s32 flat_stage = -1; ///< >= 0: that stage's flattened user data, the recorder's
+            /// PERF-GTS-377: where the job thread already copied the bytes in the ahead arena
+            /// (NoAhead: not there; copied at commit as before).
+            u64 ahead = ~u64{0};
         };
         std::vector<u8> upload_bytes;
         boost::container::small_vector<Upload, 4> uploads;
@@ -1380,13 +1477,38 @@ private:
         boost::container::static_vector<SamplerOrigin,Shader::NUM_SAMPLERS*(Shader::MaxStageTypes-1)> sampler_origins;
         u64 sampler_origins_epoch{};
         bool sampler_origins_valid{true};
+        /// PERF-GTS-392: given back without Reset; NewPrepared resets it on the thread that
+        /// takes it (written and read under prepared_pool_mutex's ordering).
+        bool reset_pending = false;
+        /// PERF-GTS-398 (set by the recorder when the draw goes into a pass packet): how many
+        /// handles had died by then, and the tick after which a set made for it may be reused.
+        u64 late_dead_seq = 0, late_retire_tick = 0;
+        /// PERF-GTS-403: sampled pictures the job thread did not find (they are made in GPU
+        /// order): where their views go in bindings.images, and what the recorder looks them
+        /// up and views them with at commit.
+        struct MissingPicture {
+            u32 first = 0;
+            u32 constant_mip = 0;
+            u8 bindings = 0;
+            u8 fallback = 0;
+            bool cube = false;
+            VideoCore::ImageInfo info;
+            VideoCore::ImageViewInfo view_info;
+        };
+        std::vector<MissingPicture> missing_pictures;
         void Reset();
     };
     /// OPT-010: the guest ranges whose region or mirror was made or dropped, by sequence number
     /// (written and checked by the recorder; job threads read the sequence before looking up).
     class ChangeLog {
     public:
-        void Note(VAddr begin, VAddr end);
+        /// `mirror`: the range of a mirror made or dropped (PERF-GTS-405); else a region's.
+        void Note(VAddr begin, VAddr end, bool mirror = false);
+        /// PERF-GTS-405: as Untouched, for work that holds mirrors by pointer: a mirror made
+        /// or dropped counts only when its range meets one of `held`, the ranges of the
+        /// mirrors held. A region made or dropped over `ranges` counts as before.
+        bool UntouchedHolding(u64 since, std::span<const std::pair<VAddr, VAddr>> ranges,
+                              std::span<const std::pair<VAddr, VAddr>> held) const;
         /// Whether none of the ranges changed after `since` (false when the log no longer
         /// reaches back that far).
         bool Untouched(u64 since, std::span<const std::pair<VAddr, VAddr>> ranges) const;
@@ -1399,11 +1521,19 @@ private:
             u64 seq = 0;
             VAddr begin = 0;
             VAddr end = 0;
+            bool mirror = false;
         };
         std::array<Entry, 1024> entries{};
         std::atomic<u64> seq{0};
+
+    public:
+        /// DIAG-GTS-401: why Untouched said no: a change over the ranges, or the log too short.
+        mutable std::atomic<u64> no_changed{0}, no_lost{0};
     };
     ChangeLog buffer_log;
+    /// PERF-GTS-405: whether no region or mirror the prepared draw depends on changed after
+    /// `since` (RYGT_PREPARED_MIRROR_EXACT=1: a mirror only when the draw holds it).
+    bool PreparedBuffersUntouched(const PreparedDraw& p, u64 since) const;
     /// OPT-010: regions and mirrors are added and removed under it (exclusive); job threads
     /// look regions up under it (shared).
     std::shared_mutex buffer_map_mutex;
@@ -1420,6 +1550,28 @@ private:
     std::vector<PreparedDraw*> prepared_free;
     PreparedDraw* NewPrepared();
     void FreePrepared(PreparedDraw* draw);
+    /// PERF-GTS-398: whether every set of the draw that is not pushed can be looked up late (a
+    /// long-lived set with a complete key), and its keys are made for the pipeline.
+    bool CanBindLate(const Pipeline& pipeline, DrawBindings& b);
+    /// PERF-GTS-398: any thread that records the prepared draw: its sets from the long-lived
+    /// table (made and written when not there), their dynamic buffer counts and offsets.
+    void BindLate(PreparedDraw& p,
+                  std::array<vk::DescriptorSet, Shader::Backend::MaxDescriptorSets>& sets,
+                  std::array<u8, Shader::Backend::MaxDescriptorSets>& counts,
+                  boost::container::static_vector<u32, 128>& offsets);
+    static void BindLateThunk(void* owner, void* prepared,
+                              std::array<vk::DescriptorSet, Shader::Backend::MaxDescriptorSets>& sets,
+                              std::array<u8, Shader::Backend::MaxDescriptorSets>& counts,
+                              boost::container::static_vector<u32, 128>& offsets);
+    /// Prepared draws a pass packet points at: given back once the passes of the list have
+    /// been recorded (Splice, after the coordinator was drained).
+    std::vector<PreparedDraw*> late_bound_prepared;
+    std::vector<PreparedDraw*> late_bound_done; ///< recorded: given back at the next draw
+    /// FIX-GTS-393: the recorder, for parallel recording: whether `info` (buffer info
+    /// `info_index` of the prepared draw) binds bytes of the arena that hold until the GPU ran
+    /// the list being recorded (their segments are marked for it again).
+    bool AheadRetained(const PreparedDraw& p, size_t info_index,
+                       const vk::DescriptorBufferInfo& info);
     /// The prepared draw for the packet, taken out of the table (none if there is none).
     PreparedDraw* TakePrepared(const void* packet);
     bool PrepareBuffers(const Shader::Info& stage, const AmdGpu::Regs& regs,
@@ -1456,6 +1608,27 @@ private:
     std::atomic<u32> recorder_epoch{0};
     struct PrepareStats {
         std::atomic<u64> made{0}, failed{0}, replaced{0}, stale{0}, ns{0};
+        /// DIAG-GTS-401: why a job thread could not prepare a draw: 0 a buffer kind the
+        /// recorder binds, 1 a buffer cut short, 2 a region that must grow, 3 a written buffer
+        /// without a region, 4 a buffer not imported, 5 a composition texture, 6 a long array
+        /// or the grass shader, 7 the depth stand-in not made yet, 8 a picture not made yet,
+        /// 9 a storage picture that cannot be bound as one.
+        std::array<std::atomic<u64>, 10> why{};
+        std::atomic<u32> missing_logged{0};
+        std::atomic<u64> left_missing{0}; ///< PERF-GTS-403: pictures left for the recorder
+        /// DIAG-GTS-402: the pictures job threads did not find, by address: how often, the
+        /// last size asked for, how many different sizes, and one program that asked.
+        struct Missing {
+            u64 count = 0, bytes = 0, program = 0;
+            u32 width = 0, height = 0, layers = 0, levels = 0, sizes = 0, first_frame = 0;
+            u32 last_frame = 0;
+            bool depth = false;
+        };
+        std::mutex missing_mutex;
+        std::unordered_map<u64, Missing> missing;
+        /// DIAG-GTS-402 (the recorder): prepared draws turned down for their pictures, by
+        /// where the change began.
+        std::unordered_map<u64, u64> turned_down_at;
     } prepare_stats;
 
     Rasterizer& r;
@@ -1470,6 +1643,10 @@ private:
     bool composition_scratch_initialized = false;
 
     std::recursive_mutex mutex; ///< v0: the recorder thread records; flips may come from others
+    /// PERF-GTS-368: game threads waiting for `mutex` to change mappings; the recorder steps
+    /// aside for them before its next draw or dispatch (it took the lock back first every time).
+    std::atomic<u32> mapping_waiters{};
+    void YieldToMappingChanges();
     struct SnapshotUploadMemo;
     std::unique_ptr<SnapshotUploadMemo> snapshot_upload_memo; ///< guarded by mutex
     Stream stream;
@@ -1604,16 +1781,38 @@ private:
         u64 flat_upload_hits = 0, flat_upload_bytes_saved = 0, flat_upload_misses = 0;
         u64 flat_upload_bytes_hashed = 0, flat_upload_reference_bytes = 0, flat_upload_bytes_uploaded = 0;
         u64 descriptor_allocate_calls = 0, descriptor_reserve_hits = 0;
+        u64 descriptor_async_updates = 0; ///< PERF-GTS-371
+        /// DIAG-GTS-372: where the bindings and prepared-draw commits of timed draws spend time.
+        std::array<uint64_t, 9> bind_phase_ns{};
+        std::array<uint64_t, 8> commit_phase_ns{};
+        uint64_t bind_phase_calls = 0, commit_phase_calls = 0;
+        /// DIAG-GTS-379: the per-picture checks of a prepared draw's commit, by check.
+        std::array<uint64_t, 7> image_check_ns{};
+        uint64_t image_check_calls = 0, image_check_pictures = 0;
+        /// DIAG-GTS-373: allocated graphics sets whose key, with buffer offsets left out, was
+        /// seen before in the same list, in the same frame, or in the last 10 s.
+        uint64_t reuse_diag_sets = 0, reuse_diag_exact = 0, reuse_diag_list = 0,
+                 reuse_diag_frame = 0, reuse_diag_window = 0;
+        uint64_t reuse_diag_serial = ~uint64_t{0}, reuse_diag_frame_number = ~uint64_t{0};
+        std::unordered_set<uint64_t> reuse_diag_in_list, reuse_diag_in_frame, reuse_diag_in_window;
         u64 prepared_used = 0, prepared_missing = 0;
         std::array<u64, 5> prepared_rejected{};
+        /// DIAG-GTS-401: prepared draws turned down for their pictures (log too short, a
+        /// picture made, pictures evicted, a picture reused) and for their buffers (a
+        /// range changed, log too short).
+        u64 prepared_image_no[4]{}, prepared_buffer_no[2]{};
         u64 prepared_vertices = 0, prepared_vertices_rejected = 0; ///< OPT-011
         u64 prepared_installed = 0; ///< OPT-012: pipelines from a job thread's selection
+        u64 prepared_pictures_made = 0; ///< PERF-GTS-403: missing pictures filled in at commit
         /// OPT-011: the record phase's parts: barrier choice, pass begin, dynamic state, vertex
         /// and index binds, pipeline bind, descriptors and push constants, the draw, write notes.
         std::array<u64, 8> record_ns{};
         u64 descriptor_reuses = 0, descriptor_allocations = 0;
         u64 texture_memo_hits = 0, texture_lookups = 0; ///< OPT-002
         u64 buffer_memo_hits = 0;                        ///< OPT-003
+        /// DIAG-GTS-387: mirrors made over existing ones, the bytes those held, and the
+        /// largest mirror made.
+        u64 mirrors_regrown = 0, mirror_retaken_bytes = 0, mirror_largest = 0;
         u64 mirror_binds = 0, mirrors_made = 0, mirror_made_bytes = 0, mirrors_dropped = 0,
             mirror_cross_address_reuses = 0,
             mirrors_evicted = 0, mirror_over_budget = 0, mirror_refresh_pages = 0; ///< NAT-150

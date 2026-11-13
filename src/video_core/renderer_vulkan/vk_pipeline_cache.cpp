@@ -2225,9 +2225,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         }
     } else if (CompilePack::CompileOn()) {
         // FIX-GT7-136: the pack's recipes are shader object sets, and SPIR-V is kept only with
-        // shader objects on; with pipelines (AMD's default) there is nothing to compile.
+        // shader objects on; with pipelines (the default since FIX-GTS-366) there is nothing to compile.
         LOG_WARNING(Render_Vulkan, "PERF-GT7-108: the compile pack needs shader objects (see "
-                                   "SO-001; RYGT_SHADER_OBJECT=1 on AMD{}): no start-up compile",
+                                   "SO-001; RYGT_SHADER_OBJECT=1{}): no start-up compile",
                     so_cache ? "" : "; RYGT_SO_CACHE not 0");
     }
     bool pretranslate_wanted = false;
@@ -2418,12 +2418,12 @@ PipelineCache::~PipelineCache() {
 
 // PERF-167: the driver cache file's size limit, from the launcher's Graphics page
 // (RYGT_DRIVER_CACHE_MAX_MB): 0 turns the file off, -1 has no limit; unset keeps the bounded
-// DriverCacheDiskBudget (2 GB, as FIX-GT7-049's default). A file over it is not loaded.
+// 4 GB limit (PERF-GTS-407; it was DriverCacheDiskBudget, 2 GB). A file over it is not loaded.
 static u64 DriverCacheMaxBytes() {
     static const u64 limit = [] {
         const char* env = std::getenv("RYGT_DRIVER_CACHE_MAX_MB");
         if (!env || !*env) {
-            return u64{DriverCacheDiskBudget};
+            return u64{4096} << 20;
         }
         const long long mb = std::strtoll(env, nullptr, 10);
         return mb < 0 ? ~u64{0} : u64(mb) << 20;
@@ -5126,7 +5126,16 @@ bool PipelineCache::RefreshGraphicsStages() {
     // address changes. -DisablePerf 36 reads it anyway.
     static const bool check_programs = Common::PerfFeatureEnabled(36);
     if (check_programs) {
-        static std::array<VAddr, 6> checked{};
+        // FIX-GTS-361: an address checked once stayed trusted after the game unmapped it, and the
+        // read-ahead later read a program there (car selection unloads cars; GPU recorder crash
+        // reading 0x1020429c00 in SearchBinaryInfo). Forget the checked addresses after any
+        // unmap. Per thread: several threads refresh keys, and the shared array had no lock.
+        thread_local std::array<VAddr, 6> checked{};
+        thread_local u64 checked_unmaps = 0;
+        if (const u64 unmaps = g_guest_unmaps.load(std::memory_order_acquire); unmaps != checked_unmaps) {
+            checked.fill(0);
+            checked_unmaps = unmaps;
+        }
         for (u32 stage = 0; stage < checked.size(); ++stage) {
             const auto* pgm = regs.ProgramForStage(stage);
             const VAddr address = pgm ? pgm->Address<VAddr>() : 0;

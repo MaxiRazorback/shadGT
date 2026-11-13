@@ -21,6 +21,21 @@ struct Draw {
     Vulkan::DynamicState dynamic;
     Shader::PushData push{};
     std::array<vk::DescriptorSet,Shader::Backend::MaxDescriptorSets> sets{};
+    // FIX-GTS-394: the sets' dynamic buffer offsets (PERF-GTS-374), set after set: how many
+    // each set takes, and the offsets in that order. A set with dynamic buffers is bound with
+    // them; without them the driver reads the offsets through a null pointer.
+    std::array<u8,Shader::Backend::MaxDescriptorSets> dynamic_counts{};
+    boost::container::static_vector<u32,128> dynamic_offsets{};
+    // PERF-GTS-398: the sets are looked up (or made) by whoever records the draw, not by the
+    // recorder: `late_bind` fills the sets that are not pushed, their counts and offsets from
+    // the renderer's prepared draw. `sets` are then empty for them.
+    using LateBind=void(*)(void* owner,void* prepared,
+        std::array<vk::DescriptorSet,Shader::Backend::MaxDescriptorSets>& sets,
+        std::array<u8,Shader::Backend::MaxDescriptorSets>& counts,
+        boost::container::static_vector<u32,128>& offsets);
+    LateBind late_bind{};
+    void* late_owner{};
+    void* late_prepared{};
     u32 push_set=Shader::Backend::MaxDescriptorSets;
     u32 required_sets_mask{};
     bool immutable_upload_buffers_verified{};
@@ -76,6 +91,10 @@ void EmitWholePass(const Pass& pass,Begin&& begin,Emit&& emit,End&& end) {
 // This routine neither resolves registry/guest state nor schedules GPU work.
 bool ValidatePass(const Pass& pass);
 bool RecordPass(vk::CommandBuffer cmd,const Vulkan::Instance& instance,const Pass& pass);
+// PERF-GTS-399: into the recorder's stream (a raw handle or the command ring).
+bool RecordPass(const Vulkan::CmdBuf& commands,const Vulkan::Instance& instance,const Pass& pass);
+bool RecordPassInline(const Vulkan::CmdBuf& commands,const Vulkan::Instance& instance,const Pass& pass,
+                      Vulkan::DynamicState& dynamic,vk::Pipeline& last_pipeline);
 // Header is immutable; storage contains publication.count completed slots. The
 // callback never reads the producer's changing vector metadata. One worker owns
 // the command buffer and its binding caches for the entire stream.

@@ -458,6 +458,29 @@ public:
         });
     }
 
+    /// PERF-GTS-371: writes to descriptor sets not bound yet, made where the commands that bind
+    /// them are replayed (in order, so before those binds) instead of on the recording thread.
+    /// False when there is no ring or a write cannot be copied: the caller writes them itself.
+    bool updateDescriptorSets(vk::Device device,
+                              vk::ArrayProxy<const vk::WriteDescriptorSet> const& writes) const {
+        if (!ring) {
+            return false;
+        }
+        for (const auto& write : writes) {
+            if (write.pNext != nullptr) {
+                return false;
+            }
+        }
+        Record(DescriptorWriteBytes(writes), [&](CommandRing::Extra& extra) {
+            const auto* copied = CopyDescriptorWrites(extra, writes);
+            const u32 count = writes.size();
+            return [=](vk::CommandBuffer) {
+                device.updateDescriptorSets(count, copied, 0, nullptr);
+            };
+        });
+        return true;
+    }
+
     void bindDescriptorSets(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
                             u32 first_set, vk::ArrayProxy<const vk::DescriptorSet> const& sets,
                             vk::ArrayProxy<const u32> const& dynamic_offsets) const {

@@ -218,6 +218,10 @@ public:
     WorkerStats TakeStats() noexcept {return {worker_jobs_.exchange(0),worker_wall_ns_.exchange(0),worker_cpu_100ns_.exchange(0),worker_cpu_samples_.exchange(0),worker_peak_.exchange(worker_active_.load()),worker_recorded_passes_.exchange(0),worker_recorded_draws_.exchange(0),std::exchange(small_groups_submitted_,0),std::exchange(small_groups_synchronous_,0),std::exchange(small_passes_,0),std::exchange(small_submitted_draws_,0)};}
     GroupStats TakeGroupStats() noexcept {auto result=group_stats_;group_stats_={};return result;}
     std::size_t PendingNodes() const noexcept {return nodes_.size();}
+    /// PERF-GTS-399: where BeginStream takes the list the recorder goes on in (not begun). The
+    /// renderer sets it to give a list recorded through the command ring; unset: a secondary
+    /// of the calling thread, as before. Called on the recorder thread only.
+    std::function<Rhi::CommandList*()> acquire_replacement;
     std::size_t InFlightNodes() const noexcept {return in_flight_count_;}
     // A queued pass needs both a prefix node and a pass node. This is only
     // a snapshot: capacity may return before the current scope ends.

@@ -38,6 +38,9 @@ bool GuardedCopy(void* dest, const void* source, size_t size);
 /// False means a read fault; on success `equal` reports full-byte equality.
 bool GuardedEqual(const void* guest, const void* stable, size_t size, bool& equal);
 bool IsValidMapping(VAddr virtual_addr, u64 size);
+/// PERF-GTS-359: maps the alias view a later TryWriteBacking of a small range writes through, so
+/// the caller can do Ryty's map call before taking a lock others wait for. Optional.
+void PrepareCachedAlias(VAddr address, u64 size);
 /// FIX-073: told of each renderer write into guest memory, after it was made.
 using OwnWriteObserver = void (*)(VAddr address, u64 size);
 void SetOwnWriteObserver(OwnWriteObserver observer);

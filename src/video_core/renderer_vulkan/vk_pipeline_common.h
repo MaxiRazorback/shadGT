@@ -114,6 +114,11 @@ public:
     vk::DescriptorSetLayout SetLayout(u32 set) const {
         return set < set_layouts.size() ? set_layouts[set] : vk::DescriptorSetLayout{};
     }
+    /// PERF-GTS-374: how many of the set's bindings (its first ones, the stage's buffers) are
+    /// storage buffers with dynamic offsets; 0 when the set binds them at fixed offsets.
+    u32 DynamicBuffers(u32 set) const {
+        return set < set_dynamic_buffers.size() ? set_dynamic_buffers[set] : 0;
+    }
 
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
     /// SHD-002: the descriptor set of each write.
@@ -139,6 +144,7 @@ protected:
     mutable std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
     std::array<const Shader::Info*, Shader::MaxStageTypes> canonical_stages{};
     u32 push_set = NoPushSet;
+    std::array<u8, Shader::Backend::MaxDescriptorSets> set_dynamic_buffers{}; ///< PERF-GTS-374
     bool is_compute;
 };
 

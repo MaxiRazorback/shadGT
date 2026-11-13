@@ -31,7 +31,22 @@ public:
         uploaded = std::move(next);
         sampled = std::move(next_samples);
         cursor = 0;
+        ++upload_serial;
     }
+    /// PERF-GTS-380: this frame's share of the whole-layer hashes, for another thread to make:
+    /// fn(layer, the hash it had at the upload). Call after Changed(..., whole = false).
+    template<class Fn>
+    void TakeWholeShare(std::uint32_t layers, std::uint64_t layer_size, Fn fn) {
+        if (!layers || layer_size < 256 || uploaded.size() != layers) return;
+        const auto count = std::clamp<std::uint64_t>((4ull << 20) / layer_size, 1, layers);
+        for (std::uint64_t n = 0; n < count; ++n) {
+            const auto i = cursor;
+            cursor = (cursor + 1) % layers;
+            fn(i, uploaded[i]);
+        }
+    }
+    /// Which upload the hashes are of (a result for an earlier one says nothing).
+    std::uint64_t UploadSerial() const { return upload_serial; }
     bool Checked(std::uint64_t frame) const { return last_frame == frame; }
     template<class Hash>
     bool Changed(std::uint32_t layers, std::uint64_t layer_size, std::uint64_t frame, Hash hash,
@@ -60,10 +75,11 @@ public:
         }
         return changed;
     }
-    void ClearUpload() { uploaded.clear(); cursor = 0; }
+    void ClearUpload() { uploaded.clear(); cursor = 0; ++upload_serial; }
 private:
     std::vector<std::uint64_t> sampled, uploaded;
     std::uint64_t last_frame = UINT64_MAX;
+    std::uint64_t upload_serial = 0;
     std::uint32_t cursor = 0;
 };
 
