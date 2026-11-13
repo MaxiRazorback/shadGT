@@ -555,6 +555,15 @@ private:
     std::unordered_map<VAddr, u64> cpu_recent_pages; ///< under region_dirty_mutex
     std::unordered_set<VAddr> ahead_pages; ///< under region_dirty_mutex
     std::unordered_set<VAddr> remapped_pages; ///< complete newly mapped pages awaiting refresh
+    /// DIAG-GTS-411: pages marked as written in 10 s, by what marked them: 0 a CPU write fault,
+    /// 1 the pages unwatched ahead of one, 2 a new mapping, 3 a picture copied back to memory,
+    /// 4 a picture's memory over a region, 5 those of 0 and 1 that fell in a region.
+    std::array<std::atomic<u64>, 6> diag_region_marks{};
+    struct DiagRegionRefresh {
+        VAddr end = 0;
+        u64 pages = 0, refreshes = 0;
+    };
+    std::unordered_map<VAddr, DiagRegionRefresh> diag_region_refresh; ///< recorder, by begin
     std::unordered_map<VAddr, u64> fault_chunks; ///< under region_dirty_mutex
     std::unordered_map<VAddr, std::vector<std::pair<VAddr, VAddr>>> downloaded_ranges;
     void FaultAhead(VAddr begin, VAddr end);

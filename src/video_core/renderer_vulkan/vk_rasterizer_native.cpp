@@ -4505,6 +4505,7 @@ void NativeRenderer::FlushWritebacks() {
                         const VAddr begin = std::max(from, region.begin), end = std::min(to, region.end);
                         for (VAddr page = Common::AlignDown(begin, 4096); begin < end && page < end; page += 4096) {
                             region.dirty_pages.push_back(page);
+                            diag_region_marks[3].fetch_add(1, std::memory_order_relaxed); // DIAG-GTS-411
                             Native::AddPageDownloadRange(downloaded_ranges[page], std::max(begin, page),
                                                          std::min(end, page + 4096));
                         }
@@ -4565,6 +4566,7 @@ void NativeRenderer::FlushWritebacks() {
                     const VAddr to = std::min(address + size, region.end);
                     for (VAddr page = Common::AlignDown(from, 4096); from < to && page < to; page += 4096) {
                         region.dirty_pages.push_back(page);
+                        diag_region_marks[4].fetch_add(1, std::memory_order_relaxed); // DIAG-GTS-411
                         Native::AddPageDownloadRange(downloaded_ranges[page], std::max(from, page),
                                                      std::min(to, page + 4096));
                     }
@@ -5070,6 +5072,9 @@ void NativeRenderer::SortRegionWrites() {
                      page += 4096) {
                     region.dirty_pages.push_back(page);
                 }
+                diag_region_marks[5].fetch_add(
+                    (std::min(end, region.end) - std::max(begin, region.begin) + 4095) / 4096,
+                    std::memory_order_relaxed); // DIAG-GTS-411
                 region.dirty_sorted = false;
             }
         }
@@ -5939,6 +5944,12 @@ void NativeRenderer::RefreshRegion(Region& region, VAddr address, u64 size) {
         }
     } timed{refresh_start, stats.region_refresh_ns};
     NATIVE_DIAGNOSTIC(stats.region_refresh_pages += pages.size());
+    {
+        auto& by = diag_region_refresh[region.begin]; // DIAG-GTS-411
+        by.end = region.end;
+        by.pages += pages.size();
+        ++by.refreshes;
+    }
 
 #endif
     auto* direct = r.buffer_cache.GetDirectMemory();
@@ -20073,6 +20084,8 @@ void NativeRenderer::OnNewMapping(VAddr address, u64 size) {
         std::scoped_lock dirty_lock{region_dirty_mutex};
         for (const auto& range : *plan) {
             auto& region = regions.at(range.region);
+            diag_region_marks[2].fetch_add((range.end - range.first) / 4096,
+                                           std::memory_order_relaxed); // DIAG-GTS-411
             for (VAddr page = range.first; page < range.end; page += 4096) {
                 region.dirty_pages.push_back(page);
                 region.cpu_pages->erase(page);
@@ -20844,6 +20857,7 @@ void NativeRenderer::FaultAhead(VAddr begin, VAddr end) {
                 r.page_manager.UpdatePageWatchers(address, bytes, VideoCore::PageOp::Untrack);
                 std::scoped_lock lock{region_dirty_mutex};
                 pending_region_writes.emplace_back(address, address + bytes);
+                diag_region_marks[1].fetch_add(bytes / 4096, std::memory_order_relaxed); // DIAG-GTS-411
                 has_pending_region_writes.store(true, std::memory_order_release);
         });
     }
@@ -20967,6 +20981,7 @@ void NativeRenderer::OnCpuWrite(VAddr address, u64 size, u64 exact) {
     {
         std::scoped_lock pending_lock{region_dirty_mutex};
         pending_region_writes.emplace_back(begin, end);
+        diag_region_marks[0].fetch_add((end - begin) / 4096, std::memory_order_relaxed); // DIAG-GTS-411
     }
     has_pending_region_writes.store(true, std::memory_order_release);
     FaultAhead(begin, end);
@@ -22837,6 +22852,34 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
                          "the recorder; it filled {} in at commit", left,
                          stats.prepared_pictures_made);
                 stats.prepared_pictures_made = 0;
+            }
+            {
+                // DIAG-GTS-411: after several track loads the recorder refreshed 40 times the
+                // region pages (1.6 million in 10 s, 5.4 s of its time) with most of them
+                // unchanged. Which regions, and what marked their pages as written.
+                std::vector<std::pair<VAddr, DiagRegionRefresh>> top(diag_region_refresh.begin(),
+                                                                     diag_region_refresh.end());
+                diag_region_refresh.clear();
+                std::ranges::sort(top, [](const auto& a, const auto& b) {
+                    return a.second.pages > b.second.pages;
+                });
+                std::string list;
+                for (size_t i = 0; i < top.size() && i < 6; ++i) {
+                    list += fmt::format(" {:#x}+{:.1f}MB: {} pages in {} refreshes;", top[i].first,
+                                        (top[i].second.end - top[i].first) / 1048576.0,
+                                        top[i].second.pages, top[i].second.refreshes);
+                }
+                std::array<u64, 6> marks{};
+                for (size_t i = 0; i < marks.size(); ++i) {
+                    marks[i] = diag_region_marks[i].exchange(0, std::memory_order_relaxed);
+                }
+                LOG_INFO(Render_Vulkan,
+                         "DIAG-GTS-411 (10 s): pages marked written: CPU write faults {}, unwatched "
+                         "ahead of a fault {} ({} of both in regions), new mappings {}, pictures "
+                         "copied back {}, picture memory over a region {}; {} regions refreshed, "
+                         "most pages:{}",
+                         marks[0], marks[1], marks[5], marks[2], marks[3], marks[4], top.size(),
+                         list);
             }
             if (!rows.empty()) {
                 LOG_INFO(Render_Vulkan, "DIAG-GTS-402 (10 s): {} misses over {} picture "
