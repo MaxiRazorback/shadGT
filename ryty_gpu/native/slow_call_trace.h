@@ -50,10 +50,21 @@ public:
         context_address = address;
         context_size = size;
     }
+    /// DIAG-GTS-372: also adds this call's phases to running totals (an average per call).
+    void AccumulateInto(std::array<uint64_t, N>& totals, uint64_t& calls) {
+        if (enabled) {
+            acc = &totals;
+            acc_calls = &calls;
+        }
+    }
     ~SlowCallTrace() {
         if (!enabled) return;
         const auto end = Clock::now();
         Account(end);
+        if (acc) {
+            for (size_t i = 0; i < N; ++i) (*acc)[i] += uint64_t(ns[i]);
+            ++*acc_calls;
+        }
         const double total = std::chrono::duration<double, std::milli>(end - start).count();
         if (total < 1.0) return;
         const double cpu_ms = double(CpuTime() - cpu_start) / 10000.0;
@@ -100,6 +111,8 @@ private:
     int64_t longest_ns{};
     uint64_t context_address{}, context_size{}, longest_address{}, longest_size{};
     uint64_t cpu_start{};
+    std::array<uint64_t, N>* acc{};
+    uint64_t* acc_calls{};
 };
 #else
 inline constexpr bool trace_guest_hash_calls=false;
@@ -112,6 +125,7 @@ public:
     constexpr SlowCallTrace(bool, const char*, std::array<const char*, N>) noexcept {}
     constexpr void Next(size_t) noexcept {}
     constexpr void Next(size_t, uint64_t, uint64_t) noexcept {}
+    constexpr void AccumulateInto(std::array<uint64_t, N>&, uint64_t&) noexcept {}
     SlowCallTrace(const SlowCallTrace&) = delete;
     SlowCallTrace& operator=(const SlowCallTrace&) = delete;
 };

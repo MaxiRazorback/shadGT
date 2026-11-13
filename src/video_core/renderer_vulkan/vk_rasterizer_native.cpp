@@ -10954,6 +10954,9 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
     Native::SlowCallTrace<9> trace{t_timed, "descriptor-bindings",
         {"push-constants", "groups-keys", "push-descriptor", "hash-lookup", "allocate",
          "copy-writes", "update-descriptors", "store-key", "bind-set"}};
+    if (bind_point == vk::PipelineBindPoint::eGraphics) {
+        trace.AccumulateInto(stats.bind_phase_ns, stats.bind_phase_calls); // DIAG-GTS-372
+    }
     Stream& s = stream;
     const CmdBuf cmdbuf{s.cmd};
     static const bool reuse_enabled = [] {
@@ -17370,6 +17373,7 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     Native::SlowCallTrace<8> trace{t_timed, "commit-prepared",
         {"stage-validation", "image-freshness", "sort-cpu-writes", "buffer-freshness",
          "refresh-regions", "upload-data", "image-rewrite-sources", "push-data"}};
+    trace.AccumulateInto(stats.commit_phase_ns, stats.commit_phase_calls); // DIAG-GTS-372
     const auto reject = [&](u32 why) {
         NATIVE_DIAGNOSTIC(++stats.prepared_rejected[why]);
         return false;
@@ -21451,6 +21455,27 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
     }
     stats.descriptor_allocate_calls = stats.descriptor_reserve_hits = 0;
     stats.descriptor_async_updates = 0;
+    if (stats.bind_phase_calls != 0 || stats.commit_phase_calls != 0) {
+        const auto us = [](const auto& ns, uint64_t calls) {
+            std::string text;
+            for (const auto value : ns) {
+                text += fmt::format("{}{:.2f}", text.empty() ? "" : "/",
+                                    calls ? double(value) / 1000.0 / double(calls) : 0.0);
+            }
+            return text;
+        };
+        LOG_INFO(Render_Vulkan,
+                 "DIAG-GTS-372 (10 s): us a timed draw in bindings push-constants/groups-keys/"
+                 "push-descriptor/hash-lookup/allocate/copy-writes/update-descriptors/store-key/"
+                 "bind-set {} ({} calls); in prepared commit stage-validation/image-freshness/"
+                 "sort-cpu-writes/buffer-freshness/refresh-regions/upload-data/"
+                 "image-rewrite-sources/push-data {} ({} calls)",
+                 us(stats.bind_phase_ns, stats.bind_phase_calls), stats.bind_phase_calls,
+                 us(stats.commit_phase_ns, stats.commit_phase_calls), stats.commit_phase_calls);
+    }
+    stats.bind_phase_ns = {};
+    stats.commit_phase_ns = {};
+    stats.bind_phase_calls = stats.commit_phase_calls = 0;
     stats.descriptor_reuses = stats.descriptor_allocations = 0;
     LOG_INFO(Render_Vulkan, "DESC-HASH: {} prepared hashes reused, {} refreshed after buffer changes",
              descriptor_hash_reused, descriptor_hash_refreshed);
