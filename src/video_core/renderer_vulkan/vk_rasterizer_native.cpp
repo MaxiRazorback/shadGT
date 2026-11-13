@@ -17744,6 +17744,25 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
         {"stage-validation", "image-freshness", "sort-cpu-writes", "buffer-freshness",
          "refresh-regions", "upload-data", "image-rewrite-sources", "push-data"}};
     trace.AccumulateInto(stats.commit_phase_ns, stats.commit_phase_calls); // DIAG-GTS-372
+    // PERF-GTS-381 (RYGT_PICTURE_PREFETCH=0 off): a race draw samples about 7 pictures, and
+    // the first check to read each one's record waited for it from memory, about 80 ns each
+    // (0.5 to 0.7 us a draw, DIAG-GTS-379). They are asked for now, and arrive while the
+    // validation, region refreshes and uploads below run.
+    static const bool prefetch_pictures = [] {
+        const char* env = std::getenv("RYGT_PICTURE_PREFETCH");
+        return !(env && env[0] == '0');
+    }();
+    if (prefetch_pictures) {
+        constexpr size_t Bytes = std::min<size_t>(sizeof(Native::ImageEntry), 512);
+        const auto ask = [](const Native::ImageEntry* entry) {
+            const char* const at = reinterpret_cast<const char*>(entry);
+            for (size_t offset = 0; offset < Bytes; offset += 64) {
+                _mm_prefetch(at + offset, _MM_HINT_T0);
+            }
+        };
+        for (const auto* sampled : p.bindings.sampled) ask(sampled);
+        for (const auto* stored : p.bindings.stored) ask(stored);
+    }
     const auto reject = [&](u32 why) {
         NATIVE_DIAGNOSTIC(++stats.prepared_rejected[why]);
         return false;
