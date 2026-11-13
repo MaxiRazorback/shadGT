@@ -120,7 +120,8 @@ public:
     /// NAT-109: hash of the guest bytes last uploaded (small textures; 0: none), so a texture
     /// made stale by a write to its page that left its bytes alone is not uploaded again.
     u64 content_hash = 0;
-    LayerHashState layer_hash;
+    /// PERF-GTS-452: shared with the background layer check (see LayerHashShared).
+    std::shared_ptr<LayerHashShared> layer_hash = std::make_shared<LayerHashShared>();
     /// A GPU-only target cannot be checked against a CPU hash. Its initial upload can instead
     /// establish that CPU writes to the complete backing range are already being watched.
     bool guest_writes_tracked = false;
@@ -277,6 +278,10 @@ public:
     /// Full-range indexed images, once each. Callback must not reenter the registry.
     /// Retirement must be serialized with this traversal.
     void ForEachImage(const std::function<void(ImageEntry&)>& fn);
+    /// PERF-GTS-450: the images of one shard (index below ShardCount()), for walks spread over
+    /// several frames. Same rules as ForEachImage.
+    void ForEachImageInShard(u32 index, const std::function<void(ImageEntry&)>& fn);
+    static constexpr u32 ShardCount() { return NumShards; }
 
     /// The image for this layout: one already at the address with the same layout (whatever
     /// its colour format, if the texel size matches), or a new one. A texture found nowhere is
