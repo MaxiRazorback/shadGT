@@ -28,6 +28,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include "ryty_gpu/native/kept_set_table.h"
 #include <vector>
 
 #include <boost/container/static_vector.hpp>
@@ -458,20 +459,24 @@ private:
     /// Recorder thread only. An entry goes when a handle it holds is about to be destroyed
     /// (Native::DeadHandles); its set stays unused in its pool until the next Flush.
     struct LongSets {
-        struct Entry {
-            std::vector<u64> words;
+        /// PERF-GTS-376: a dropped entry's set, written again once the GPU ran the lists
+        /// that may have bound it.
+        struct Retired {
+            u64 tick;
+            u64 layout;
             vk::DescriptorSet set;
         };
-        std::unordered_multimap<u64, Entry> entries;  ///< by key hash
-        std::unordered_multimap<u64, u64> users;      ///< handle -> key hash
+        Native::KeptSetTable<vk::DescriptorSet> entries;                ///< by 128-bit key hash
+        std::unordered_multimap<u64, std::pair<u64, u64>> users;        ///< handle -> key hash
+        std::deque<Retired> retired;
+        std::unordered_map<u64, std::vector<vk::DescriptorSet>> spare;  ///< by layout
         std::vector<vk::DescriptorPool> pools;
-        u64 unused_sets = 0; ///< sets of dropped entries, still in the pools
-        u64 hits = 0, made = 0, dropped = 0, flushes = 0;
+        u64 unused_sets = 0; ///< sets whose layout was destroyed, still in the pools
+        u64 hits = 0, made = 0, dropped = 0, flushes = 0, rewritten = 0;
     };
     LongSets long_sets;
-    vk::DescriptorSet FindLongSet(u64 hash, std::span<const u64> words);
     vk::DescriptorSet MakeLongSet(vk::DescriptorSetLayout layout);
-    void StoreLongSet(u64 hash, std::span<const u64> words, vk::DescriptorSet set,
+    void StoreLongSet(u64 hash, u64 check, vk::DescriptorSetLayout layout, vk::DescriptorSet set,
                       std::span<const u64> handles);
     void DropLongSets(std::span<const u64> dead_handles);
     void FlushLongSets();
