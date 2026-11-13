@@ -16922,6 +16922,7 @@ void NativeRenderer::PreparedDraw::Reset() {
     index_address = 0;
     mirrors.clear();
     in_place.clear();
+    missing_pictures.clear(); // PERF-GTS-403
     for (auto& copy : stage_copies) {
         copy.present = false;
     }
@@ -17162,7 +17163,8 @@ void NativeRenderer::PrepareJobDraw(const void* packet, u32 epoch, const AmdGpu:
     if (DrawPreparationEnabled(2)) StableUniquePrepared(p->regions);
     p->bindings.PrepareWriteGroups(); // binding-owned spans, published with this draw
     p->bindings.PrepareDescriptorKeys(pipeline);
-    if (ParallelRecordingRequested()) try {
+    // PERF-GTS-403: not for a draw with a picture still to be made (its views are not known).
+    if (ParallelRecordingRequested() && p->missing_pictures.empty()) try {
         auto* candidate=&p->cpu_proof;candidate->prepared_identity=p;candidate->pipeline_identity=&pipeline;
         candidate->pipeline_layout=pipeline.GetLayout();
         const auto& b=p->bindings;candidate->writes_data=b.writes.data();candidate->writes_size=b.writes.size();
@@ -17918,6 +17920,29 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
         if (!storage && (!entry || entry->needs_upload.load(std::memory_order_relaxed))) {
             warm_upload(desc.info.guest_address, desc.info.guest_size);
         }
+        // PERF-GTS-403 (RYGT_PREPARE_MISSING_PICTURES=1): a sampled picture that is not there
+        // yet no longer costs the whole prepared draw. GT Sport's light grid (30x17, 16
+        // layers) moves by a few hundred bytes now and then, each time a new picture: every
+        // lit draw of that frame (1,000 to 2,800) missed it here and took the recorder's own
+        // lookups, 7,700 to 51,500 draws in 10 s at Tokyo, a third of the frames of 34 ms and
+        // more beside such a burst. The draw keeps what was found; the recorder makes the
+        // picture in GPU order at commit and fills its views in.
+        static const bool leave_missing = [] {
+            const char* env = std::getenv("RYGT_PREPARE_MISSING_PICTURES");
+            return env && env[0] == '1' && env[1] == '\0';
+        }();
+        if (!entry && leave_missing && !storage) {
+            for (u32 i = 0; i < num_bindings; ++i) {
+                b.images.push_back({VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral});
+            }
+            p.missing_pictures.push_back({first, image_desc.constant_mip_index,
+                                          static_cast<u8>(num_bindings),
+                                          static_cast<u8>(image_desc.mip_fallback_mode),
+                                          cube_sampling, desc.info, desc.view_info});
+            prepare_stats.left_missing.fetch_add(1, std::memory_order_relaxed);
+            add_write();
+            continue;
+        }
         if (!entry) {
             NATIVE_DIAGNOSTIC(++prepare_stats.why[8]);
 #if !defined(NDEBUG)
@@ -18303,6 +18328,38 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
         NATIVE_DIAGNOSTIC(++stats.prepared_buffer_no[lost ? 1 : 0]);
         static_cast<void>(lost);
         return reject(4);
+    }
+    // PERF-GTS-403: the pictures the job thread did not find are looked up again and made
+    // now, in GPU order, as BindTextures makes them; the loop over the sampled pictures below
+    // then treats them as the others. The keys were made without their views.
+    if (!p.missing_pictures.empty()) {
+        for (const auto& missing : p.missing_pictures) {
+            Native::ImageEntry* const entry = registry->Find(missing.info, false, frame);
+            if (!entry) {
+                return reject(3); // the recorder's own lookups bind what there is
+            }
+            const auto fallback = static_cast<Shader::MipStorageFallbackMode>(missing.fallback);
+            for (u32 i = 0; i < missing.bindings; ++i) {
+                auto view_info = missing.view_info;
+                if (fallback == Shader::MipStorageFallbackMode::ConstantIndex) {
+                    view_info.range.base.level += missing.constant_mip;
+                    view_info.range.extent.levels = 1;
+                } else if (fallback == Shader::MipStorageFallbackMode::DynamicIndex) {
+                    view_info.range.base.level += i;
+                    view_info.range.extent.levels = 1;
+                }
+                p.bindings.images[missing.first + i].imageView =
+                    View(*entry, view_info,
+                         missing.cube ? ViewUse::CubeSampled : ViewUse::Sampled);
+            }
+            p.bindings.sampled.push_back(entry);
+            p.image_ranges.emplace_back(missing.info.guest_address,
+                                        missing.info.guest_address +
+                                            std::max<u64>(missing.info.guest_size, 1));
+            NATIVE_DIAGNOSTIC(++stats.prepared_pictures_made);
+        }
+        p.missing_pictures.clear();
+        p.bindings.key_layout = nullptr;
     }
     // The ordered part, as BindBuffers and BindTextures do it.
     trace.Next(4);
@@ -22699,6 +22756,13 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
                                     address, miss.bytes, miss.count, miss.width, miss.height,
                                     miss.layers, miss.levels, miss.depth ? " depth" : "",
                                     miss.sizes, miss.first_frame, miss.last_frame, miss.program);
+            }
+            if (const u64 left = prepare_stats.left_missing.exchange(0);
+                left + stats.prepared_pictures_made != 0) {
+                LOG_INFO(Render_Vulkan, "PERF-GTS-403 (10 s): job threads left {} pictures for "
+                         "the recorder; it filled {} in at commit", left,
+                         stats.prepared_pictures_made);
+                stats.prepared_pictures_made = 0;
             }
             if (!rows.empty()) {
                 LOG_INFO(Render_Vulkan, "DIAG-GTS-402 (10 s): {} misses over {} picture "

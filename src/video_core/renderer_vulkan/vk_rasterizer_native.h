@@ -1469,6 +1469,19 @@ private:
         /// PERF-GTS-398 (set by the recorder when the draw goes into a pass packet): how many
         /// handles had died by then, and the tick after which a set made for it may be reused.
         u64 late_dead_seq = 0, late_retire_tick = 0;
+        /// PERF-GTS-403: sampled pictures the job thread did not find (they are made in GPU
+        /// order): where their views go in bindings.images, and what the recorder looks them
+        /// up and views them with at commit.
+        struct MissingPicture {
+            u32 first = 0;
+            u32 constant_mip = 0;
+            u8 bindings = 0;
+            u8 fallback = 0;
+            bool cube = false;
+            VideoCore::ImageInfo info;
+            VideoCore::ImageViewInfo view_info;
+        };
+        std::vector<MissingPicture> missing_pictures;
         void Reset();
     };
     /// OPT-010: the guest ranges whose region or mirror was made or dropped, by sequence number
@@ -1578,6 +1591,7 @@ private:
         /// 9 a storage picture that cannot be bound as one.
         std::array<std::atomic<u64>, 10> why{};
         std::atomic<u32> missing_logged{0};
+        std::atomic<u64> left_missing{0}; ///< PERF-GTS-403: pictures left for the recorder
         /// DIAG-GTS-402: the pictures job threads did not find, by address: how often, the
         /// last size asked for, how many different sizes, and one program that asked.
         struct Missing {
@@ -1765,6 +1779,7 @@ private:
         u64 prepared_image_no[4]{}, prepared_buffer_no[2]{};
         u64 prepared_vertices = 0, prepared_vertices_rejected = 0; ///< OPT-011
         u64 prepared_installed = 0; ///< OPT-012: pipelines from a job thread's selection
+        u64 prepared_pictures_made = 0; ///< PERF-GTS-403: missing pictures filled in at commit
         /// OPT-011: the record phase's parts: barrier choice, pass begin, dynamic state, vertex
         /// and index binds, pipeline bind, descriptors and push constants, the draw, write notes.
         std::array<u64, 8> record_ns{};
