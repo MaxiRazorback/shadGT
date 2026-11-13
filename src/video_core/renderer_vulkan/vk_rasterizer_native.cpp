@@ -19768,8 +19768,8 @@ void NativeRenderer::ProbeWatchedPictures() {
 }
 
 void NativeRenderer::EvictImages() {
-    Native::SlowCallTrace<3> trace{true, "frame-retirement",
-        {"completed-views", "cold-mirrors", "cold-images"}};
+    Native::SlowCallTrace<4> trace{true, "frame-retirement",
+        {"completed-views", "cold-mirrors", "kept-textures", "cold-images"}};
     ProbeWatchedPictures(); // FIX-156 (diagnosis)
     {
         // PERF-GT7-052: each frame, the per-frame textures uploaded since are looked at again:
@@ -19923,7 +19923,14 @@ void NativeRenderer::EvictImages() {
         std::scoped_lock lock{entry.sources_mutex};
         return entry.sources.empty();
     };
-    std::unordered_set<const Native::ImageEntry*> kept_textures;
+    // PERF-GTS-450: choosing the kept set walked and sorted every image the registry holds
+    // (thousands in a race) on the recorder thread each frame: frame retirement took ~1.5 ms in
+    // every frame. The walk now covers a few shards per frame and a full walk chooses the set
+    // again (about every 22 frames; the idle set changes slowly, KeepFrames is 120). A texture
+    // that goes idle in between is kept when eviction meets it, while the budget allows.
+    // Entries are keys only, never read through: one may be gone by the end of a walk.
+    auto& kept_textures = kept_texture_cache;
+    constexpr u32 KeptShardsPerFrame = 3;
     // VRAM-PRESSURE-001: a device allocation failed (a heavy track's 257 MB buffer on an 8 GB
     // card, 17 failures and then an abort, while up to 805 MB of idle textures were kept).
     // This pass keeps none of them, so the next attempt finds the room.
@@ -19933,32 +19940,69 @@ void NativeRenderer::EvictImages() {
         LOG_WARNING(Render_Vulkan, "VRAM-PRESSURE-001: device memory ran out; idle textures are "
                                    "released instead of kept");
     }
-    if (texture_budget != 0 && !pressure) {
-        std::vector<Native::ImageEntry*> idle;
-        registry->ForEachImage([&](Native::ImageEntry& entry) {
-            if (entry.from_cpu && entry.image &&
-                entry.last_use.load(std::memory_order_relaxed) < frame - KeepFrames) {
-                idle.push_back(&entry);
+    if (pressure || texture_budget == 0) {
+        kept_textures.clear();
+        kept_texture_scan.clear();
+        kept_texture_shard = 0;
+        kept_texture_bytes = 0;
+    } else {
+        const u32 shards = Native::ImageRegistry::ShardCount();
+        for (u32 i = 0; i < KeptShardsPerFrame && kept_texture_shard < shards; ++i) {
+            registry->ForEachImageInShard(kept_texture_shard++, [&](Native::ImageEntry& entry) {
+                const u64 last_use = entry.last_use.load(std::memory_order_relaxed);
+                if (entry.from_cpu && entry.image && last_use < frame - KeepFrames &&
+                    loaded_texture(entry)) {
+                    kept_texture_scan.push_back({&entry, last_use,
+                                                 std::max<u64>(entry.info.guest_size, 1),
+                                                 entry.info.guest_address});
+                }
+            });
+        }
+        if (kept_texture_shard >= shards) {
+            std::ranges::sort(kept_texture_scan, std::greater{},
+                              &KeptTextureCandidate::last_use);
+            kept_textures.clear();
+            std::unordered_map<VAddr, u32> kept_at;
+            u64 bytes = 0;
+            for (const auto& candidate : kept_texture_scan) {
+                if (kept_at[candidate.address] >= 4) {
+                    continue;
+                }
+                if (bytes + candidate.size > texture_budget) {
+                    break;
+                }
+                bytes += candidate.size;
+                ++kept_at[candidate.address];
+                kept_textures.insert(candidate.entry);
             }
-        });
-        std::ranges::sort(idle, std::greater{}, [](const Native::ImageEntry* entry) {
-            return entry->last_use.load(std::memory_order_relaxed);
-        });
-        std::unordered_map<VAddr, u32> kept_at;
-        u64 bytes = 0;
-        for (Native::ImageEntry* entry : idle) {
-            if (!loaded_texture(*entry) || kept_at[entry->info.guest_address] >= 4) {
-                continue;
-            }
-            bytes += std::max<u64>(entry->info.guest_size, 1);
-            if (bytes > texture_budget) {
-                break;
-            }
-            ++kept_at[entry->info.guest_address];
-            kept_textures.insert(entry);
+            kept_texture_bytes = bytes;
+            kept_texture_scan.clear();
+            kept_texture_shard = 0;
         }
     }
+    // A loaded texture that went idle after the last full walk (RYGT_NATIVE_KEEP_NEW_IDLE=0: not).
+    static const bool keep_new_idle = [] {
+        const char* env = std::getenv("RYGT_NATIVE_KEEP_NEW_IDLE");
+        return !(env && env[0] == '0');
+    }();
+    const auto keep_new_texture = [&](Native::ImageEntry& entry) {
+        if (!keep_new_idle || pressure || texture_budget == 0 || !entry.from_cpu || !entry.image) {
+            return false;
+        }
+        const u64 size = std::max<u64>(entry.info.guest_size, 1);
+        if (kept_texture_bytes + size > texture_budget || !loaded_texture(entry)) {
+            return false;
+        }
+        kept_texture_bytes += size;
+        kept_textures.insert(&entry);
+        return true;
+    };
+    trace.Next(3);
     registry->Evict(frame - KeepFrames, [&](Native::ImageEntry& entry) {
+        if (kept_textures.erase(&entry) != 0) {
+            kept_texture_bytes -= std::min<u64>(kept_texture_bytes,
+                                                std::max<u64>(entry.info.guest_size, 1));
+        }
         retired_watch_ranges.emplace_back(
             VideoCore::PageManager::GetPageAddr(entry.info.guest_address),
             VideoCore::PageManager::GetNextPageAddr(
@@ -19997,7 +20041,7 @@ void NativeRenderer::EvictImages() {
             it = owners.empty() ? stencil_owners.erase(it) : std::next(it);
         }
     }, [&](Native::ImageEntry& entry) {
-        return kept_textures.contains(&entry) || keep(entry);
+        return kept_textures.contains(&entry) || keep(entry) || keep_new_texture(entry);
     }, 16);
     if (newly_kept != 0) {
         static std::atomic<u32> logged{};

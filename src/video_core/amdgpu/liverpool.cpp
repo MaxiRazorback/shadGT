@@ -401,11 +401,6 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
 }
 
-void Liverpool::BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
-    rasterizer = rasterizer_;
-    retire_on_gpu = rasterizer_ && rasterizer_->RetiresSubmitsOnGpu(); // FIX-GTS-358
-}
-
 Liverpool::~Liverpool() {
     process_thread.request_stop();
     process_thread.join();
@@ -1649,9 +1644,6 @@ void Liverpool::Process(std::stop_token stoken) {
                     , submitted, decoded, ranges
 #endif
                 ] {
-                    if (retire_on_gpu) {
-                        ++recorded_unretired; // FIX-GTS-358: retired by the next counting flush
-                    }
                     --num_submits;
 #ifndef NDEBUG
                     u64 gpu_range = 0;
@@ -1797,33 +1789,7 @@ void Liverpool::Process(std::stop_token stoken) {
                 }
             });
         }
-        RecordSafe([this] {
-            if (!retire_on_gpu) {
-                Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
-                return;
-            }
-            // FIX-GTS-358: the submissions recorded since the last pass are submitted, and the GPU
-            // reports idle once it has finished them (and the fences deferred before them).
-            const u32 recorded = recorded_unretired.exchange(0);
-            if (recorded == 0) {
-                if (unretired == 0) {
-                    Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
-                }
-                return;
-            }
-            if (!rasterizer) {
-                if ((unretired -= recorded) == 0) {
-                    Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
-                }
-                return;
-            }
-            const u64 tick = rasterizer->Flush();
-            rasterizer->WhenTickDone(tick, [this, recorded] {
-                if ((unretired -= recorded) == 0) {
-                    Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
-                }
-            });
-        });
+        RecordSafe([] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle); });
     }
 }
 
@@ -4252,9 +4218,6 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
 
     std::scoped_lock lk{submit_mutex};
     ++num_submits;
-    if (retire_on_gpu) {
-        ++unretired; // FIX-GTS-358
-    }
     ++num_tasks;
     submit_cv.notify_one();
 }
@@ -4277,9 +4240,6 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     num_mapped_queues.store(std::max(num_mapped_queues.load(std::memory_order_relaxed),
                                      gnm_vqid + 1), std::memory_order_release);
     ++num_submits;
-    if (retire_on_gpu) {
-        ++unretired; // FIX-GTS-358
-    }
     ++num_tasks;
     submit_cv.notify_one();
 }

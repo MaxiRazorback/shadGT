@@ -1255,6 +1255,18 @@ private:
     void ProbeDisplay(const Native::ImageEntry& entry);
     /// FIX-157: bytes of pictures kept past their idle time.
     u64 kept_bytes = 0;
+    /// PERF-GTS-450: idle textures kept past their idle time. The registry is walked a few
+    /// shards per frame; a full walk chooses the set again. Pointers are keys only.
+    struct KeptTextureCandidate {
+        const Native::ImageEntry* entry;
+        u64 last_use;
+        u64 size;
+        VAddr address;
+    };
+    std::unordered_set<const Native::ImageEntry*> kept_texture_cache;
+    std::vector<KeptTextureCandidate> kept_texture_scan;
+    u32 kept_texture_shard = 0;
+    u64 kept_texture_bytes = 0;
     std::vector<Native::ImageEntry*> writebacks;
     struct PendingLinearDownload;
     std::unordered_map<const Native::ImageEntry*, std::shared_ptr<PendingLinearDownload>> pending_linear_downloads;

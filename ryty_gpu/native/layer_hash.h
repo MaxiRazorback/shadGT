@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <vector>
 #include <utility>
 
@@ -79,5 +81,17 @@ private:
     std::uint64_t last_frame = UINT64_MAX;
     std::uint64_t upload_serial = 0;
     std::uint32_t cursor = 0;
+};
+
+// PERF-GTS-452: a texture's layer hashes and the result of the check a background thread ran.
+// Shared with that check, so an entry evicted meanwhile leaves it valid. The mutex guards
+// state; Capture (an upload) bumps generation, and a check begun before it is dropped.
+struct LayerHashShared {
+    std::mutex mutex;
+    LayerHashState state;
+    std::atomic<bool> busy{false};
+    std::atomic<bool> changed{false};
+    std::atomic<std::uint64_t> generation{0};
+    std::atomic<std::uint64_t> checked_frame{UINT64_MAX};
 };
 }

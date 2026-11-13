@@ -387,8 +387,8 @@ public:
         return shader_clock && shader_clock_features.shaderSubgroupClock;
     }
 
-    /// FIX-GTS-358: a GCN Radeon (R7/R9, three-digit RX 400/500/600 models, Vega, Radeon VII) on
-    /// AMD's driver. Four-digit RX models (RX 5300 and up) are RDNA.
+    /// FIX-GTS-364: a GCN Radeon (R7/R9, three-digit RX 400/500/600 models, Vega, Radeon VII)
+    /// on AMD's driver. Four-digit RX models (RX 5300 and up) are RDNA.
     bool IsAmdGcn() const;
 
     /// AMD-306/307: AMD's driver compiling with its older proprietary shader compiler

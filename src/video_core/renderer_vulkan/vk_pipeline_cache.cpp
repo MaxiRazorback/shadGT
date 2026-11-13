@@ -2174,7 +2174,21 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         VideoCore::DirectMemory::Enabled() && instance.IsExternalMemoryHostSupported();
     profile.lds_read_counters = DiagLdsReadCountersAddress(instance); // DIAG-GTS-459
 #ifdef RYTY_GPU
-    profile.native_cube_sampling = NativeModeRequested() && instance.IsImageCubeArraySupported();
+    // FIX-GTS-364: an RX 480 drew GT7 right only with the legacy 2D-array cube sampling path, so
+    // GCN Radeons take it by default. RYGT_NATIVE_CUBE=0 picks the legacy path on any GPU, =1
+    // the native one.
+    {
+        const char* native_cube_env = std::getenv("RYGT_NATIVE_CUBE");
+        const bool native_cube = native_cube_env && *native_cube_env ? native_cube_env[0] != '0'
+                                                                     : !instance.IsAmdGcn();
+        profile.native_cube_sampling =
+            NativeModeRequested() && instance.IsImageCubeArraySupported() && native_cube;
+        LOG_INFO(Render_Vulkan, "FIX-GTS-364: native cube sampling {}{}",
+                 profile.native_cube_sampling ? "on" : "off",
+                 native_cube_env && *native_cube_env ? " (RYGT_NATIVE_CUBE)"
+                 : instance.IsAmdGcn()              ? " (GCN Radeon)"
+                                                    : "");
+    }
     SetNativeCubeCacheEnabled(profile.native_cube_sampling);
 #endif
     SetVertexOrderCheckCacheEnabled(profile.vertex_order_check); // AMD-307
