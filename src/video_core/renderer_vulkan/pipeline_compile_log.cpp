@@ -15,6 +15,7 @@
 
 #include "common/logging/log.h"
 #include "common/types.h"
+#include <xxhash.h>
 #include "common/path_util.h"
 #include "video_core/renderer_vulkan/pipeline_compile_log.h"
 
@@ -28,6 +29,7 @@ namespace {
 PFN_vkCreateGraphicsPipelines real_create_graphics{};
 PFN_vkCreateComputePipelines real_create_compute{};
 PFN_vkCreateShadersEXT real_create_shaders{};
+PFN_vkCreateShaderModule real_create_module{};
 PFN_vkSetDebugUtilsObjectNameEXT real_set_name{};
 PFN_vkCmdBindPipeline real_bind{};
 PFN_vkCmdInsertDebugUtilsLabelEXT insert_label{};
@@ -158,11 +160,52 @@ std::string Statistics(VkDevice device, VkPipeline pipeline, bool captured) {
     return out;
 }
 
+// SPIR-V hash of each shader module, to tell whether a pipeline that misses the driver cache
+// again in the next run was handed different code.
+std::mutex module_mutex;
+std::unordered_map<VkShaderModule, u64> module_hashes;
+
+VKAPI_ATTR VkResult VKAPI_CALL CreateModule(VkDevice device, const VkShaderModuleCreateInfo* info,
+                                            const VkAllocationCallbacks* alloc,
+                                            VkShaderModule* module) {
+    const VkResult result = real_create_module(device, info, alloc, module);
+    if (result == VK_SUCCESS && info && info->pCode) {
+        const u64 hash = XXH3_64bits(info->pCode, info->codeSize);
+        std::scoped_lock lock{module_mutex};
+        module_hashes[*module] = hash;
+    }
+    return result;
+}
+
+// "vs=<spirv hash>[+<specialization hash>];ps=..." for the stages handed to the driver.
+std::string StageHashes(const VkPipelineShaderStageCreateInfo* infos, u32 count) {
+    std::string out;
+    for (u32 i = 0; infos && i < count; ++i) {
+        const auto& s = infos[i];
+        u64 hash = 0;
+        if (s.module) {
+            std::scoped_lock lock{module_mutex};
+            if (auto it = module_hashes.find(s.module); it != module_hashes.end()) hash = it->second;
+        } else if (auto* inline_code = reinterpret_cast<const VkShaderModuleCreateInfo*>(
+                       FindInChain(s.pNext, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO));
+                   inline_code && inline_code->pCode) {
+            hash = XXH3_64bits(inline_code->pCode, inline_code->codeSize);
+        }
+        out += fmt::format("{}{}={:016x}", i ? ";" : "", StageName(s.stage), hash);
+        if (s.pSpecializationInfo && s.pSpecializationInfo->dataSize) {
+            out += fmt::format("+{:08x}", static_cast<u32>(XXH3_64bits(
+                                              s.pSpecializationInfo->pData,
+                                              s.pSpecializationInfo->dataSize)));
+        }
+    }
+    return out;
+}
+
 // One row per pipeline; feedback may be invalid when the driver does not fill it.
 void LogPipeline(VkDevice device, const char* kind, VkPipeline pipeline, double ms,
                  const VkPipelineCreationFeedback& whole,
                  const VkPipelineCreationFeedback* stages, const VkPipelineShaderStageCreateInfo* infos,
-                 u32 stage_count, VkResult result, bool captured) {
+                 u32 stage_count, VkResult result, bool captured, const std::string& spirv) {
     const bool valid = whole.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT;
     const bool hit = whole.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT;
     std::string stage_text;
@@ -173,10 +216,10 @@ void LogPipeline(VkDevice device, const char* kind, VkPipeline pipeline, double 
                                   (stages[i].flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) ? "h" : "");
     }
     const double driver_ms = valid ? whole.duration / 1e6 : -1.0;
-    WriteRow(fmt::format("{:.3f},{},{},{:#x},{:.3f},{:.3f},{},{},{},{}", NowMs(), ThreadId(), kind,
+    WriteRow(fmt::format("{:.3f},{},{},{:#x},{:.3f},{:.3f},{},{},{},{},{}", NowMs(), ThreadId(), kind,
                          reinterpret_cast<u64>(pipeline), ms, driver_ms,
                          valid ? (hit ? "hit" : "miss") : "unknown", Quote(stage_text),
-                         static_cast<int>(result), Quote(Statistics(device, pipeline, captured && result == VK_SUCCESS))));
+                         static_cast<int>(result), Quote(Statistics(device, pipeline, captured && result == VK_SUCCESS)), Quote(spirv)));
     if (pipeline && insert_label) {
         std::scoped_lock lock{pending_mutex};
         pending[pipeline] = fmt::format("RyGT compile {} {:.1f} ms {}", kind, ms,
@@ -254,7 +297,14 @@ VkResult CreateLogged(VkDevice device, VkPipelineCache cache, u32 count, const C
         }
         LogPipeline(device, kinds[i], pipelines[i], ms, *fb->pPipelineCreationFeedback,
                     fb->pPipelineStageCreationFeedbacks, stage_infos,
-                    fb->pipelineStageCreationFeedbackCount, result, captured[i] != 0);
+                    fb->pipelineStageCreationFeedbackCount, result, captured[i] != 0,
+                    StageHashes(stage_infos, [&]() -> u32 {
+                        if constexpr (std::is_same_v<CreateInfo, VkGraphicsPipelineCreateInfo>) {
+                            return copies[i].stageCount;
+                        } else {
+                            return 1;
+                        }
+                    }()));
     }
     return result;
 }
@@ -285,7 +335,7 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateShaders(VkDevice device, u32 count,
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
     std::string stages;
     for (u32 i = 0; i < count; ++i) stages += fmt::format("{}{}", i ? ";" : "", StageName(infos[i].stage));
-    WriteRow(fmt::format("{:.3f},{},shader-object,{:#x},{:.3f},-1,unknown,{},{},\"\"", NowMs(),
+    WriteRow(fmt::format("{:.3f},{},shader-object,{:#x},{:.3f},-1,unknown,{},{},\"\",\"\"", NowMs(),
                          ThreadId(), count ? reinterpret_cast<u64>(shaders[0]) : 0, ms,
                          Quote(stages), static_cast<int>(result)));
     return result;
@@ -294,7 +344,7 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateShaders(VkDevice device, u32 count,
 VKAPI_ATTR VkResult VKAPI_CALL SetName(VkDevice device, const VkDebugUtilsObjectNameInfoEXT* info) {
     if (info && info->pObjectName &&
         (info->objectType == VK_OBJECT_TYPE_PIPELINE || info->objectType == VK_OBJECT_TYPE_SHADER_EXT)) {
-        WriteRow(fmt::format("{:.3f},{},name,{:#x},0,0,,{},0,\"\"", NowMs(), ThreadId(),
+        WriteRow(fmt::format("{:.3f},{},name,{:#x},0,0,,{},0,\"\",\"\"", NowMs(), ThreadId(),
                              info->objectHandle, Quote(info->pObjectName)));
         if (info->objectType == VK_OBJECT_TYPE_PIPELINE && pending_count.load(std::memory_order_relaxed)) {
             std::scoped_lock lock{pending_mutex};
@@ -355,7 +405,7 @@ void Install(vk::Device device, bool executable_properties) {
             LOG_ERROR(Render_Vulkan, "DIAG-SHC-001: cannot write {}", path.string());
             return;
         }
-        std::fputs("ms,thread,kind,handle,call_ms,driver_ms,cache,stages,result,statistics\n", file);
+        std::fputs("ms,thread,kind,handle,call_ms,driver_ms,cache,stages,result,statistics,spirv\n", file);
         std::fflush(file);
     }
     capture_statistics = executable_properties;
@@ -369,6 +419,10 @@ void Install(vk::Device device, bool executable_properties) {
     if (d.vkCreateComputePipelines) {
         real_create_compute = d.vkCreateComputePipelines;
         d.vkCreateComputePipelines = CreateCompute;
+    }
+    if (d.vkCreateShaderModule) {
+        real_create_module = d.vkCreateShaderModule;
+        d.vkCreateShaderModule = CreateModule;
     }
     if (d.vkCreateShadersEXT) {
         real_create_shaders = d.vkCreateShadersEXT;
