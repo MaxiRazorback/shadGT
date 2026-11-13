@@ -555,6 +555,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
             .submitted = std::chrono::steady_clock::now(),
 #endif
         });
+        request_depth.store(static_cast<u32>(requests.size()), std::memory_order_release);
     }
 #ifndef NDEBUG
     RyDiag::Timeline('Q', RyDiag::Seconds(std::chrono::steady_clock::now()), 0.0, 0.0, 0.0,
@@ -607,8 +608,32 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         return ticks_per_vblank > 1 && !DebugState.IsGuestThreadsPaused() &&
                !Common::GuestClock::IsPaused();
     };
+    // PERF-GTS-410 (RYGT_FLIP_BUFFER_FRAMES=1 or 2, default 0): the presenter keeps that many
+    // frames queued behind the one it shows. Before PERF-GTS-406 it kept three by accident
+    // (flips 17.2 ms apart against a game at 60), which hid every game stall shorter than the
+    // queue at the cost of 58 fps and 51 ms from submit to flip; with 406 the queue stays at one
+    // frame and every stall longer than a frame shows. With the target met, flips come a vblank
+    // apart; above it 1 ms sooner (the queue drains); below it 0.5 ms later, so a game running
+    // at 60 refills it in about half a second a frame. Implies PERF-GTS-406's timing.
+    static const u32 buffer_frames = [] {
+        const char* env = std::getenv("RYGT_FLIP_BUFFER_FRAMES");
+        const unsigned long value = env && *env ? std::strtoul(env, nullptr, 10) : 0;
+        return static_cast<u32>(std::min<unsigned long>(value, 2));
+    }();
+    // `depth`: the flips queued, the one to flip next included.
+    const auto flip_interval = [&](u32 depth) -> std::chrono::nanoseconds {
+        const int rate = current_flip_rate();
+        if (buffer_frames == 0) {
+            return FastFlipInterval(vblank_period, rate);
+        }
+        const std::chrono::nanoseconds whole = vblank_period * (rate + 1);
+        if (depth > buffer_frames + 1) {
+            return whole - std::chrono::milliseconds{1};
+        }
+        return depth == buffer_frames + 1 ? whole : whole + std::chrono::microseconds{500};
+    };
     const auto flip_allowed_at = [&] {
-        return last_flip_time + FastFlipInterval(vblank_period, current_flip_rate());
+        return last_flip_time + flip_interval(request_depth.load(std::memory_order_acquire));
     };
     // PERF-GTS-406 (RYGT_FLIP_PACE_EXACT=1): a frame that was waiting for its time counts from
     // that time, not from when its flip returned. Counting from the return adds the flip's own
@@ -620,10 +645,12 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         return env && env[0] == '1' && env[1] == '\0';
     }();
     const auto flip_paced = [&](const Request& request) {
-        const auto due = flip_allowed_at();
+        // The request is taken off the queue already: count it in.
+        const auto due = last_flip_time +
+                         flip_interval(request_depth.load(std::memory_order_acquire) + 1);
         const auto began = Clock::now();
         Flip(request);
-        if (!pace_exact) {
+        if (!pace_exact && buffer_frames == 0) {
             last_flip_time = Clock::now();
         } else if (began >= due && began - due <= std::chrono::milliseconds{2}) {
             last_flip_time = due;
@@ -637,6 +664,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         if (!requests.empty()) {
             auto request = requests.front();
             requests.pop();
+            request_depth.store(static_cast<u32>(requests.size()), std::memory_order_release);
 #ifndef NDEBUG
             if (request.trace.generation)
                 Common::FrameQueueTrace::Dequeue(request.trace);
