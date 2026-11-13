@@ -455,6 +455,11 @@ private:
     void TrimIdleChunks();
     vk::DescriptorBufferInfo UploadFlatData(u32 stage, const u8* source, u32 size, bool* backing_proven = nullptr);
     vk::DescriptorPool TakeDescriptorPool();
+    /// PERF-GTS-399: a list for the recorder to go on in after a parallel pass (not begun): one
+    /// recorded through the command ring when the ring is on for parallel recording, else a
+    /// secondary of this thread. And the command stream of a list of either kind.
+    Native::Rhi::CommandList* AcquireReplacementList();
+    CmdBuf StreamCmdOf(Native::Rhi::CommandList& list) const;
     /// PERF-GTS-375: descriptor sets with dynamic buffer offsets kept across command lists.
     /// Recorder thread only. An entry goes when a handle it holds is about to be destroyed
     /// (Native::DeadHandles); its set stays unused in its pool until the next Flush.

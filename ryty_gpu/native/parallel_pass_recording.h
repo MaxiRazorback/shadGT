@@ -91,6 +91,10 @@ void EmitWholePass(const Pass& pass,Begin&& begin,Emit&& emit,End&& end) {
 // This routine neither resolves registry/guest state nor schedules GPU work.
 bool ValidatePass(const Pass& pass);
 bool RecordPass(vk::CommandBuffer cmd,const Vulkan::Instance& instance,const Pass& pass);
+// PERF-GTS-399: into the recorder's stream (a raw handle or the command ring).
+bool RecordPass(const Vulkan::CmdBuf& commands,const Vulkan::Instance& instance,const Pass& pass);
+bool RecordPassInline(const Vulkan::CmdBuf& commands,const Vulkan::Instance& instance,const Pass& pass,
+                      Vulkan::DynamicState& dynamic,vk::Pipeline& last_pipeline);
 // Header is immutable; storage contains publication.count completed slots. The
 // callback never reads the producer's changing vector metadata. One worker owns
 // the command buffer and its binding caches for the entire stream.

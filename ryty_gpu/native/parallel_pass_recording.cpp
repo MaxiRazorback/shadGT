@@ -118,7 +118,9 @@ static void EmitWholePass(PassTraversal& traversal,Begin&& begin,Emit&& emit,End
     }
     end();
 }
-static bool RecordPassImpl(vk::CommandBuffer cmd,const Vulkan::Instance& instance,const Pass& pass,
+// PERF-GTS-399: `commands` is a raw command buffer (a pass worker's) or the recorder's stream,
+// which records into the command ring when the ring is on.
+static bool RecordPassImpl(const Vulkan::CmdBuf& commands,const Vulkan::Instance& instance,const Pass& pass,
                            Vulkan::DynamicState* inline_dynamic,vk::Pipeline* inline_pipeline,
                            DrawPublication* publication=nullptr,const Draw* storage=nullptr
 #if !defined(NDEBUG)
@@ -129,7 +131,7 @@ static bool RecordPassImpl(vk::CommandBuffer cmd,const Vulkan::Instance& instanc
     PassProbe probe;
     const auto t_validate_start = probe.Start();
 #endif
-    const bool valid=cmd && (publication ? storage && ValidatePassHeader(pass) : ValidatePass(pass));
+    const bool valid=bool(commands) && (publication ? storage && ValidatePassHeader(pass) : ValidatePass(pass));
 #if !defined(NDEBUG)
     probe.Add(probe.local.validate_ns,t_validate_start);
 #endif
@@ -146,7 +148,6 @@ static bool RecordPassImpl(vk::CommandBuffer cmd,const Vulkan::Instance& instanc
     const vk::RenderingAttachmentInfo stencil{.imageView=db.image_view,.imageLayout=vk::ImageLayout::eGeneral,
         .loadOp=db.stencil_clear?vk::AttachmentLoadOp::eClear:vk::AttachmentLoadOp::eLoad,.storeOp=vk::AttachmentStoreOp::eStore,
         .clearValue=vk::ClearValue{.depthStencil=vk::ClearDepthStencilValue{.stencil=db.clear_value[1]}}};
-    const Vulkan::CmdBuf commands{cmd};
     const auto flags=vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eTessellationControl |
         vk::ShaderStageFlagBits::eTessellationEvaluation | vk::ShaderStageFlagBits::eGeometry | vk::ShaderStageFlagBits::eFragment;
     Vulkan::DynamicState local_dynamic{};
@@ -169,7 +170,7 @@ static bool RecordPassImpl(vk::CommandBuffer cmd,const Vulkan::Instance& instanc
                Vulkan::VertexInputBytesEqual(a.vertex_strides, b.vertex_strides);
     };
     EmitWholePass(traversal,
-        [&](const auto&) {cmd.beginRendering(vk::RenderingInfo{.renderArea{.offset={0,0},.extent={target.width,target.height}},
+        [&](const auto&) {commands.beginRendering(vk::RenderingInfo{.renderArea{.offset={0,0},.extent={target.width,target.height}},
             .layerCount=target.num_layers,.colorAttachmentCount=target.num_color_attachments,.pColorAttachments=colors.data(),
             .pDepthAttachment=db.has_depth?&depth:nullptr,.pStencilAttachment=db.has_stencil?&stencil:nullptr});},
         [&](const Draw& draw) {
@@ -262,7 +263,7 @@ static bool RecordPassImpl(vk::CommandBuffer cmd,const Vulkan::Instance& instanc
 #endif
             }
         },
-        [&] {if(!inline_dynamic)cmd.endRendering();});
+        [&] {if(!inline_dynamic)commands.endRendering();});
     if(!traversal.valid)return false;
     if(inline_pipeline)*inline_pipeline=bound_pipeline;
 #if !defined(NDEBUG)
@@ -271,7 +272,10 @@ static bool RecordPassImpl(vk::CommandBuffer cmd,const Vulkan::Instance& instanc
     return true;
 }
 bool RecordPass(vk::CommandBuffer cmd,const Vulkan::Instance& instance,const Pass& pass) {
-    return RecordPassImpl(cmd,instance,pass,nullptr,nullptr);
+    return RecordPassImpl(Vulkan::CmdBuf{cmd},instance,pass,nullptr,nullptr);
+}
+bool RecordPass(const Vulkan::CmdBuf& commands,const Vulkan::Instance& instance,const Pass& pass) {
+    return RecordPassImpl(commands,instance,pass,nullptr,nullptr);
 }
 bool RecordPublishedPass(vk::CommandBuffer cmd,const Vulkan::Instance& instance,
                          const Pass& header,const Draw* storage,DrawPublication& publication
@@ -279,7 +283,7 @@ bool RecordPublishedPass(vk::CommandBuffer cmd,const Vulkan::Instance& instance,
                          ,std::size_t* early_draws
 #endif
                          ) {
-    return RecordPassImpl(cmd,instance,header,nullptr,nullptr,&publication,storage
+    return RecordPassImpl(Vulkan::CmdBuf{cmd},instance,header,nullptr,nullptr,&publication,storage
 #if !defined(NDEBUG)
                           ,early_draws
 #endif
@@ -287,7 +291,11 @@ bool RecordPublishedPass(vk::CommandBuffer cmd,const Vulkan::Instance& instance,
 }
 bool RecordPassInline(vk::CommandBuffer cmd,const Vulkan::Instance& instance,const Pass& pass,
                       Vulkan::DynamicState& dynamic,vk::Pipeline& last_pipeline) {
-    return RecordPassImpl(cmd,instance,pass,&dynamic,&last_pipeline);
+    return RecordPassImpl(Vulkan::CmdBuf{cmd},instance,pass,&dynamic,&last_pipeline);
+}
+bool RecordPassInline(const Vulkan::CmdBuf& commands,const Vulkan::Instance& instance,const Pass& pass,
+                      Vulkan::DynamicState& dynamic,vk::Pipeline& last_pipeline) {
+    return RecordPassImpl(commands,instance,pass,&dynamic,&last_pipeline);
 }
 
 #if !defined(NDEBUG)

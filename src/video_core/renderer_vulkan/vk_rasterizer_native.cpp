@@ -2541,6 +2541,7 @@ NativeRenderer::NativeRenderer(Rasterizer& rasterizer) : r{rasterizer} {
     }
 }
 
+static bool ParallelRingOn(); // PERF-GTS-399, below
 NativeRenderer::~NativeRenderer() {
     auto expected_observer = one_off_observer;
     g_one_off_observer.compare_exchange_strong(expected_observer, {}, std::memory_order_acq_rel);
@@ -2586,6 +2587,10 @@ NativeRenderer::~NativeRenderer() {
     if (stream.list) Splice();
     // Snapshot owners also need GPU retirement when direct imports are unavailable.
     r.scheduler.Finish();
+    if (ParallelRingOn()) { // PERF-GTS-399: as without parallel recording, above
+        ApplyRingPriority(false);
+        r.scheduler.SyncCommandThread();
+    }
     retired_pipeline_owners.ClearAfterGpuIdle();
     stream.writeback_plan_leases.clear();
     retired_writeback_plans.ClearAfterGpuIdle();
@@ -3239,18 +3244,55 @@ void NativeRenderer::ApplyRingPriority(bool enabled) {
     }
 }
 
+// PERF-GTS-399 (RYGT_PARALLEL_RING=1, with RYGT_PARALLEL_RECORDING=1): the recorder's own lists
+// go through the command ring with parallel recording too. The ring was off in that mode, so
+// every command the recorder still records itself was a driver call on its thread (13% of its
+// CPU time in a race at Tokyo, the command thread at 12% of a core): the pass code took raw
+// handles of the recorder's lists (the list after a pass, a pass the recorder records itself,
+// the lists run at a splice), which a ring-recorded list does not have on this thread. Those
+// now take the list's command stream. The pass workers' own lists stay raw; they are run in
+// order by commands the recorder puts on the ring once the workers have ended them.
+static bool ParallelRingOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_PARALLEL_RING");
+        return env && env[0] == '1' && env[1] == '\0' && ParallelRecordingRequested();
+    }();
+    return on;
+}
+
+Native::Rhi::CommandList* NativeRenderer::AcquireReplacementList() {
+    if (ParallelRingOn() && RingEnabled() && !Native::GpuCheckpoints::Requested() &&
+        !Scheduler::ThreadRing()) {
+        if (CommandRing* ring = r.scheduler.CommandThreadRing()) {
+            if (auto* list = device->AcquireDeferredCommandList(ring)) {
+                return list;
+            }
+        }
+    }
+    return device->AcquireCommandList(Native::Rhi::CommandListLevel::Secondary);
+}
+
+CmdBuf NativeRenderer::StreamCmdOf(Native::Rhi::CommandList& list) const {
+    if (const auto* slot = list.NativeHandleSlot()) {
+        return CmdBuf{r.scheduler.CommandThreadRing(),
+                      reinterpret_cast<const vk::CommandBuffer*>(slot)};
+    }
+    return CmdBuf{vk::CommandBuffer{Handle<VkCommandBuffer_T>(list.NativeHandle())}};
+}
+
 void NativeRenderer::AcquireList(Stream& s) {
     const bool enabled = RingEnabled();
     static const bool logged = [enabled] {
         if (enabled && ParallelRecordingRequested())
-            LOG_INFO(Render_Vulkan, "Native command ring disabled while parallel recording is requested");
+            LOG_INFO(Render_Vulkan, "Native command ring {} while parallel recording is requested",
+                     ParallelRingOn() ? "kept on (RYGT_PARALLEL_RING=1)" : "disabled");
         return true;
     }();
     (void)logged;
     // ImageRegistry's optional checkpoint path records a raw Vulkan handle.
     // Keep that diagnostic on the direct path until it can enqueue its markers.
-    if (enabled && !ParallelRecordingRequested() && !Native::GpuCheckpoints::Requested() &&
-        !Scheduler::ThreadRing()) {
+    if (enabled && (!ParallelRecordingRequested() || ParallelRingOn()) &&
+        !Native::GpuCheckpoints::Requested() && !Scheduler::ThreadRing()) {
         if (CommandRing* ring = r.scheduler.CommandThreadRing()) {
             if (auto* list = device->AcquireDeferredCommandList(ring)) {
                 ApplyRingPriority(true);
@@ -3710,7 +3752,7 @@ void NativeRenderer::EndRendering(u32 reason, [[maybe_unused]] std::source_locat
             sidecar->coordinator->FinishStream(ticket);
             stream.list=sidecar->coordinator->StreamReplacement(ticket);
             ASSERT_MSG(stream.list,"stream replacement command list missing");
-            stream.cmd=CmdBuf{vk::CommandBuffer{reinterpret_cast<VkCommandBuffer>(stream.list->NativeHandle())}};
+            stream.cmd=StreamCmdOf(*stream.list); // PERF-GTS-399
             stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;
             sidecar->sync_pins.Queued(sidecar->pin_slot);
             NATIVE_DIAGNOSTIC(++sidecar->queued);
@@ -3727,16 +3769,15 @@ void NativeRenderer::EndRendering(u32 reason, [[maybe_unused]] std::source_locat
         bool queued=false;
         if((pass.draws.size()>=8 || ParallelSmallPassBatchEnabled()) && !sidecar->closing) {
             const auto reset=[&]() noexcept {stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;};
-            auto direct_cmd = stream.cmd.Direct();
             if(Native::Parallel::RotateSegment(*sidecar->coordinator,*device,sidecar->epoch,
-                    stream.list,direct_cmd,sidecar->lease,64*1024,reset,
+                    stream.list,[this]{return AcquireReplacementList();},sidecar->lease,64*1024,reset,
 #if !defined(NDEBUG)
                     &sidecar->rotation_diag
 #else
                     nullptr
 #endif
                     )) {
-                stream.cmd = CmdBuf{direct_cmd};
+                stream.cmd = StreamCmdOf(*stream.list); // PERF-GTS-399
                 std::size_t bytes=sizeof(pass)+pass.draws.capacity()*sizeof(Native::Parallel::Draw);
                 for(const auto& draw:pass.draws) bytes+=draw.descriptor_bytes;
                 try {queued=pass.draws.size()>=8 ? (sidecar->transfer_applied_mode.Enabled() ? sidecar->coordinator->TryPassTransfer(sidecar->epoch,pass,bytes) : sidecar->coordinator->TryPass(sidecar->epoch,pass,bytes)) : sidecar->coordinator->TrySmallPass(sidecar->epoch,pass,bytes);}
@@ -3745,7 +3786,7 @@ void NativeRenderer::EndRendering(u32 reason, [[maybe_unused]] std::source_locat
         }
         if(queued) {NATIVE_DIAGNOSTIC(++sidecar->queued);sidecar->sync_pins.Queued(sidecar->pin_slot);} else {
             NATIVE_DIAGNOSTIC(++sidecar->synchronous);
-            ASSERT_MSG(Native::Parallel::RecordPass(stream.cmd.Direct(),r.instance,pass),"parallel pass synchronous fallback failed");
+            ASSERT_MSG(Native::Parallel::RecordPass(stream.cmd,r.instance,pass),"parallel pass synchronous fallback failed");
             ASSERT_MSG(sidecar->sync_pins.Tag(sidecar->pin_slot,sidecar->epoch),"parallel synchronous owner pin failed");
             stream.dynamic.Invalidate();stream.pipelines.Invalidate();stream.vertex_state_known=false;
         }
@@ -3782,7 +3823,7 @@ bool NativeRenderer::ContinueSmallParallelPass(const RenderState& target,u32 rea
     NATIVE_DIAGNOSTIC(++sidecar->pass_size_hist[std::min<std::size_t>(8,draws)]);
     u64 begin=0,end=0;const bool timed=ParallelGateDiagEnabled() && DescriptorThreadCpu100ns(begin);
     vk::Pipeline last{};
-    ASSERT_MSG(Native::Parallel::RecordPassInline(stream.cmd.Direct(),r.instance,pass,stream.dynamic,last),
+    ASSERT_MSG(Native::Parallel::RecordPassInline(stream.cmd,r.instance,pass,stream.dynamic,last),
                "parallel pass inline continuation failed");
     ASSERT_MSG(sidecar->sync_pins.Tag(sidecar->pin_slot,sidecar->epoch),"parallel synchronous owner pin failed");
     NATIVE_DIAGNOSTIC(++sidecar->synchronous);NATIVE_DIAGNOSTIC(++sidecar->inline_continuations);
@@ -13652,6 +13693,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                 worker_affinity_masks.clear();
             }
             sidecar->coordinator=std::make_unique<Native::Parallel::PassCoordinator>(*device,r.instance,*timeline,worker_count,32,64*1024*1024,64,worker_affinity_masks);
+            if(ParallelRingOn())sidecar->coordinator->acquire_replacement=[this]{return AcquireReplacementList();}; // PERF-GTS-399
 #if !defined(NDEBUG)
             if(const char* path=std::getenv("RYGT_PARALLEL_TRANSFER_MODE_FILE");path && *path)
                 sidecar->transfer_mode_controller=std::make_unique<Native::Parallel::ModeController>(std::filesystem::path(path),sidecar->transfer_applied_mode.Enabled());
@@ -20853,8 +20895,8 @@ void NativeRenderer::Splice() {
         const bool drained=sidecar->coordinator->Drain(signal,
             [&](Native::Rhi::CommandList* list,Native::Parallel::PassCoordinator::JobPtr,
                 Native::Parallel::PassCoordinator::PrefixPtr) noexcept {
-                const vk::CommandBuffer cmd{reinterpret_cast<VkCommandBuffer>(list->NativeHandle())};
-                r.scheduler.CommandBuffer().executeCommands(cmd);
+                // PERF-GTS-399: a recorder list (raw or ring-recorded) or a worker's raw one.
+                r.scheduler.CommandBuffer().executeCommands(StreamCmdOf(*list));
                 device->MarkExecuted(list,{timeline.get(),signal});
             });
 #if !defined(NDEBUG)
