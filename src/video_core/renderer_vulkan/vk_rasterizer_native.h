@@ -1699,6 +1699,9 @@ private:
         u64 descriptor_reuses = 0, descriptor_allocations = 0;
         u64 texture_memo_hits = 0, texture_lookups = 0; ///< OPT-002
         u64 buffer_memo_hits = 0;                        ///< OPT-003
+        /// DIAG-GTS-387: mirrors made over existing ones, the bytes those held, and the
+        /// largest mirror made.
+        u64 mirrors_regrown = 0, mirror_retaken_bytes = 0, mirror_largest = 0;
         u64 mirror_binds = 0, mirrors_made = 0, mirror_made_bytes = 0, mirrors_dropped = 0,
             mirror_cross_address_reuses = 0,
             mirrors_evicted = 0, mirror_over_budget = 0, mirror_refresh_pages = 0; ///< NAT-150

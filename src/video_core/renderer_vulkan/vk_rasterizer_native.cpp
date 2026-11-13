@@ -5496,6 +5496,10 @@ void NativeRenderer::MakePendingMirrors() {
         mirror_bytes += end - begin;
         NATIVE_DIAGNOSTIC(++stats.mirrors_made);
         NATIVE_DIAGNOSTIC(stats.mirror_made_bytes += end - begin);
+        // DIAG-GTS-387: how much of what is copied was in a mirror already.
+        NATIVE_DIAGNOSTIC(stats.mirrors_regrown += taken != 0);
+        NATIVE_DIAGNOSTIC(stats.mirror_retaken_bytes += taken);
+        NATIVE_DIAGNOSTIC(stats.mirror_largest = std::max<u64>(stats.mirror_largest, end - begin));
         promotion_trace.Next(6);
         mirrors.emplace(begin, Mirror{.begin = begin,
                                       .end = end,
@@ -21983,6 +21987,14 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
     stats.reuse_diag_sets = stats.reuse_diag_exact = stats.reuse_diag_list = 0;
     stats.reuse_diag_frame = stats.reuse_diag_window = 0;
     stats.reuse_diag_in_window.clear();
+    if (stats.mirrors_made != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "DIAG-GTS-387 (10 s): {} mirrors made ({:.1f} MB), {} of them over existing "
+                 "mirrors that held {:.1f} MB of it; largest {:.1f} MB",
+                 stats.mirrors_made, stats.mirror_made_bytes / 1048576.0, stats.mirrors_regrown,
+                 stats.mirror_retaken_bytes / 1048576.0, stats.mirror_largest / 1048576.0);
+    }
+    stats.mirrors_regrown = stats.mirror_retaken_bytes = stats.mirror_largest = 0;
     if (stats.image_check_calls != 0) {
         std::string text;
         for (const auto value : stats.image_check_ns) {
