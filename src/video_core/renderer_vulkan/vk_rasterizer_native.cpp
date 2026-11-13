@@ -13692,7 +13692,12 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                     worker_affinity_masks.size(), worker_count);
                 worker_affinity_masks.clear();
             }
-            sidecar->coordinator=std::make_unique<Native::Parallel::PassCoordinator>(*device,r.instance,*timeline,worker_count,32,64*1024*1024,64,worker_affinity_masks);
+            // PERF-GTS-400: 256 nodes and 256 MB of packets in flight (64 and 64 MB). A pass and the
+            // recorder's list before it stay charged until the GPU ran them; with the lists longer
+            // (PERF-GTS-397) and the ring on (399) the 64 MB were full most of the time, and a
+            // third of the passes (10,824 of 33,035 in 10 s at Tokyo) were refused and recorded
+            // by the recorder itself.
+            sidecar->coordinator=std::make_unique<Native::Parallel::PassCoordinator>(*device,r.instance,*timeline,worker_count,32,256*1024*1024,256,worker_affinity_masks);
             if(ParallelRingOn())sidecar->coordinator->acquire_replacement=[this]{return AcquireReplacementList();}; // PERF-GTS-399
 #if !defined(NDEBUG)
             if(const char* path=std::getenv("RYGT_PARALLEL_TRANSFER_MODE_FILE");path && *path)
