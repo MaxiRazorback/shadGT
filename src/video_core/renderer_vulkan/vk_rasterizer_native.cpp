@@ -10997,11 +10997,21 @@ bool NativeRenderer::AheadAllocate(u32 size, u64& position, u8*& data) {
         if (offset + bytes <= capacity) break; // else it straddles the end: claim again
         if (attempt == 2) return false;
     }
-    const u64 known = r.scheduler.GetWorkSemaphore()->KnownGpuTick();
+    auto* const semaphore = r.scheduler.GetWorkSemaphore();
+    u64 known = semaphore->KnownGpuTick();
     const u64 first = offset >> AheadArena::SegmentBits;
     const u64 last = (offset + bytes - 1) >> AheadArena::SegmentBits;
+    bool asked = false;
     for (u64 segment = first; segment <= last; ++segment) {
-        if (arena.busy[segment].load(std::memory_order_seq_cst) > known) {
+        const u64 busy = arena.busy[segment].load(std::memory_order_seq_cst);
+        if (busy > known && !asked) {
+            // The known tick is only as new as the last question to the driver: with nothing
+            // else asking, 20 to 45% of the copies were refused for segments long free.
+            semaphore->Refresh();
+            known = semaphore->KnownGpuTick();
+            asked = true;
+        }
+        if (busy > known) {
             arena.refused.fetch_add(1, std::memory_order_relaxed);
             return false; // the GPU has not run what was bound there
         }
