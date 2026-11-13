@@ -326,6 +326,14 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 
 std::array<u8, 48_KB> Liverpool::ConstantEngine::constants_heap;
 
+bool Liverpool::DirectNestedResume() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_DIRECT_NESTED_RESUME");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
 // DIAG-206 (RYGT_WATCH_WRITES=<hex address>,<hex size>): GPU-command writes into that range.
 static void WatchWrite(VAddr dst, u64 size, VAddr src, const char* what) {
     static const std::pair<u64, u64> watch = [] {
@@ -1588,7 +1596,25 @@ void Liverpool::Process(std::stop_token stoken) {
                 }
                 task = queue.submits.front();
             }
-            task.resume();
+            if (queue.nest.empty()) {
+                task.resume();
+            } else {
+                // PERF-GTS-383: the innermost command buffer still being decoded is resumed
+                // itself. One that finishes hands over to the buffer that called it, at once.
+                while (true) {
+                    Task::Handle inner = task;
+                    for (size_t i = queue.nest.size(); i-- > 0;) {
+                        if (!queue.nest[i].done()) {
+                            inner = queue.nest[i];
+                            break;
+                        }
+                    }
+                    inner.resume();
+                    if (inner == task || !inner.done()) {
+                        break;
+                    }
+                }
+            }
 
             if (task.done()) {
                 task.destroy();
@@ -3060,11 +3086,27 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 SetCurrentDecodeIb(indirect_buffer->Address<const u32>(), indirect_buffer->ib_size);
                 auto task = ProcessGraphics(
                     {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
+                // PERF-GTS-383 (RYGT_DIRECT_NESTED_RESUME=1): GT Sport calls each command
+                // buffer from the one before it, over 250 deep in a race. A yield left every
+                // one of them in turn and the next resume entered them all again: 47% of this
+                // thread's CPU time in a 20-car race (it ran at 88% of a core). The thread's
+                // loop now resumes the innermost buffer itself; this one is resumed when it
+                // has finished.
+                const bool direct_resume = DirectNestedResume();
+                if (direct_resume) {
+                    mapped_queues[GfxQueueId].nest.push_back(task.handle);
+                }
                 RESUME_GFX(task);
 
                 while (!task.handle.done()) {
                     YIELD_GFX();
-                    RESUME_GFX(task);
+                    if (!direct_resume) {
+                        RESUME_GFX(task);
+                    }
+                }
+                if (direct_resume) {
+                    ASSERT(mapped_queues[GfxQueueId].nest.back() == task.handle);
+                    mapped_queues[GfxQueueId].nest.pop_back();
                 }
                 SetCurrentDecodeIb(outer_ib.first, outer_ib.second);
                 // FIX-054: a finished coroutine's frame stays allocated until destroyed. GT Sport
@@ -3409,11 +3451,21 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
             auto task = ProcessCompute<true>(
                 {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, vqid);
+            const bool direct_resume = DirectNestedResume(); // PERF-GTS-383
+            if (direct_resume) {
+                mapped_queues[vqid + 1].nest.push_back(task.handle);
+            }
             RESUME_ASC(task, vqid);
 
             while (!task.handle.done()) {
                 YIELD_ASC(vqid);
-                RESUME_ASC(task, vqid);
+                if (!direct_resume) {
+                    RESUME_ASC(task, vqid);
+                }
+            }
+            if (direct_resume) {
+                ASSERT(mapped_queues[vqid + 1].nest.back() == task.handle);
+                mapped_queues[vqid + 1].nest.pop_back();
             }
             task.handle.destroy(); // FIX-054
             break;
