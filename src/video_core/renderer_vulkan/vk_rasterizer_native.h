@@ -467,7 +467,9 @@ private:
             vk::DescriptorSet set;
         };
         Native::KeptSetTable<vk::DescriptorSet> entries;                ///< by 128-bit key hash
-        std::unordered_multimap<u64, std::pair<u64, u64>> users;        ///< handle -> key hash
+        /// handle -> the key hashes of the sets that hold it (and of sets since dropped: a
+        /// list is thinned when it is much longer than the table)
+        std::unordered_map<u64, std::vector<std::pair<u64, u64>>> users;
         std::deque<Retired> retired;
         std::unordered_map<u64, std::vector<vk::DescriptorSet>> spare;  ///< by layout
         std::vector<vk::DescriptorPool> pools;
