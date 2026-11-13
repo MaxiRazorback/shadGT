@@ -18512,7 +18512,9 @@ void NativeRenderer::DispatchDirect() {
         return p && *p ? std::strtoull(p,nullptr,0) : u64{0};
     }();
     static u64 captures=0;
-    const char* forced_descriptor=std::getenv("RYGT_A82D2FE_DESCRIPTOR_ONLY");
+    // PERF-GTS-389: read once. Asked at every dispatch it was 1.4% of the recorder's CPU time
+    // in a race at Tokyo (8,000 dispatches a second; getenv takes a lock and walks the block).
+    static const char* const forced_descriptor=std::getenv("RYGT_A82D2FE_DESCRIPTOR_ONLY");
     const bool after_race_ready=A82CaptureAfterRace();
     if (after_race_ready && capture_budget && captures < capture_budget && frame >= capture_from &&
         diag_cs.pgm_hash == 0xa82d2fe && forced_descriptor && forced_descriptor[0]=='1' &&
