@@ -11155,8 +11155,25 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         }
         bind_count = 0;
     };
+    // PERF-GTS-371 (RYGT_ASYNC_DESCRIPTOR_UPDATES=1): a race draw allocates and writes about two
+    // new descriptor sets (1,040,164 sets for 514,080 draws in 10 s, 3% reused), each write a
+    // driver call on the recorder. The sets are new, so nothing binds them before the binds
+    // recorded below: the writes go into the command ring ahead of those binds and are made by
+    // the command thread (5 to 7% busy) when it replays them.
+    static const bool async_updates = [] {
+        const char* env = std::getenv("RYGT_ASYNC_DESCRIPTOR_UPDATES");
+        return env && env[0] == '1';
+    }();
     Native::CommitDescriptorBatch(updates,sets,pipeline.PushSet(),by_set,
-        [&](const auto& all) {trace.Next(6);vk_device.updateDescriptorSets(all,{});},
+        [&](const auto& all) {
+            trace.Next(6);
+            const vk::ArrayProxy<const vk::WriteDescriptorSet> proxy{u32(all.size()), all.data()};
+            if (async_updates && cmdbuf.updateDescriptorSets(vk_device, proxy)) {
+                NATIVE_DIAGNOSTIC(++stats.descriptor_async_updates);
+                return;
+            }
+            vk_device.updateDescriptorSets(all,{});
+        },
         [&](u32 index,const auto& writes) {
             static thread_local std::vector<u64> signature;
             signature.clear();
@@ -21411,8 +21428,10 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
         sidecar->readonly_range_hint_hits=sidecar->readonly_range_hint_misses=sidecar->readonly_region_hint_hits=sidecar->readonly_region_hint_misses=0;
         sidecar->absent_sampled_attempts=sidecar->absent_sampled_accepted=sidecar->absent_sampled_rejected=sidecar->sampled_null_view=sidecar->sampled_nonnull_sampler=sidecar->sampled_nongeneral=sidecar->sampled_canonical_null=sidecar->absent_mode0_attempts=sidecar->absent_mode0_accepted=sidecar->absent_mode0_rejected=sidecar->natural_preclosed=sidecar->natural_captured=sidecar->natural_serial_fallback=sidecar->natural_binding_skip=sidecar->sampler_proof_hits=sidecar->sampler_proof_misses=sidecar->sampler_scan_steps=sidecar->sampler_scan_positives=sidecar->proof_table_builds=sidecar->proof_table_hits=sidecar->extended_clear_rejected=sidecar->fast_rejected=sidecar->no_pass_room_rejected=sidecar->serial_scope_bypassed=sidecar->owner_slot_pressure=sidecar->eligible_in_serial_scope=sidecar->eligible_in_active_scope=sidecar->eligible_at_boundary=sidecar->vertex_candidates=sidecar->vertex_preflight_draws=sidecar->vertex_backing_pass=sidecar->vertex_bad_structure=sidecar->vertex_bad_binding=sidecar->vertex_bad_pnext=sidecar->vertex_unknown_backing=sidecar->vertex_direct_ranges=sidecar->vertex_direct_attempts=sidecar->vertex_direct_matches=sidecar->descriptor_readonly_attempts=sidecar->descriptor_readonly_regions=sidecar->descriptor_readonly_imports=sidecar->descriptor_readonly_uncontained=sidecar->descriptor_readonly_unmatched=sidecar->descriptor_clip_nulls=sidecar->direct_slot_attempts=sidecar->direct_slot_accepted=sidecar->passes=sidecar->draws=sidecar->queued=sidecar->synchronous=sidecar->considered=sidecar->eligible=sidecar->unknown_resource_key=sidecar->buffer_rejected=sidecar->alias_rejected=sidecar->descriptor_rejected=sidecar->missing_sets=sidecar->preflight_samples=sidecar->preflight_wall_ns=sidecar->preflight_cpu_100ns=sidecar->preflight_cpu_samples=sidecar->drain_ns=sidecar->coordinator_cpu_100ns=sidecar->coordinator_cpu_samples=0;
     }
-    LOG_INFO(Render_Vulkan, "NAT: descriptor allocation calls={} reserve hits={} unused={}",
-             stats.descriptor_allocate_calls, stats.descriptor_reserve_hits, stream.descriptor_reserve.SpareCount());
+    LOG_INFO(Render_Vulkan, "NAT: descriptor allocation calls={} reserve hits={} unused={}; "
+             "update calls left to the command thread {} (PERF-GTS-371)",
+             stats.descriptor_allocate_calls, stats.descriptor_reserve_hits, stream.descriptor_reserve.SpareCount(),
+             stats.descriptor_async_updates);
     if (DescriptorAllocDiagEnabled() && descriptor_alloc_owner == this) {
         const auto& m=descriptor_alloc_metrics;
         for (u32 kind=0;kind<2;++kind) LOG_INFO(Render_Vulkan,
@@ -21431,6 +21450,7 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
         descriptor_alloc_metrics={};
     }
     stats.descriptor_allocate_calls = stats.descriptor_reserve_hits = 0;
+    stats.descriptor_async_updates = 0;
     stats.descriptor_reuses = stats.descriptor_allocations = 0;
     LOG_INFO(Render_Vulkan, "DESC-HASH: {} prepared hashes reused, {} refreshed after buffer changes",
              descriptor_hash_reused, descriptor_hash_refreshed);

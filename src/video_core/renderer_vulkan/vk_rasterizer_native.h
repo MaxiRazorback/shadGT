@@ -1602,6 +1602,7 @@ private:
         u64 flat_upload_hits = 0, flat_upload_bytes_saved = 0, flat_upload_misses = 0;
         u64 flat_upload_bytes_hashed = 0, flat_upload_reference_bytes = 0, flat_upload_bytes_uploaded = 0;
         u64 descriptor_allocate_calls = 0, descriptor_reserve_hits = 0;
+        u64 descriptor_async_updates = 0; ///< PERF-GTS-371
         u64 prepared_used = 0, prepared_missing = 0;
         std::array<u64, 5> prepared_rejected{};
         u64 prepared_vertices = 0, prepared_vertices_rejected = 0; ///< OPT-011
