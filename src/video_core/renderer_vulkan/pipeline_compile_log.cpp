@@ -11,6 +11,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <cstring>
+#include <type_traits>
 #include <fmt/format.h>
 
 #include "common/logging/log.h"
@@ -201,11 +203,193 @@ std::string StageHashes(const VkPipelineShaderStageCreateInfo* infos, u32 count)
     return out;
 }
 
+// Value hashes of samplers, set layouts and pipeline layouts, so a layout rebuilt in another run
+// with the same contents gets the same hash (handles change from run to run, contents should not).
+PFN_vkCreateSampler real_create_sampler{};
+PFN_vkCreateDescriptorSetLayout real_create_set_layout{};
+PFN_vkCreatePipelineLayout real_create_layout{};
+std::mutex object_mutex;
+std::unordered_map<u64, u64> object_hashes; // handle -> content hash
+
+struct Hasher {
+    std::vector<u8> bytes;
+    template <typename T>
+    void Add(const T& value) {
+        static_assert(std::is_trivially_copyable_v<T>);
+        const auto* p = reinterpret_cast<const u8*>(&value);
+        bytes.insert(bytes.end(), p, p + sizeof(T));
+    }
+    void AddBytes(const void* data, size_t size) {
+        if (!data) return Add(size_t{0});
+        const auto* p = static_cast<const u8*>(data);
+        bytes.insert(bytes.end(), p, p + size);
+    }
+    u64 Done() const {
+        return XXH3_64bits(bytes.data(), bytes.size());
+    }
+};
+
+u64 ObjectHash(u64 handle) {
+    if (!handle) return 0;
+    std::scoped_lock lock{object_mutex};
+    const auto it = object_hashes.find(handle);
+    return it != object_hashes.end() ? it->second : 0xdeadull;
+}
+
+void NoteObject(u64 handle, u64 hash) {
+    std::scoped_lock lock{object_mutex};
+    object_hashes[handle] = hash;
+}
+
+// sType/pNext chains: hash the sTypes so an added or dropped extension struct shows.
+void AddChainTypes(Hasher& h, const void* next) {
+    for (auto* s = static_cast<const VkBaseInStructure*>(next); s; s = s->pNext) h.Add(s->sType);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL CreateSampler(VkDevice device, const VkSamplerCreateInfo* info,
+                                             const VkAllocationCallbacks* alloc, VkSampler* out) {
+    const VkResult result = real_create_sampler(device, info, alloc, out);
+    if (result == VK_SUCCESS && info) {
+        Hasher h;
+        h.AddBytes(reinterpret_cast<const u8*>(info) + 16, sizeof(*info) - 16); // after sType/pNext
+        AddChainTypes(h, info->pNext);
+        if (auto* border = reinterpret_cast<const VkSamplerCustomBorderColorCreateInfoEXT*>(
+                FindInChain(info->pNext, VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT))) {
+            h.Add(border->customBorderColor);
+            h.Add(border->format);
+        }
+        NoteObject(reinterpret_cast<u64>(*out), h.Done());
+    }
+    return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL CreateSetLayout(VkDevice device,
+                                               const VkDescriptorSetLayoutCreateInfo* info,
+                                               const VkAllocationCallbacks* alloc,
+                                               VkDescriptorSetLayout* out) {
+    const VkResult result = real_create_set_layout(device, info, alloc, out);
+    if (result == VK_SUCCESS && info) {
+        Hasher h;
+        h.Add(info->flags);
+        AddChainTypes(h, info->pNext);
+        for (u32 i = 0; i < info->bindingCount; ++i) {
+            const auto& b = info->pBindings[i];
+            h.Add(b.binding);
+            h.Add(b.descriptorType);
+            h.Add(b.descriptorCount);
+            h.Add(b.stageFlags);
+            for (u32 j = 0; b.pImmutableSamplers && j < b.descriptorCount; ++j) {
+                h.Add(ObjectHash(reinterpret_cast<u64>(b.pImmutableSamplers[j])));
+            }
+        }
+        NoteObject(reinterpret_cast<u64>(*out), h.Done());
+    }
+    return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL CreateLayout(VkDevice device, const VkPipelineLayoutCreateInfo* info,
+                                            const VkAllocationCallbacks* alloc,
+                                            VkPipelineLayout* out) {
+    const VkResult result = real_create_layout(device, info, alloc, out);
+    if (result == VK_SUCCESS && info) {
+        Hasher h;
+        h.Add(info->flags);
+        for (u32 i = 0; i < info->setLayoutCount; ++i) {
+            h.Add(ObjectHash(reinterpret_cast<u64>(info->pSetLayouts[i])));
+        }
+        for (u32 i = 0; i < info->pushConstantRangeCount; ++i) h.Add(info->pPushConstantRanges[i]);
+        NoteObject(reinterpret_cast<u64>(*out), h.Done());
+    }
+    return result;
+}
+
+template <typename T>
+u32 Short(const T* p) {
+    if (!p) return 0;
+    Hasher h;
+    h.AddBytes(reinterpret_cast<const u8*>(p) + 16, sizeof(T) - 16); // fields after sType/pNext
+    AddChainTypes(h, p->pNext);
+    return static_cast<u32>(h.Done());
+}
+
+// "flags=..;vi=..;ia=..;ts=..;vp=..;rs=..;ms=..;ds=..;cb=..;dyn=..;rend=..;chain=..;layout=..":
+// one short hash per part of a whole graphics pipeline's description, pointers left out.
+std::string StateHashes(const VkGraphicsPipelineCreateInfo& ci) {
+    auto part = [](u64 v) { return fmt::format("{:08x}", static_cast<u32>(v)); };
+    std::string out = fmt::format("flags={:x}", ci.flags);
+    if (auto* vi = ci.pVertexInputState) {
+        Hasher h;
+        h.Add(vi->flags);
+        for (u32 i = 0; i < vi->vertexBindingDescriptionCount; ++i) h.Add(vi->pVertexBindingDescriptions[i]);
+        for (u32 i = 0; i < vi->vertexAttributeDescriptionCount; ++i) h.Add(vi->pVertexAttributeDescriptions[i]);
+        AddChainTypes(h, vi->pNext);
+        out += ";vi=" + part(h.Done());
+    }
+    out += ";ia=" + part(Short(ci.pInputAssemblyState));
+    out += ";ts=" + part(Short(ci.pTessellationState));
+    if (auto* vp = ci.pViewportState) {
+        Hasher h;
+        h.Add(vp->viewportCount);
+        h.Add(vp->scissorCount);
+        AddChainTypes(h, vp->pNext);
+        out += ";vp=" + part(h.Done());
+    }
+    out += ";rs=" + part(Short(ci.pRasterizationState));
+    if (auto* ms = ci.pMultisampleState) {
+        Hasher h;
+        auto copy = *ms;
+        copy.pSampleMask = nullptr;
+        h.AddBytes(reinterpret_cast<const u8*>(&copy) + 16, sizeof(copy) - 16);
+        if (ms->pSampleMask) h.Add(ms->pSampleMask[0]);
+        AddChainTypes(h, ms->pNext);
+        out += ";ms=" + part(h.Done());
+    }
+    out += ";ds=" + part(Short(ci.pDepthStencilState));
+    if (auto* cb = ci.pColorBlendState) {
+        Hasher h;
+        h.Add(cb->flags);
+        h.Add(cb->logicOpEnable);
+        h.Add(cb->logicOp);
+        h.Add(cb->blendConstants);
+        for (u32 i = 0; cb->pAttachments && i < cb->attachmentCount; ++i) h.Add(cb->pAttachments[i]);
+        AddChainTypes(h, cb->pNext);
+        out += ";cb=" + part(h.Done());
+    }
+    if (auto* dyn = ci.pDynamicState) {
+        Hasher h;
+        h.AddBytes(dyn->pDynamicStates, dyn->dynamicStateCount * sizeof(VkDynamicState));
+        out += ";dyn=" + part(h.Done());
+    }
+    if (auto* rend = reinterpret_cast<const VkPipelineRenderingCreateInfo*>(
+            FindInChain(ci.pNext, VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO))) {
+        Hasher h;
+        h.Add(rend->viewMask);
+        h.AddBytes(rend->pColorAttachmentFormats, rend->colorAttachmentCount * sizeof(VkFormat));
+        h.Add(rend->depthAttachmentFormat);
+        h.Add(rend->stencilAttachmentFormat);
+        out += ";rend=" + part(h.Done());
+    }
+    {
+        Hasher h;
+        AddChainTypes(h, ci.pNext);
+        for (u32 i = 0; i < ci.stageCount; ++i) {
+            h.Add(ci.pStages[i].flags);
+            h.Add(ci.pStages[i].stage);
+            h.AddBytes(ci.pStages[i].pName, ci.pStages[i].pName ? std::strlen(ci.pStages[i].pName) : 0);
+            AddChainTypes(h, ci.pStages[i].pNext);
+        }
+        out += ";chain=" + part(h.Done());
+    }
+    out += ";layout=" + part(ObjectHash(reinterpret_cast<u64>(ci.layout)));
+    return out;
+}
+
 // One row per pipeline; feedback may be invalid when the driver does not fill it.
 void LogPipeline(VkDevice device, const char* kind, VkPipeline pipeline, double ms,
                  const VkPipelineCreationFeedback& whole,
                  const VkPipelineCreationFeedback* stages, const VkPipelineShaderStageCreateInfo* infos,
-                 u32 stage_count, VkResult result, bool captured, const std::string& spirv) {
+                 u32 stage_count, VkResult result, bool captured, const std::string& spirv,
+                 const std::string& state) {
     const bool valid = whole.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT;
     const bool hit = whole.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT;
     std::string stage_text;
@@ -216,10 +400,10 @@ void LogPipeline(VkDevice device, const char* kind, VkPipeline pipeline, double 
                                   (stages[i].flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) ? "h" : "");
     }
     const double driver_ms = valid ? whole.duration / 1e6 : -1.0;
-    WriteRow(fmt::format("{:.3f},{},{},{:#x},{:.3f},{:.3f},{},{},{},{},{}", NowMs(), ThreadId(), kind,
+    WriteRow(fmt::format("{:.3f},{},{},{:#x},{:.3f},{:.3f},{},{},{},{},{},{}", NowMs(), ThreadId(), kind,
                          reinterpret_cast<u64>(pipeline), ms, driver_ms,
                          valid ? (hit ? "hit" : "miss") : "unknown", Quote(stage_text),
-                         static_cast<int>(result), Quote(Statistics(device, pipeline, captured && result == VK_SUCCESS)), Quote(spirv)));
+                         static_cast<int>(result), Quote(Statistics(device, pipeline, captured && result == VK_SUCCESS)), Quote(spirv), Quote(state)));
     if (pipeline && insert_label) {
         std::scoped_lock lock{pending_mutex};
         pending[pipeline] = fmt::format("RyGT compile {} {:.1f} ms {}", kind, ms,
@@ -304,7 +488,15 @@ VkResult CreateLogged(VkDevice device, VkPipelineCache cache, u32 count, const C
                         } else {
                             return 1;
                         }
-                    }()));
+                    }()),
+                    [&]() -> std::string {
+                        if constexpr (std::is_same_v<CreateInfo, VkGraphicsPipelineCreateInfo>) {
+                            return StateHashes(copies[i]);
+                        } else {
+                            return fmt::format("layout={:08x}", static_cast<u32>(ObjectHash(
+                                reinterpret_cast<u64>(copies[i].layout))));
+                        }
+                    }());
     }
     return result;
 }
@@ -335,7 +527,7 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateShaders(VkDevice device, u32 count,
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
     std::string stages;
     for (u32 i = 0; i < count; ++i) stages += fmt::format("{}{}", i ? ";" : "", StageName(infos[i].stage));
-    WriteRow(fmt::format("{:.3f},{},shader-object,{:#x},{:.3f},-1,unknown,{},{},\"\",\"\"", NowMs(),
+    WriteRow(fmt::format("{:.3f},{},shader-object,{:#x},{:.3f},-1,unknown,{},{},\"\",\"\",\"\"", NowMs(),
                          ThreadId(), count ? reinterpret_cast<u64>(shaders[0]) : 0, ms,
                          Quote(stages), static_cast<int>(result)));
     return result;
@@ -344,7 +536,7 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateShaders(VkDevice device, u32 count,
 VKAPI_ATTR VkResult VKAPI_CALL SetName(VkDevice device, const VkDebugUtilsObjectNameInfoEXT* info) {
     if (info && info->pObjectName &&
         (info->objectType == VK_OBJECT_TYPE_PIPELINE || info->objectType == VK_OBJECT_TYPE_SHADER_EXT)) {
-        WriteRow(fmt::format("{:.3f},{},name,{:#x},0,0,,{},0,\"\",\"\"", NowMs(), ThreadId(),
+        WriteRow(fmt::format("{:.3f},{},name,{:#x},0,0,,{},0,\"\",\"\",\"\"", NowMs(), ThreadId(),
                              info->objectHandle, Quote(info->pObjectName)));
         if (info->objectType == VK_OBJECT_TYPE_PIPELINE && pending_count.load(std::memory_order_relaxed)) {
             std::scoped_lock lock{pending_mutex};
@@ -405,7 +597,7 @@ void Install(vk::Device device, bool executable_properties) {
             LOG_ERROR(Render_Vulkan, "DIAG-SHC-001: cannot write {}", path.string());
             return;
         }
-        std::fputs("ms,thread,kind,handle,call_ms,driver_ms,cache,stages,result,statistics,spirv\n", file);
+        std::fputs("ms,thread,kind,handle,call_ms,driver_ms,cache,stages,result,statistics,spirv,state\n", file);
         std::fflush(file);
     }
     capture_statistics = executable_properties;
@@ -419,6 +611,14 @@ void Install(vk::Device device, bool executable_properties) {
     if (d.vkCreateComputePipelines) {
         real_create_compute = d.vkCreateComputePipelines;
         d.vkCreateComputePipelines = CreateCompute;
+    }
+    if (d.vkCreateSampler && d.vkCreateDescriptorSetLayout && d.vkCreatePipelineLayout) {
+        real_create_sampler = d.vkCreateSampler;
+        d.vkCreateSampler = CreateSampler;
+        real_create_set_layout = d.vkCreateDescriptorSetLayout;
+        d.vkCreateDescriptorSetLayout = CreateSetLayout;
+        real_create_layout = d.vkCreatePipelineLayout;
+        d.vkCreatePipelineLayout = CreateLayout;
     }
     if (d.vkCreateShaderModule) {
         real_create_module = d.vkCreateShaderModule;
