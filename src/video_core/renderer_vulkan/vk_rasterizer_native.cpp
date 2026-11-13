@@ -5342,6 +5342,48 @@ void NativeRenderer::MakePendingMirrors() {
             end = std::max(end, it->second.end);
             taken += it->second.end - it->second.begin;
         }
+        // PERF-GTS-388 (RYGT_MIRROR_ROUND_MB=<power of two>, 0 = off): a mirror made over
+        // existing ones copies all they held again, and the game's vertex data grows a little
+        // at a time: at Tokyo 105 to 207 of the 150 to 335 mirrors made in 10 s were such
+        // regrowths, and 85 to 93% of the 460 to 1210 MB copied was in a mirror already
+        // (DIAG-GTS-387); each also refuses the prepared draws over it. The range is widened
+        // to that boundary, so the next ranges nearby are inside it. Only when the widened
+        // range is mirrorable as a whole (mapped, no region, no CPU-written granule, no CPU
+        // stack); else it is made as asked.
+        static const u64 round = [] {
+            const char* env = std::getenv("RYGT_MIRROR_ROUND_MB");
+            const u64 mb = env && *env ? std::strtoull(env, nullptr, 10) : 0;
+            return mb != 0 && (mb & (mb - 1)) == 0 && mb <= 64 ? mb * 1_MB : u64{0};
+        }();
+        if (round != 0 && direct) {
+            const VAddr wide_begin = begin & ~(round - 1);
+            const VAddr wide_end = (end + round - 1) & ~(round - 1);
+            if ((wide_begin != begin || wide_end != end) && wide_end - wide_begin <= 256_MB &&
+                !RegionOver(wide_begin, wide_end - wide_begin) &&
+                !IsDynamic(wide_begin, wide_end, nullptr, nullptr)) {
+                bool allowed;
+                {
+                    Native::CpuStackRegistry::Lease lease{Native::CpuStacks()};
+                    allowed = lease.Allowed(wide_begin, wide_end);
+                }
+                auto outcome = VideoCore::DirectMemory::PartOutcome::Invalid;
+                if (allowed) {
+                    direct->TryForEachPart(wide_begin, wide_end - wide_begin, [] { return false; },
+                        [](const VideoCore::Buffer&, u64, u64, u64) {}, &outcome);
+                }
+                if (outcome == VideoCore::DirectMemory::PartOutcome::Covered) {
+                    begin = wide_begin;
+                    end = wide_end;
+                    taken = 0;
+                    for (auto it = FirstMirror(begin); it != mirrors.end() && it->second.begin < end;
+                         ++it) {
+                        begin = std::min(begin, it->second.begin);
+                        end = std::max(end, it->second.end);
+                        taken += it->second.end - it->second.begin;
+                    }
+                }
+            }
+        }
         if (end - begin > 256_MB) {
             continue;
         }
