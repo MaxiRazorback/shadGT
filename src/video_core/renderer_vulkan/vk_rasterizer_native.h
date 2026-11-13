@@ -1490,6 +1490,11 @@ private:
     std::vector<PreparedDraw*> prepared_free;
     PreparedDraw* NewPrepared();
     void FreePrepared(PreparedDraw* draw);
+    /// FIX-GTS-393: the recorder, for parallel recording: whether `info` (buffer info
+    /// `info_index` of the prepared draw) binds bytes of the arena that hold until the GPU ran
+    /// the list being recorded (their segments are marked for it again).
+    bool AheadRetained(const PreparedDraw& p, size_t info_index,
+                       const vk::DescriptorBufferInfo& info);
     /// The prepared draw for the packet, taken out of the table (none if there is none).
     PreparedDraw* TakePrepared(const void* packet);
     bool PrepareBuffers(const Shader::Info& stage, const AmdGpu::Regs& regs,

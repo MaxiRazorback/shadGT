@@ -11179,6 +11179,32 @@ vk::DescriptorSet NativeRenderer::MakeLongSet(vk::DescriptorSetLayout layout) {
     return {};
 }
 
+bool NativeRenderer::AheadRetained(const PreparedDraw& p, size_t info_index,
+                                   const vk::DescriptorBufferInfo& info) {
+    // FIX-GTS-393: with RYGT_AHEAD_UPLOAD_MB a prepared draw's constants are bound from the
+    // ahead arena (PERF-GTS-377), not from one of the list's upload chunks. Parallel recording
+    // only took a buffer info for upload memory when its buffer was one of those chunks, so
+    // with the arena on it refused every draw (742,275 of 840,428 in 10 s at Tokyo, all at
+    // this check). The arena's bytes hold as a chunk's do: the segments are marked with the
+    // tick of the list being recorded, and no thread writes there before the GPU ran it. The
+    // mark is made again here, for the list open now (a Splice since the commit opened a new
+    // one), and the position is checked against the head as at the commit.
+    const auto& arena = ahead_arena;
+    if (!arena.buffer || info.buffer != arena.handle || info.range == 0 ||
+        info.range == VK_WHOLE_SIZE) {
+        return false;
+    }
+    for (const auto& upload : p.uploads) {
+        if (upload.info != info_index || upload.size != info.range || upload.ahead == ~u64{0} ||
+            (upload.ahead & (arena.capacity - 1)) != info.offset) {
+            continue;
+        }
+        vk::DescriptorBufferInfo again;
+        return AheadCommit(upload.ahead, upload.size, again) && again.offset == info.offset;
+    }
+    return false;
+}
+
 void NativeRenderer::StoreLongSet(u64 hash, u64 check, vk::DescriptorSetLayout layout,
                                   vk::DescriptorSet set, std::span<const u64> handles) {
     long_sets.entries.Insert(hash, check, u64(VkDescriptorSetLayout(layout)), set);
@@ -14776,7 +14802,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                                    if(!chunk.buffer || !chunk.buffer->Mapped() ||
                                       vk::Buffer{Handle<VkBuffer_T>(chunk.buffer->NativeHandle())}!=info.buffer)return false;
                                    const u64 size=chunk.buffer->Size();return info.offset<=size && info.range<=size-info.offset;
-                               }))) {buffer_prefix=false;break;}
+                               }) && !AheadRetained(*prepared,upload.info,info))) {buffer_prefix=false;break;} // FIX-GTS-393
                         }
                         if(!buffer_prefix)native_upload_receipt_used=false;
                     }
@@ -14957,7 +14983,8 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                                    info->range==VK_WHOLE_SIZE || !info->range)return false;
                                 const u64 size=chunk.buffer->Size();return info->offset<=size && info->range<=size-info->offset;
                             });});};
-                            const bool retained=recorded && retained_scan();
+                            // FIX-GTS-393: or bytes of the ahead arena (PERF-GTS-377).
+                            const bool retained=recorded && (retained_scan() || (prepared && AheadRetained(*prepared,index,*info)));
                             const auto readonly_slot=[&]() -> bool {
                                 if(!ParallelReadonlyDescriptorEnabled() || write.descriptorType!=vk::DescriptorType::eStorageBuffer || !info->buffer || !info->range ||
                                    info->range==VK_WHOLE_SIZE || prepared->buffer_ranges.size()>64 || prepared->regions.size()>64)return false;
