@@ -5117,7 +5117,7 @@ void NativeRenderer::SortRegionWrites() {
                 mirror_bytes -= mirror.end - mirror.begin;
                 NATIVE_DIAGNOSTIC(++stats.mirrors_dropped);
                 ++buffer_generation; // OPT-003
-                buffer_log.Note(mirror.begin, mirror.end); // OPT-010
+                buffer_log.Note(mirror.begin, mirror.end, true); // OPT-010
                 retired_watch_ranges.emplace_back(mirror.begin, mirror.end);
                 std::unique_lock map_lock{buffer_map_mutex};
                 it = mirrors.erase(it); // freed once the GPU is done with it
@@ -5503,7 +5503,7 @@ void NativeRenderer::MakePendingMirrors() {
                     mirror_bytes -= it->second.end - it->second.begin;
                     NATIVE_DIAGNOSTIC(++stats.mirrors_evicted);
                     ++buffer_generation;
-                    buffer_log.Note(it->second.begin, it->second.end);
+                    buffer_log.Note(it->second.begin, it->second.end, true);
                     retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
                     it = mirrors.erase(it);
                 } else {
@@ -5581,7 +5581,7 @@ void NativeRenderer::MakePendingMirrors() {
                 it = mirrors.erase(it); // freed once the GPU is done with it
             }
         }
-        buffer_log.Note(begin, end); // OPT-010
+        buffer_log.Note(begin, end, true); // OPT-010 (PERF-GTS-405: with the mirrors it took in)
         // Copy commands were recorded under the source-view guard above;
         // allocation and bounded import warming happened on the worker.
         // CPU writes to it from now on are copied in before its next use.
@@ -5614,7 +5614,7 @@ void NativeRenderer::DropMirrors(VAddr address, u64 size, u32 diagnostic_reason)
             NoteMirrorDiagnostic(diagnostic_reason,address,address+size,it->second.begin,it->second.end,unmap_generation.load());
         mirror_bytes -= it->second.end - it->second.begin;
         ++buffer_generation; // OPT-003
-        buffer_log.Note(it->second.begin, it->second.end); // OPT-010
+        buffer_log.Note(it->second.begin, it->second.end, true); // OPT-010
         retired_watch_ranges.emplace_back(it->second.begin, it->second.end);
         std::unique_lock map_lock{buffer_map_mutex};
         it = mirrors.erase(it); // freed once the GPU is done with it
@@ -14258,7 +14258,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         // MirrorBuffer may process CPU writes after CommitPrepared. A changed
         // range invalidates both prepared bindings and vertices, not only vi.
         if(prepared->unmap_gen!=unmap_generation.load(std::memory_order_acquire) ||
-           !buffer_log.Untouched(prepared->buffer_seq,prepared->buffer_ranges)) {
+           !PreparedBuffersUntouched(*prepared,prepared->buffer_seq)) {
             from_prepared=false;prepared_vertices_valid=false;buffer_freshness_certified=false;
         } else {
             buffer_freshness_seq=buffer_log.Seq();
@@ -14758,7 +14758,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         // Draw while its sequence is unchanged; otherwise scan the original ranges.
         if(!fast_reject && (prepared->unmap_gen!=unmap_generation.load(std::memory_order_acquire) ||
            !(from_prepared && buffer_freshness_certified && buffer_log.Seq()==buffer_freshness_seq) &&
-           !buffer_log.Untouched(prepared->buffer_seq,prepared->buffer_ranges))) fast_reject=true;
+           !PreparedBuffersUntouched(*prepared,prepared->buffer_seq))) fast_reject=true;
         if(fast_reject) {
             NATIVE_DIAGNOSTIC(++parallel->fast_rejected);if(no_pass_room)NATIVE_DIAGNOSTIC(++parallel->no_pass_room_rejected);if(extended && any_clear)NATIVE_DIAGNOSTIC(++parallel->extended_clear_rejected);if(serial_scope_bypass)NATIVE_DIAGNOSTIC(++parallel->serial_scope_bypassed);
             if(ParallelGateDiagEnabled()) {
@@ -16910,6 +16910,7 @@ void NativeRenderer::PreparedDraw::Reset() {
     regions.clear();
     image_ranges.clear();
     picture_ranges.clear(); // PERF-GTS-404
+    mirror_ranges.clear();  // PERF-GTS-405
     buffer_ranges.clear();
     upload_bytes.clear();
     uploads.clear();
@@ -16929,10 +16930,59 @@ void NativeRenderer::PreparedDraw::Reset() {
     }
 }
 
-void NativeRenderer::ChangeLog::Note(VAddr begin, VAddr end) {
+void NativeRenderer::ChangeLog::Note(VAddr begin, VAddr end, bool mirror) {
     const u64 next = seq.load(std::memory_order_relaxed) + 1;
-    entries[next % entries.size()] = {next, begin, end};
+    entries[next % entries.size()] = {next, begin, end, mirror};
     seq.store(next, std::memory_order_release);
+}
+
+bool NativeRenderer::ChangeLog::UntouchedHolding(
+    u64 since, std::span<const std::pair<VAddr, VAddr>> ranges,
+    std::span<const std::pair<VAddr, VAddr>> held) const {
+    const u64 now = seq.load(std::memory_order_acquire);
+    if (now == since) {
+        return true;
+    }
+    if (now - since > entries.size()) {
+        no_lost.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    const FreshnessRangeSearch<VAddr> search{ranges};
+    for (u64 at = since + 1; at <= now; ++at) {
+        const Entry& entry = entries[at % entries.size()];
+        if (entry.mirror) {
+            // A mirror is bound only as a vertex or index buffer, by the work that holds it.
+            // What reads the same memory in place, or binds it as a shader's buffer, reads
+            // what it read before.
+            for (const auto& [begin, end] : held) {
+                if (entry.begin < end && entry.end > begin) {
+                    no_changed.fetch_add(1, std::memory_order_relaxed);
+                    return false;
+                }
+            }
+            continue;
+        }
+        if (search.Intersects(entry.begin, entry.end)) {
+            no_changed.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+    return true;
+}
+
+// PERF-GTS-405 (RYGT_PREPARED_MIRROR_EXACT=1): a mirror made or dropped turns a prepared draw
+// down only when the draw holds a mirror over that range. Any mirror change over memory the
+// draw binds did, also for the constants it reads in place and for vertices it reads in place:
+// 100 to 41,400 draws in 10 s at Tokyo, in bursts when a large mirror is made again.
+bool NativeRenderer::PreparedBuffersUntouched(const PreparedDraw& p, u64 since) const {
+    static const bool mirror_exact = [] {
+        const char* env = std::getenv("RYGT_PREPARED_MIRROR_EXACT");
+        return env && env[0] == '1' && env[1] == '\0';
+    }();
+    return mirror_exact
+               ? buffer_log.UntouchedHolding(since, p.buffer_ranges,
+                                             {p.mirror_ranges.data(), p.mirror_ranges.size()})
+               : buffer_log.Untouched(since, p.buffer_ranges);
 }
 
 bool NativeRenderer::ChangeLog::Untouched(u64 since,
@@ -18106,6 +18156,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobVertexBuffer(VAddr 
                 if (lease.Allowed(mirror->begin, mirror->end)) {
                     if (std::ranges::find(p.mirrors, mirror) == p.mirrors.end()) {
                         p.mirrors.push_back(mirror);
+                        p.mirror_ranges.emplace_back(mirror->begin, mirror->end); // PERF-GTS-405
                     }
                     *mirror_out = mirror;
                     if(native_receipt)*native_receipt=valid_native(*mirror);
@@ -18339,7 +18390,7 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     // the second scan must still check every later change. Sampling after the scan is unsafe.
     const u64 recheck_from = buffer_log.Seq();
     const u64 buffer_lost_before = buffer_log.no_lost.load(std::memory_order_relaxed);
-    if (!buffer_log.Untouched(p.buffer_seq, p.buffer_ranges)) {
+    if (!PreparedBuffersUntouched(p, p.buffer_seq)) {
         const bool lost = buffer_log.no_lost.load(std::memory_order_relaxed) != buffer_lost_before;
         NATIVE_DIAGNOSTIC(++stats.prepared_buffer_no[lost ? 1 : 0]);
         static_cast<void>(lost);
@@ -18456,7 +18507,7 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     // dereferencing its vertex mirrors if any prepared range changed.
     Begin();
     if (p.unmap_gen != unmap_generation.load(std::memory_order_acquire)) return reject(2);
-    if (!buffer_log.Untouched(recheck_from, p.buffer_ranges)) return reject(4);
+    if (!PreparedBuffersUntouched(p, recheck_from)) return reject(4);
     // The viewport transform the shaders get, from the registers as recorded.
     trace.Next(7);
     const Shader::PushData fresh = UserData(regs);

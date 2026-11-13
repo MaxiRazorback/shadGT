@@ -1422,6 +1422,8 @@ private:
         /// PERF-GTS-404: the own range (address and size) of every picture held in
         /// bindings.sampled and bindings.stored, as the registry logs it when it evicts one.
         std::vector<std::pair<VAddr, VAddr>> picture_ranges;
+        /// PERF-GTS-405: the ranges of the mirrors held in `mirrors`.
+        boost::container::small_vector<std::pair<VAddr, VAddr>, 4> mirror_ranges;
         std::vector<std::pair<VAddr, VAddr>> buffer_ranges;
         /// Upload memory (flattened user data, clip planes, D3 tables): bytes copied at commit
         /// into the list's upload memory, and the buffer info that binds them.
@@ -1491,7 +1493,13 @@ private:
     /// (written and checked by the recorder; job threads read the sequence before looking up).
     class ChangeLog {
     public:
-        void Note(VAddr begin, VAddr end);
+        /// `mirror`: the range of a mirror made or dropped (PERF-GTS-405); else a region's.
+        void Note(VAddr begin, VAddr end, bool mirror = false);
+        /// PERF-GTS-405: as Untouched, for work that holds mirrors by pointer: a mirror made
+        /// or dropped counts only when its range meets one of `held`, the ranges of the
+        /// mirrors held. A region made or dropped over `ranges` counts as before.
+        bool UntouchedHolding(u64 since, std::span<const std::pair<VAddr, VAddr>> ranges,
+                              std::span<const std::pair<VAddr, VAddr>> held) const;
         /// Whether none of the ranges changed after `since` (false when the log no longer
         /// reaches back that far).
         bool Untouched(u64 since, std::span<const std::pair<VAddr, VAddr>> ranges) const;
@@ -1504,6 +1512,7 @@ private:
             u64 seq = 0;
             VAddr begin = 0;
             VAddr end = 0;
+            bool mirror = false;
         };
         std::array<Entry, 1024> entries{};
         std::atomic<u64> seq{0};
@@ -1513,6 +1522,9 @@ private:
         mutable std::atomic<u64> no_changed{0}, no_lost{0};
     };
     ChangeLog buffer_log;
+    /// PERF-GTS-405: whether no region or mirror the prepared draw depends on changed after
+    /// `since` (RYGT_PREPARED_MIRROR_EXACT=1: a mirror only when the draw holds it).
+    bool PreparedBuffersUntouched(const PreparedDraw& p, u64 since) const;
     /// OPT-010: regions and mirrors are added and removed under it (exclusive); job threads
     /// look regions up under it (shared).
     std::shared_mutex buffer_map_mutex;
