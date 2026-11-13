@@ -10,6 +10,7 @@
 #include <mutex>
 #include <span>
 #include <unordered_map>
+#include <utility>
 #include <algorithm>
 #include <ctime>
 #include <vector>
@@ -404,17 +405,22 @@ void AllowAllCores() {
     SetWideCores(GetCurrentThread());
 }
 
-// PERF-GT7-048 (RYGT_CORE_OWNERS=<mask>: 1 command processor, 2 recorder, 4 Vulkan commands; 0 none):
-// a renderer thread gets a physical core of its own, both hardware threads, from the last of the
-// cores that aren't the compile cores; the others' threads run on the rest (the first core takes
-// the interrupts). Threads ask from their own loops; `wanted` false gives the core back. By default
-// the recorder's: same screens of GT7's rain pre-race, one run, 35.6 against 36.9 ms a frame, the
-// slowest tenth 39.2 against 41.8. The recorder and the command processor each, or all three, were
-// worse: the game's job threads ran short of cores (2.4 to 2.8 ms more before the next frame).
+// PERF-GT7-048 (RYGT_CORE_OWNERS=<mask>: 1 command processor, 2 recorder, 4 Vulkan commands; 0 none,
+// the default): a renderer thread gets a physical core of its own, both hardware threads, from the
+// last of the cores that aren't the compile cores; the process's threads without a CPU set of their
+// own, the game's included, run on the rest (the first core takes the interrupts). Threads ask from
+// their own loops; `wanted` false gives the core back. Measured on 8 cores and 16 threads only, the
+// recorder's (mask 2), GT7's rain pre-race, switched within a run: 35.6 against 36.9 ms a frame
+// and 43.0 against 44.5, a third run 46.6 against 46.1. The recorder and the command processor
+// each, or all three, were worse: the game's job threads ran short of cores (2.4 to 2.8 ms more
+// before the next frame).
+// FIX-GTS-408 (shadgt7 FIX-GT7-165): no owner by default (it was the recorder's). With 6 cores and
+// 12 threads the rest is 3 cores, after 2 compile cores and the owner's: GT7 ran at ~30 fps against
+// ~50 without an owner (rygt7 issue 41, Ryzen 5 7500F and 5500X3D).
 void UpdateCoreOwner(u32 slot, bool wanted) {
     static const u32 mask = [] {
         const char* env = std::getenv("RYGT_CORE_OWNERS");
-        return env && *env ? u32(std::strtoul(env, nullptr, 0)) : u32{2};
+        return env && *env ? u32(std::strtoul(env, nullptr, 0)) : u32{0};
     }();
     if (((mask >> slot) & 1) == 0) {
         return;
@@ -454,7 +460,19 @@ void UpdateCoreOwner(u32 slot, bool wanted) {
     // Without compile cores, nothing is kept from the game's threads but the owners' cores.
     const auto& usable = CompileCoresOn() ? classes.game_cores : classes.all_cores;
     if (classes.hybrid || usable.size() < owners + 2) {
+        static bool told_ignored = false; // under owner_policy_mutex; the loops ask every pass
+        if (wanted && !std::exchange(told_ignored, true)) {
+            LOG_INFO(Common, "PERF-GT7-048: core owners {:#x} (RYGT_CORE_OWNERS) ignored: {}", mask,
+                     classes.hybrid ? "hybrid CPU" : "too few cores");
+        }
         return;
+    }
+    static bool told_applied = false;
+    if (wanted && !std::exchange(told_applied, true)) {
+        LOG_INFO(Common,
+                 "PERF-GT7-048: core owners {:#x} (RYGT_CORE_OWNERS), {} of {} usable cores left "
+                 "to the other threads",
+                 mask, usable.size() - owners, usable.size());
     }
     size_t index = 0; // from the last core down, in slot order
     for (u32 i = 0; i < slot; ++i) {
@@ -482,6 +500,11 @@ void UpdateCoreOwner(u32 slot, bool wanted) {
         }
         if (!set_default(GetCurrentProcess(), wanted ? rest.data() : nullptr,
                          wanted ? ULONG(rest.size()) : 0)) {
+            static bool told_failed = false;
+            if (wanted && !std::exchange(told_failed, true)) {
+                LOG_ERROR(Common, "PERF-GT7-048: SetProcessDefaultCpuSets failed ({})",
+                          GetLastError());
+            }
             if (wanted) CallSetThreadSelectedCpuSets(GetCurrentThread(), nullptr, 0);
             return;
         }

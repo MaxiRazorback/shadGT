@@ -115,7 +115,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|SHADGT_PREWARM_LIMIT|int|Shader compiling|unlimited|number of pipelines|Builds at most this many stored pipelines in the background prewarm (most recently used first).",
     // Native recorder & sync
     "RYGTSW1|RYGT_CMD_YIELD_US|int|Native recorder & sync|200|microseconds; 0 = spin, then sleep (the old behaviour)|After its short spin, the command thread yields its core for up to this many microseconds before sleeping, so the recorder needs no wake-up (PERF-416/417).",
-    "RYGTSW1|RYGT_CORE_OWNERS|int|Native recorder & sync|2 (recorder)|bitmask: 1 command processor, 2 recorder, 4 Vulkan commands, 0 none|Which renderer threads get a physical CPU core of their own (PERF-GT7-048). Default 2 gives one to the recorder.",
+    "RYGTSW1|RYGT_CORE_OWNERS|int|Native recorder & sync|0 (none)|bitmask: 1 command processor, 2 recorder, 4 Vulkan commands, 0 none|Gives renderer threads a CPU core each; the game keeps only the cores left. Try 2 on 8+ cores with SMT; much slower on 6; ignored on hybrid CPUs.",
     "RYGTSW1|RYGT_DIRECT_FIND_RECENT|flag|Native recorder & sync|on|0 = off|Each thread remembers recently found direct-memory views to skip the locked map lookup (PERF-GT7-127); 0 turns it off.",
     "RYGTSW1|RYGT_FLAT_PREFETCH|flag|Native recorder & sync|on|0 = off|Prefetches each stage's shader user data into cache before binding buffers (PERF-GT7-122); 0 turns it off.",
     "RYGTSW1|RYGT_GFX_YIELD_PACKETS|int|Native recorder & sync|32|graphics packets between yields; 0 = never yield|Lets compute submissions decode after every N graphics packets (PERF-GT7-052); 0 never yields.",
