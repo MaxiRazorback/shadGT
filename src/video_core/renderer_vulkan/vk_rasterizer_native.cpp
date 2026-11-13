@@ -10948,6 +10948,97 @@ vk::ImageView NativeRenderer::DepthStandIn(bool array, bool may_create) {
     return vk::ImageView{handle};
 }
 
+void NativeRenderer::EnsureAheadArena() {
+    if (ahead_arena.tried) return;
+    ahead_arena.tried = true;
+    // PERF-GTS-377 (RYGT_AHEAD_UPLOAD_MB, 0 = off): a race draw's constants (about 550 bytes,
+    // 25 to 34 MB a second) were hashed, copied to upload memory and copied again as a
+    // reference by the recorder at commit: about 1.0 us of the 8.2 us a draw costs it.
+    const char* env = std::getenv("RYGT_AHEAD_UPLOAD_MB");
+    const u64 megabytes = env && *env ? std::strtoull(env, nullptr, 10) : 0;
+    if (megabytes == 0) return;
+    const u64 capacity = std::bit_ceil(std::clamp<u64>(megabytes, 16, 1024)) << 20;
+    auto buffer = device->CreateBuffer({
+        .size = capacity,
+        .usage = Native::Rhi::BufferUsageStorage | Native::Rhi::BufferUsageUniform |
+                 Native::Rhi::BufferUsageIndex | Native::Rhi::BufferUsageVertex |
+                 Native::Rhi::BufferUsageIndirect | Native::Rhi::BufferUsageTransferSrc,
+        .memory = Native::Rhi::MemoryKind::Upload,
+        .name = "native ahead upload",
+    });
+    if (!buffer || !buffer->Mapped()) {
+        LOG_WARNING(Render_Vulkan, "PERF-GTS-377: no {} MB ahead upload arena", capacity >> 20);
+        return;
+    }
+    const u64 segments = capacity >> AheadArena::SegmentBits;
+    ahead_arena.busy = std::make_unique<std::atomic<u64>[]>(segments);
+    for (u64 i = 0; i < segments; ++i) ahead_arena.busy[i].store(0, std::memory_order_relaxed);
+    ahead_arena.capacity = capacity;
+    ahead_arena.handle = vk::Buffer{Handle<VkBuffer_T>(buffer->NativeHandle())};
+    u8* const mapped = buffer->Mapped();
+    ahead_arena.buffer = std::move(buffer);
+    ahead_arena.mapped.store(mapped, std::memory_order_release);
+    LOG_INFO(Render_Vulkan, "PERF-GTS-377: job threads copy draw constants into a {} MB arena",
+             capacity >> 20);
+}
+
+bool NativeRenderer::AheadAllocate(u32 size, u64& position, u8*& data) {
+    auto& arena = ahead_arena;
+    u8* const mapped = arena.mapped.load(std::memory_order_acquire);
+    if (!mapped || size == 0 || size > (u64{1} << AheadArena::SegmentBits)) return false;
+    const u64 bytes = Common::AlignUp<u64>(size, AheadArena::Align);
+    const u64 capacity = arena.capacity;
+    u64 pos = 0, offset = 0;
+    for (u32 attempt = 0;; ++attempt) {
+        // The claim first, then the look at the segments (the recorder marks a segment first
+        // and then looks at the head): one of the two always sees the other.
+        pos = arena.head.fetch_add(bytes, std::memory_order_seq_cst);
+        offset = pos & (capacity - 1);
+        if (offset + bytes <= capacity) break; // else it straddles the end: claim again
+        if (attempt == 2) return false;
+    }
+    const u64 known = r.scheduler.GetWorkSemaphore()->KnownGpuTick();
+    const u64 first = offset >> AheadArena::SegmentBits;
+    const u64 last = (offset + bytes - 1) >> AheadArena::SegmentBits;
+    for (u64 segment = first; segment <= last; ++segment) {
+        if (arena.busy[segment].load(std::memory_order_seq_cst) > known) {
+            arena.refused.fetch_add(1, std::memory_order_relaxed);
+            return false; // the GPU has not run what was bound there
+        }
+    }
+    position = pos;
+    data = mapped + offset;
+    arena.copied.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool NativeRenderer::AheadCommit(u64 position, u32 size, vk::DescriptorBufferInfo& info) {
+    auto& arena = ahead_arena;
+    if (!arena.buffer) return false;
+    const u64 bytes = Common::AlignUp<u64>(size, AheadArena::Align);
+    const u64 capacity = arena.capacity;
+    const u64 offset = position & (capacity - 1);
+    // The list being recorded binds them: the segments wait for the GPU to run it.
+    const u64 tick = r.scheduler.CurrentTick() + 1;
+    const u64 first = offset >> AheadArena::SegmentBits;
+    const u64 last = (offset + bytes - 1) >> AheadArena::SegmentBits;
+    for (u64 segment = first; segment <= last; ++segment) {
+        auto& busy = arena.busy[segment];
+        u64 seen = busy.load(std::memory_order_seq_cst);
+        while (seen < tick && !busy.compare_exchange_weak(seen, tick, std::memory_order_seq_cst)) {
+        }
+    }
+    // Claims only grow: once the head is a capacity past the position, a later claim may
+    // have the same offsets.
+    if (arena.head.load(std::memory_order_seq_cst) - position >= capacity) {
+        ++arena.stale;
+        return false;
+    }
+    info = vk::DescriptorBufferInfo{arena.handle, offset, size};
+    ++arena.bound;
+    return true;
+}
+
 vk::DescriptorSet NativeRenderer::MakeLongSet(vk::DescriptorSetLayout layout) {
     const vk::Device vk_device = r.instance.GetDevice();
     // PERF-GTS-376: a set of a dropped entry first (the GPU is done with it).
@@ -13095,6 +13186,7 @@ void NativeRenderer::YieldToMappingChanges() {
 void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect) {
     YieldToMappingChanges(); // PERF-GTS-368
     std::scoped_lock lock{mutex};
+    EnsureAheadArena(); // PERF-GTS-377
     struct StreamUnwindGuard {
         NativeRenderer& renderer;
         int exceptions=std::uncaught_exceptions();
@@ -16998,6 +17090,12 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
         const auto* bytes = static_cast<const u8*>(data);
         p.upload_bytes.insert(p.upload_bytes.end(), bytes, bytes + size);
         p.uploads.push_back({static_cast<u32>(b.buffers.size()), offset, size});
+        u64 position = 0;
+        u8* ahead = nullptr;
+        if (AheadAllocate(size, position, ahead)) {
+            std::memcpy(ahead, bytes, size); // PERF-GTS-377
+            p.uploads.back().ahead = position;
+        }
         return vk::DescriptorBufferInfo{VK_NULL_HANDLE, 0, size};
     };
     u32 index = 0;
@@ -17016,6 +17114,14 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
                 if (size != 0) {
                     p.uploads.push_back({static_cast<u32>(b.buffers.size()), 0, size,
                                          static_cast<s32>(stage.sw_stage)});
+                    u64 position = 0;
+                    u8* ahead = nullptr;
+                    if (AheadAllocate(size, position, ahead)) {
+                        // PERF-GTS-377: this thread's copy of the user data; bound when the
+                        // recorder installs the stages from this prepared draw (trusted).
+                        std::memcpy(ahead, stage.flattened_ud_buf.data(), size);
+                        p.uploads.back().ahead = position;
+                    }
                     info = vk::DescriptorBufferInfo{VK_NULL_HANDLE, 0, size};
                 }
                 break;
@@ -17660,6 +17766,14 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     const bool receipt_requested=trusted && p.proof_context && p.proof_context->Valid(p.proof_mode_state);
     bool uploads_proven=receipt_requested && upload_incarnation && !p.uploads.empty();
     for (const auto& upload : p.uploads) {
+        // PERF-GTS-377: already copied by the job thread, when its bytes still stand.
+        if (upload.ahead != ~u64{0} && (upload.flat_stage < 0 || trusted)) {
+            if (vk::DescriptorBufferInfo info; AheadCommit(upload.ahead, upload.size, info)) {
+                p.bindings.buffers[upload.info] = info;
+                uploads_proven = false;
+                continue;
+            }
+        }
         bool backing_proven=false;
         const u8* source = p.upload_bytes.data() + upload.offset;
         u32 size = upload.size;
@@ -21709,6 +21823,15 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
                  "image-rewrite-sources/push-data {} ({} calls)",
                  us(stats.bind_phase_ns, stats.bind_phase_calls), stats.bind_phase_calls,
                  us(stats.commit_phase_ns, stats.commit_phase_calls), stats.commit_phase_calls);
+    }
+    if (ahead_arena.buffer) {
+        LOG_INFO(Render_Vulkan,
+                 "PERF-GTS-377 (10 s): draw constants copied by job threads: {} copies, {} bound "
+                 "by the recorder, {} written over before their draw (copied at commit), {} "
+                 "copies refused (the GPU still needed the space)",
+                 ahead_arena.copied.exchange(0), ahead_arena.bound, ahead_arena.stale,
+                 ahead_arena.refused.exchange(0));
+        ahead_arena.bound = ahead_arena.stale = 0;
     }
     if (long_sets.hits + long_sets.made != 0) {
         LOG_INFO(Render_Vulkan,

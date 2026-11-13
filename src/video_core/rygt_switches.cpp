@@ -205,6 +205,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|RYGT_UPLOAD_COPY_RESERVE_MB|int|Memory & VRAM|256|MB, 0-4096, in 128 MB blocks; 0 = off|Reserves this much upload memory up front for texture upload copies, so textures seen for the first time do not wait for an allocation (PERF-GTS-364). Uses that much more VRAM.",
     "RYGTSW1|RYGT_UPLOAD_COPY_POOL_MB|int|Memory & VRAM|512|MB, 0-4096; 0 = off|Keeps this many MB of finished texture upload copies for reuse, so streaming does not allocate GPU memory for each one (PERF-GTS-362). Uses that much more VRAM.",
     "RYGTSW1|RYGT_HOT_PAGE_FAULTS|int|Memory & VRAM|8|1..64 write faults|Number of CPU write faults before a memory page is treated as hot and stops being protected (PERF-GT7-050).",
+    "RYGTSW1|RYGT_AHEAD_UPLOAD_MB|int|Memory & VRAM|0 (off)|megabytes, 16-1024 (rounded up to a power of two); 0 = off|The game's job threads copy each draw's constants into an upload arena of this size, so the recorder only binds them (PERF-GTS-377). Experimental.",
     "RYGTSW1|RYGT_NATIVE_CHUNK_MB|int|Memory & VRAM|1|megabytes, 1-64; invalid = 1|Size of the native recorder's upload chunks in MB. Larger chunks mean fewer allocations but more memory.",
     "RYGTSW1|RYGT_NATIVE_CHUNK_TRIM|flag|Memory & VRAM|on|0 = off|Frees idle upload chunks every 150 frames. 0 keeps them (more memory).",
     "RYGTSW1|RYGT_NATIVE_FILL_PATTERNS|int|Memory & VRAM|64|count; 0 = every pattern keeps its buffer|How many fill-pattern buffers are kept (max 256 MB); fixed 1.5 GB VRAM leak (FIX-GT7-123).",

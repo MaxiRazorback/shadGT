@@ -475,6 +475,31 @@ private:
         u64 hits = 0, made = 0, dropped = 0, flushes = 0, rewritten = 0;
     };
     LongSets long_sets;
+    /// PERF-GTS-377: upload memory the job threads copy a prepared draw's constants into, so
+    /// the recorder only binds them. One buffer used as a ring; positions only grow (the offset
+    /// is the position modulo the capacity). A draw's bytes hold until the head is a whole
+    /// capacity past them (checked at commit), and no thread writes into a 1 MB segment before
+    /// the GPU ran the lists that bound bytes of it.
+    struct AheadArena {
+        static constexpr u64 SegmentBits = 20;
+        static constexpr u64 Align = 64;
+        std::unique_ptr<Native::Rhi::Buffer> buffer;
+        vk::Buffer handle{};
+        u64 capacity = 0;
+        std::atomic<u8*> mapped{nullptr}; ///< set last: the job threads' sign that it is there
+        std::atomic<u64> head{0};
+        std::unique_ptr<std::atomic<u64>[]> busy; ///< by segment: the GPU tick it waits for
+        std::atomic<u64> copied{0}, refused{0};   ///< by the job threads
+        u64 bound = 0, stale = 0;                 ///< by the recorder
+        bool tried = false;
+    };
+    AheadArena ahead_arena;
+    void EnsureAheadArena();
+    /// A job thread: space for `size` bytes. False when there is none now.
+    bool AheadAllocate(u32 size, u64& position, u8*& data);
+    /// The recorder: the bytes at `position` are still the draw's, and stay until the GPU ran
+    /// the list being recorded. False when they were written over.
+    bool AheadCommit(u64 position, u32 size, vk::DescriptorBufferInfo& info);
     vk::DescriptorSet MakeLongSet(vk::DescriptorSetLayout layout);
     void StoreLongSet(u64 hash, u64 check, vk::DescriptorSetLayout layout, vk::DescriptorSet set,
                       std::span<const u64> handles);
@@ -1367,6 +1392,9 @@ private:
             u32 offset = 0;
             u32 size = 0;
             s32 flat_stage = -1; ///< >= 0: that stage's flattened user data, the recorder's
+            /// PERF-GTS-377: where the job thread already copied the bytes in the ahead arena
+            /// (NoAhead: not there; copied at commit as before).
+            u64 ahead = ~u64{0};
         };
         std::vector<u8> upload_bytes;
         boost::container::small_vector<Upload, 4> uploads;
