@@ -167,6 +167,7 @@ RYGT_SWITCH_EXPORT const char* const RyGT_SwitchDescriptions[] = {
     "RYGTSW1|RYGT_PARALLEL_DRAW_PROOF_REUSE|flag|Native recorder & sync|off|exactly 1 = on|Experimental: reuses per-draw stage proofs in the parallel recorder's descriptor checks.",
     "RYGTSW1|RYGT_PARALLEL_EXTENDED|flag|Native recorder & sync|off|exactly 1 = on|Experimental: admits indexed, multi-target and depth draws into parallel recording.",
     "RYGTSW1|RYGT_PARALLEL_INITIAL_MODE|string|Native recorder & sync|renderer default|initial mode, used with RYGT_PARALLEL_MODE_FILE. Debug builds only.|Debug: initial on/off state for the parallel mode file controller.",
+    "RYGTSW1|RYGT_PARALLEL_LATE_BINDINGS|flag|Native recorder & sync|on|0 = off; only used with RYGT_PARALLEL_RECORDING=1 and RYGT_LONG_LIVED_SETS=1|The pass workers look up each draw's descriptor sets themselves instead of the recorder doing it for them (PERF-GTS-398). 0 turns it off.",
     "RYGTSW1|RYGT_PARALLEL_MODE_FILE|string|Native recorder & sync|unset|file path. Debug builds only.|Debug: a file that switches parallel recording on/off while the game runs. For A/B testing.",
     "RYGTSW1|RYGT_PARALLEL_NATURAL_BOUNDARY|flag|Native recorder & sync|off|exactly 1 = on|Experimental: closes a changed serial render scope before a parallel draw starts.",
     "RYGTSW1|RYGT_PARALLEL_PREPARED_VIEW_PROOF|flag|Native recorder & sync|off|exactly 1 = on|Experimental: reuses prepared-draw proofs that sampled image views are safe, for the parallel recorder.",

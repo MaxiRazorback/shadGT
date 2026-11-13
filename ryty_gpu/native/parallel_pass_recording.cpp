@@ -69,6 +69,9 @@ static bool ValidateDraw(const Draw& draw,bool extended_verified) {
                draw.vertex_attributes[i].pNext || draw.vertex_bindings[i].pNext)return false;
         }
         static_assert(Shader::Backend::MaxDescriptorSets<=32);
+        if(draw.late_bind) { // PERF-GTS-398: the sets come when the draw is recorded
+            if(!draw.late_owner || !draw.late_prepared)return false;
+        } else
         for(u32 i=0;i<draw.sets.size();++i) if((draw.required_sets_mask & (u32{1}<<i)) && !draw.sets[i])return false;
         if(draw.push_set<draw.sets.size() && (draw.required_sets_mask & (u32{1}<<draw.push_set)))return false;
         if(draw.push_writes) {
@@ -209,19 +212,30 @@ static bool RecordPassImpl(vk::CommandBuffer cmd,const Vulkan::Instance& instanc
                 if(probe.enabled) ++probe.local.descriptor_flush_count;
 #endif
             }};
+            // PERF-GTS-398: this thread looks the sets up when the packet asks for it.
+            std::array<vk::DescriptorSet,Shader::Backend::MaxDescriptorSets> late_sets;
+            std::array<u8,Shader::Backend::MaxDescriptorSets> late_counts;
+            boost::container::static_vector<u32,128> late_offsets;
+            const auto* bound_sets=&draw.sets;const auto* bound_counts=&draw.dynamic_counts;
+            const u32* bound_offsets=draw.dynamic_offsets.data();
+            if(draw.late_bind) {
+                late_sets=draw.sets;late_counts={};
+                draw.late_bind(draw.late_owner,draw.late_prepared,late_sets,late_counts,late_offsets);
+                bound_sets=&late_sets;bound_counts=&late_counts;bound_offsets=late_offsets.data();
+            }
             u32 dynamic_at=0; // FIX-GTS-394
             for(u32 i=0;i<draw.sets.size();++i) {
-                const u32 dynamic=draw.dynamic_counts[i];
+                const u32 dynamic=(*bound_counts)[i];
                 if(i==draw.push_set && draw.push_writes && !draw.push_writes->Writes().empty()) {
                     flush();const auto writes=draw.push_writes->Writes();
                     commands.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics,draw.layout,i,
                         vk::ArrayProxy<const vk::WriteDescriptorSet>{static_cast<u32>(writes.size()),writes.data()});
-                } else if(draw.sets[i] && dynamic) {
+                } else if((*bound_sets)[i] && dynamic) {
                     // As the serial recorder: a set with dynamic buffers is bound alone, with its offsets.
                     flush();
-                    commands.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,draw.layout,i,draw.sets[i],
-                        vk::ArrayProxy<const u32>{dynamic,draw.dynamic_offsets.data()+dynamic_at});
-                } else if(draw.sets[i]) {if(count && i!=first+count)flush();if(!count)first=i;run[count++]=draw.sets[i];}
+                    commands.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,draw.layout,i,(*bound_sets)[i],
+                        vk::ArrayProxy<const u32>{dynamic,bound_offsets+dynamic_at});
+                } else if((*bound_sets)[i]) {if(count && i!=first+count)flush();if(!count)first=i;run[count++]=(*bound_sets)[i];}
                 dynamic_at+=dynamic;
             }
             flush();

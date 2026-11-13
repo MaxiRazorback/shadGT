@@ -26,6 +26,16 @@ struct Draw {
     // them; without them the driver reads the offsets through a null pointer.
     std::array<u8,Shader::Backend::MaxDescriptorSets> dynamic_counts{};
     boost::container::static_vector<u32,128> dynamic_offsets{};
+    // PERF-GTS-398: the sets are looked up (or made) by whoever records the draw, not by the
+    // recorder: `late_bind` fills the sets that are not pushed, their counts and offsets from
+    // the renderer's prepared draw. `sets` are then empty for them.
+    using LateBind=void(*)(void* owner,void* prepared,
+        std::array<vk::DescriptorSet,Shader::Backend::MaxDescriptorSets>& sets,
+        std::array<u8,Shader::Backend::MaxDescriptorSets>& counts,
+        boost::container::static_vector<u32,128>& offsets);
+    LateBind late_bind{};
+    void* late_owner{};
+    void* late_prepared{};
     u32 push_set=Shader::Backend::MaxDescriptorSets;
     u32 required_sets_mask{};
     bool immutable_upload_buffers_verified{};

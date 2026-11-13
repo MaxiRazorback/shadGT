@@ -475,8 +475,19 @@ private:
         std::vector<vk::DescriptorPool> pools;
         u64 unused_sets = 0; ///< sets whose layout was destroyed, still in the pools
         u64 hits = 0, made = 0, dropped = 0, flushes = 0, rewritten = 0;
+        /// PERF-GTS-398: the handles DropLongSets was given, in order (a ring; `dead_count`
+        /// is how many in all). A set made late for a draw recorded before one of its
+        /// handles died is not kept.
+        std::array<u64, 4096> dead_ring{};
+        u64 dead_count = 0;
+        u64 late_hits = 0, late_made = 0, late_not_kept = 0;
     };
     LongSets long_sets;
+    /// PERF-GTS-398: with parallel recording the pass workers look sets up and make them too:
+    /// then everything of `long_sets` is read and changed under this.
+    std::mutex long_sets_mutex;
+    /// The recorder: dead handles' sets dropped, the table flushed when it is too large.
+    void LongSetsUpkeep();
     /// PERF-GTS-377: upload memory the job threads copy a prepared draw's constants into, so
     /// the recorder only binds them. One buffer used as a ring; positions only grow (the offset
     /// is the position modulo the capacity). A draw's bytes hold until the head is a whole
@@ -1450,6 +1461,9 @@ private:
         /// PERF-GTS-392: given back without Reset; NewPrepared resets it on the thread that
         /// takes it (written and read under prepared_pool_mutex's ordering).
         bool reset_pending = false;
+        /// PERF-GTS-398 (set by the recorder when the draw goes into a pass packet): how many
+        /// handles had died by then, and the tick after which a set made for it may be reused.
+        u64 late_dead_seq = 0, late_retire_tick = 0;
         void Reset();
     };
     /// OPT-010: the guest ranges whose region or mirror was made or dropped, by sequence number
@@ -1490,6 +1504,23 @@ private:
     std::vector<PreparedDraw*> prepared_free;
     PreparedDraw* NewPrepared();
     void FreePrepared(PreparedDraw* draw);
+    /// PERF-GTS-398: whether every set of the draw that is not pushed can be looked up late (a
+    /// long-lived set with a complete key), and its keys are made for the pipeline.
+    bool CanBindLate(const Pipeline& pipeline, DrawBindings& b);
+    /// PERF-GTS-398: any thread that records the prepared draw: its sets from the long-lived
+    /// table (made and written when not there), their dynamic buffer counts and offsets.
+    void BindLate(PreparedDraw& p,
+                  std::array<vk::DescriptorSet, Shader::Backend::MaxDescriptorSets>& sets,
+                  std::array<u8, Shader::Backend::MaxDescriptorSets>& counts,
+                  boost::container::static_vector<u32, 128>& offsets);
+    static void BindLateThunk(void* owner, void* prepared,
+                              std::array<vk::DescriptorSet, Shader::Backend::MaxDescriptorSets>& sets,
+                              std::array<u8, Shader::Backend::MaxDescriptorSets>& counts,
+                              boost::container::static_vector<u32, 128>& offsets);
+    /// Prepared draws a pass packet points at: given back once the passes of the list have
+    /// been recorded (Splice, after the coordinator was drained).
+    std::vector<PreparedDraw*> late_bound_prepared;
+    std::vector<PreparedDraw*> late_bound_done; ///< recorded: given back at the next draw
     /// FIX-GTS-393: the recorder, for parallel recording: whether `info` (buffer info
     /// `info_index` of the prepared draw) binds bytes of the arena that hold until the GPU ran
     /// the list being recorded (their segments are marked for it again).

@@ -11155,6 +11155,172 @@ bool NativeRenderer::AheadCommit(u64 position, u32 size, vk::DescriptorBufferInf
     return true;
 }
 
+static bool LongLivedSetsOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_LONG_LIVED_SETS");
+        const bool enabled = env && env[0] == '1' && !UiHires::Enabled();
+        if (enabled) Native::DeadHandles::enabled.store(true, std::memory_order_release);
+        return enabled;
+    }();
+    return on;
+}
+
+// PERF-GTS-398 (with RYGT_PARALLEL_RECORDING=1; RYGT_PARALLEL_LATE_BINDINGS=0: as before): a
+// draw recorded by a pass worker has its descriptor sets looked up by that worker. The
+// recorder did it for every such draw (PushBindings, 9.6% of its CPU time in a race at Tokyo
+// with 87% of the draws recorded by workers), and handed over the sets.
+static bool LateBindingsOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("RYGT_PARALLEL_LATE_BINDINGS");
+        return !(env && env[0] == '0') && ParallelRecordingRequested();
+    }();
+    return on;
+}
+
+void NativeRenderer::LongSetsUpkeep() {
+    if (!LongLivedSetsOn()) return;
+    static thread_local std::vector<u64> dead;
+    const bool some = Native::DeadHandles::Take(dead);
+    std::unique_lock<std::mutex> lock{long_sets_mutex, std::defer_lock};
+    if (ParallelRecordingRequested()) lock.lock();
+    if (some) DropLongSets(dead);
+    if (long_sets.entries.Size() > 200000 || long_sets.unused_sets > 20000) FlushLongSets();
+}
+
+bool NativeRenderer::CanBindLate(const Pipeline& pipeline, DrawBindings& b) {
+    if (!LateBindingsOn() || !LongLivedSetsOn() || b.writes.empty()) return false;
+    if (!b.groups_ready) b.PrepareWriteGroups();
+    if (b.key_layout != pipeline.GetLayout()) b.PrepareDescriptorKeys(pipeline);
+    u32 offsets = 0;
+    bool any = false;
+    for (u32 index = 0; index < b.grouped_writes.size(); ++index) {
+        if (b.grouped_writes[index].empty() || index == pipeline.PushSet()) continue;
+        const u32 dynamic = pipeline.DynamicBuffers(index);
+        if (dynamic == 0 || !b.descriptor_keys[index].cacheable || !pipeline.SetLayout(index)) {
+            return false; // a set of the list's own cache: the recorder's
+        }
+        offsets += dynamic;
+        any = true;
+    }
+    return any && offsets <= 128;
+}
+
+void NativeRenderer::BindLateThunk(void* owner, void* prepared,
+        std::array<vk::DescriptorSet, Shader::Backend::MaxDescriptorSets>& sets,
+        std::array<u8, Shader::Backend::MaxDescriptorSets>& counts,
+        boost::container::static_vector<u32, 128>& offsets) {
+    static_cast<NativeRenderer*>(owner)->BindLate(*static_cast<PreparedDraw*>(prepared), sets,
+                                                  counts, offsets);
+}
+
+void NativeRenderer::BindLate(PreparedDraw& p,
+        std::array<vk::DescriptorSet, Shader::Backend::MaxDescriptorSets>& sets,
+        std::array<u8, Shader::Backend::MaxDescriptorSets>& counts,
+        boost::container::static_vector<u32, 128>& offsets) {
+    // As PushBindings does for a long-lived set, without the stream: the key without the
+    // offsets, the table, and on a miss a set written at once (it is bound right after, and
+    // another thread may find it in the table as soon as the lock is given up).
+    const Pipeline& pipeline = *p.pipeline;
+    DrawBindings& b = p.bindings;
+    const vk::Device vk_device = r.instance.GetDevice();
+    static thread_local std::vector<u64> key;
+    static thread_local std::vector<vk::WriteDescriptorSet> updates;
+    static thread_local std::vector<vk::DescriptorBufferInfo> infos;
+    static thread_local std::vector<u64> handles;
+    const auto fits = [](const vk::DescriptorBufferInfo& info) {
+        return info.buffer && info.range != VK_WHOLE_SIZE && info.offset <= 0xFFFFFFFFull;
+    };
+    for (u32 index = 0; index < b.grouped_writes.size() && index < sets.size(); ++index) {
+        const auto& writes = b.grouped_writes[index];
+        if (writes.empty() || index == pipeline.PushSet()) continue;
+        const u32 dynamic = pipeline.DynamicBuffers(index);
+        auto& prepared_key = b.descriptor_keys[index];
+        if (dynamic == 0 || offsets.size() + dynamic > offsets.capacity()) continue; // CanBindLate
+        prepared_key.RefreshBuffers<false>();
+        const auto& words = prepared_key.words;
+        const size_t at = offsets.size();
+        offsets.resize(at + dynamic, 0u);
+        key.assign(words.begin(), words.end());
+        for (const auto& entry : prepared_key.buffers) {
+            const u64 buffer = words[entry.word];
+            const u64 offset = words[entry.word + 1];
+            const u64 range = words[entry.word + 2];
+            if (entry.slot >= dynamic || buffer == 0 || range == VK_WHOLE_SIZE ||
+                offset > 0xFFFFFFFFull) {
+                continue;
+            }
+            offsets[at + entry.slot] = static_cast<u32>(offset);
+            key[entry.word + 1] = 0;
+        }
+        const XXH128_hash_t wide = XXH3_128bits(key.data(), key.size() * sizeof(u64));
+        counts[index] = static_cast<u8>(dynamic);
+        const vk::DescriptorSetLayout layout = pipeline.SetLayout(index);
+        const u64 layout_key = u64(VkDescriptorSetLayout(layout));
+        std::scoped_lock lock{long_sets_mutex};
+        if (const auto kept = long_sets.entries.Find(wide.low64, wide.high64)) {
+            sets[index] = kept;
+            ++long_sets.late_hits;
+            continue;
+        }
+        const vk::DescriptorSet set = MakeLongSet(layout);
+        if (!set) continue; // as a draw the recorder finds no set for: not bound
+        size_t buffer_count = 0;
+        for (const auto& write : writes) {
+            if (write.pBufferInfo) buffer_count += write.descriptorCount;
+        }
+        updates.clear();
+        infos.clear();
+        infos.reserve(buffer_count);
+        handles.clear();
+        handles.push_back(layout_key);
+        for (const auto& write : writes) {
+            auto update = write;
+            update.dstSet = set;
+            if (write.pBufferInfo) {
+                const size_t first = infos.size();
+                for (u32 n = 0; n < write.descriptorCount; ++n) {
+                    auto info = write.pBufferInfo[n];
+                    handles.push_back(u64(VkBuffer(info.buffer)));
+                    if (write.descriptorType == vk::DescriptorType::eStorageBuffer &&
+                        write.dstBinding + n < dynamic && fits(info)) {
+                        info.offset = 0;
+                    }
+                    infos.push_back(info);
+                }
+                if (write.descriptorType == vk::DescriptorType::eStorageBuffer) {
+                    update.descriptorType = vk::DescriptorType::eStorageBufferDynamic;
+                }
+                update.pBufferInfo = infos.data() + first;
+            } else if (write.pImageInfo) {
+                for (u32 n = 0; n < write.descriptorCount; ++n) {
+                    handles.push_back(u64(VkImageView(write.pImageInfo[n].imageView)));
+                    handles.push_back(u64(VkSampler(write.pImageInfo[n].sampler)));
+                }
+            }
+            updates.push_back(update);
+        }
+        vk_device.updateDescriptorSets(
+            vk::ArrayProxy<const vk::WriteDescriptorSet>{static_cast<u32>(updates.size()),
+                                                         updates.data()}, {});
+        // A handle of the set that died after the draw went into its packet: the recorder
+        // has dropped that handle's sets already and would not see this one. It is used for
+        // this draw and written again once the GPU ran the draw's list.
+        bool died = long_sets.dead_count - p.late_dead_seq > long_sets.dead_ring.size();
+        for (u64 n = p.late_dead_seq; !died && n < long_sets.dead_count; ++n) {
+            const u64 dead = long_sets.dead_ring[n % long_sets.dead_ring.size()];
+            died = std::ranges::find(handles, dead) != handles.end();
+        }
+        if (died) {
+            long_sets.retired.push_back({p.late_retire_tick, layout_key, set});
+            ++long_sets.late_not_kept;
+        } else {
+            StoreLongSet(wide.low64, wide.high64, layout, set, handles);
+            ++long_sets.late_made;
+        }
+        sets[index] = set;
+    }
+}
+
 vk::DescriptorSet NativeRenderer::MakeLongSet(vk::DescriptorSetLayout layout) {
     const vk::Device vk_device = r.instance.GetDevice();
     // PERF-GTS-376: a set of a dropped entry first (the GPU is done with it).
@@ -11240,6 +11406,7 @@ void NativeRenderer::StoreLongSet(u64 hash, u64 check, vk::DescriptorSetLayout l
 
 void NativeRenderer::DropLongSets(std::span<const u64> dead_handles) {
     for (const u64 handle : dead_handles) {
+        long_sets.dead_ring[long_sets.dead_count++ % long_sets.dead_ring.size()] = handle; // PERF-GTS-398
         const auto found = long_sets.users.find(handle);
         if (found == long_sets.users.end()) continue;
         // The open list may have bound the set: it is written again only after the GPU ran it.
@@ -11285,17 +11452,10 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
     // PERF-GTS-375 (RYGT_LONG_LIVED_SETS=1, with RYGT_DYNAMIC_BUFFER_OFFSETS=1): sets with
     // dynamic offsets are kept across lists. A list has about 40 draws, so its own cache reused
     // 18% of them; 93% match a set of the last 10 s (DIAG-GTS-373).
-    static const bool long_sets_on = [] {
-        const char* env = std::getenv("RYGT_LONG_LIVED_SETS");
-        const bool on = env && env[0] == '1' && !UiHires::Enabled();
-        if (on) Native::DeadHandles::enabled.store(true, std::memory_order_release);
-        return on;
-    }();
-    if (long_sets_on) {
-        static thread_local std::vector<u64> dead;
-        if (Native::DeadHandles::Take(dead)) DropLongSets(dead);
-        if (long_sets.entries.Size() > 200000 || long_sets.unused_sets > 20000) FlushLongSets();
-    }
+    static const bool long_sets_on = LongLivedSetsOn();
+    // PERF-GTS-398: with parallel recording the table is the pass workers' too.
+    static const bool long_sets_shared = ParallelRecordingRequested();
+    LongSetsUpkeep();
     auto* pending_owner=FindParallelRuntime(this);
     if(!parallel_binding_capture && pending_owner)
         pending_owner->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::Serial);
@@ -11489,7 +11649,10 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         // set with its offsets as the recorder does (FIX-GTS-394); a new one's rows are
         // staged and written before the pass is handed over, and before any serial draw.
         bool long_lived = long_sets_on && dynamic_buffers != 0 && cacheable;
+        // PERF-GTS-398: held from the lookup until the new set is in the table.
+        std::unique_lock<std::mutex> long_lock{long_sets_mutex, std::defer_lock};
         if (long_lived) {
+            if (long_sets_shared) long_lock.lock();
             if (const auto kept = long_sets.entries.Find(key_hash, key_check)) {
                 sets[index] = kept;
                 ++long_sets.hits;
@@ -11579,7 +11742,10 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         // A miss needs mutable destinations. Hits and push sets borrow the original
         // writes directly; never leave a destination handle in per-draw storage.
         trace.Next(5);
-        if(deferred) {
+        // PERF-GTS-398: a set a worker may find in the table is written before it is put
+        // there, not staged or batched (a worker would bind it unwritten).
+        const bool write_now = long_lived && long_sets_shared;
+        if(deferred && !write_now) {
             pending->Stage(writes,set);
             // FIX-GTS-394: the staged rows too are written as dynamic buffers at offset 0 (as
             // the rows below are). They were staged as plain storage buffers at their offsets,
@@ -11594,7 +11760,7 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
             }
         }
         else Native::AppendDescriptorUpdates(writes,set,updates);
-        if (dynamic_buffers != 0 && !deferred) {
+        if (dynamic_buffers != 0 && (!deferred || write_now)) {
             // PERF-GTS-374: written as dynamic buffers at offset 0 (the bind gives the offset).
             for (size_t u = updates.size() - writes.size(); u < updates.size(); ++u) {
                 auto& update = updates[u];
@@ -11615,6 +11781,13 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
                 }
                 update.pBufferInfo = dynamic_infos.data() + first;
             }
+        }
+        if (write_now) {
+            const size_t rows = writes.size();
+            vk_device.updateDescriptorSets(
+                vk::ArrayProxy<const vk::WriteDescriptorSet>{static_cast<u32>(rows),
+                                                             updates.data() + (updates.size() - rows)}, {});
+            updates.resize(updates.size() - rows);
         }
         trace.Next(7);
         if (long_lived) {
@@ -13645,6 +13818,10 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
         prepared = TakePrepared(Rasterizer::t_draw_packet);
         NATIVE_DIAGNOSTIC(stats.prepared_missing += prepared ? 0 : 1);
     }
+    if (!late_bound_done.empty()) { // PERF-GTS-398
+        for (PreparedDraw* done : late_bound_done) FreePrepared(done);
+        late_bound_done.clear();
+    }
     struct GiveBack {
         NativeRenderer& n;
         PreparedDraw* p;
@@ -14461,6 +14638,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
     bool parallel_draw=false;
     bool parallel_index_safe=false;u64 parallel_index_bytes=0;
     ParallelBindingCapture parallel_bindings{};
+    bool parallel_late_bind=false; // PERF-GTS-398
     std::shared_ptr<const DescriptorSnapshot> parallel_push_writes;
     std::size_t parallel_descriptor_bytes=0;
     u32 parallel_required_sets=0;
@@ -15742,9 +15920,16 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                 parallel->ahead_flights[ahead_slot].lease=ahead;parallel->ahead_flights[ahead_slot].release=std::move(ahead_release);parallel->ahead_flights[ahead_slot].tick=0;++parallel->ahead_live;
             }
             if(!serial_split_prebound) {
+                // PERF-GTS-398: the worker looks the sets up when it records the draw.
+                parallel_late_bind=from_prepared && prepared && prepared->pipeline==pipeline &&
+                    CanBindLate(*pipeline,b);
+                if(parallel_late_bind) {
+                    LongSetsUpkeep();
+                } else {
                 parallel_bindings.write_structure_proven=true; // descriptor_safe validated every source row
                 set_count_proof();
                 {ScopedParallelBindingCapture capture{parallel_bindings};PushBindings(*pipeline,vk::PipelineBindPoint::eGraphics,b);}
+                }
             }
             if(parallel_bindings.ahead_used) {
                 ASSERT_MSG(ahead && ahead_slot<parallel->ahead_flights.size(),"ahead descriptor lease missing");
@@ -15758,7 +15943,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             if(!b.writes.empty()) for(u32 i=0;i<b.grouped_writes.size();++i) {
                 if(i==pipeline->PushSet() || b.grouped_writes[i].empty())continue;
                 parallel_required_sets|=u32{1}<<i;
-                if(!parallel_bindings.sets[i])missing=true;
+                if(!parallel_late_bind && !parallel_bindings.sets[i])missing=true;
             }
             if(missing) {
                 // A fresh secondary cannot inherit a serial command buffer's old
@@ -15817,6 +16002,14 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             captured.pipeline_owner=prepared->pipeline_keepalive;captured.dynamic=s.dynamic;captured.push=b.push;
             captured.sets=parallel_bindings.sets;captured.required_sets_mask=parallel_required_sets;
             captured.dynamic_counts=parallel_bindings.dynamic_counts;captured.dynamic_offsets=parallel_bindings.dynamic_offsets; // FIX-GTS-394
+            if(parallel_late_bind) {
+                // PERF-GTS-398: the packet points at the prepared draw, which is kept until the
+                // list's passes have been recorded (Splice).
+                prepared->late_dead_seq=long_sets.dead_count;
+                prepared->late_retire_tick=r.scheduler.CurrentTick()+1;
+                captured.late_bind=&NativeRenderer::BindLateThunk;captured.late_owner=this;captured.late_prepared=prepared;
+                late_bound_prepared.push_back(prepared);give_back.p=nullptr;
+            }
             captured.immutable_upload_buffers_verified=true;captured.push_writes=std::move(parallel_push_writes);
             captured.push_set=pipeline->PushSet()<captured.sets.size()?pipeline->PushSet():static_cast<u32>(captured.sets.size());
             captured.descriptor_bytes=parallel_descriptor_bytes;
@@ -20674,6 +20867,11 @@ void NativeRenderer::Splice() {
     if (!wrapped) {
         r.scheduler.CommandBuffer().executeCommands(s.cmd);
     }
+    // PERF-GTS-398: every pass of the list has been recorded: its packets' prepared draws go
+    // (at the next draw: a draw that is being recorded may have asked for this splice).
+    late_bound_done.insert(late_bound_done.end(), late_bound_prepared.begin(),
+                           late_bound_prepared.end());
+    late_bound_prepared.clear();
     const u64 tick = r.scheduler.CurrentTick();
     GpuTimeCollect(); // DIAG-GT7-001: lists the GPU finished
     SpliceHudStream(tick); // GT7-UW
@@ -22141,6 +22339,8 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
                  ahead_arena.refused.exchange(0));
         ahead_arena.bound = ahead_arena.stale = 0;
     }
+    {
+    std::scoped_lock long_lock{long_sets_mutex};
     if (long_sets.hits + long_sets.made != 0) {
         LOG_INFO(Render_Vulkan,
                  "PERF-GTS-375 (10 s): sets kept across lists: {} reused, {} made ({} in the set "
@@ -22150,8 +22350,16 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
                  long_sets.flushes, long_sets.entries.Size(), long_sets.pools.size(),
                  long_sets.retired.size());
     }
+    if (long_sets.late_hits + long_sets.late_made + long_sets.late_not_kept != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "PERF-GTS-398 (10 s): sets looked up by pass workers: {} reused, {} made, {} "
+                 "made and not kept (a handle of theirs had died)",
+                 long_sets.late_hits, long_sets.late_made, long_sets.late_not_kept);
+    }
     long_sets.hits = long_sets.made = long_sets.dropped = long_sets.flushes = 0;
     long_sets.rewritten = 0;
+    long_sets.late_hits = long_sets.late_made = long_sets.late_not_kept = 0;
+    }
     if (stats.reuse_diag_sets != 0) {
         const auto pct = [&](uint64_t n) { return 100.0 * double(n) / double(stats.reuse_diag_sets); };
         LOG_INFO(Render_Vulkan,
