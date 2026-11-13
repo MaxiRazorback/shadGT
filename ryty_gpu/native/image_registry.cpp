@@ -1220,8 +1220,19 @@ u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_
     // Scan metadata in every shard: a heavily populated single shard must still
     // be able to retire a full budget every frame, rather than once per rotation.
     // Rotate the selection order so a busy shard cannot starve the others.
-    const u32 visits = NumShards;
-    if (bounded) eviction_shard_cursor = (first + 1) % NumShards;
+    // PERF-GTS-385 (RYGT_EVICT_SCAN_SHARDS=<1..64>, default 64 = as before): the bounded
+    // per-frame scan read every picture's last use, a cache miss each: 7.5% of the recorder's
+    // CPU time in a 20-car race at Tokyo (about 1.2 ms a frame), and a second walk of every
+    // shard whenever something went (1.8%). With fewer shards a frame the scan goes round
+    // the table over several frames; a frame's budget is still filled whenever the shards
+    // it visits hold that many idle pictures.
+    static const u32 scan_shards = [] {
+        const char* env = std::getenv("RYGT_EVICT_SCAN_SHARDS");
+        const u32 value = env && *env ? u32(std::strtoul(env, nullptr, 10)) : NumShards;
+        return std::clamp<u32>(value, 1, NumShards);
+    }();
+    const u32 visits = bounded ? scan_shards : NumShards;
+    if (bounded) eviction_shard_cursor = (first + visits) % NumShards;
     for (u32 i = 0; i < visits; ++i) {
         Shard& shard = shards[(first + i) % NumShards];
         std::shared_lock lock{shard.mutex};
