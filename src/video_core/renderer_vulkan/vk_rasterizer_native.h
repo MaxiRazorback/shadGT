@@ -1578,6 +1578,19 @@ private:
         /// 9 a storage picture that cannot be bound as one.
         std::array<std::atomic<u64>, 10> why{};
         std::atomic<u32> missing_logged{0};
+        /// DIAG-GTS-402: the pictures job threads did not find, by address: how often, the
+        /// last size asked for, how many different sizes, and one program that asked.
+        struct Missing {
+            u64 count = 0, bytes = 0, program = 0;
+            u32 width = 0, height = 0, layers = 0, levels = 0, sizes = 0, first_frame = 0;
+            u32 last_frame = 0;
+            bool depth = false;
+        };
+        std::mutex missing_mutex;
+        std::unordered_map<u64, Missing> missing;
+        /// DIAG-GTS-402 (the recorder): prepared draws turned down for their pictures, by
+        /// where the change began.
+        std::unordered_map<u64, u64> turned_down_at;
     } prepare_stats;
 
     Rasterizer& r;

@@ -520,6 +520,8 @@ public:
     /// DIAG-GTS-401: why Untouched said no: a change of that kind over the ranges, or the log
     /// no longer reaching back to `since` (index 0).
     std::array<std::atomic<u64>, 4> untouched_no{};
+    /// DIAG-GTS-402: where the change that last made Untouched say no began.
+    std::atomic<u64> untouched_no_begin{0};
 
 private:
     // Recorder-only scratch shared by sequential untile dispatch/copy pairs.

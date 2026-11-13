@@ -17921,6 +17921,25 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
         if (!entry) {
             NATIVE_DIAGNOSTIC(++prepare_stats.why[8]);
 #if !defined(NDEBUG)
+            {
+                // DIAG-GTS-402: every miss, by the picture's address.
+                std::scoped_lock missing_lock{prepare_stats.missing_mutex};
+                auto& miss = prepare_stats.missing[desc.info.guest_address];
+                if (miss.count == 0) miss.first_frame = static_cast<u32>(now_frame);
+                if (miss.width != desc.info.size.width || miss.height != desc.info.size.height ||
+                    miss.layers != desc.info.resources.layers) {
+                    ++miss.sizes;
+                }
+                ++miss.count;
+                miss.bytes = desc.info.guest_size;
+                miss.program = stage.pgm_hash;
+                miss.width = desc.info.size.width;
+                miss.height = desc.info.size.height;
+                miss.layers = desc.info.resources.layers;
+                miss.levels = desc.info.resources.levels;
+                miss.depth = image_desc.is_depth;
+                miss.last_frame = static_cast<u32>(now_frame);
+            }
             // DIAG-GTS-401: the first few pictures a job thread did not find, each 10 s.
             if (prepare_stats.missing_logged.fetch_add(1, std::memory_order_relaxed) < 8) {
                 LOG_INFO(Render_Vulkan,
@@ -18268,6 +18287,8 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
             NATIVE_DIAGNOSTIC(stats.prepared_image_no[i] +=
                 registry->untouched_no[i].load(std::memory_order_relaxed) - image_no_before[i]);
         }
+        NATIVE_DIAGNOSTIC(++prepare_stats.turned_down_at[
+            registry->untouched_no_begin.load(std::memory_order_relaxed)]); // DIAG-GTS-402
         return reject(3);
     }
     trace.Next(2);
@@ -22656,6 +22677,48 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
         const u64 buffer_lost = stats.prepared_buffer_no[1];
         stats.prepared_buffer_no[0] = stats.prepared_buffer_no[1] = 0;
         prepare_stats.missing_logged.store(0, std::memory_order_relaxed);
+#if !defined(NDEBUG)
+        {
+            // DIAG-GTS-402: the pictures behind those counts, the ten most frequent.
+            std::vector<std::pair<u64, PrepareStats::Missing>> rows;
+            {
+                std::scoped_lock missing_lock{prepare_stats.missing_mutex};
+                rows.assign(prepare_stats.missing.begin(), prepare_stats.missing.end());
+                prepare_stats.missing.clear();
+            }
+            std::ranges::sort(rows, [](const auto& a, const auto& b) {
+                return a.second.count > b.second.count;
+            });
+            u64 all = 0;
+            for (const auto& row : rows) all += row.second.count;
+            std::string text;
+            for (size_t i = 0; i < rows.size() && i < 10; ++i) {
+                const auto& [address, miss] = rows[i];
+                text += fmt::format(" | {:#x}+{:#x} x{} last {}x{} layers {} levels {}{} in {} "
+                                    "sizes, frames {}-{}, program {:#x}",
+                                    address, miss.bytes, miss.count, miss.width, miss.height,
+                                    miss.layers, miss.levels, miss.depth ? " depth" : "",
+                                    miss.sizes, miss.first_frame, miss.last_frame, miss.program);
+            }
+            if (!rows.empty()) {
+                LOG_INFO(Render_Vulkan, "DIAG-GTS-402 (10 s): {} misses over {} picture "
+                         "addresses on job threads (frame now {}):{}", all, rows.size(), frame,
+                         text);
+            }
+            std::vector<std::pair<u64, u64>> down(prepare_stats.turned_down_at.begin(),
+                                                  prepare_stats.turned_down_at.end());
+            prepare_stats.turned_down_at.clear();
+            std::ranges::sort(down, [](const auto& a, const auto& b) { return a.second > b.second; });
+            std::string down_text;
+            for (size_t i = 0; i < down.size() && i < 8; ++i) {
+                down_text += fmt::format(" {:#x} x{}", down[i].first, down[i].second);
+            }
+            if (!down.empty()) {
+                LOG_INFO(Render_Vulkan, "DIAG-GTS-402 (10 s): prepared draws turned down for a "
+                         "picture change beginning at ({} addresses):{}", down.size(), down_text);
+            }
+        }
+#endif
         if (any + buffer_changed + buffer_lost != 0) {
             LOG_INFO(Render_Vulkan,
                      "DIAG-GTS-401 (10 s): job threads could not prepare: buffer kind {}, buffer "

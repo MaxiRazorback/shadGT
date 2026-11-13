@@ -703,6 +703,7 @@ bool ImageRegistry::Untouched(u64 since, std::span<const std::pair<VAddr, VAddr>
             if (change.begin < end && change.end > begin) {
                 untouched_no[change.kind >= 1 && change.kind <= 3 ? change.kind : 1].fetch_add(
                     1, std::memory_order_relaxed); // DIAG-GTS-401
+                untouched_no_begin.store(change.begin, std::memory_order_relaxed); // DIAG-GTS-402
                 return false;
             }
         }
