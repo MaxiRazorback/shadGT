@@ -32,6 +32,7 @@ PFN_vkCreateGraphicsPipelines real_create_graphics{};
 PFN_vkCreateComputePipelines real_create_compute{};
 PFN_vkCreateShadersEXT real_create_shaders{};
 PFN_vkCreateShaderModule real_create_module{};
+PFN_vkDestroyPipeline destroy_pipeline{};
 PFN_vkSetDebugUtilsObjectNameEXT real_set_name{};
 PFN_vkCmdBindPipeline real_bind{};
 PFN_vkCmdInsertDebugUtilsLabelEXT insert_label{};
@@ -471,6 +472,33 @@ VkResult CreateLogged(VkDevice device, VkPipelineCache cache, u32 count, const C
     const double ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count() /
         std::max<u32>(count, 1);
+    // Level 3: build each whole pipeline a second time at once with the same cache. If even
+    // this repeat misses, the driver does not keep whole pipelines in the application cache.
+    if (Level() >= 3 && result == VK_SUCCESS && destroy_pipeline) {
+        for (u32 i = 0; i < count; ++i) {
+            if (kinds[i] != whole_kind || theirs[i]) continue;
+            VkPipelineCreationFeedback repeat_whole{};
+            std::vector<VkPipelineCreationFeedback> repeat_stages(stages[i].size());
+            VkPipelineCreationFeedbackCreateInfo repeat_fb = feedback[i];
+            repeat_fb.pPipelineCreationFeedback = &repeat_whole;
+            repeat_fb.pPipelineStageCreationFeedbacks = repeat_stages.data();
+            CreateInfo again = copies[i];
+            again.pNext = &repeat_fb;
+            VkPipeline repeat = VK_NULL_HANDLE;
+            const auto t0 = std::chrono::steady_clock::now();
+            const VkResult r = real(device, cache, 1, &again, alloc, &repeat);
+            const double repeat_ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            const bool valid = repeat_whole.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT;
+            const bool hit = repeat_whole.flags &
+                             VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT;
+            WriteRow(fmt::format("{:.3f},{},{}-repeat,{:#x},{:.3f},{:.3f},{},\"\",{},\"\",\"\",\"\"",
+                                 NowMs(), ThreadId(), whole_kind, reinterpret_cast<u64>(pipelines[i]),
+                                 repeat_ms, valid ? repeat_whole.duration / 1e6 : -1.0,
+                                 valid ? (hit ? "hit" : "miss") : "unknown", static_cast<int>(r)));
+            if (repeat) destroy_pipeline(device, repeat, alloc);
+        }
+    }
     for (u32 i = 0; i < count; ++i) {
         const auto* fb = theirs[i] ? theirs[i] : &feedback[i];
         const VkPipelineShaderStageCreateInfo* stage_infos;
@@ -579,7 +607,7 @@ int Level() {
 }
 
 bool WantsExecutableProperties() {
-    return Level() >= 2;
+    return Level() == 2;
 }
 
 void Install(vk::Device device, bool executable_properties) {
@@ -601,6 +629,7 @@ void Install(vk::Device device, bool executable_properties) {
         std::fflush(file);
     }
     capture_statistics = executable_properties;
+    destroy_pipeline = d.vkDestroyPipeline;
     get_executables = d.vkGetPipelineExecutablePropertiesKHR;
     get_statistics = d.vkGetPipelineExecutableStatisticsKHR;
     insert_label = d.vkCmdInsertDebugUtilsLabelEXT;
