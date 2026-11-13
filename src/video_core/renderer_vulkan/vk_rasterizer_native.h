@@ -1666,6 +1666,9 @@ private:
         std::array<uint64_t, 9> bind_phase_ns{};
         std::array<uint64_t, 8> commit_phase_ns{};
         uint64_t bind_phase_calls = 0, commit_phase_calls = 0;
+        /// DIAG-GTS-379: the per-picture checks of a prepared draw's commit, by check.
+        std::array<uint64_t, 7> image_check_ns{};
+        uint64_t image_check_calls = 0, image_check_pictures = 0;
         /// DIAG-GTS-373: allocated graphics sets whose key, with buffer offsets left out, was
         /// seen before in the same list, in the same frame, or in the last 10 s.
         uint64_t reuse_diag_sets = 0, reuse_diag_exact = 0, reuse_diag_list = 0,

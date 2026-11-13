@@ -17822,6 +17822,12 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     if(uploads_proven && stream.upload_incarnation==upload_incarnation)
         p.upload_receipt_incarnation=upload_incarnation;
     trace.Next(6);
+    {
+    // DIAG-GTS-379: which of the checks each picture gets costs the 1.0 us a draw of this step.
+    Native::SlowCallTrace<7> checks{t_timed, "commit-picture-checks",
+        {"stored", "last-use", "layers", "rewrite", "depth-twin", "small-rewrite", "sources"}};
+    checks.AccumulateInto(stats.image_check_ns, stats.image_check_calls);
+    if (t_timed) stats.image_check_pictures += p.bindings.stored.size() + p.bindings.sampled.size();
     for (const auto* stored : p.bindings.stored) {
         auto& entry = *const_cast<Native::ImageEntry*>(stored);
         entry.last_use.store(frame, std::memory_order_relaxed);
@@ -17830,14 +17836,21 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     }
     for (const auto* sampled : p.bindings.sampled) {
         auto& entry = *const_cast<Native::ImageEntry*>(sampled);
+        checks.Next(1);
         entry.last_use.store(frame, std::memory_order_relaxed);
+        checks.Next(2);
         if (entry.from_cpu) registry->LayersRewritten(entry, frame);
+        checks.Next(3);
         ApplyRewrite(entry); // NAT-120, NAT-133
+        checks.Next(4);
         SyncDepthTwin(entry); // FIX-212
+        checks.Next(5);
         if (entry.from_cpu && registry->RewrittenSmall(entry)) {
             ++stats.small_rewrites; // FIX-202
         }
+        checks.Next(6);
         RefreshSources(entry); // NAT-104 (FIX-197: targets too)
+    }
     }
     // RefreshRegion can process CPU writes again after the first freshness
     // check and retire a prepared mirror. Settle any new stream/promotion,
@@ -21886,6 +21899,21 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
     stats.reuse_diag_sets = stats.reuse_diag_exact = stats.reuse_diag_list = 0;
     stats.reuse_diag_frame = stats.reuse_diag_window = 0;
     stats.reuse_diag_in_window.clear();
+    if (stats.image_check_calls != 0) {
+        std::string text;
+        for (const auto value : stats.image_check_ns) {
+            text += fmt::format("{}{:.3f}", text.empty() ? "" : "/",
+                                double(value) / 1000.0 / double(stats.image_check_calls));
+        }
+        LOG_INFO(Render_Vulkan,
+                 "DIAG-GTS-379 (10 s): us a timed draw in the picture checks stored/last-use/"
+                 "layers/rewrite/depth-twin/small-rewrite/sources {} ({} draws, {:.2f} pictures "
+                 "a draw)",
+                 text, stats.image_check_calls,
+                 double(stats.image_check_pictures) / double(stats.image_check_calls));
+    }
+    stats.image_check_ns = {};
+    stats.image_check_calls = stats.image_check_pictures = 0;
     stats.bind_phase_ns = {};
     stats.commit_phase_ns = {};
     stats.bind_phase_calls = stats.commit_phase_calls = 0;
