@@ -11001,17 +11001,22 @@ bool NativeRenderer::AheadAllocate(u32 size, u64& position, u8*& data) {
     u64 known = semaphore->KnownGpuTick();
     const u64 first = offset >> AheadArena::SegmentBits;
     const u64 last = (offset + bytes - 1) >> AheadArena::SegmentBits;
+    const u64 lap = pos / capacity;
     bool asked = false;
     for (u64 segment = first; segment <= last; ++segment) {
-        const u64 busy = arena.busy[segment].load(std::memory_order_seq_cst);
-        if (busy > known && !asked) {
-            // The known tick is only as new as the last question to the driver: with nothing
-            // else asking, 20 to 45% of the copies were refused for segments long free.
-            semaphore->Refresh();
+        // A segment's mark is the lap and the GPU tick of the last bytes bound in it. Bytes
+        // of this lap are other claims, beside this one: only an earlier lap's can lie under
+        // it. (Without the lap, the draws just bound in the segment being filled refused 30
+        // to 45% of the copies.)
+        const u64 mark = arena.busy[segment].load(std::memory_order_seq_cst);
+        if ((mark >> AheadArena::TickBits) >= lap) continue;
+        const u64 tick = mark & AheadArena::TickMask;
+        if (tick > known && !asked) {
+            semaphore->Refresh(); // the known tick is only as new as the last question
             known = semaphore->KnownGpuTick();
             asked = true;
         }
-        if (busy > known) {
+        if (tick > known) {
             arena.refused.fetch_add(1, std::memory_order_relaxed);
             return false; // the GPU has not run what was bound there
         }
@@ -11030,12 +11035,14 @@ bool NativeRenderer::AheadCommit(u64 position, u32 size, vk::DescriptorBufferInf
     const u64 offset = position & (capacity - 1);
     // The list being recorded binds them: the segments wait for the GPU to run it.
     const u64 tick = r.scheduler.CurrentTick() + 1;
+    const u64 mark = ((position / capacity) << AheadArena::TickBits) |
+                     (tick & AheadArena::TickMask);
     const u64 first = offset >> AheadArena::SegmentBits;
     const u64 last = (offset + bytes - 1) >> AheadArena::SegmentBits;
     for (u64 segment = first; segment <= last; ++segment) {
         auto& busy = arena.busy[segment];
         u64 seen = busy.load(std::memory_order_seq_cst);
-        while (seen < tick && !busy.compare_exchange_weak(seen, tick, std::memory_order_seq_cst)) {
+        while (seen < mark && !busy.compare_exchange_weak(seen, mark, std::memory_order_seq_cst)) {
         }
     }
     // Claims only grow: once the head is a capacity past the position, a later claim may

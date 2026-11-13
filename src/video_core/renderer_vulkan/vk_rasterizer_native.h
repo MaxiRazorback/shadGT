@@ -483,12 +483,15 @@ private:
     struct AheadArena {
         static constexpr u64 SegmentBits = 20;
         static constexpr u64 Align = 64;
+        /// A segment's mark: the lap in the high bits, the GPU tick in the low ones.
+        static constexpr u64 TickBits = 44;
+        static constexpr u64 TickMask = (u64{1} << TickBits) - 1;
         std::unique_ptr<Native::Rhi::Buffer> buffer;
         vk::Buffer handle{};
         u64 capacity = 0;
         std::atomic<u8*> mapped{nullptr}; ///< set last: the job threads' sign that it is there
         std::atomic<u64> head{0};
-        std::unique_ptr<std::atomic<u64>[]> busy; ///< by segment: the GPU tick it waits for
+        std::unique_ptr<std::atomic<u64>[]> busy; ///< by segment: its mark (lap and GPU tick)
         std::atomic<u64> copied{0}, refused{0};   ///< by the job threads
         u64 bound = 0, stale = 0;                 ///< by the recorder
         bool tried = false;
