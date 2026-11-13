@@ -608,7 +608,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         return ticks_per_vblank > 1 && !DebugState.IsGuestThreadsPaused() &&
                !Common::GuestClock::IsPaused();
     };
-    // PERF-GTS-410 (RYGT_FLIP_BUFFER_FRAMES=1 or 2, default 0): the presenter keeps that many
+    // PERF-GTS-410 (RYGT_FLIP_BUFFER_FRAMES=0, 1 or 2, default 1): the presenter keeps that many
     // frames queued behind the one it shows. Before PERF-GTS-406 it kept three by accident
     // (flips 17.2 ms apart against a game at 60), which hid every game stall shorter than the
     // queue at the cost of 58 fps and 51 ms from submit to flip; with 406 the queue stays at one
@@ -617,7 +617,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     // at 60 refills it in about half a second a frame. Implies PERF-GTS-406's timing.
     static const u32 buffer_frames = [] {
         const char* env = std::getenv("RYGT_FLIP_BUFFER_FRAMES");
-        const unsigned long value = env && *env ? std::strtoul(env, nullptr, 10) : 0;
+        const unsigned long value = env && *env ? std::strtoul(env, nullptr, 10) : 1;
         return static_cast<u32>(std::min<unsigned long>(value, 2));
     }();
     // `depth`: the flips queued, the one to flip next included.
