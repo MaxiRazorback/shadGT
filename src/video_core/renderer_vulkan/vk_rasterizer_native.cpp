@@ -269,6 +269,9 @@ namespace {
 // consume immutable pass packets and RHI device/instance handles.
 struct ParallelBindingCapture {
     std::array<vk::DescriptorSet,Shader::Backend::MaxDescriptorSets> sets{};
+    // FIX-GTS-394: as Native::Parallel::Draw's.
+    std::array<u8,Shader::Backend::MaxDescriptorSets> dynamic_counts{};
+    boost::container::static_vector<u32,128> dynamic_offsets{};
     AheadLease* ahead{};bool ahead_used{},write_structure_proven{},counts_proven{};
     std::size_t ordinary_writes{},ordinary_buffers{},ordinary_images{};
 };
@@ -11562,7 +11565,20 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         // A miss needs mutable destinations. Hits and push sets borrow the original
         // writes directly; never leave a destination handle in per-draw storage.
         trace.Next(5);
-        if(deferred)pending->Stage(writes,set);
+        if(deferred) {
+            pending->Stage(writes,set);
+            // FIX-GTS-394: the staged rows too are written as dynamic buffers at offset 0 (as
+            // the rows below are). They were staged as plain storage buffers at their offsets,
+            // into a set whose layout has dynamic ones (RYGT_DYNAMIC_BUFFER_OFFSETS=1).
+            if(dynamic_buffers!=0)for(size_t u=pending->nw-writes.size();u<pending->nw;++u) {
+                auto& row=pending->writes[u];
+                if(!row.pBufferInfo || row.descriptorType!=vk::DescriptorType::eStorageBuffer)continue;
+                row.descriptorType=vk::DescriptorType::eStorageBufferDynamic;
+                auto* const infos=pending->buffers.data()+(row.pBufferInfo-pending->buffers.data()); // Stage's copies
+                for(u32 n=0;n<row.descriptorCount;++n)
+                    if(row.dstBinding+n<dynamic_buffers && dynamic_offset_fits(infos[n]))infos[n].offset=0;
+            }
+        }
         else Native::AppendDescriptorUpdates(writes,set,updates);
         if (dynamic_buffers != 0 && !deferred) {
             // PERF-GTS-374: written as dynamic buffers at offset 0 (the bind gives the offset).
@@ -11618,7 +11634,20 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         if(deferred && pending->staged_rows!=staged_before)NATIVE_DIAGNOSTIC(++pending->logical_draws);
         if(!updates.empty()) {trace.Next(6);vk_device.updateDescriptorSets(updates,{});
             if(pending){NATIVE_DIAGNOSTIC(++pending->actual_calls);NATIVE_DIAGNOSTIC(++pending->logical_draws);NATIVE_DIAGNOSTIC(++pending->immediate_draws);}}
-        parallel_binding_capture->sets=sets;
+        // FIX-GTS-394: the offsets the worker binds each dynamic set with. A draw with more
+        // of them than a packet holds loses that set, and is recorded by the recorder.
+        auto& capture=*parallel_binding_capture;
+        capture.dynamic_counts={};capture.dynamic_offsets.clear();
+        for(u32 index=0;index<sets.size();++index) {
+            const auto& offsets=dynamic_offsets[index];
+            if(!sets[index] || offsets.empty())continue;
+            if(offsets.size()>capture.dynamic_offsets.capacity()-capture.dynamic_offsets.size()) {
+                sets[index]=vk::DescriptorSet{};continue;
+            }
+            capture.dynamic_counts[index]=static_cast<u8>(offsets.size());
+            capture.dynamic_offsets.insert(capture.dynamic_offsets.end(),offsets.begin(),offsets.end());
+        }
+        capture.sets=sets;
         return;
     }
     std::array<vk::DescriptorSet, Shader::Backend::MaxDescriptorSets> bind_run{};
@@ -15765,6 +15794,7 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
             captured.pipeline=pipeline->Handle();captured.layout=pipeline->GetLayout();
             captured.pipeline_owner=prepared->pipeline_keepalive;captured.dynamic=s.dynamic;captured.push=b.push;
             captured.sets=parallel_bindings.sets;captured.required_sets_mask=parallel_required_sets;
+            captured.dynamic_counts=parallel_bindings.dynamic_counts;captured.dynamic_offsets=parallel_bindings.dynamic_offsets; // FIX-GTS-394
             captured.immutable_upload_buffers_verified=true;captured.push_writes=std::move(parallel_push_writes);
             captured.push_set=pipeline->PushSet()<captured.sets.size()?pipeline->PushSet():static_cast<u32>(captured.sets.size());
             captured.descriptor_bytes=parallel_descriptor_bytes;

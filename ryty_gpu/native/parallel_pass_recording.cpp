@@ -209,12 +209,20 @@ static bool RecordPassImpl(vk::CommandBuffer cmd,const Vulkan::Instance& instanc
                 if(probe.enabled) ++probe.local.descriptor_flush_count;
 #endif
             }};
+            u32 dynamic_at=0; // FIX-GTS-394
             for(u32 i=0;i<draw.sets.size();++i) {
+                const u32 dynamic=draw.dynamic_counts[i];
                 if(i==draw.push_set && draw.push_writes && !draw.push_writes->Writes().empty()) {
                     flush();const auto writes=draw.push_writes->Writes();
                     commands.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics,draw.layout,i,
                         vk::ArrayProxy<const vk::WriteDescriptorSet>{static_cast<u32>(writes.size()),writes.data()});
+                } else if(draw.sets[i] && dynamic) {
+                    // As the serial recorder: a set with dynamic buffers is bound alone, with its offsets.
+                    flush();
+                    commands.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,draw.layout,i,draw.sets[i],
+                        vk::ArrayProxy<const u32>{dynamic,draw.dynamic_offsets.data()+dynamic_at});
                 } else if(draw.sets[i]) {if(count && i!=first+count)flush();if(!count)first=i;run[count++]=draw.sets[i];}
+                dynamic_at+=dynamic;
             }
             flush();
 #if !defined(NDEBUG)

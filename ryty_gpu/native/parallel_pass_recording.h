@@ -21,6 +21,11 @@ struct Draw {
     Vulkan::DynamicState dynamic;
     Shader::PushData push{};
     std::array<vk::DescriptorSet,Shader::Backend::MaxDescriptorSets> sets{};
+    // FIX-GTS-394: the sets' dynamic buffer offsets (PERF-GTS-374), set after set: how many
+    // each set takes, and the offsets in that order. A set with dynamic buffers is bound with
+    // them; without them the driver reads the offsets through a null pointer.
+    std::array<u8,Shader::Backend::MaxDescriptorSets> dynamic_counts{};
+    boost::container::static_vector<u32,128> dynamic_offsets{};
     u32 push_set=Shader::Backend::MaxDescriptorSets;
     u32 required_sets_mask{};
     bool immutable_upload_buffers_verified{};
