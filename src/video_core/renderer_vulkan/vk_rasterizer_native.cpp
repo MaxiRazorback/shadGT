@@ -5121,8 +5121,10 @@ bool NativeRenderer::IsDynamic(VAddr begin, VAddr end, u64* blocked_granule, u64
     // went that way (as many as granules left the list), each drop made the mirrors beside it
     // anew (up to 1.2 GB of copies in 10 s at Tokyo) and refused the 150 or so prepared draws
     // over it, 5 to 10% of all draws. Once a mirror is dropped its pages are no longer
-    // watched, so later writes are not seen; instead each further drop of a granule doubles
-    // the time it is read in place, up to 32 times (about five minutes at 60 fps).
+    // watched, so later writes are not seen; instead a dropped granule is read in place for
+    // 3600 frames (a minute at 60 fps), and for 19200 (about five minutes) once it was
+    // dropped a second time. (Doubling from 600 frames took minutes to settle: after 70 s of
+    // a race the drops had only fallen from 150 to 55 in 10 s.)
     static const bool backoff = [] {
         const char* env = std::getenv("RYGT_MIRROR_DROP_BACKOFF");
         return env && env[0] == '1';
@@ -5134,10 +5136,9 @@ bool NativeRenderer::IsDynamic(VAddr begin, VAddr end, u64* blocked_granule, u64
         }
         u64 wait = DynamicFrames;
         if (backoff) {
-            if (const auto strikes = dynamic_strikes.find(granule);
-                strikes != dynamic_strikes.end() && strikes->second > 1) {
-                wait <<= std::min<u32>(strikes->second - 1, 5);
-            }
+            const auto strikes = dynamic_strikes.find(granule);
+            wait = strikes != dynamic_strikes.end() && strikes->second > 1 ? DynamicFrames * 32
+                                                                            : DynamicFrames * 6;
         }
         if (frame - it->second < wait) {
             if(blocked_granule)*blocked_granule=granule << 16;
