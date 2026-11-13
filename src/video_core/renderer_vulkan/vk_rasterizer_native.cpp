@@ -16940,12 +16940,16 @@ bool NativeRenderer::ChangeLog::Untouched(u64 since,
         return true;
     }
     if (now - since > entries.size()) {
+        no_lost.fetch_add(1, std::memory_order_relaxed); // DIAG-GTS-401
         return false;
     }
     const FreshnessRangeSearch<VAddr> search{ranges};
     for (u64 at = since + 1; at <= now; ++at) {
         const Entry& entry = entries[at % entries.size()];
-        if (search.Intersects(entry.begin, entry.end)) return false;
+        if (search.Intersects(entry.begin, entry.end)) {
+            no_changed.fetch_add(1, std::memory_order_relaxed); // DIAG-GTS-401
+            return false;
+        }
     }
     return true;
 }
@@ -17487,6 +17491,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobGuestBuffer(VAddr a
         std::shared_lock map_lock{buffer_map_mutex};
         if (Region* region = RegionOver(address, size)) {
             if (address < region->begin || address + size > region->end) {
+                NATIVE_DIAGNOSTIC(++prepare_stats.why[2]);
                 return std::nullopt; // the region grows over it first
             }
             p.regions.push_back({region, address, size});
@@ -17495,6 +17500,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobGuestBuffer(VAddr a
         }
     }
     if (write) {
+        NATIVE_DIAGNOSTIC(++prepare_stats.why[3]);
         return std::nullopt; // a region is made for it (NAT-144), or mirrors dropped
     }
     auto* direct = r.buffer_cache.GetDirectMemory();
@@ -17503,6 +17509,7 @@ std::optional<std::pair<vk::Buffer, u64>> NativeRenderer::JobGuestBuffer(VAddr a
             return std::pair{found->first->Handle(), found->second};
         }
     }
+    NATIVE_DIAGNOSTIC(++prepare_stats.why[4]);
     return std::nullopt; // gathered or copied, in GPU order
 }
 
@@ -17628,6 +17635,7 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
                 break;
             }
             default:
+                NATIVE_DIAGNOSTIC(++prepare_stats.why[0]);
                 return false; // compute-only kinds and the unsupported ones: the recorder
             }
         } else {
@@ -17680,7 +17688,10 @@ bool NativeRenderer::PrepareBuffers(const Shader::Info& stage, const AmdGpu::Reg
             // A region can appear after a worker's overlap check. Recheck any
             // truncated/empty range on the serialized recorder rather than
             // publishing an untracked truncated descriptor.
-            if (size != original_size) return false;
+            if (size != original_size) {
+                NATIVE_DIAGNOSTIC(++prepare_stats.why[1]);
+                return false;
+            }
             if (bindable && size != 0) {
                 bool region_over;
                 {
@@ -17760,6 +17771,7 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
     for (const auto& image_desc : stage.images) {
         auto tsharp = image_desc.GetSharp(stage);
         if (!MatchExperimentalCompositionTexture(tsharp, stage, image_desc, *registry)) {
+            NATIVE_DIAGNOSTIC(++prepare_stats.why[5]);
             return false; // Wait for preceding target registrations on the recorder.
         }
         const bool cube_sampling = image_desc.post_op == Shader::SharpFetchPostOp::NativeCubeSampling;
@@ -17787,6 +17799,7 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
                                                ? DepthStandIn(image_desc.is_array, false)
                                                : vk::ImageView{};
             if (wants_stand_in && !stand_in && DepthStandInOn()) {
+                NATIVE_DIAGNOSTIC(++prepare_stats.why[7]);
                 return false; // FIX-GT7-133: made and cleared on the recorder, which binds it
             }
             for (u32 i = 0; i < num_bindings; ++i) {
@@ -17805,6 +17818,7 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
                                ((image_desc.constant_mip_index & 0xff) << 6) |
                                (num_bindings << 16) | (u32(cube_sampling) << 31);
         if (num_bindings > 4 || stage.pgm_hash == 0xaa3822a3) {
+            NATIVE_DIAGNOSTIC(++prepare_stats.why[6]);
             return false; // the recorder (FIX-081's grass shader, long arrays)
         }
         const u64 memo_generation = p.image_generation + p.unmap_gen;
@@ -17905,10 +17919,24 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
             warm_upload(desc.info.guest_address, desc.info.guest_size);
         }
         if (!entry) {
+            NATIVE_DIAGNOSTIC(++prepare_stats.why[8]);
+#if !defined(NDEBUG)
+            // DIAG-GTS-401: the first few pictures a job thread did not find, each 10 s.
+            if (prepare_stats.missing_logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_INFO(Render_Vulkan,
+                         "DIAG-GTS-401: picture not there for a job thread: {:#x}+{:#x} {}x{} "
+                         "levels {} layers {} tile {} storage {} depth {} program {:#x} (frame {})",
+                         desc.info.guest_address, desc.info.guest_size, desc.info.size.width,
+                         desc.info.size.height, desc.info.resources.levels,
+                         desc.info.resources.layers, u32(desc.info.tile_mode), storage,
+                         image_desc.is_depth, stage.pgm_hash, now_frame);
+            }
+#endif
             return false; // made by the recorder, in GPU order
         }
         if (storage && !(vk::ImageUsageFlags{entry->backend_usage} &
                          vk::ImageUsageFlagBits::eStorage)) {
+            NATIVE_DIAGNOSTIC(++prepare_stats.why[9]);
             return false; // Let the recorder handle the unsupported storage binding.
         }
         const auto fallback = image_desc.mip_fallback_mode;
@@ -18230,7 +18258,16 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
         return reject(2);
     }
     trace.Next(1);
+    // DIAG-GTS-401: which kind of change (or a log too short) turned the prepared draw down.
+    std::array<u64, 4> image_no_before{};
+    for (size_t i = 0; i < image_no_before.size(); ++i) {
+        image_no_before[i] = registry->untouched_no[i].load(std::memory_order_relaxed);
+    }
     if (!registry->Untouched(p.image_generation, p.image_ranges)) {
+        for (size_t i = 0; i < image_no_before.size(); ++i) {
+            NATIVE_DIAGNOSTIC(stats.prepared_image_no[i] +=
+                registry->untouched_no[i].load(std::memory_order_relaxed) - image_no_before[i]);
+        }
         return reject(3);
     }
     trace.Next(2);
@@ -18239,7 +18276,11 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     // A successful first scan certifies history through this earlier checkpoint;
     // the second scan must still check every later change. Sampling after the scan is unsafe.
     const u64 recheck_from = buffer_log.Seq();
+    const u64 buffer_lost_before = buffer_log.no_lost.load(std::memory_order_relaxed);
     if (!buffer_log.Untouched(p.buffer_seq, p.buffer_ranges)) {
+        const bool lost = buffer_log.no_lost.load(std::memory_order_relaxed) != buffer_lost_before;
+        NATIVE_DIAGNOSTIC(++stats.prepared_buffer_no[lost ? 1 : 0]);
+        static_cast<void>(lost);
         return reject(4);
     }
     // The ordered part, as BindBuffers and BindTextures do it.
@@ -22601,6 +22642,34 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
     stats.snapshot_direct_attempts = stats.snapshot_direct_hits = stats.snapshot_direct_faults = stats.snapshot_direct_bytes = 0;
     stats.snapshot_memo_hits = stats.snapshot_memo_misses = stats.snapshot_upload_bytes_saved = 0;
     stats.record_ns = {};
+    {
+        // DIAG-GTS-401: why draws reach the recorder without a usable prepared draw.
+        std::array<u64, 10> why{};
+        u64 any = 0;
+        for (size_t i = 0; i < why.size(); ++i) any += why[i] = prepare_stats.why[i].exchange(0);
+        std::array<u64, 4> image_no{};
+        for (size_t i = 0; i < image_no.size(); ++i) {
+            any += image_no[i] = stats.prepared_image_no[i];
+            stats.prepared_image_no[i] = 0;
+        }
+        const u64 buffer_changed = stats.prepared_buffer_no[0];
+        const u64 buffer_lost = stats.prepared_buffer_no[1];
+        stats.prepared_buffer_no[0] = stats.prepared_buffer_no[1] = 0;
+        prepare_stats.missing_logged.store(0, std::memory_order_relaxed);
+        if (any + buffer_changed + buffer_lost != 0) {
+            LOG_INFO(Render_Vulkan,
+                     "DIAG-GTS-401 (10 s): job threads could not prepare: buffer kind {}, buffer "
+                     "cut short {}, region must grow {}, written buffer without a region {}, "
+                     "buffer not imported {}, composition texture {}, long array or grass {}, "
+                     "depth stand-in not made {}, picture not made yet {}, storage picture {}. "
+                     "Prepared draws turned down for their pictures: picture made {}, pictures "
+                     "evicted {}, picture reused {}, log too short {}. For their buffers: range "
+                     "changed {}, log too short {}",
+                     why[0], why[1], why[2], why[3], why[4], why[5], why[6], why[7], why[8],
+                     why[9], image_no[1], image_no[2], image_no[3], image_no[0], buffer_changed,
+                     buffer_lost);
+        }
+    }
     prepare_stats.made = 0;
     prepare_stats.failed = 0;
     prepare_stats.replaced = 0;

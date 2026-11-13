@@ -508,12 +508,20 @@ private:
         u64 generation = 0;
         VAddr begin = 0;
         VAddr end = 0;
+        u8 kind = 0; ///< DIAG-GTS-401: 1 a picture made, 2 pictures evicted, 3 a picture reused
     };
     std::mutex changes_mutex;
     std::array<Change, 1024> changes{};
     u64 change_count = 0;
     /// Logs the ranges, then moves the generation on.
-    void NoteChanges(std::span<const std::pair<VAddr, VAddr>> ranges);
+    void NoteChanges(std::span<const std::pair<VAddr, VAddr>> ranges, u8 kind = 0);
+
+public:
+    /// DIAG-GTS-401: why Untouched said no: a change of that kind over the ranges, or the log
+    /// no longer reaching back to `since` (index 0).
+    std::array<std::atomic<u64>, 4> untouched_no{};
+
+private:
     // Recorder-only scratch shared by sequential untile dispatch/copy pairs.
     std::unique_ptr<Rhi::Buffer> upload_scratch;
     std::unique_ptr<Rhi::Buffer> upload_gather_scratch;

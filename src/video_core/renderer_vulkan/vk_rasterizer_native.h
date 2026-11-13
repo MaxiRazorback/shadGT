@@ -1491,6 +1491,10 @@ private:
         };
         std::array<Entry, 1024> entries{};
         std::atomic<u64> seq{0};
+
+    public:
+        /// DIAG-GTS-401: why Untouched said no: a change over the ranges, or the log too short.
+        mutable std::atomic<u64> no_changed{0}, no_lost{0};
     };
     ChangeLog buffer_log;
     /// OPT-010: regions and mirrors are added and removed under it (exclusive); job threads
@@ -1567,6 +1571,13 @@ private:
     std::atomic<u32> recorder_epoch{0};
     struct PrepareStats {
         std::atomic<u64> made{0}, failed{0}, replaced{0}, stale{0}, ns{0};
+        /// DIAG-GTS-401: why a job thread could not prepare a draw: 0 a buffer kind the
+        /// recorder binds, 1 a buffer cut short, 2 a region that must grow, 3 a written buffer
+        /// without a region, 4 a buffer not imported, 5 a composition texture, 6 a long array
+        /// or the grass shader, 7 the depth stand-in not made yet, 8 a picture not made yet,
+        /// 9 a storage picture that cannot be bound as one.
+        std::array<std::atomic<u64>, 10> why{};
+        std::atomic<u32> missing_logged{0};
     } prepare_stats;
 
     Rasterizer& r;
@@ -1735,6 +1746,10 @@ private:
         std::unordered_set<uint64_t> reuse_diag_in_list, reuse_diag_in_frame, reuse_diag_in_window;
         u64 prepared_used = 0, prepared_missing = 0;
         std::array<u64, 5> prepared_rejected{};
+        /// DIAG-GTS-401: prepared draws turned down for their pictures (log too short, a
+        /// picture made, pictures evicted, a picture reused) and for their buffers (a
+        /// range changed, log too short).
+        u64 prepared_image_no[4]{}, prepared_buffer_no[2]{};
         u64 prepared_vertices = 0, prepared_vertices_rejected = 0; ///< OPT-011
         u64 prepared_installed = 0; ///< OPT-012: pipelines from a job thread's selection
         /// OPT-011: the record phase's parts: barrier choice, pass begin, dynamic state, vertex

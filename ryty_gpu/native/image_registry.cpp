@@ -589,7 +589,7 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
         IndexEntry(*result);
         const std::pair<VAddr, VAddr> range{info.guest_address,
                                             info.guest_address + std::max<u64>(info.guest_size, 1)};
-        NoteChanges({&range, 1}); // OPT-002, OPT-010
+        NoteChanges({&range, 1}, 1); // OPT-002, OPT-010
     }
     fill_lock.unlock();
 #ifndef NDEBUG
@@ -679,11 +679,11 @@ ImageEntry* ImageRegistry::Find(const VideoCore::ImageInfo& info, bool render_ta
     return result;
 }
 
-void ImageRegistry::NoteChanges(std::span<const std::pair<VAddr, VAddr>> ranges) {
+void ImageRegistry::NoteChanges(std::span<const std::pair<VAddr, VAddr>> ranges, u8 kind) {
     std::scoped_lock lock{changes_mutex};
     const u64 next = generation.load(std::memory_order_relaxed) + 1;
     for (const auto& [begin, end] : ranges) {
-        changes[change_count++ % changes.size()] = {next, begin, end};
+        changes[change_count++ % changes.size()] = {next, begin, end, kind};
     }
     generation.fetch_add(1, std::memory_order_acq_rel);
 }
@@ -701,11 +701,16 @@ bool ImageRegistry::Untouched(u64 since, std::span<const std::pair<VAddr, VAddr>
         }
         for (const auto& [begin, end] : ranges) {
             if (change.begin < end && change.end > begin) {
+                untouched_no[change.kind >= 1 && change.kind <= 3 ? change.kind : 1].fetch_add(
+                    1, std::memory_order_relaxed); // DIAG-GTS-401
                 return false;
             }
         }
     }
     // Every change kept is newer: the log reaches back far enough only if none was lost.
+    if (change_count > changes.size()) {
+        untouched_no[0].fetch_add(1, std::memory_order_relaxed); // DIAG-GTS-401
+    }
     return change_count <= changes.size();
 }
 
@@ -1292,7 +1297,7 @@ u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_
             ranges.emplace_back(entry->info.guest_address,
                                 entry->info.guest_address + std::max<u64>(entry->info.guest_size, 1));
         }
-        NoteChanges(ranges); // OPT-002, OPT-010
+        NoteChanges(ranges, 2); // OPT-002, OPT-010
     }
     // The links between textures and targets that went (NAT-111: both directions).
     for (const auto& entry : taken) {
@@ -1467,7 +1472,7 @@ void ImageRegistry::MarkReused(ImageEntry& entry) {
     const std::pair<VAddr, VAddr> range{entry.info.guest_address,
                                         entry.info.guest_address +
                                             std::max<u64>(entry.info.guest_size, 1)};
-    NoteChanges({&range, 1});
+    NoteChanges({&range, 1}, 3);
 #ifndef NDEBUG
     if (WatchedTexture(entry.info.guest_address, entry.info.guest_address + 1)) {
         LOG_WARNING(Render_Vulkan, "FIX-157 watch: kept {:#x} reused", entry.info.guest_address);
