@@ -5044,6 +5044,7 @@ void NativeRenderer::SortRegionWrites() {
                     dynamic = true;
                     if(mirror_diag && blocked_granule==~u64{0}) {blocked_granule=granule<<16;blocked_age=frame-written->second;}
                     dynamic_granules[granule] = frame;
+                    ++dynamic_strikes[granule]; // PERF-GTS-386 (the mirror goes below: once a drop)
                 }
                 written->second = frame;
             }
@@ -5115,12 +5116,30 @@ bool NativeRenderer::IsDynamic(VAddr begin, VAddr end, u64* blocked_granule, u64
     if (dynamic_granules.empty()) {
         return false;
     }
+    // PERF-GTS-386 (RYGT_MIRROR_DROP_BACKOFF=1): memory the game keeps rewriting was mirrored
+    // again every 600 frames, written, and dropped again: in a race about 15 mirrors a second
+    // went that way (as many as granules left the list), each drop made the mirrors beside it
+    // anew (up to 1.2 GB of copies in 10 s at Tokyo) and refused the 150 or so prepared draws
+    // over it, 5 to 10% of all draws. Once a mirror is dropped its pages are no longer
+    // watched, so later writes are not seen; instead each further drop of a granule doubles
+    // the time it is read in place, up to 32 times (about five minutes at 60 fps).
+    static const bool backoff = [] {
+        const char* env = std::getenv("RYGT_MIRROR_DROP_BACKOFF");
+        return env && env[0] == '1';
+    }();
     for (u64 granule = begin >> 16; granule <= (end - 1) >> 16; ++granule) {
         const auto it = dynamic_granules.find(granule);
         if (it == dynamic_granules.end()) {
             continue;
         }
-        if (frame - it->second < DynamicFrames) {
+        u64 wait = DynamicFrames;
+        if (backoff) {
+            if (const auto strikes = dynamic_strikes.find(granule);
+                strikes != dynamic_strikes.end() && strikes->second > 1) {
+                wait <<= std::min<u32>(strikes->second - 1, 5);
+            }
+        }
+        if (frame - it->second < wait) {
             if(blocked_granule)*blocked_granule=granule << 16;
             if(blocked_age)*blocked_age=frame-it->second;
             return true;

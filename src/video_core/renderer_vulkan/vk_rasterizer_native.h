@@ -784,6 +784,8 @@ private:
     OptionalMirrorBudget mirror_promotion_budget; ///< shared across lists of this frame
     std::unordered_map<u64, u64> mirror_writes;    ///< granule -> frame the CPU wrote a mirror there
     std::unordered_map<u64, u64> dynamic_granules; ///< granule -> frame it was found CPU-written
+    /// PERF-GTS-386: granule -> how often a mirror over it was dropped as CPU-written.
+    std::unordered_map<u64, u32> dynamic_strikes;
     /// The first mirror that may overlap memory from `begin` on.
     std::map<VAddr, Mirror>::iterator FirstMirror(VAddr begin);
     /// The mirror holding all of the range, if any.
