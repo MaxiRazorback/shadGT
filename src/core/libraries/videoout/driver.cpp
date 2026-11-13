@@ -610,6 +610,27 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     const auto flip_allowed_at = [&] {
         return last_flip_time + FastFlipInterval(vblank_period, current_flip_rate());
     };
+    // PERF-GTS-406 (RYGT_FLIP_PACE_EXACT=1): a frame that was waiting for its time counts from
+    // that time, not from when its flip returned. Counting from the return adds the flip's own
+    // duration and the late wake to every interval: with frames queued the flips came 17.2 ms
+    // apart at Tokyo, so a game running at 60 filled the queue (3 frames, 51 ms from submit to
+    // flip) and was then held at 58.
+    static const bool pace_exact = [] {
+        const char* env = std::getenv("RYGT_FLIP_PACE_EXACT");
+        return env && env[0] == '1' && env[1] == '\0';
+    }();
+    const auto flip_paced = [&](const Request& request) {
+        const auto due = flip_allowed_at();
+        const auto began = Clock::now();
+        Flip(request);
+        if (!pace_exact) {
+            last_flip_time = Clock::now();
+        } else if (began >= due && began - due <= std::chrono::milliseconds{2}) {
+            last_flip_time = due;
+        } else {
+            last_flip_time = began;
+        }
+    };
 
     const auto receive_request = [this] -> Request {
         std::scoped_lock lk{mutex};
@@ -650,8 +671,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                                 ++g_flip_stats.early_flips;
                             }
 #endif
-                            Flip(request);
-                            last_flip_time = Clock::now();
+                            flip_paced(request);
                             FRAME_END;
                         }
                     }
@@ -732,8 +752,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                         ++g_flip_stats.early_flips;
                     }
 #endif
-                    Flip(request);
-                    last_flip_time = Clock::now();
+                    flip_paced(request);
                     FRAME_END;
                 }
             }
@@ -770,8 +789,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                     }
                 }
             } else {
-                Flip(request);
-                last_flip_time = Clock::now();
+                flip_paced(request);
                 FRAME_END;
             }
         }
