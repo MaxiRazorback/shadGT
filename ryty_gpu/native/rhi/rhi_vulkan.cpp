@@ -1023,7 +1023,7 @@ std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
         // shader data there every draw, and over PCIe each read waited (~16 us a draw).
         static const bool vram = [] {
             const char* env = std::getenv("RYGT_NATIVE_UPLOAD_VRAM");
-            return env && env[0] == '1';
+            return !env || !*env || env[0] == '1'; // PERF-GTS-407: on unless set to something else
         }();
         alloc_ci.usage = vram ? VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE : VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
         alloc_ci.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT |

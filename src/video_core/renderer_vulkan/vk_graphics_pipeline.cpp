@@ -2186,7 +2186,8 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
 #ifdef RYTY_GPU
     static const bool dynamic_requested = [] {
         const char* env = std::getenv("RYGT_DYNAMIC_BUFFER_OFFSETS");
-        return env && env[0] == '1' && NativeModeRequested();
+        // PERF-GTS-407: on unless set to something else
+        return (!env || !*env || env[0] == '1') && NativeModeRequested();
     }();
     if (dynamic_requested) {
         static const u32 dynamic_limit = instance.GetPhysicalDevice()

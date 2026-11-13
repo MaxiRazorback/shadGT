@@ -5180,7 +5180,7 @@ bool NativeRenderer::IsDynamic(VAddr begin, VAddr end, u64* blocked_granule, u64
     // a race the drops had only fallen from 150 to 55 in 10 s.)
     static const bool backoff = [] {
         const char* env = std::getenv("RYGT_MIRROR_DROP_BACKOFF");
-        return env && env[0] == '1';
+        return !env || !*env || env[0] == '1'; // PERF-GTS-407: on unless set to something else
     }();
     for (u64 granule = begin >> 16; granule <= (end - 1) >> 16; ++granule) {
         const auto it = dynamic_granules.find(granule);
@@ -5405,7 +5405,8 @@ void NativeRenderer::MakePendingMirrors() {
         // stack); else it is made as asked.
         static const u64 round = [] {
             const char* env = std::getenv("RYGT_MIRROR_ROUND_MB");
-            const u64 mb = env && *env ? std::strtoull(env, nullptr, 10) : 0;
+            // PERF-GTS-407: 4 MB unless set (0 = off).
+            const u64 mb = env && *env ? std::strtoull(env, nullptr, 10) : 4;
             return mb != 0 && (mb & (mb - 1)) == 0 && mb <= 64 ? mb * 1_MB : u64{0};
         }();
         if (round != 0 && direct) {
@@ -11095,7 +11096,8 @@ void NativeRenderer::EnsureAheadArena() {
     // 25 to 34 MB a second) were hashed, copied to upload memory and copied again as a
     // reference by the recorder at commit: about 1.0 us of the 8.2 us a draw costs it.
     const char* env = std::getenv("RYGT_AHEAD_UPLOAD_MB");
-    const u64 megabytes = env && *env ? std::strtoull(env, nullptr, 10) : 0;
+    // PERF-GTS-407: 128 MB unless set (0 = off).
+    const u64 megabytes = env && *env ? std::strtoull(env, nullptr, 10) : 128;
     if (megabytes == 0) return;
     const u64 capacity = std::bit_ceil(std::clamp<u64>(megabytes, 16, 1024)) << 20;
     auto buffer = device->CreateBuffer({
@@ -11199,7 +11201,8 @@ bool NativeRenderer::AheadCommit(u64 position, u32 size, vk::DescriptorBufferInf
 static bool LongLivedSetsOn() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_LONG_LIVED_SETS");
-        const bool enabled = env && env[0] == '1' && !UiHires::Enabled();
+        // PERF-GTS-407: on unless set to something else
+        const bool enabled = (!env || !*env || env[0] == '1') && !UiHires::Enabled();
         if (enabled) Native::DeadHandles::enabled.store(true, std::memory_order_release);
         return enabled;
     }();
@@ -16977,7 +16980,7 @@ bool NativeRenderer::ChangeLog::UntouchedHolding(
 bool NativeRenderer::PreparedBuffersUntouched(const PreparedDraw& p, u64 since) const {
     static const bool mirror_exact = [] {
         const char* env = std::getenv("RYGT_PREPARED_MIRROR_EXACT");
-        return env && env[0] == '1' && env[1] == '\0';
+        return !env || !*env || (env[0] == '1' && env[1] == '\0'); // PERF-GTS-407: on unless set to something else
     }();
     return mirror_exact
                ? buffer_log.UntouchedHolding(since, p.buffer_ranges,
@@ -17981,7 +17984,8 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
         // picture in GPU order at commit and fills its views in.
         static const bool leave_missing = [] {
             const char* env = std::getenv("RYGT_PREPARE_MISSING_PICTURES");
-            return env && env[0] == '1' && env[1] == '\0';
+            // PERF-GTS-407: on unless set to something else
+            return !env || !*env || (env[0] == '1' && env[1] == '\0');
         }();
         if (!entry && leave_missing && !storage) {
             for (u32 i = 0; i < num_bindings; ++i) {
@@ -18370,7 +18374,7 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     // memory) was turned down with it, 3,500 to 18,800 draws in 10 s at Tokyo.
     static const bool evict_exact = [] {
         const char* env = std::getenv("RYGT_PREPARED_EVICT_EXACT");
-        return env && env[0] == '1' && env[1] == '\0';
+        return !env || !*env || (env[0] == '1' && env[1] == '\0'); // PERF-GTS-407: on unless set to something else
     }();
     if (!(evict_exact
               ? registry->UntouchedHolding(p.image_generation, p.image_ranges, p.picture_ranges)

@@ -2418,12 +2418,12 @@ PipelineCache::~PipelineCache() {
 
 // PERF-167: the driver cache file's size limit, from the launcher's Graphics page
 // (RYGT_DRIVER_CACHE_MAX_MB): 0 turns the file off, -1 has no limit; unset keeps the bounded
-// DriverCacheDiskBudget (2 GB, as FIX-GT7-049's default). A file over it is not loaded.
+// 4 GB limit (PERF-GTS-407; it was DriverCacheDiskBudget, 2 GB). A file over it is not loaded.
 static u64 DriverCacheMaxBytes() {
     static const u64 limit = [] {
         const char* env = std::getenv("RYGT_DRIVER_CACHE_MAX_MB");
         if (!env || !*env) {
-            return u64{DriverCacheDiskBudget};
+            return u64{4096} << 20;
         }
         const long long mb = std::strtoll(env, nullptr, 10);
         return mb < 0 ? ~u64{0} : u64(mb) << 20;

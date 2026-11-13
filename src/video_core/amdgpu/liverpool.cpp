@@ -329,7 +329,8 @@ std::array<u8, 48_KB> Liverpool::ConstantEngine::constants_heap;
 bool Liverpool::DirectNestedResume() {
     static const bool on = [] {
         const char* env = std::getenv("RYGT_DIRECT_NESTED_RESUME");
-        return env && env[0] == '1';
+        // PERF-GTS-407: on in native mode unless set to something else.
+        return env && *env ? env[0] == '1' : Vulkan::NativeModeRequested();
     }();
     return on;
 }

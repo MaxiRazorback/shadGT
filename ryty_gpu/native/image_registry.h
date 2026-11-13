@@ -368,7 +368,7 @@ public:
         }
         static const bool once_a_frame = [] {
             const char* env = std::getenv("RYGT_UPLOAD_ONCE_A_FRAME");
-            return env && env[0] == '1';
+            return !env || !*env || env[0] == '1'; // PERF-GTS-407: on unless set to something else
         }();
         if (!once_a_frame || !entry.from_cpu || entry.info.guest_size < (4ull << 20) ||
             entry.force_upload.load(std::memory_order_relaxed)) {

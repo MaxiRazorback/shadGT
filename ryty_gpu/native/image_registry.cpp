@@ -1272,7 +1272,8 @@ u32 ImageRegistry::Evict(u64 before, const std::function<void(ImageEntry&)>& on_
     // it visits hold that many idle pictures.
     static const u32 scan_shards = [] {
         const char* env = std::getenv("RYGT_EVICT_SCAN_SHARDS");
-        const u32 value = env && *env ? u32(std::strtoul(env, nullptr, 10)) : NumShards;
+        // PERF-GTS-407: 8 shards a frame unless set.
+        const u32 value = env && *env ? u32(std::strtoul(env, nullptr, 10)) : 8;
         return std::clamp<u32>(value, 1, NumShards);
     }();
     const u32 visits = bounded ? scan_shards : NumShards;
