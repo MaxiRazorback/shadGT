@@ -27,6 +27,9 @@ u64 ReadAheadStates::PipelineStateHash(std::span<const u32> regs) {
             primitive[reg - PrimitiveFirst] = 0;
         }
     }
+    for (const auto& range : DynamicRanges) { // PERF-GTS-413
+        std::fill_n(context.begin() + (range.first - ContextFirst), range.count, 0u);
+    }
     u64 hash = XXH3_64bits(sh.data(), sizeof(sh));
     hash = XXH3_64bits_withSeed(context.data(), sizeof(context), hash);
     return XXH3_64bits_withSeed(primitive.data(), sizeof(primitive), hash);

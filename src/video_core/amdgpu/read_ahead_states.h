@@ -90,6 +90,26 @@ public:
         return false;
     }
 
+    /// PERF-GTS-413: context registers that are dynamic state or clear values, which no pipeline
+    /// key reads: depth bounds, the clear values and the screen scissor; the window offset and
+    /// scissor; the generic scissor; the viewport scissors and depths; the index offset; the
+    /// blend constants; the stencil references; the viewports; the polygon offset. Scissors
+    /// and viewports follow the camera, so hashing them made thousands of draw states a second
+    /// new ones (Special Stage Route X: 16,000 to 26,000 evaluated in 2 s for a handful of
+    /// builds, a quarter of the command thread's time).
+    static constexpr std::array<Range, 9> DynamicRanges{{
+        {0xA008, 6}, {0xA080, 3}, {0xA090, 2}, {0xA094, 64}, {0xA102, 1},
+        {0xA105, 4}, {0xA10C, 2}, {0xA10F, 96}, {0xA2DF, 5},
+    }};
+    static constexpr bool IsDynamic(u32 reg) {
+        for (const auto& range : DynamicRanges) {
+            if (reg >= range.first && reg < range.first + range.count) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// Whether writing [first, first + count) can change what PipelineStateHash hashes.
     static constexpr bool AffectsPipeline(u32 first, u32 count) {
         const u32 end = first + count;
@@ -103,7 +123,8 @@ public:
             }
             return false;
         };
-        return any_in(ContextFirst, ContextCount, IsPerDraw) ||
+        return any_in(ContextFirst, ContextCount,
+                      [](u32 reg) { return IsPerDraw(reg) || IsDynamic(reg); }) ||
                any_in(PrimitiveFirst, PrimitiveCount, IsPerDraw) ||
                any_in(ShGfxFirst, ShGfxCount, IsUserData);
     }
