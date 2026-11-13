@@ -16632,18 +16632,35 @@ bool NativeRenderer::ChangeLog::Untouched(u64 since,
 }
 
 NativeRenderer::PreparedDraw* NativeRenderer::NewPrepared() {
-    std::scoped_lock lock{prepared_pool_mutex};
-    if (!prepared_free.empty()) {
-        PreparedDraw* draw = prepared_free.back();
+    PreparedDraw* draw;
+    {
+        std::scoped_lock lock{prepared_pool_mutex};
+        if (prepared_free.empty()) {
+            prepared_all.push_back(std::make_unique<PreparedDraw>());
+            return prepared_all.back().get();
+        }
+        draw = prepared_free.back();
         prepared_free.pop_back();
-        return draw;
     }
-    prepared_all.push_back(std::make_unique<PreparedDraw>());
-    return prepared_all.back().get();
+    if (draw->reset_pending) { // PERF-GTS-392: here, on the thread that fills it again
+        draw->Reset();
+        draw->reset_pending = false;
+    }
+    return draw;
 }
 
 void NativeRenderer::FreePrepared(PreparedDraw* draw) {
-    draw->Reset();
+    // PERF-GTS-392: the recorder gave each prepared draw back cleared: Reset was 1.9% of its
+    // CPU time in a race at Tokyo, most of it clearing fields the recorder had never read
+    // (written by the worker that prepared the draw, on another core). The draw is now cleared
+    // by the thread that takes it for the next draw, which writes those fields anyway. What
+    // holds something for others is still released here: the pipeline and the descriptor sets
+    // prepared ahead.
+    if (AheadRequested()) {
+        draw->ahead_descriptor_lease.store({}, std::memory_order_release);
+    }
+    draw->pipeline_keepalive.reset();
+    draw->reset_pending = true;
     std::scoped_lock lock{prepared_pool_mutex};
     prepared_free.push_back(draw);
 }

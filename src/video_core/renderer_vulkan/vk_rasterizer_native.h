@@ -1447,6 +1447,9 @@ private:
         boost::container::static_vector<SamplerOrigin,Shader::NUM_SAMPLERS*(Shader::MaxStageTypes-1)> sampler_origins;
         u64 sampler_origins_epoch{};
         bool sampler_origins_valid{true};
+        /// PERF-GTS-392: given back without Reset; NewPrepared resets it on the thread that
+        /// takes it (written and read under prepared_pool_mutex's ordering).
+        bool reset_pending = false;
         void Reset();
     };
     /// OPT-010: the guest ranges whose region or mirror was made or dropped, by sequence number
