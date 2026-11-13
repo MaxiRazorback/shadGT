@@ -295,6 +295,12 @@ public:
     /// OPT-010: whether no picture was made or dropped over any of the ranges since generation
     /// `since` (false when the log of changes no longer reaches back that far).
     bool Untouched(u64 since, std::span<const std::pair<VAddr, VAddr>> ranges);
+    /// PERF-GTS-404: as Untouched, for work that holds pictures by pointer: an eviction
+    /// counts only when it took a picture whose own range (address and size) is one of
+    /// `held`, the ranges of the pictures held. A picture made or reused over `ranges`
+    /// counts as before. `held` must have every held picture's own range.
+    bool UntouchedHolding(u64 since, std::span<const std::pair<VAddr, VAddr>> ranges,
+                          std::span<const std::pair<VAddr, VAddr>> held);
 
     /// OPT-002: changes whenever a picture is made or dropped (what Find returns may change).
     u64 Generation() const {

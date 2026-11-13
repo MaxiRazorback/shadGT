@@ -16909,6 +16909,7 @@ void NativeRenderer::PreparedDraw::Reset() {
     bindings.Clear();
     regions.clear();
     image_ranges.clear();
+    picture_ranges.clear(); // PERF-GTS-404
     buffer_ranges.clear();
     upload_bytes.clear();
     uploads.clear();
@@ -17864,6 +17865,7 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
                     for(u32 i=0;i<num_bindings;++i)Native::Parallel::AddSampledViewProof(p.sampled_view_proofs,first+i,b.sampled.size()-1,memo.views[i],entry,proof_epoch,cube_sampling);
             }
             p.image_ranges.emplace_back(entry->info.guest_address, entry->info.guest_address + std::max<u64>(entry->info.guest_size, 1));
+            p.picture_ranges.emplace_back(entry->info.guest_address, entry->info.guest_address + std::max<u64>(entry->info.guest_size, 1)); // PERF-GTS-404
             add_write();
             continue;
         }
@@ -18017,6 +18019,9 @@ bool NativeRenderer::PrepareTextures(const Shader::Info& stage, const AmdGpu::Re
         p.image_ranges.emplace_back(desc.info.guest_address,
                                     desc.info.guest_address +
                                         std::max<u64>(desc.info.guest_size, 1));
+        p.picture_ranges.emplace_back(entry->info.guest_address, // PERF-GTS-404: the picture's own
+                                      entry->info.guest_address +
+                                          std::max<u64>(entry->info.guest_size, 1));
         add_write();
     }
     for (const auto& sampler : stage.samplers) {
@@ -18307,7 +18312,18 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
     for (size_t i = 0; i < image_no_before.size(); ++i) {
         image_no_before[i] = registry->untouched_no[i].load(std::memory_order_relaxed);
     }
-    if (!registry->Untouched(p.image_generation, p.image_ranges)) {
+    // PERF-GTS-404 (RYGT_PREPARED_EVICT_EXACT=1): an eviction turns a prepared draw down only
+    // when it took a picture the draw holds. Any eviction over the draw's pictures' memory did:
+    // GT Sport's light grid moves by a few hundred bytes now and then, each old copy is evicted
+    // when it has gone unused, and every prepared draw sampling the current copy (over the same
+    // memory) was turned down with it, 3,500 to 18,800 draws in 10 s at Tokyo.
+    static const bool evict_exact = [] {
+        const char* env = std::getenv("RYGT_PREPARED_EVICT_EXACT");
+        return env && env[0] == '1' && env[1] == '\0';
+    }();
+    if (!(evict_exact
+              ? registry->UntouchedHolding(p.image_generation, p.image_ranges, p.picture_ranges)
+              : registry->Untouched(p.image_generation, p.image_ranges))) {
         for (size_t i = 0; i < image_no_before.size(); ++i) {
             NATIVE_DIAGNOSTIC(stats.prepared_image_no[i] +=
                 registry->untouched_no[i].load(std::memory_order_relaxed) - image_no_before[i]);
@@ -18356,6 +18372,9 @@ bool NativeRenderer::CommitPrepared(PreparedDraw& p, const GraphicsPipeline& pip
             p.image_ranges.emplace_back(missing.info.guest_address,
                                         missing.info.guest_address +
                                             std::max<u64>(missing.info.guest_size, 1));
+            p.picture_ranges.emplace_back(entry->info.guest_address, // PERF-GTS-404
+                                          entry->info.guest_address +
+                                              std::max<u64>(entry->info.guest_size, 1));
             NATIVE_DIAGNOSTIC(++stats.prepared_pictures_made);
         }
         p.missing_pictures.clear();

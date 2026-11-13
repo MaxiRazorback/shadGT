@@ -1419,6 +1419,9 @@ private:
         };
         boost::container::small_vector<RegionUse, 4> regions;
         std::vector<std::pair<VAddr, VAddr>> image_ranges;
+        /// PERF-GTS-404: the own range (address and size) of every picture held in
+        /// bindings.sampled and bindings.stored, as the registry logs it when it evicts one.
+        std::vector<std::pair<VAddr, VAddr>> picture_ranges;
         std::vector<std::pair<VAddr, VAddr>> buffer_ranges;
         /// Upload memory (flattened user data, clip planes, D3 tables): bytes copied at commit
         /// into the list's upload memory, and the buffer info that binds them.

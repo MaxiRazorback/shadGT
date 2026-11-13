@@ -715,6 +715,44 @@ bool ImageRegistry::Untouched(u64 since, std::span<const std::pair<VAddr, VAddr>
     return change_count <= changes.size();
 }
 
+bool ImageRegistry::UntouchedHolding(u64 since, std::span<const std::pair<VAddr, VAddr>> ranges,
+                                     std::span<const std::pair<VAddr, VAddr>> held) {
+    if (generation.load(std::memory_order_acquire) == since) {
+        return true;
+    }
+    std::scoped_lock lock{changes_mutex};
+    const u64 kept = std::min<u64>(change_count, changes.size());
+    for (u64 i = 0; i < kept; ++i) {
+        const Change& change = changes[(change_count - 1 - i) % changes.size()];
+        if (change.generation <= since) {
+            return true;
+        }
+        if (change.kind == 2) {
+            // An evicted picture is gone for whoever held it, and for nobody else: a lookup
+            // that answered with another picture still answers with that one.
+            for (const auto& [begin, end] : held) {
+                if (change.begin == begin && change.end == end) {
+                    untouched_no[2].fetch_add(1, std::memory_order_relaxed);
+                    untouched_no_begin.store(change.begin, std::memory_order_relaxed);
+                    return false;
+                }
+            }
+            continue;
+        }
+        for (const auto& [begin, end] : ranges) {
+            if (change.begin < end && change.end > begin) {
+                untouched_no[change.kind == 3 ? 3 : 1].fetch_add(1, std::memory_order_relaxed);
+                untouched_no_begin.store(change.begin, std::memory_order_relaxed);
+                return false;
+            }
+        }
+    }
+    if (change_count > changes.size()) {
+        untouched_no[0].fetch_add(1, std::memory_order_relaxed);
+    }
+    return change_count <= changes.size();
+}
+
 bool ImageRegistry::HasImageAt(VAddr address) {
     Shard& shard = ShardOf(address);
     std::shared_lock lock{shard.mutex};
