@@ -1464,6 +1464,10 @@ private:
     bool composition_scratch_initialized = false;
 
     std::recursive_mutex mutex; ///< v0: the recorder thread records; flips may come from others
+    /// PERF-GTS-368: game threads waiting for `mutex` to change mappings; the recorder steps
+    /// aside for them before its next draw or dispatch (it took the lock back first every time).
+    std::atomic<u32> mapping_waiters{};
+    void YieldToMappingChanges();
     struct SnapshotUploadMemo;
     std::unique_ptr<SnapshotUploadMemo> snapshot_upload_memo; ///< guarded by mutex
     Stream stream;

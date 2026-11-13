@@ -12805,7 +12805,27 @@ struct PixelTrace {
 } // namespace
 #endif
 
+void NativeRenderer::YieldToMappingChanges() {
+    // PERF-GTS-368: the recorder takes `mutex` for each draw and dispatch and took it straight
+    // back after each one, so a game thread unmapping memory (OnUnmap) waited out whole
+    // stretches of recording: 250 to 390 ms at the Autopolis start (no CPU time used), and
+    // the game's GPU work waited for that thread. With a mapping change waiting, the recorder
+    // lets it in before its next lock; at most 4 ms, so a lock this thread already holds
+    // further up cannot deadlock it. RYGT_UNMAP_HANDOFF=0 turns it off.
+    static const bool enabled = [] {
+        const char* env = std::getenv("RYGT_UNMAP_HANDOFF");
+        return !(env && env[0] == '0');
+    }();
+    if (!enabled || mapping_waiters.load(std::memory_order_acquire) == 0) return;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(4);
+    while (mapping_waiters.load(std::memory_order_acquire) != 0 &&
+           std::chrono::steady_clock::now() < until) {
+        std::this_thread::yield();
+    }
+}
+
 void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw* indirect) {
+    YieldToMappingChanges(); // PERF-GTS-368
     std::scoped_lock lock{mutex};
     struct StreamUnwindGuard {
         NativeRenderer& renderer;
@@ -17867,6 +17887,7 @@ bool NativeRenderer::MetaClearDispatch(const Shader::Info& cs) {
 }
 
 void NativeRenderer::DispatchDirect() {
+    YieldToMappingChanges(); // PERF-GTS-368
     std::scoped_lock lock{mutex};
     AmdGpu::RecorderParts::Scope recorder_part{AmdGpu::RecorderParts::Part::Dispatches};
 #if !defined(NDEBUG)
@@ -18293,6 +18314,7 @@ void NativeRenderer::DispatchDirect() {
 }
 
 void NativeRenderer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+    YieldToMappingChanges(); // PERF-GTS-368
     std::scoped_lock lock{mutex};
 #if !defined(NDEBUG)
     SceneTrace::CpuScope scene_trace{r.FrameDumpCollecting(),frame,"dispatch-indirect"};
@@ -18625,6 +18647,7 @@ void NativeRenderer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is
     if (num_bytes == 0) {
         return;
     }
+    YieldToMappingChanges(); // PERF-GTS-368
     std::scoped_lock lock{mutex};
     if (!is_gds) {
         SyncUiRange(address, num_bytes, false);
@@ -18696,6 +18719,7 @@ void NativeRenderer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gd
     if (num_bytes == 0) {
         return;
     }
+    YieldToMappingChanges(); // PERF-GTS-368
     std::scoped_lock lock{mutex};
     if (!src_gds) {
         SyncUiRange(src, num_bytes, true);
@@ -18773,6 +18797,7 @@ bool NativeRenderer::InlineWrite(VAddr address, std::span<const u8> data) {
         return false;
     }
     NoteHistory(address, data.size(), 6, 0); // DIAG-187 (diagnosis)
+    YieldToMappingChanges(); // PERF-GTS-368
     std::scoped_lock lock{mutex};
     SnapshotLease::MarkUnsafe(address, data.size(), 16);
     auto* direct = r.buffer_cache.GetDirectMemory();
@@ -18827,6 +18852,10 @@ void NativeRenderer::CancelLinearDownloads(VAddr address, u64 size) {
 }
 
 void NativeRenderer::OnUnmap(VAddr address, u64 size) {
+    // PERF-GTS-368: which part of an unmap waits (the guest-unmap trace has it as one phase).
+    Native::SlowCallTrace<5> trace{true, "native-unmap",
+        {"ui", "unwatch", "registry", "renderer-lock", "drop"}};
+    trace.Next(0, address, size);
     if (UiHires::Enabled()) {
         auto& ui = UiHires::Get();
         std::scoped_lock lock{ui.mutex};
@@ -18858,12 +18887,18 @@ void NativeRenderer::OnUnmap(VAddr address, u64 size) {
     // protected nothing, and was never set again (the page was "watched"). GT Sport maps a car's
     // models and textures into the same memory each time: the showroom's 32x32 lighting texture
     // kept the zeros of the fresh mapping, and the car screens came out blown out.
+    trace.Next(1);
     if (size != 0) {
         UnwatchPages(VideoCore::PageManager::GetPageAddr(address),
                      VideoCore::PageManager::GetNextPageAddr(address + size - 1));
     }
+    trace.Next(2);
     registry->Invalidate(address, size, Native::ImageRegistry::Stale::Unmap);
+    trace.Next(3);
+    mapping_waiters.fetch_add(1, std::memory_order_acq_rel); // PERF-GTS-368
     std::scoped_lock lock{mutex};
+    mapping_waiters.fetch_sub(1, std::memory_order_acq_rel);
+    trace.Next(4);
     CancelLinearDownloads(address, size);
     if (FaultAheadEnabled() && size != 0) {
         page_watches.ClearExclusions(VideoCore::PageManager::GetPageAddr(address),
@@ -18923,7 +18958,9 @@ u32 NativeRenderer::DropRegionsOver(VAddr address, u64 size, u32 mirror_reason) 
 
 void NativeRenderer::OnNewMapping(VAddr address, u64 size) {
     if (!size) return;
+    mapping_waiters.fetch_add(1, std::memory_order_acq_rel); // PERF-GTS-368
     std::scoped_lock lock{mutex};
+    mapping_waiters.fetch_sub(1, std::memory_order_acq_rel);
     CancelLinearDownloads(address, size);
     std::optional<std::vector<Native::MappingRefreshRange>> plan;
     std::unordered_set<VAddr> prepared_pages;
