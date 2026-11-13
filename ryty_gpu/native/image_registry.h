@@ -381,6 +381,9 @@ public:
     /// FIX-221: a large layered texture whose layers' memory changed with no CPU write seen is
     /// uploaded again (true when it was asked for).
     bool LayersRewritten(ImageEntry& entry, u64 frame);
+    /// PERF-GTS-380: the thread that makes the whole-layer hashes (see LayersRewritten).
+    struct LayerHashWorker;
+    std::shared_ptr<LayerHashWorker> layer_hash_worker;
     u64 Count();
 
     /// Records the uploads queued since the last call (copy from guest memory, untile, copy

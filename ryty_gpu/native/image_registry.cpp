@@ -8,6 +8,10 @@ bool RytyWideScene(); // WIDE-001 (ryty_game_patch.cpp)
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <stop_token>
+#include <thread>
 #include <algorithm>
 #include <bit>
 #include <cstring>
@@ -1489,6 +1493,71 @@ static bool LayerWholeHashEnabled() {
     return enabled;
 }
 
+// PERF-GTS-380: FIX-221 hashes 4 MB of each large layered texture a frame against its upload,
+// which was the recorder's largest per-picture check (about 0.5 to 1.0 us a draw, 0.5 to 0.9 ms
+// a frame at Autopolis). The hashing only reads guest memory (safely), so this thread does it;
+// the recorder posts each frame's share and takes a "changed" at the texture's next check,
+// a frame or so later (the check already takes many frames to go round a texture). Jobs hold
+// no pointer into the registry: a texture is known by its entry's address and the serial of
+// the upload its hashes are of.
+struct ImageRegistry::LayerHashWorker {
+    struct Job {
+        const void* texture;
+        u64 serial;
+        VAddr address;
+        u64 size;
+        u64 expected;
+    };
+    std::mutex mutex;
+    std::condition_variable_any wake;
+    std::deque<Job> jobs;
+    std::unordered_map<const void*, u64> changed; ///< texture -> the upload a change was seen of
+    std::atomic<u64> posted{0}, hashed{0}, dropped{0};
+    std::jthread thread;
+
+    LayerHashWorker() {
+        thread = std::jthread([this](std::stop_token stop) {
+            while (true) {
+                Job job;
+                {
+                    std::unique_lock lock{mutex};
+                    wake.wait(lock, stop, [&] { return !jobs.empty(); });
+                    if (jobs.empty()) return; // stopped
+                    job = jobs.front();
+                    jobs.pop_front();
+                }
+                const bool differs = Core::HashGuestBytes(job.address, job.size) != job.expected;
+                hashed.fetch_add(1, std::memory_order_relaxed);
+                if (differs) {
+                    std::scoped_lock lock{mutex};
+                    changed[job.texture] = job.serial;
+                }
+            }
+        });
+    }
+    void Post(const Job& job) {
+        {
+            std::scoped_lock lock{mutex};
+            if (jobs.size() >= 4096) { // far behind: the check goes round again later
+                dropped.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            jobs.push_back(job);
+        }
+        posted.fetch_add(1, std::memory_order_relaxed);
+        wake.notify_one();
+    }
+    /// A change seen of this upload of the texture (taken: asked once).
+    bool TakeChanged(const void* texture, u64 serial) {
+        std::scoped_lock lock{mutex};
+        const auto it = changed.find(texture);
+        if (it == changed.end()) return false;
+        const bool current = it->second == serial;
+        changed.erase(it);
+        return current;
+    }
+};
+
 bool ImageRegistry::LayersRewritten(ImageEntry& entry, u64 frame) {
     const bool samples = LayerSamplesEnabled();
     const bool whole = LayerWholeHashEnabled();
@@ -1499,10 +1568,29 @@ bool ImageRegistry::LayersRewritten(ImageEntry& entry, u64 frame) {
         entry.layer_hash.Checked(frame) || !memory_clamp ||
         memory_clamp(entry.info.guest_address, size) != size) return false;
     const u64 layer_size = size / layers;
-    const bool changed = entry.layer_hash.Changed(layers, layer_size, frame,
-        [&](u32 layer, u64 offset, u64 bytes) {
-            return Core::HashGuestBytes(entry.info.guest_address + layer * layer_size + offset, bytes);
-        }, samples, whole);
+    static const bool on_worker = [] {
+        const char* env = std::getenv("RYGT_ASYNC_LAYER_HASH");
+        return env && env[0] == '1';
+    }();
+    const auto hash = [&](u32 layer, u64 offset, u64 bytes) {
+        return Core::HashGuestBytes(entry.info.guest_address + layer * layer_size + offset, bytes);
+    };
+    bool changed = false;
+    if (on_worker && whole) {
+        if (!layer_hash_worker) layer_hash_worker = std::make_shared<LayerHashWorker>();
+        changed = layer_hash_worker->TakeChanged(&entry, entry.layer_hash.UploadSerial());
+        changed |= entry.layer_hash.Changed(layers, layer_size, frame, hash, samples, false);
+        if (!changed) {
+            const u64 serial = entry.layer_hash.UploadSerial();
+            entry.layer_hash.TakeWholeShare(layers, layer_size, [&](u32 layer, u64 expected) {
+                layer_hash_worker->Post({&entry, serial,
+                                         entry.info.guest_address + layer * layer_size,
+                                         layer_size, expected});
+            });
+        }
+    } else {
+        changed = entry.layer_hash.Changed(layers, layer_size, frame, hash, samples, whole);
+    }
     if (changed) MarkStale(entry, Stale::CpuWrite);
     return changed;
 }
