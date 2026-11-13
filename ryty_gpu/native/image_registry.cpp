@@ -2087,7 +2087,7 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
     }
     // PERF-109: the stale textures the work uses (an entry listed twice is uploaded once).
     for (ImageEntry* entry : bound) {
-        if (entry && entry->from_cpu && entry->needs_upload.load(std::memory_order_relaxed)) {
+        if (entry && entry->from_cpu && UploadDue(*entry)) {
             pending.push_back(entry);
         }
     }
@@ -2098,9 +2098,14 @@ u32 ImageRegistry::RecordUploads(Rhi::CommandList& list, std::span<ImageEntry* c
     u32 uploaded = 0;
     std::vector<std::unique_ptr<Rhi::Buffer>> staging; // freed after the GPU used them
     for (ImageEntry* entry : pending) {
+        if (!UploadDue(*entry)) {
+            continue; // PERF-GTS-384: not stale, or uploaded this frame already (stays stale)
+        }
         if (!entry->needs_upload.exchange(false)) {
             continue;
         }
+        entry->upload_frame.store(upload_frame_now.load(std::memory_order_relaxed),
+                                  std::memory_order_relaxed);
         const VideoCore::ImageInfo& info = entry->info;
         const u64 size = info.guest_size;
 #ifndef NDEBUG

@@ -136,6 +136,8 @@ public:
     std::atomic<bool> gpu_backing_written{false};
     bool from_cpu = false; ///< texture data the CPU wrote; render targets are GPU-only
     std::atomic<bool> needs_upload{false};
+    /// PERF-GTS-384: the frame of its last upload (see ImageRegistry::UploadDue).
+    std::atomic<u64> upload_frame{UINT64_MAX};
     std::atomic<u64> last_use{0};
     /// FIX-157: the frame it was made (how long a picture has been in use). A picture the GPU
     /// wrote is `kept` past its idle time while nothing else wrote its memory (its pages are
@@ -347,9 +349,35 @@ public:
     /// NAT-120: uploads the image from guest memory before its next use.
     // Admission happens on actual image use, not on each intermediate streaming write.
     // Duplicate requests are harmless: RecordUploads atomically consumes needs_upload.
+    /// PERF-GTS-384 (RYGT_UPLOAD_ONCE_A_FRAME=1): whether a stale texture is uploaded at this
+    /// use. GT Sport streams a track's 4096x4096 textures (21 MB with their mips) in while draws
+    /// already sample them: each write made the texture stale and the next draw uploaded all of
+    /// it again, up to four times a frame (85 MB), in frames of 45 to 57 ms. A large texture
+    /// the CPU wrote is now uploaded at most once a frame; one written again after that stays
+    /// stale and is uploaded at its first use in the next frame. GPU writes and unmaps (forced
+    /// uploads) are not held back.
+    bool UploadDue(const ImageEntry& entry) const {
+        if (!entry.needs_upload.load(std::memory_order_acquire)) {
+            return false;
+        }
+        static const bool once_a_frame = [] {
+            const char* env = std::getenv("RYGT_UPLOAD_ONCE_A_FRAME");
+            return env && env[0] == '1';
+        }();
+        if (!once_a_frame || !entry.from_cpu || entry.info.guest_size < (4ull << 20) ||
+            entry.force_upload.load(std::memory_order_relaxed)) {
+            return true;
+        }
+        return entry.upload_frame.load(std::memory_order_relaxed) !=
+               upload_frame_now.load(std::memory_order_relaxed);
+    }
+    /// The frame being recorded (the renderer tells before it asks for uploads).
+    void SetUploadFrame(u64 frame) {
+        upload_frame_now.store(frame, std::memory_order_relaxed);
+    }
+    std::atomic<u64> upload_frame_now{0};
     void QueueUploadForUse(ImageEntry& entry) {
-        if (entry.from_cpu &&
-            entry.needs_upload.load(std::memory_order_acquire)) {
+        if (entry.from_cpu && UploadDue(entry)) {
             std::scoped_lock lock{upload_mutex};
             pending_uploads.push_back(&entry);
         }

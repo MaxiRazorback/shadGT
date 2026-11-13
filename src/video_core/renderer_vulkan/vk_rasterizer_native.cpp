@@ -4566,9 +4566,10 @@ void NativeRenderer::PrepareImages(std::span<const Native::ImageEntry* const> bo
         {"pending-init-lock", "pending-upload-lock", "end-rendering", "initialize", "global-barrier", "uploads"}};
     const bool init = device->PendingImageInit();
     trace.Next(1);
+    registry->SetUploadFrame(frame); // PERF-GTS-384
     // PERF-109: the stale textures the work uses, with the uploads queued.
-    const bool bound_stale = std::ranges::any_of(bound, [](const Native::ImageEntry* entry) {
-        return entry && entry->from_cpu && entry->needs_upload.load(std::memory_order_relaxed);
+    const bool bound_stale = std::ranges::any_of(bound, [&](const Native::ImageEntry* entry) {
+        return entry && entry->from_cpu && registry->UploadDue(*entry);
     });
     const bool uploads = bound_stale || registry->HasPendingUploads();
     if (!init && !uploads) {
