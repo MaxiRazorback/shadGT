@@ -11473,8 +11473,13 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
             stats.reuse_diag_window += !stats.reuse_diag_in_window.insert(loose).second;
             stats.reuse_diag_exact += bool(s.descriptor_sets.Find(key_hash, descriptor_key));
         }
-        bool long_lived = long_sets_on && dynamic_buffers != 0 && cacheable &&
-                          !parallel_binding_capture;
+        // PERF-GTS-396: for a draw captured for a parallel pass too. They were left out, so
+        // every draw a worker recorded had its sets made and written anew by the recorder (25
+        // descriptor rows a draw, 55,000 to 93,000 sets reused in 10 s at Tokyo where the
+        // serial recorder reuses a million): 11.5 us a draw for 5.6. The worker binds a kept
+        // set with its offsets as the recorder does (FIX-GTS-394); a new one's rows are
+        // staged and written before the pass is handed over, and before any serial draw.
+        bool long_lived = long_sets_on && dynamic_buffers != 0 && cacheable;
         if (long_lived) {
             if (const auto kept = long_sets.entries.Find(key_hash, key_check)) {
                 sets[index] = kept;
@@ -11494,7 +11499,7 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
         trace.Next(4);
         const u64 layout_key = u64(VkDescriptorSetLayout(layout));
         vk::DescriptorSet set{};
-        if(parallel_binding_capture && parallel_binding_capture->ahead) {
+        if(parallel_binding_capture && parallel_binding_capture->ahead && !long_lived) {
             auto* ahead=parallel_binding_capture->ahead;
             if(ahead->pipeline_layout==pipeline.GetLayout() && ahead->layouts[index]==layout && ahead->sets[index]) {
                 set=ahead->sets[index];++ahead->used_sets;ahead->context->used_sets.fetch_add(1,std::memory_order_relaxed);parallel_binding_capture->ahead_used=true;
