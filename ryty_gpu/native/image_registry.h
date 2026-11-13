@@ -209,7 +209,7 @@ std::string WatchedBytes(VAddr address);
 struct DownloadBatch {
     struct Tiling {
         const Rhi::Pipeline* pipeline;
-        std::unique_ptr<Rhi::Buffer> params;
+        const Rhi::Buffer* params; ///< the picture's own (PERF-GTS-370)
         const Rhi::Buffer* out;
         u64 out_offset;
         u64 size;

@@ -12823,10 +12823,11 @@ void NativeRenderer::YieldToMappingChanges() {
     // stretches of recording: 250 to 390 ms at the Autopolis start (no CPU time used), and
     // the game's GPU work waited for that thread. With a mapping change waiting, the recorder
     // lets it in before its next lock; at most 4 ms, so a lock this thread already holds
-    // further up cannot deadlock it. RYGT_UNMAP_HANDOFF=0 turns it off.
+    // further up cannot deadlock it. Off unless RYGT_UNMAP_HANDOFF=1: A/B runs at Autopolis came
+    // out even (the long waits are one draw building a region, not lock starvation).
     static const bool enabled = [] {
         const char* env = std::getenv("RYGT_UNMAP_HANDOFF");
-        return !(env && env[0] == '0');
+        return env && env[0] == '1';
     }();
     if (!enabled || mapping_waiters.load(std::memory_order_acquire) == 0) return;
     const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(4);

@@ -2414,7 +2414,7 @@ void ImageRegistry::FinishDownloads(Rhi::CommandList& list, DownloadBatch& batch
              .offset = tiling.tiled_offset, .size = tiling.size},
             {.slot = 1, .type = Rhi::BindingType::StorageBuffer, .buffer = batch.scratch.get(),
              .offset = tiling.linear_offset, .size = tiling.size},
-            {.slot = 2, .type = Rhi::BindingType::UniformBuffer, .buffer = tiling.params.get(),
+            {.slot = 2, .type = Rhi::BindingType::UniformBuffer, .buffer = tiling.params,
              .size = sizeof(TilingParams)},
         }};
         list.PushBindings(bindings);
@@ -2447,7 +2447,14 @@ bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, co
         return true;
     }
     const Rhi::Pipeline* tile = TilingPipeline(info, true);
-    auto batch_params = batch && tile ? TilingParamsBuffer(info) : nullptr;
+    // PERF-GTS-370: a batched write-back made a new params buffer each time (PERF-314 reused the
+    // picture's only for unbatched ones): 11% of the recorder's time at the Autopolis start went
+    // to creating them. The picture's own, made once, is the same bytes; the entry outlives the
+    // batch, which FinishDownloads records in the same flush.
+    if (batch && tile && !entry.download_params) {
+        entry.download_params = TilingParamsBuffer(info);
+    }
+    const Rhi::Buffer* batch_params = batch && tile ? entry.download_params.get() : nullptr;
     if (batch && tile && batch_params) {
         // The tiling leaves padding unwritten: the copy back keeps what guest memory holds there.
         const u64 step = Common::AlignUp(size, batch->alignment);
@@ -2465,7 +2472,7 @@ bool ImageRegistry::RecordDownload(Rhi::CommandList& list, ImageEntry& entry, co
         list.CopyImageToBuffer(entry.image.get(), batch->scratch.get(), copies);
         list.CopyBuffer(&out, out_offset, batch->scratch.get(), tiled_offset, size);
         batch->tilings.push_back({.pipeline = tile,
-                                  .params = std::move(batch_params),
+                                  .params = batch_params,
                                   .out = &out,
                                   .out_offset = out_offset,
                                   .size = size,
