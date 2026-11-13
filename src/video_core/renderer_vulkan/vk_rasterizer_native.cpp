@@ -15187,8 +15187,16 @@ void NativeRenderer::Draw(bool is_indexed, u32 index_offset, const IndirectDraw*
                                     if(std::ranges::any_of(it->second,[&](const auto& view){return (view.use==ViewUse::Sampled || view.use==ViewUse::CubeSampled) && *view.view==wanted;}))return true;}
                                 return false;
                             };
-                            bool known=false;
-                            if(PreparedSampledProofRequested() && from_prepared && prepared && prepared->pipeline==pipeline &&
+                            // FIX-GTS-395: the depth stand-in (FIX-GT7-133) is no picture of the registry,
+                            // so no entry of b.sampled owns its view and every draw that binds it for an
+                            // empty shadow map was refused here (404,241 of 476,119 draws considered in
+                            // 10 s at Tokyo, as many as images were bound empty). It is the renderer's own
+                            // 1x1 image, cleared once when made and never written again, kept as long as
+                            // the renderer: a worker may bind it as it is.
+                            const VkImageView raw_view=static_cast<VkImageView>(info.imageView);
+                            bool known=raw_view==depth_stand_in_handles[0].load(std::memory_order_acquire) ||
+                                       raw_view==depth_stand_in_handles[1].load(std::memory_order_acquire);
+                            if(!known && PreparedSampledProofRequested() && from_prepared && prepared && prepared->pipeline==pipeline &&
                                prepared->proof_context && prepared->proof_context->Valid(prepared->proof_mode_state)) {
                                 NATIVE_DIAGNOSTIC(++parallel->prepared_view_attempts);
                                 const auto slot=static_cast<std::size_t>(&info-b.images.data());
