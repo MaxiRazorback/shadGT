@@ -267,6 +267,7 @@ private:
     // PERF-050
     std::deque<Work> urgent;
     std::atomic<bool> has_urgent{};
+    std::atomic<bool> has_work{}; ///< PERF-GTS-382: jobs are queued (the recorder looks before sleeping)
     bool exclusive{};
     bool recorder_callback_running{}; // an urgent job or the idle hook is using the caches
     u64 pushed{};
