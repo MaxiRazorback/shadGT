@@ -16,6 +16,7 @@
 #include "ryty_gpu/native/linear_image_download.h"
 #include "ryty_gpu/native/parallel_direct_capability.h"
 #include "ryty_gpu/native/parallel_gate_histogram.h"
+#include "ryty_gpu/native/descriptor_dead_handles.h"
 #include "core/emulator_settings.h"
 #include "ryty_gpu/native/parallel_rotate_segment.h"
 #include "ryty_gpu/native/natural_scope_boundary.h"
@@ -10947,8 +10948,88 @@ vk::ImageView NativeRenderer::DepthStandIn(bool array, bool may_create) {
     return vk::ImageView{handle};
 }
 
+vk::DescriptorSet NativeRenderer::FindLongSet(u64 hash, std::span<const u64> words) {
+    const auto [first, last] = long_sets.entries.equal_range(hash);
+    for (auto it = first; it != last; ++it) {
+        if (std::ranges::equal(it->second.words, words)) {
+            return it->second.set;
+        }
+    }
+    return {};
+}
+
+vk::DescriptorSet NativeRenderer::MakeLongSet(vk::DescriptorSetLayout layout) {
+    const vk::Device vk_device = r.instance.GetDevice();
+    for (u32 attempt = 0; attempt < 2; ++attempt) {
+        if (long_sets.pools.empty() || attempt == 1) {
+            long_sets.pools.push_back(TakeDescriptorPool());
+        }
+        const vk::DescriptorSetAllocateInfo alloc{
+            .descriptorPool = long_sets.pools.back(),
+            .descriptorSetCount = 1,
+            .pSetLayouts = &layout,
+        };
+        vk::DescriptorSet set{};
+        if (vk_device.allocateDescriptorSets(&alloc, &set) == vk::Result::eSuccess) {
+            return set;
+        }
+    }
+    return {};
+}
+
+void NativeRenderer::StoreLongSet(u64 hash, std::span<const u64> words, vk::DescriptorSet set,
+                                  std::span<const u64> handles) {
+    long_sets.entries.emplace(hash, LongSets::Entry{{words.begin(), words.end()}, set});
+    for (const u64 handle : handles) {
+        if (handle != 0) long_sets.users.emplace(handle, hash);
+    }
+    ++long_sets.made;
+}
+
+void NativeRenderer::DropLongSets(std::span<const u64> dead_handles) {
+    for (const u64 handle : dead_handles) {
+        const auto [first, last] = long_sets.users.equal_range(handle);
+        for (auto it = first; it != last; ++it) {
+            const auto count = long_sets.entries.erase(it->second);
+            long_sets.dropped += count;
+            long_sets.unused_sets += count;
+        }
+        long_sets.users.erase(first, last);
+    }
+}
+
+void NativeRenderer::FlushLongSets() {
+    // The open list may bind these sets: the pools are reset once the GPU ran it.
+    const u64 tick = r.scheduler.CurrentTick() + 1;
+    {
+        std::scoped_lock chunk_lock{chunk_mutex};
+        for (const auto pool : long_sets.pools) {
+            retiring_pools.emplace_back(tick, pool);
+        }
+    }
+    long_sets.pools.clear();
+    long_sets.entries.clear();
+    long_sets.users.clear();
+    long_sets.unused_sets = 0;
+    ++long_sets.flushes;
+}
+
 void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoint bind_point,
                                   DrawBindings& b) {
+    // PERF-GTS-375 (RYGT_LONG_LIVED_SETS=1, with RYGT_DYNAMIC_BUFFER_OFFSETS=1): sets with
+    // dynamic offsets are kept across lists. A list has about 40 draws, so its own cache reused
+    // 18% of them; 93% match a set of the last 10 s (DIAG-GTS-373).
+    static const bool long_sets_on = [] {
+        const char* env = std::getenv("RYGT_LONG_LIVED_SETS");
+        const bool on = env && env[0] == '1' && !UiHires::Enabled();
+        if (on) Native::DeadHandles::enabled.store(true, std::memory_order_release);
+        return on;
+    }();
+    if (long_sets_on) {
+        static thread_local std::vector<u64> dead;
+        if (Native::DeadHandles::Take(dead)) DropLongSets(dead);
+        if (long_sets.entries.size() > 60000 || long_sets.unused_sets > 20000) FlushLongSets();
+    }
     auto* pending_owner=FindParallelRuntime(this);
     if(!parallel_binding_capture && pending_owner)
         pending_owner->descriptor_updates.Flush(r.instance.GetDevice(),PendingDescriptorUpdates::Serial);
@@ -11112,7 +11193,17 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
             stats.reuse_diag_window += !stats.reuse_diag_in_window.insert(loose).second;
             stats.reuse_diag_exact += bool(s.descriptor_sets.Find(key_hash, descriptor_key));
         }
-        if (cacheable) {
+        bool long_lived = long_sets_on && dynamic_buffers != 0 && cacheable &&
+                          !parallel_binding_capture;
+        if (long_lived) {
+            if (const auto kept = FindLongSet(key_hash, descriptor_key)) {
+                sets[index] = kept;
+                ++long_sets.hits;
+                NATIVE_DIAGNOSTIC(++stats.descriptor_reuses);
+                continue;
+            }
+        }
+        if (cacheable && !long_lived) {
             if (const auto reused = s.descriptor_sets.Find(key_hash, descriptor_key)) {
                 sets[index] = reused;
                 NATIVE_DIAGNOSTIC(++stats.descriptor_reuses);
@@ -11130,6 +11221,10 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
             }
         }
         const bool ahead_hit=bool(set);
+        if (long_lived) {
+            set = MakeLongSet(layout);
+            if (!set) long_lived = false; // as before, from the list's pools
+        }
         if(!set)set=s.descriptor_reserve.Take(layout_key);
         const bool reserve_hit=bool(set) && !ahead_hit;
         if(reserve_hit)NATIVE_DIAGNOSTIC(++stats.descriptor_reserve_hits);
@@ -11215,7 +11310,22 @@ void NativeRenderer::PushBindings(const Pipeline& pipeline, vk::PipelineBindPoin
             }
         }
         trace.Next(7);
-        if (cacheable) s.descriptor_sets.Store(key_hash, descriptor_key, set);
+        if (long_lived) {
+            static thread_local std::vector<u64> handles;
+            handles.clear();
+            handles.push_back(u64(VkDescriptorSetLayout(layout)));
+            for (const auto& write : writes) {
+                for (u32 n = 0; n < write.descriptorCount; ++n) {
+                    if (write.pBufferInfo) {
+                        handles.push_back(u64(VkBuffer(write.pBufferInfo[n].buffer)));
+                    } else if (write.pImageInfo) {
+                        handles.push_back(u64(VkImageView(write.pImageInfo[n].imageView)));
+                        handles.push_back(u64(VkSampler(write.pImageInfo[n].sampler)));
+                    }
+                }
+            }
+            StoreLongSet(key_hash, descriptor_key, set, handles);
+        } else if (cacheable) s.descriptor_sets.Store(key_hash, descriptor_key, set);
         sets[index] = set;
     }} catch(...) {
         // A partially built immediate draw may already have published earlier sets.
@@ -19480,6 +19590,8 @@ void NativeRenderer::EvictImages() {
     {
         const u64 done = r.scheduler.GetWorkSemaphore()->KnownGpuTick();
         while (!retired_views.empty() && retired_views.front().first <= done) {
+            Native::DeadHandles::Note(
+                static_cast<VkImageView>(*retired_views.front().second)); // PERF-GTS-375
             retired_views.pop_front();
         }
     }
@@ -21572,6 +21684,14 @@ static_assert(timing_names.size() == static_cast<std::size_t>(Native::Parallel::
                  us(stats.bind_phase_ns, stats.bind_phase_calls), stats.bind_phase_calls,
                  us(stats.commit_phase_ns, stats.commit_phase_calls), stats.commit_phase_calls);
     }
+    if (long_sets.hits + long_sets.made != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "PERF-GTS-375 (10 s): sets kept across lists: {} reused, {} made, {} dropped "
+                 "(an object of theirs was destroyed), {} flushes; {} kept in {} pools",
+                 long_sets.hits, long_sets.made, long_sets.dropped, long_sets.flushes,
+                 long_sets.entries.size(), long_sets.pools.size());
+    }
+    long_sets.hits = long_sets.made = long_sets.dropped = long_sets.flushes = 0;
     if (stats.reuse_diag_sets != 0) {
         const auto pct = [&](uint64_t n) { return 100.0 * double(n) / double(stats.reuse_diag_sets); };
         LOG_INFO(Render_Vulkan,

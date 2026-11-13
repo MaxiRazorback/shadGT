@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <numeric>
+#include "ryty_gpu/native/descriptor_dead_handles.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -71,6 +72,9 @@ UniqueBuffer::~UniqueBuffer() {
 }
 
 void UniqueBuffer::Destroy() {
+    if (buffer) {
+        Native::DeadHandles::Note(static_cast<VkBuffer>(buffer)); // PERF-GTS-375
+    }
     if (allocation) {
         vmaDestroyBuffer(allocator, buffer, allocation);
     } else if (buffer) {

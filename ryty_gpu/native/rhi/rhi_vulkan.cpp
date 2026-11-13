@@ -1,4 +1,5 @@
 #include "ryty_gpu/native/rhi/completed_owner_release.h"
+#include "ryty_gpu/native/descriptor_dead_handles.h"
 #include "ryty_gpu/native/descriptor_update_batch.h"
 #include "ryty_gpu/native/rhi/descriptor_batch_test_spv.h"
 #include "ryty_gpu/native/rhi/gpu_timing_lease.h"
@@ -680,8 +681,10 @@ void VulkanBuffer::ReleaseCompleted() {
         device.Recycle({buffer, allocation, mapped, address, recycle_bytes, recycle_usage,
                         recycle_memory, recycle_reserved}); // PERF-GTS-362
     } else if (allocation) {
+        Native::DeadHandles::Note(static_cast<VkBuffer>(buffer)); // PERF-GTS-375
         vmaDestroyBuffer(device.allocator, static_cast<VkBuffer>(buffer), allocation);
     } else {
+        Native::DeadHandles::Note(static_cast<VkBuffer>(buffer)); // PERF-GTS-375
         device.device.destroyBuffer(buffer);
         device.device.freeMemory(memory);
     }
@@ -717,8 +720,10 @@ VulkanBuffer::~VulkanBuffer() {
 #ifndef NDEBUG
             vmaGetAllocationInfo(alloc, allocation, &allocation_info);
 #endif
+            Native::DeadHandles::Note(static_cast<VkBuffer>(buffer)); // PERF-GTS-375
             vmaDestroyBuffer(alloc, static_cast<VkBuffer>(buffer), allocation);
         } else {
+            Native::DeadHandles::Note(static_cast<VkBuffer>(buffer)); // PERF-GTS-375
             dev.destroyBuffer(buffer);
             dev.freeMemory(memory);
         }
@@ -747,10 +752,16 @@ VulkanImage::~VulkanImage() {
     });
 }
 VulkanImageView::~VulkanImageView() {
-    device.Retire([dev = device.device, view = view] { dev.destroyImageView(view); });
+    device.Retire([dev = device.device, view = view] {
+        Native::DeadHandles::Note(static_cast<VkImageView>(view)); // PERF-GTS-375
+        dev.destroyImageView(view);
+    });
 }
 VulkanSampler::~VulkanSampler() {
-    device.Retire([dev = device.device, sampler = sampler] { dev.destroySampler(sampler); });
+    device.Retire([dev = device.device, sampler = sampler] {
+        Native::DeadHandles::Note(static_cast<VkSampler>(sampler)); // PERF-GTS-375
+        dev.destroySampler(sampler);
+    });
 }
 VulkanPipelineLayout::~VulkanPipelineLayout() {
     device.Retire([dev = device.device, set_layout = set_layout, layout = layout] {
@@ -1056,6 +1067,7 @@ std::unique_ptr<Buffer> VulkanDevice::CreateBuffer(const BufferDesc& desc) {
                   allocation = nullptr;
                   RecycledBuffer idle{};
                   if (evicted == 16 || !TakeReservedRecycled(idle)) break;
+                  Native::DeadHandles::Note(static_cast<VkBuffer>(idle.buffer)); // PERF-GTS-375
                   vmaDestroyBuffer(allocator, static_cast<VkBuffer>(idle.buffer), idle.allocation);
               }
               // Still no room (or unsuitable): allocate as before.
@@ -1193,6 +1205,7 @@ void VulkanDevice::Recycle(const RecycledBuffer& buffer) {
         }
     }
     if (!keep) {
+        Native::DeadHandles::Note(static_cast<VkBuffer>(buffer.buffer)); // PERF-GTS-375
         vmaDestroyBuffer(allocator, static_cast<VkBuffer>(buffer.buffer), buffer.allocation);
     }
 }
@@ -1205,6 +1218,7 @@ void VulkanDevice::DropRecycled() {
         recycled_bytes = 0;
     }
     for (const auto& buffer : dropped) {
+        Native::DeadHandles::Note(static_cast<VkBuffer>(buffer.buffer)); // PERF-GTS-375
         vmaDestroyBuffer(allocator, static_cast<VkBuffer>(buffer.buffer), buffer.allocation);
     }
 }

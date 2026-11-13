@@ -454,6 +454,27 @@ private:
     void TrimIdleChunks();
     vk::DescriptorBufferInfo UploadFlatData(u32 stage, const u8* source, u32 size, bool* backing_proven = nullptr);
     vk::DescriptorPool TakeDescriptorPool();
+    /// PERF-GTS-375: descriptor sets with dynamic buffer offsets kept across command lists.
+    /// Recorder thread only. An entry goes when a handle it holds is about to be destroyed
+    /// (Native::DeadHandles); its set stays unused in its pool until the next Flush.
+    struct LongSets {
+        struct Entry {
+            std::vector<u64> words;
+            vk::DescriptorSet set;
+        };
+        std::unordered_multimap<u64, Entry> entries;  ///< by key hash
+        std::unordered_multimap<u64, u64> users;      ///< handle -> key hash
+        std::vector<vk::DescriptorPool> pools;
+        u64 unused_sets = 0; ///< sets of dropped entries, still in the pools
+        u64 hits = 0, made = 0, dropped = 0, flushes = 0;
+    };
+    LongSets long_sets;
+    vk::DescriptorSet FindLongSet(u64 hash, std::span<const u64> words);
+    vk::DescriptorSet MakeLongSet(vk::DescriptorSetLayout layout);
+    void StoreLongSet(u64 hash, std::span<const u64> words, vk::DescriptorSet set,
+                      std::span<const u64> handles);
+    void DropLongSets(std::span<const u64> dead_handles);
+    void FlushLongSets();
 
     /// NAT-114: a range shaders write that no single imported view holds lives in a buffer of
     /// its own on the GPU (a region), filled from guest memory when made; every later binding
